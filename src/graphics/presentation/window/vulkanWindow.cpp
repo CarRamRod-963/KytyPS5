@@ -404,11 +404,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>
+	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR,
+	                   vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, uniform_control_flow,
+	       maximal_reconvergence] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
@@ -444,6 +447,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
+	// Maximal reconvergence takes subgroup uniform control flow too.
+	if (!HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) ||
+	    !add(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME) ||
+	    !add(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
+		supported.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -453,6 +463,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.maximal_reconvergence_enabled =
+	    uniform_control_flow.shaderSubgroupUniformControlFlow &&
+	    maximal_reconvergence.shaderMaximalReconvergence;
+	LOGF("Vulkan maximal reconvergence: %s\n",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
@@ -607,6 +622,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
 	    shader_clock, conditional_rendering,
+	    vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR {
+	        .shaderSubgroupUniformControlFlow = VK_TRUE},
+	    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR {.shaderMaximalReconvergence = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -644,6 +662,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+	}
+	if (!graphics.maximal_reconvergence_enabled) {
+		create.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
 	}
 
 	vk::Device device = nullptr;
