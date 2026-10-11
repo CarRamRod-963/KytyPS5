@@ -15323,6 +15323,7 @@ void TestSrtWalkerRealSBufferTranslation() {
             std::equal(flat.begin(), flat.end(), table.begin()),
         "real S_BUFFER_LOAD walk did not align offset components independently");
 
+  // Dwords past NUM_RECORDS read as zero, as they do on the GPU.
   user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
   Check(bounds_walked && flat == std::vector<uint32_t>{table[0], table[1], table[2], 0u},
