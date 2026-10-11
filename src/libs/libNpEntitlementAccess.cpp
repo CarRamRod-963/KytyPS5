@@ -165,6 +165,9 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"85y-je"}, {}}, 3, 4},
     {{{"5d5c48"}, {}}, 3, 4},
     {{{"_mtqu6"}, {}}, 3, 4},
+    // Ghost of Yotei (PPSA26344) queries its base-game SKUs and stops at "missing base
+    // entitlement" without one.
+    {{{"GHOST2BASEME0000"}, {}}, 3, 4},
 };
 
 static NpEntitlementAccessAddcontEntitlementInfo
