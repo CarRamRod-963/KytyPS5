@@ -164,6 +164,8 @@ struct EmitterState {
 	uint32_t indirect_format_table = 0;
 };
 
+bool MaximalReconvergenceEnabled();
+
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);

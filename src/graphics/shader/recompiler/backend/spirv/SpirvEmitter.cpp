@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+std::atomic<bool> g_maximal_reconvergence {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -243,5 +246,17 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 
 	return state.builder.Build();
 }
+
+void SetMaximalReconvergence(bool enabled) {
+	g_maximal_reconvergence.store(enabled, std::memory_order_relaxed);
+}
+
+namespace Emitter {
+
+bool MaximalReconvergenceEnabled() {
+	return g_maximal_reconvergence.load(std::memory_order_relaxed);
+}
+
+} // namespace Emitter
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
