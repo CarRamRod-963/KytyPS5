@@ -402,12 +402,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
 	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
-	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
+	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+	                   vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR,
+	                   vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, acceleration_structure,
-	       ray_query, cooperative_matrix, float8] = supported;
+	       ray_query, cooperative_matrix, float8, uniform_control_flow,
+	       maximal_reconvergence] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
@@ -465,6 +468,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!fsr || !add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
 	}
+	// Maximal reconvergence takes subgroup uniform control flow too.
+	if (!HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) ||
+	    !add(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME) ||
+	    !add(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
+		supported.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
@@ -478,6 +488,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
+	graphics.maximal_reconvergence_enabled =
+	    uniform_control_flow.shaderSubgroupUniformControlFlow &&
+	    maximal_reconvergence.shaderMaximalReconvergence;
+	LOGF("Vulkan maximal reconvergence: %s\n",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
@@ -643,6 +658,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    shader_clock, conditional_rendering,
 	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE},
 	    vk::PhysicalDeviceRayQueryFeaturesKHR {.rayQuery = VK_TRUE}, cooperative_matrix, float8,
+	    vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR {
+	        .shaderSubgroupUniformControlFlow = VK_TRUE},
+	    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR {.shaderMaximalReconvergence = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -687,6 +705,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!ray_query_enabled) {
 		create.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
 		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+	}
+	if (!graphics.maximal_reconvergence_enabled) {
+		create.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
 	}
 
 	vk::Device device = nullptr;
