@@ -147,6 +147,8 @@ struct EmitterState {
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
+	// Declared for a wave64 program run one lane per host invocation (see Shuffle).
+	uint32_t                   subgroup_size_variable                = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -254,6 +256,7 @@ struct ValueEmitContext {
 	uint32_t              Ballot(IR::Value predicate);
 	uint32_t              FirstLane(uint32_t ballot);
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
+	uint32_t              ExistingLaneAtOrBelow(uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              Define(const IR::Inst& inst, uint32_t value);
 	uint32_t              ResourceIndex(IR::Value value, IR::ValueOpcode opcode);
