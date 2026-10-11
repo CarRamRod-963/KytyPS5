@@ -27876,6 +27876,50 @@ TestCase VectorPermlanex16() {
   return test;
 }
 
+// The wave64 minimum reduction of Ghost of Yotei PS 0x964747887d898821: DPP
+// row_shr:1/2/4/8 prefix minima per row, V_PERMLANEX16 to combine row pairs,
+// then V_READLANE 31 and 63 and an S_MIN_U32. The shader loops until this
+// minimum reaches 255, so a wrong result hangs the GPU.
+TestCase VectorDppPermlaneWaveMinimum() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorDppPermlaneWaveMinimum";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1d, 1, InlineU32(45), 0)); // v1 = lane ^ 45
+  AppendVMovU32(&code, 2, 50);
+  code.push_back(EncodeVop2(
+      0x25, 13, Vgpr(1), 2)); // v13 = 50 + (lane ^ 45): minimum 50 at lane 45
+  for (const u32 shift : {0x111u, 0x112u, 0x114u, 0x118u}) {
+    code.push_back(
+        EncodeVop2(0x13, 13, 250, 13)); // v_min_u32 v13, v13 (dpp row_shr), v13
+    code.push_back(EncodeVop2Dpp(13, shift));
+  }
+  // v_permlanex16_b32 v12, v13, -1, -1 op_sel:[0,1]: lane 15 of the other row
+  // of each pair.
+  AppendVop3(&code, 0x378, 12, Vgpr(13), InlineU32(0) + 65, InlineU32(0) + 65,
+             0, 2);
+  code.push_back(EncodeVop2(0x13, 13, Vgpr(13), 12));
+  AppendVop3(&code, 0x360, 6, Vgpr(13), InlineU32(31));
+  AppendVop3(&code, 0x360, 7, Vgpr(13), InlineU32(63));
+  code.push_back(EncodeSop2(0x07, 8, 6, 7)); // s_min_u32 s8, s6, s7
+  code.push_back(EncodeVop1(0x01, 2, 8));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+  test.expected = std::vector<u32>(64, 50u);
+  test.opcodes = {O::V_XOR_B32, O::V_MOV_B32,         O::V_ADD_NC_U32,
+                  O::V_MIN_U32, O::V_PERMLANEX16_B32, O::V_READLANE_B32,
+                  O::S_MIN_U32, O::V_LSHLREV_B32,     O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
@@ -44038,6 +44082,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDppPermlaneWaveMinimum);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
@@ -50268,6 +50313,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppPermlaneWaveMinimum());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
