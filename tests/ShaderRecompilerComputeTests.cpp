@@ -38540,6 +38540,30 @@ TestCase ImageGatherCompareOpcodes() {
   return test;
 }
 
+// IMAGE_GATHER4_C_L (Ghost of Yotei): a depth-compare gather at an explicit LOD
+// takes {dref, s, t, lod} and selects its mip like IMAGE_GATHER4_L.
+TestCase ImageGatherCompareExplicitLod() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 24, 0x3f000000u);
+  AppendVMovLiteral(&code, 25, 0x3f200000u);
+  AppendVMovLiteral(&code, 26, 0x3ec00000u);
+  AppendVMovLiteral(&code, 27, 0x3f800000u);
+  code.push_back(EncodeMimg0(0x4c, 0x1));
+  code.push_back(EncodeMimg1(4, 24));
+  AppendStoreVgpr(&code, 4, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageGatherCompareExplicitLod";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_C_L, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpImageDrefGather"};
+  test.compile_only = true;
+  return test;
+}
+
 TestCase ImageStoreVariants() {
   using O = ShaderOpcode;
 
@@ -43641,6 +43665,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
+  AddCase(ImageGatherCompareExplicitLod);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
