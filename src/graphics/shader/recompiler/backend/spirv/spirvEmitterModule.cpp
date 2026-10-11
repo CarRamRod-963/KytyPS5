@@ -595,6 +595,17 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
+	if (state.program.info.subgroup_shuffle && state.program.wave_size == 64u &&
+	    state.lane_count == 1u) {
+		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
+		                                              "gl_SubgroupSize");
+		state.subgroup_size_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInSubgroupSize);
+		if (state.program.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
+		}
+	}
 }
 
 void DefineOutputs(EmitterState& state) {
