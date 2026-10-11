@@ -338,12 +338,10 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
-			ir.SetExecLo(IR::U32(value));
-			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
+			WriteRawExec({IR::U32(value), ir.GetExecHi()});
 			break;
 		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+			WriteRawExec({ir.GetExecLo(), IR::U32(value)});
 			break;
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
@@ -587,11 +585,7 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
-			return;
+		case Decoder::OperandKind::ExecLo: WriteRawExec(value); return;
 		case Decoder::OperandKind::VccLo:
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);
@@ -602,6 +596,22 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	}
 	WriteRawU32(operand, value[0]);
 	WriteRawU32(OffsetOperand(operand, 1), value[1]);
+}
+
+// EXEC written from raw bits. In a graphics stage the host subgroup is the wave: guest lanes
+// outside it (an NGG shader sets EXEC = ~0 >> (64 - vertices) for a 64-lane wave on a 32-lane host,
+// or lanes of a partly filled subgroup) run in another subgroup or not at all. The SGPR form is the
+// ballot of this subgroup's lanes, so a loop that drains a copy of EXEC lane by lane (a waterfall)
+// terminates. Compute and mesh workgroups keep raw bits: their lanes all exist.
+void Translator::WriteRawExec(const std::array<IR::U32, 2>& mask) {
+	const auto exec = ThreadBit(mask);
+	ir.SetExec(exec);
+	ir.SetExecLo(mask[0]);
+	ir.SetExecHi(mask[1]);
+	if (program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh) return;
+	const auto lanes = BallotMask(exec);
+	ir.SetExecLo(lanes[0]);
+	if (program.wave_size == 64u) ir.SetExecHi(lanes[1]);
 }
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
