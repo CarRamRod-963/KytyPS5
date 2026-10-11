@@ -23,6 +23,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   const Profile& profile               = DefaultProfile,
                                   bool           emit_debug_info       = false);
 
+// Set once, before any emission, when the device enables VK_KHR_shader_maximal_reconvergence.
+// Guest waves iterate scalar loops whose exits need every lane of the host subgroup to take
+// part in each ballot and broadcast; only maximal reconvergence guarantees that.
+void SetMaximalReconvergence(bool enabled);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */
