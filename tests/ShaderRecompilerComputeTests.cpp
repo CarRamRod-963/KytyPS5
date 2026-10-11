@@ -27908,6 +27908,78 @@ TestCase VectorDppPermlaneWaveMinimum() {
   return test;
 }
 
+// The S_FF1/V_READLANE waterfall of Ghost of Yotei's CS 0x6e177a8afcbd0817:
+// each pass reads the key of the first remaining lane, serves every lane with
+// that key and clears them.
+TestCase VectorReadlaneFf1Waterfall(u32 threads) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = threads == 64 ? "VectorReadlaneFf1WaterfallWave64"
+                            : "VectorReadlaneFf1WaterfallPartialWave64";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x16, 1, InlineU32(3), 0)); // v1 = lane >> 3
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeSop1(0x04, 4, 126)); // s[4:5] = exec
+  code.push_back(EncodeSMovB32(12, InlineU32(0)));
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeSop1(0x14, 6, 4));  // s6 = ff1(s[4:5])
+  AppendVop3(&code, 0x360, 7, Vgpr(1), 6); // s7 = readlane(v1, s6)
+  AppendVop3(&code, 0xc2, 8, 7, Vgpr(1));  // s[8:9] = v1 == s7
+  code.push_back(EncodeSop2(0x00, 12, 12, InlineU32(1)));
+  code.push_back(
+      EncodeSop1(0x24, 10, 8)); // s_and_saveexec_b64 s[10:11], s[8:9]
+  code.push_back(EncodeVop1(0x01, 3, 7));
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 3)); // v2 = s7 + 1
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  code.push_back(EncodeSop2(0x15, 4, 4, 8)); // s[4:5] &= ~s[8:9]
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(0);
+  code.push_back(
+      EncodeSopc(0x0a, 12, InlineU32(64))); // Bound a broken loop for the test.
+  code.push_back(
+      EncodeSopp(0x05, (loop - static_cast<u32>(code.size()) - 1u) & 0xffffu));
+  code[exit_branch] =
+      EncodeSopp(0x04, static_cast<u32>(code.size()) - exit_branch - 1u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 12, 0, threads);
+  AppendEnd(&code);
+  for (u32 lane = 0; lane < threads; ++lane) {
+    test.expected.push_back((lane >> 3u) + 1u);
+  }
+  test.expected.insert(test.expected.end(), threads, (threads + 7u) / 8u);
+  test.opcodes = {
+      O::V_LSHRREV_B32,      O::V_MOV_B32,      O::S_MOV_B64,
+      O::S_MOV_B32,          O::S_FF1_I32_B64,  O::V_READLANE_B32,
+      O::V_CMP_EQ_U32,       O::S_ADD_U32,      O::S_AND_SAVEEXEC_B64,
+      O::V_ADD_NC_U32,       O::S_ANDN2_B64,    O::S_CBRANCH_SCC0,
+      O::S_CMP_LT_U32,       O::S_CBRANCH_SCC1, O::V_LSHLREV_B32,
+      O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Hosts with maximal reconvergence mark every entry point, so a waterfall's
+// ballot and broadcast see each lane of the host subgroup; without it the mode
+// is not emitted.
+void CheckMaximalReconvergenceExecutionMode() {
+  auto test = VectorReadlaneFf1Waterfall(64);
+  test.name = "MaximalReconvergenceExecutionMode";
+  test.required_spirv = {"SPV_KHR_maximal_reconvergence",
+                         "MaximallyReconvergesKHR"};
+  ShaderRecompiler::Spirv::SetMaximalReconvergence(true);
+  (void)CompileCase(test);
+  ShaderRecompiler::Spirv::SetMaximalReconvergence(false);
+  test.required_spirv.clear();
+  test.forbidden_spirv = {"MaximallyReconvergesKHR"};
+  (void)CompileCase(test);
+  std::printf("[host]    %-32s ok\n", test.name);
+}
+
 TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
@@ -44148,6 +44220,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(VectorDppPermlaneWaveMinimum);
+  cases.push_back(VectorReadlaneFf1Waterfall(64));
+  cases.push_back(VectorReadlaneFf1Waterfall(48));
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
@@ -51456,6 +51530,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
+  CheckMaximalReconvergenceExecutionMode();
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
   CheckGpuSelectedRecordBufferAccess(vulkan);

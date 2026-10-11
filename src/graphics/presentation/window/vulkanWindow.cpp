@@ -535,6 +535,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool reconvergence_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniform_control_flow {};
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR       maximal_reconvergence {};
+	if (reconvergence_extension) {
+		uniform_control_flow.pNext  = supported_features2.pNext;
+		maximal_reconvergence.pNext = &uniform_control_flow;
+		supported_features2.pNext   = &maximal_reconvergence;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -544,6 +553,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.maximal_reconvergence_enabled =
+	    reconvergence_extension && uniform_control_flow.shaderSubgroupUniformControlFlow &&
+	    maximal_reconvergence.shaderMaximalReconvergence;
+	LOGF("Vulkan maximal reconvergence: %s\n",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false");
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -732,6 +746,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
+	}
+	if (graphics.maximal_reconvergence_enabled) {
+		uniform_control_flow.pNext  = const_cast<void*>(create_info.pNext);
+		maximal_reconvergence.pNext = &uniform_control_flow;
+		create_info.pNext           = &maximal_reconvergence;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1115,6 +1134,13 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions,
+		                 VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions,
+		                 VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
