@@ -165,6 +165,9 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
+    // Ghost of Yotei (PPSA26344) queries its base-game SKUs and stops at "missing base
+    // entitlement" without one.
+    {{{"GHOST2BASEME0000"}, {}}, 3, 4},
 };
 
 static NpEntitlementAccessAddcontEntitlementInfo
