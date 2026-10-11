@@ -614,6 +614,12 @@ struct MsgDialogResult {
 	uint8_t reserved[32];
 };
 
+struct MsgDialogUserMessageParam {
+	int32_t     button_type;
+	int32_t     reserved;
+	const char* msg;
+};
+
 static int g_status = STATUS_NONE;
 static int g_mode   = 0;
 
@@ -641,6 +647,13 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     p->size, p->mode, reinterpret_cast<uint64_t>(p->user_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
+		// The dialog closes at once, so the log is the only place its text is seen.
+		if (const auto* user = static_cast<const MsgDialogUserMessageParam*>(p->user_msg_param);
+		    user != nullptr && user->msg != nullptr) {
+			LOGF("\t button_type    = %d\n"
+			     "\t msg            = %s\n",
+			     user->button_type, user->msg);
+		}
 	}
 
 	g_status = STATUS_FINISHED;
