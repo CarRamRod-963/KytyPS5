@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -513,11 +514,64 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	              low_first, high_lane);
 }
 
+// A pixel subgroup is often partly filled: guest lanes without a pixel have no host invocation,
+// while on the GPU they run (under an all-ones EXEC) and contribute the identity of a wave
+// reduction. Reading such a lane is undefined in SPIR-V. Read the highest active lane at or below
+// it instead, which holds the same scan or all-reduce result (a min reduction that read zero from
+// a missing lane never reached its exit value and hung the GPU).
+uint32_t ValueEmitContext::ExistingLaneAtOrBelow(uint32_t lane) {
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto scope   = ConstantU32(state, spv::ScopeSubgroup);
+	const auto ballot  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot, scope,
+	                          ConstantBool(state, true));
+	std::array<uint32_t, 4> masked {};
+	uint32_t                any = 0;
+	for (uint32_t word = 0; word < 4u; ++word) {
+		const auto base = word * 32u;
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, bits, ballot, word);
+		const auto partial = EmitBinaryU32(
+		    state, spv::OpISub,
+		    EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 2),
+		                  EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31))),
+		    ConstantU32(state, 1));
+		const auto full =
+		    Binary(state, spv::OpUGreaterThanEqual, boolean, lane, ConstantU32(state, base + 31u));
+		const auto inside =
+		    Binary(state, spv::OpUGreaterThanEqual, boolean, lane, ConstantU32(state, base));
+		const auto mask = Select(state, u32, full, ConstantU32(state, UINT32_MAX),
+		                         Select(state, u32, inside, partial, ConstantU32(state, 0)));
+		masked[word]    = EmitBinaryU32(state, spv::OpBitwiseAnd, bits, mask);
+		any = word == 0u ? masked[word] : EmitBinaryU32(state, spv::OpBitwiseOr, any, masked[word]);
+	}
+	const auto vector = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector, masked[0],
+	                          masked[1], masked[2], masked[3]);
+	const auto highest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallotFindMSB, u32, highest, scope, vector);
+	return Select(state, u32, Binary(state, spv::OpINotEqual, boolean, any, ConstantU32(state, 0)),
+	              highest, lane);
+}
+
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
+		if (state.subgroup_size_variable != 0) {
+			// A wave64 program run one guest lane per host invocation on a 32-lane host subgroup
+			// (a pixel shader) has no host invocations for guest lanes 32-63; reading one is
+			// undefined in SPIR-V. The host subgroup is the whole wave there: read the lane in
+			// it (lane 63 is the last lane, as for a prefix-scan total or a half combine).
+			const auto size = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), size,
+			                          state.subgroup_size_variable);
+			lane = EmitBinaryU32(state, spv::OpBitwiseAnd, lane,
+			                     EmitBinaryU32(state, spv::OpISub, size, ConstantU32(state, 1)));
+		}
+		if (state.program.stage == ShaderType::Pixel) lane = ExistingLaneAtOrBelow(lane);
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
 		                          lane);
 		return low;
