@@ -27203,6 +27203,73 @@ TestCase VectorReadlaneFf1Waterfall(u32 threads) {
   return test;
 }
 
+// The masked waterfall of CS 0x6e177a8afcbd0817 at 0x3528: a lane's key is
+// served only when its float test fails, through S_ORN2 / S_AND_SAVEEXEC /
+// S_ANDN2 on EXEC, and an S_CBRANCH_EXECZ skips the body when no lane is left.
+TestCase VectorMaskedReadlaneWaterfall(u32 threads) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = threads == 64 ? "VectorMaskedReadlaneWaterfallWave64"
+                            : "VectorMaskedReadlaneWaterfallPartialWave64";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x16, 1, InlineU32(3), 0)); // v1 = lane >> 3
+  code.push_back(EncodeVop2(0x1b, 3, InlineU32(1), 0)); // v3 = lane & 1
+  code.push_back(EncodeVop1(0x01, 4, 244));             // v4 = 2.0
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 3));    // vcc = v3 == 0
+  code.push_back(EncodeVop2(0x01, 10, 240, 4));         // v10 = vcc ? 2.0 : 0.5
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeSop1(0x04, 26, 126)); // s[26:27] = exec
+  code.push_back(EncodeSMovB32(40, InlineU32(0)));
+  const auto loop = static_cast<u32>(code.size());
+  AppendVop3(&code, 0x004, 16, 242, Vgpr(10)); // s[16:17] = 1.0 > v10
+  code.push_back(EncodeSop1(0x14, 106, 26));   // vcc_lo = ff1(s[26:27])
+  AppendVop3(&code, 0x360, 34, Vgpr(1), 106);  // s34 = readlane(v1, vcc_lo)
+  AppendVop3(&code, 0xc2, 32, 34, Vgpr(1));    // s[32:33] = v1 == s34
+  // v2 = s[32:33] ? 1 : 0
+  AppendVop3(&code, 0x101, 2, InlineU32(0), InlineU32(1), 32);
+  code.push_back(EncodeSop2(0x17, 106, 16, 32)); // vcc = s[16:17] | ~s[32:33]
+  code.push_back(EncodeSop1(0x24, 24, 106)); // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 2));
+  code.push_back(EncodeSop2(0x15, 126, 24, 126)); // exec = s[24:25] & ~exec
+  const auto skip_branch = static_cast<u32>(code.size());
+  code.push_back(0);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5)); // v5 += 1
+  code[skip_branch] =
+      EncodeSopp(0x08, static_cast<u32>(code.size()) - skip_branch - 1u);
+  code.push_back(EncodeSop2(0x00, 40, 40, InlineU32(1)));
+  code.push_back(EncodeSop1(0x04, 126, 24));
+  code.push_back(EncodeSop2(0x15, 26, 26, 32)); // s[26:27] &= ~s[32:33]
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(0);
+  code.push_back(EncodeSopc(0x0a, 40, InlineU32(64))); // Bound a broken loop.
+  code.push_back(
+      EncodeSopp(0x05, (loop - static_cast<u32>(code.size()) - 1u) & 0xffffu));
+  code[exit_branch] =
+      EncodeSopp(0x04, static_cast<u32>(code.size()) - exit_branch - 1u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 40, 0, threads);
+  AppendEnd(&code);
+  for (u32 lane = 0; lane < threads; ++lane) {
+    test.expected.push_back((lane & 1u) == 0u ? 1u : 0u);
+  }
+  test.expected.insert(test.expected.end(), threads, (threads + 7u) / 8u);
+  test.opcodes = {O::V_LSHRREV_B32,  O::V_AND_B32,       O::V_MOV_B32,
+                  O::V_CMP_EQ_U32,   O::V_CNDMASK_B32,   O::S_MOV_B64,
+                  O::S_MOV_B32,      O::V_CMP_GT_F32,    O::S_FF1_I32_B64,
+                  O::V_READLANE_B32, O::S_ORN2_B64,      O::S_AND_SAVEEXEC_B64,
+                  O::S_ANDN2_B64,    O::S_CBRANCH_EXECZ, O::V_ADD_NC_U32,
+                  O::S_ADD_U32,      O::S_CBRANCH_SCC0,  O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::V_LSHLREV_B32,   O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 // Hosts with maximal reconvergence mark every entry point, so a waterfall's
 // ballot and broadcast see each lane of the host subgroup; without it the mode
 // is not emitted.
@@ -43391,6 +43458,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppPermlaneWaveMinimum);
   cases.push_back(VectorReadlaneFf1Waterfall(64));
   cases.push_back(VectorReadlaneFf1Waterfall(48));
+  cases.push_back(VectorMaskedReadlaneWaterfall(64));
+  cases.push_back(VectorMaskedReadlaneWaterfall(48));
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
