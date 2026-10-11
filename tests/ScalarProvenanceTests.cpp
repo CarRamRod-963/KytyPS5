@@ -606,6 +606,28 @@ void TestConstantBufferBounds() {
     Check(flat == std::vector<uint32_t>{test.expected} && memory_image.attempts == test.reads,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
+
+  // An empty V# is an unbound resource: its reads are zero without touching memory.
+  {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, 0u);
+    const auto buffer =
+        fixture.Emit(ValueOpcode::GetBufferResource,
+                     {Value(0x3000u), Value(0u), Value(0u), Value(0u)});
+    const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
+                                         {buffer, Value(4u)}, memory);
+    LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    fixture.Plan();
+
+    TestMemory memory_image{{{0x3004u, 0x12345678u}}};
+    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+    std::vector<uint32_t> flat;
+    Check(WalkSrt(ExtractResourcePlan(fixture.program, SrtWalkerLoads::Reader), runtime, flat,
+                  nullptr) &&
+              flat == std::vector<uint32_t>{0u} && memory_image.reads == 0,
+          "constant-buffer walk did not read an empty V# as zero");
+  }
+
 }
 
 void TestReadLaneElimination() {
