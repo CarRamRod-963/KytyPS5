@@ -31,6 +31,8 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		// Resolved at run time through the bindless translation table (no candidates).
+		bool                          bindless                   = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

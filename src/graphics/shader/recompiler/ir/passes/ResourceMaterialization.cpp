@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <type_traits>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -636,6 +637,36 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			return false;
 		}
+		if (indirect.bindless) {
+			// Nothing to enumerate: the renderer resolves the keys the GPU asks for between
+			// frames. The snapshot describes the heap, the flattened SRT reserves the words the
+			// renderer patches per draw, and the root samples the null image until then.
+			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+				if (table_value.dword_count != 4u || table.Type() != 0u || table.Stride() == 0u ||
+				    table.SwizzleEnabled() || table.AddTid() || table_size > UINT32_MAX)
+					return false;
+				const auto mapping_offset = snapshot.flattened_srt.size();
+				snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+				snapshot.bindless_uses.push_back({.resource       = resource_index,
+				                                  .base           = table_base,
+				                                  .size           = table_size,
+				                                  .record_stride  = table.Stride(),
+				                                  .pointer_offset = indirect.pointer_offset,
+				                                  .table_offset   = indirect.table_offset,
+				                                  .layer_stride   = indirect.table_stride,
+				                                  .layer_count    = indirect.layer_count,
+				                                  .mapping_offset = static_cast<uint32_t>(mapping_offset)});
+				descriptors[resource_index]     = {.dword_count = dword_count};
+				auto& root                      = specializations[resource_index];
+				root.indirect_root              = resource_index;
+				root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+				root.indirect_search_iterations = 0u;
+				root.bindless                   = true;
+				return true;
+			} else {
+				return false;
+			}
+		}
 		if (byte_keys && table_size > UINT32_MAX) return failed("table geometry");
 		bool use_selector = selector != nullptr;
 		if (byte_keys && selector != nullptr) {
@@ -1018,8 +1049,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
-		if (root.indirect_root != root_index) {
-			continue;
+		if (root.indirect_root != root_index || root.bindless) {
+			continue; // bindless: resolved at run time, the class comes from the instruction
 		}
 		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
 		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
@@ -1838,6 +1869,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.bindless                   = source.bindless;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
