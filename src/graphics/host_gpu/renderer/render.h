@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -161,6 +162,8 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// Translates the bindless keys shaders flagged since the last call (once per frame).
+	void ResolveBindlessImages(CommandBuffer& buffer);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -203,6 +206,13 @@ private:
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
+	void                      PrepareBindlessHeaps(PreparedBindings& prepared);
+	void                      EnsureBindlessPlaceholder();
+	void                      CommitBindlessImages(const PreparedBindings& prepared,
+	                                               vk::CommandBuffer       vk_buffer);
+	void                      ValidateBindlessSlots();
+	[[nodiscard]] uint32_t    ResolveBindlessKey(uint32_t                            heap,
+	                                             const BindlessTranslation::Request& request);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -213,6 +223,13 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// Bindless state: whether the placeholder slot (every unresolved key) holds the null
+	// descriptor, the image resource each heap's T#s are decoded as, and the texture cache
+	// deletions the slots were validated at.
+	bool                                  m_bindless_placeholder_ready = false;
+	std::vector<ShaderRecompiler::IR::ImageResource> m_bindless_resources;
+	uint64_t                              m_bindless_deletion_epoch = 0;
+	std::vector<uint32_t>                 m_bindless_feedback;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
