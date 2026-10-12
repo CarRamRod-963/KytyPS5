@@ -66,6 +66,9 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 				                     : output.kind == IR::StageOutputKind::Layer ? spv::BuiltInLayer
 				                                                                 : spv::BuiltInPosition;
 				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
+				if (builtin == spv::BuiltInPosition) {
+					state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationInvariant);
+				}
 			}
 			if (output.kind == IR::StageOutputKind::Layer) {
 				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPerPrimitiveEXT);
