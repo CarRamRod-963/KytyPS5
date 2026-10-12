@@ -643,6 +643,15 @@ struct DescriptorSource {
 // Layers a bindless key reserves per record (the per-wave material index of Ghost of Yotei's
 // material records is below 255).
 inline constexpr uint32_t BindlessLayerCount = 256;
+// Descriptor set 1 of a program with bindless images: the image array a key's slot indexes
+// (slot 0 is the placeholder), the key -> slot translation the renderer fills per heap, and the
+// feedback words a shader sets for keys whose translation is still pending.
+inline constexpr uint32_t BindlessDescriptorSet      = 1;
+inline constexpr uint32_t BindlessImagesBinding      = 0;
+inline constexpr uint32_t BindlessTranslationBinding = 1;
+inline constexpr uint32_t BindlessFeedbackBinding    = 2;
+inline constexpr uint32_t BindlessImageSlots         = 4096;
+inline constexpr uint32_t BindlessPending            = 0xffffffffu;
 
 struct SrtRead {
 	Value    value;
