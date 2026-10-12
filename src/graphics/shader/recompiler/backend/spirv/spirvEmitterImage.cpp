@@ -686,6 +686,43 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
+// The slot of a bindless image's key: translation[region + key] when the key is inside the
+// heap's entry count (both patched into the flattened SRT by the renderer), slot 0 (the
+// placeholder) outside it and while the entry is pending. A pending entry is flagged in the
+// feedback buffer for the renderer to resolve; every lane that reads an entry sees the same
+// translation, so the unconditional store never races with a different value.
+static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& image,
+                                 uint32_t key) {
+	const auto Load = [&](uint32_t variable, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, variable, ConstantU32(state, 0), index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto region = Load(state.flattened_srt_variable,
+	                         ConstantU32(state, image.indirect_mapping_offset));
+	const auto count  = Load(state.flattened_srt_variable,
+	                         ConstantU32(state, image.indirect_mapping_offset + 1u));
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
+	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), region, key);
+	const auto index    = Select(state, TypeU32(state), in_range, entry, ConstantU32(state, 0u));
+	const auto raw      = Load(state.bindless_translation_variable, index);
+	const auto pending  = Binary(state, spv::OpIEqual, TypeBool(state), raw,
+	                             ConstantU32(state, IR::BindlessPending));
+	if (state.bindless_feedback_variable != 0) {
+		const auto flag    = Select(state, TypeU32(state), pending, ConstantU32(state, 1u),
+		                            ConstantU32(state, 0u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+		                          index);
+		state.builder.AddFunction(spv::OpStore, pointer, flag);
+	}
+	return Select(state, TypeU32(state), pending, ConstantU32(state, 0u), raw);
+}
+
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
                      const Emit& emit) {
@@ -702,6 +739,12 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		ctx.Fail(inst, "has invalid indirect image key provenance");
 	}
 	const auto key = ctx.Def(handle->Arg(0));
+	if (image.bindless) {
+		if (state.flattened_srt_variable == 0 || state.bindless_translation_variable == 0) {
+			ctx.Fail(inst, "has no bindless runtime mapping");
+		}
+		return emit(mem.resource, EmitBindlessSlot(state, image, key));
+	}
 	if (state.flattened_srt_variable == 0 ||
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
