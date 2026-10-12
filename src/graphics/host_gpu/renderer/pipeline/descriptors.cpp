@@ -1045,12 +1045,18 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	table.MakeFeedbackVisible(buffer.Handle());
 	m_bindless_feedback.clear();
 	table.TakeFeedback(m_bindless_feedback, budget);
-	if (m_bindless_feedback.empty()) {
-		return;
-	}
 	auto& translation = table.Translation();
-	if (m_context.GetTextureCache().DeletionEpoch() != m_bindless_deletion_epoch) {
+	auto& cache       = m_context.GetTextureCache();
+	if (cache.DeletionEpoch() != m_bindless_deletion_epoch) {
 		ValidateBindlessSlots();
+	}
+	// A resolved image is sampled through its slot without a lookup, so guest writes to it
+	// (streamed-in texture data) are picked up here, once per frame.
+	for (uint32_t slot = BindlessTranslation::PlaceholderSlot + 1u; slot < translation.SlotCount();
+	     ++slot) {
+		if (translation.GetSlot(slot).InUse()) {
+			cache.UpdateImage(translation.GetSlot(slot).image);
+		}
 	}
 	for (const auto entry: m_bindless_feedback) {
 		BindlessTranslation::Request request;
