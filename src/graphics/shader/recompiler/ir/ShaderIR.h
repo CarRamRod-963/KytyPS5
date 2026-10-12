@@ -608,6 +608,15 @@ struct DescriptorSource {
 		bool     table_scalar = false;
 		bool     indexed = false;
 		bool     signed_count = false;
+		// The table record holds a 64-bit address; the descriptor is at that address plus this
+		// offset (UINT32_MAX: the descriptor is in the record itself).
+		uint32_t pointer_offset = UINT32_MAX;
+		// No enumeration: a vector load fetches the record pointer per lane, so which records a
+		// draw reaches depends on GPU data. The shader looks its key (record index * layer_count +
+		// layer) up in the bindless translation table; the host resolves flagged keys between
+		// frames. The T# lies at pointer + table_offset + layer * table_stride.
+		bool     bindless    = false;
+		uint32_t layer_count = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
 		// First selector index, or first descriptor key for a direct or bitmap range.
@@ -624,6 +633,10 @@ struct DescriptorSource {
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
+
+// Layers a bindless key reserves per record (the per-wave material index of Ghost of Yotei's
+// material records is below 255).
+inline constexpr uint32_t BindlessLayerCount = 256;
 
 struct SrtRead {
 	Value    value;
