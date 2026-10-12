@@ -476,6 +476,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	// Indirect mesh draws launch their records' groups from a task shader.
 	graphics.mesh_shader_enabled = mesh.meshShader && mesh.taskShader;
+	features12.descriptorIndexing = supported12.descriptorIndexing;
+	features12.descriptorBindingPartiallyBound =
+	    supported12.descriptorBindingPartiallyBound;
+	features12.descriptorBindingSampledImageUpdateAfterBind =
+	    supported12.descriptorBindingSampledImageUpdateAfterBind;
+	graphics.bindless_enabled = features12.descriptorIndexing == VK_TRUE &&
+	                            features12.descriptorBindingPartiallyBound == VK_TRUE &&
+	                            features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE;
+	LOGF("Vulkan bindless images: %s\n", graphics.bindless_enabled ? "true" : "false");
 
 	vk::StructureChain<
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
