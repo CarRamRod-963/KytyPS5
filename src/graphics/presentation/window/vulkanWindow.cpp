@@ -582,6 +582,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	features12.descriptorIndexing = supported_features12.descriptorIndexing;
+	features12.descriptorBindingPartiallyBound =
+	    supported_features12.descriptorBindingPartiallyBound;
+	features12.descriptorBindingSampledImageUpdateAfterBind =
+	    supported_features12.descriptorBindingSampledImageUpdateAfterBind;
+	graphics.bindless_enabled = features12.descriptorIndexing == VK_TRUE &&
+	                            features12.descriptorBindingPartiallyBound == VK_TRUE &&
+	                            features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE;
+	LOGF("Vulkan bindless images: %s\n", graphics.bindless_enabled ? "true" : "false");
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
