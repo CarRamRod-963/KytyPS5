@@ -42,6 +42,10 @@ struct GraphicContext {
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
+	// Descriptor indexing with update-after-bind sampled images (BindlessTable), and the
+	// table's set layout once a renderer created it.
+	bool                                      bindless_enabled                      = false;
+	vk::DescriptorSetLayout                   bindless_set_layout                   = nullptr;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
