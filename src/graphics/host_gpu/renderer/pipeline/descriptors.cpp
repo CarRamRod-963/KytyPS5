@@ -363,9 +363,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = image_layers > 1u ? descriptor.BaseArray5() : 0u;
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
+				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				     descriptor.fields[6], descriptor.fields[7]);
 			}
 			view.layer_count = 1;
 			break;
@@ -373,7 +378,12 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
+				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				     descriptor.fields[6], descriptor.fields[7]);
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -387,16 +397,27 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
+				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				     descriptor.fields[6], descriptor.fields[7]);
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			// A T# without array slices has nothing for BASE_ARRAY to select.
+			view.base_layer = image_layers > 1u ? descriptor.BaseArray5() : 0u;
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
+				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				     descriptor.fields[6], descriptor.fields[7]);
 			}
 			view.layer_count = 1;
 			break;
