@@ -262,7 +262,7 @@ void DefineDescriptors(EmitterState& state) {
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
-	// Bindless images read their slot through descriptor set 1; all bindless images of a
+	// Bindless images read their slot through descriptor set 2; all bindless images of a
 	// program share one array, so they must be of one image type.
 	if (const auto bindless = std::ranges::find_if(
 	        info.images, [](const IR::ImageResource& image) { return image.bindless; });
