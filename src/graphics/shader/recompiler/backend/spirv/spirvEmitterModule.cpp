@@ -190,10 +190,13 @@ uint32_t PushConstantBlockType(EmitterState& state) {
 	                                   PushConstantArrayType(state));
 }
 
+// The position is invariant: a depth prepass and the main pass compute it in different
+// programs and the main pass tests depth for equality against the prepass.
 uint32_t PerVertexType(EmitterState& state) {
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct,
 	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+	     {spv::OpMemberDecorate, {0, spv::DecorationInvariant}},
 	     {spv::OpDecorate, {spv::DecorationBlock}}},
 	    TypeF32Vector(state, 4));
 }
