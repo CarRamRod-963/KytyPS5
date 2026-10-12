@@ -3756,6 +3756,65 @@ void TestImageDescriptorFields() {
   }
 }
 
+void TestPerLanePointerImageReadsNull() {
+  // A T# behind a 64-bit pointer that a vector buffer load fetches per lane and ReadFirstLane
+  // makes uniform (Ghost of Yotei 617c7166f3308810): the host cannot enumerate the records the
+  // GPU selects, so the image reads as null instead of failing the translation.
+  Fixture fixture(ShaderType::Pixel);
+  std::array<Value, 4> instance_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    instance_words[dword] = fixture.UserData(dword);
+  }
+  const auto instances = fixture.Buffer(instance_words);
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  MemoryInfo vector;
+  vector.kind = ResourceKind::Buffer;
+  const auto record = fixture.Emit(ValueOpcode::LoadBufferU32x2,
+      {instances, lane, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(vector, 0x100));
+  std::array<Value, 2> pointer;
+  for (uint32_t word = 0; word < pointer.size(); ++word) {
+    const auto part = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {record, Value(word)});
+    pointer[word] = fixture.Emit(ValueOpcode::ReadFirstLane, {part, Value(true)});
+  }
+  const auto layer = fixture.Emit(ValueOpcode::IMul32, {fixture.UserData(4), Value(0x170u)});
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  // Several T#s of the record, read through separate equivalent pointer handles as the
+  // scalar loads of the guest shader are.
+  for (uint32_t table = 0; table < 3u; ++table) {
+    const auto material = fixture.Address(pointer[0], pointer[1]);
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = 64u * table + word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {material, layer, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x200 + table * 8u));
+    }
+    const auto image = fixture.Image(words, 0x228 + table * 8u);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(sample, 0x228 + table * 8u));
+  }
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  // The three null descriptors share one image resource.
+  Check(!plan.info.images.empty(), "per-lane pointer images were not tracked");
+  for (const auto& image : plan.info.images) {
+    Check(image.source < plan.descriptor_sources.size(), "per-lane pointer image has no source");
+    const auto& source = plan.descriptor_sources[image.source];
+    Check(!source.indirect_descriptor.has_value() &&
+              std::all_of(source.dwords.begin(), source.dwords.begin() + source.dword_count,
+                          [](const Value& word) {
+                            return word.IsImmediate() && word.U32() == 0u;
+                          }),
+          "per-lane pointer image did not read as the null descriptor");
+  }
+}
+
 void TestUniformScalarBufferImage() {
   Fixture fixture(ShaderType::Pixel);
   std::array<Value, 4> material_words;
@@ -8938,6 +8997,7 @@ int main() {
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
+    Run("per-lane pointer image", TestPerLanePointerImageReadsNull);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
