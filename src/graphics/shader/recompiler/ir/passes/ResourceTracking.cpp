@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <fmt/format.h>
@@ -1012,6 +1013,26 @@ private:
 			}
 		}
 		m_program.srt_plan_complete = true;
+	}
+
+	// A T# read through a 64-bit pointer that a vector buffer load fetched per lane and
+	// V_READFIRSTLANE made uniform for the scalar loads (Ghost of Yotei 617c7166f3308810: an
+	// instance's material record, selected by a per-wave material index). Which records a draw
+	// reaches depends on data the GPU computes, so the host cannot enumerate the descriptors.
+	bool PerLanePointerDescriptor(const Inst& handle) const {
+		const auto per_lane = [](Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			return inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+		};
+		for (size_t dword = 0; dword < handle.NumArgs(); ++dword) {
+			const auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32) return false;
+			const auto* address = read->Arg(0).Resolve().TryInstruction();
+			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    address->NumArgs() != 2 || (!per_lane(address->Arg(0)) && !per_lane(address->Arg(1))))
+				return false;
+		}
+		return handle.NumArgs() != 0;
 	}
 
 	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
@@ -4031,6 +4052,22 @@ private:
 								Fail(flags.pc, "shared descriptor read has incompatible keys");
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
+					} else if (!sampler && !buffer_store && PerLanePointerDescriptor(*handle)) {
+						// Until bindless descriptors exist, such an image samples as null.
+						if (!m_per_lane_pointer_warned) {
+							std::fprintf(stderr,
+							             "shader resource tracking: hash=0x%016" PRIx64
+							             " stage=%s pc=0x%08x image descriptor behind a per-lane "
+							             "pointer reads as null\n",
+							             m_program.shader_hash, StageName(m_program.stage), flags.pc);
+							m_per_lane_pointer_warned = true;
+						}
+						for (size_t dword = 0; dword < handle->NumArgs(); ++dword) {
+							handle->SetArg(dword, Value(0u));
+						}
+						std::erase_if(m_resolved_handles, [&](const ResolvedHandle& resolved) {
+							return resolved.handle == handle;
+						});
 					}
 				};
 				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
@@ -4424,6 +4461,7 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
+	bool m_per_lane_pointer_warned = false;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
