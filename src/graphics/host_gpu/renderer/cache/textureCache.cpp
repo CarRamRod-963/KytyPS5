@@ -1863,7 +1863,12 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
-		if (image.info.data.address != address) {
+		// A block-compressed image is only ever filled through a buffer alias, piece by piece
+		// (Ghost of Yotei compresses reflection cubes into a 102-layer BC6H array in 64K, 16K and
+		// 4K pieces, none at the array's start), so a write anywhere inside it counts.
+		const bool inside = image.info.IsBlock() && address >= image.info.data.address &&
+		                    address + size <= image.info.data.End();
+		if (image.info.data.address != address && !inside) {
 			return;
 		}
 		image.ClearGpuModified();
