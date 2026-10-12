@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -704,6 +705,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	prepared.bindless_heaps.clear();
+	prepared.bindless_srt.clear();
+	if (!snapshot.bindless_uses.empty()) {
+		PrepareBindlessHeaps(prepared);
+	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
@@ -805,7 +811,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		pack_memory_offset(index, buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt = NativeUpload(m_context, prepared.bindless_srt.empty()
+		                                                     ? snapshot.flattened_srt
+		                                                     : prepared.bindless_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
@@ -856,6 +864,193 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 	}
+}
+
+// A heap is the records of one V# a stage reaches T#s through (ResourceSnapshot::BindlessUse);
+// its region and entry count go into the stage's copy of the flattened SRT.
+void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	auto&       table    = m_context.GetBindlessTable();
+	if (!table.Enabled()) {
+		EXIT("bindless images need descriptor indexing with update-after-bind sampled images\n");
+	}
+	auto& translation = table.Translation();
+	EnsureBindlessPlaceholder();
+	prepared.bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+	for (const auto& use: snapshot.bindless_uses) {
+		EXIT_IF(use.layer_count == 0 || use.mapping_offset + 1u >= prepared.bindless_srt.size());
+		auto* words = prepared.bindless_srt.data() + use.mapping_offset;
+		// Keys past the heap's entries sample the placeholder (EmitBindlessSlot).
+		constexpr uint64_t max_entries = BindlessTable::Entries / 4u;
+		const auto records = static_cast<uint32_t>(std::min<uint64_t>(
+		    use.record_stride == 0 ? 1u : use.size / use.record_stride,
+		    max_entries / use.layer_count));
+		const BindlessTranslation::HeapKey key {use.base,         use.record_stride,
+		                                        use.pointer_offset, use.table_offset,
+		                                        use.layer_stride, use.layer_count};
+		const auto heap = translation.FindOrCreateHeap(key, records);
+		if (heap == BindlessTranslation::NoHeap) {
+			static bool reported = false;
+			if (!std::exchange(reported, true)) {
+				LOGF("bindless translation table is full; keys of heap 0x%016" PRIx64
+				     " sample the placeholder\n",
+				     use.base);
+			}
+			words[0] = 0;
+			words[1] = 0;
+			continue;
+		}
+		if (heap >= m_bindless_resources.size()) {
+			m_bindless_resources.resize(heap + 1u);
+			m_bindless_resources[heap] = program.info.images[use.resource];
+		}
+		const auto& found = translation.GetHeap(heap);
+		words[0]          = found.region;
+		words[1]          = found.Entries();
+		if (std::ranges::find(prepared.bindless_heaps, heap) == prepared.bindless_heaps.end()) {
+			prepared.bindless_heaps.push_back(heap);
+		}
+	}
+}
+
+void RenderExecutor::EnsureBindlessPlaceholder() {
+	// Unresolved keys sample a native null descriptor, as unbound textures do.
+	if (m_bindless_placeholder_ready) return;
+	m_context.GetBindlessTable().WriteSlot(BindlessTranslation::PlaceholderSlot, nullptr,
+	                                       vk::ImageLayout::eGeneral);
+	m_bindless_placeholder_ready = true;
+}
+
+// Every image a key of the draw's heaps resolved to is sampled in read-only layout; an image
+// the draw also renders to keeps its attachment layout, as an enumerated binding would.
+void RenderExecutor::CommitBindlessImages(const PreparedBindings& prepared,
+                                          vk::CommandBuffer       vk_buffer) {
+	KYTY_PROFILER_FUNCTION();
+	auto& cache       = m_context.GetTextureCache();
+	auto& translation = m_context.GetBindlessTable().Translation();
+	if (cache.DeletionEpoch() != m_bindless_deletion_epoch) {
+		ValidateBindlessSlots();
+	}
+	for (const auto heap: prepared.bindless_heaps) {
+		for (const auto slot: translation.GetHeap(heap).slots) {
+			auto& image = cache.GetImage(translation.GetSlot(slot).image);
+			if (image.binding.is_target) continue;
+			image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+			              {}, vk_buffer);
+		}
+	}
+}
+
+// Slots of images the texture cache deleted go back to the placeholder; their keys resolve
+// again when a shader next flags them.
+void RenderExecutor::ValidateBindlessSlots() {
+	auto& cache       = m_context.GetTextureCache();
+	auto& table       = m_context.GetBindlessTable();
+	auto& translation = table.Translation();
+	m_bindless_deletion_epoch = cache.DeletionEpoch();
+	for (uint32_t slot = BindlessTranslation::PlaceholderSlot + 1u; slot < translation.SlotCount();
+	     ++slot) {
+		const auto& entry = translation.GetSlot(slot);
+		if (!entry.InUse()) continue;
+		const auto* image = cache.m_slot_images.try_get(entry.image);
+		if (image != nullptr && (image->registered || image->info.data.Empty())) continue;
+		table.WriteSlot(slot, nullptr, vk::ImageLayout::eGeneral);
+		translation.FreeSlot(slot);
+	}
+	table.FlushTranslation();
+}
+
+// The slot of the T# a key names: the record's pointer, then the layer's T# behind it, read
+// from guest memory as the shader would. Anything unreadable or unsupported is the placeholder.
+uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            heap,
+                                            const BindlessTranslation::Request& request) {
+	auto&       table       = m_context.GetBindlessTable();
+	auto&       translation = table.Translation();
+	const auto& key         = translation.GetHeap(heap).key;
+	uint64_t    pointer     = 0;
+	const auto  record = key.base + uint64_t {request.record} * key.record_stride + key.pointer_offset;
+	const bool readable = LibKernel::Memory::TryReadBacking(record, &pointer, sizeof(pointer));
+	// The shader sign-extends bit 47; the bits above it carry what the game stores there.
+	pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
+	if (!readable || pointer == 0) {
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	ShaderRecompiler::IR::DescriptorValue value;
+	value.dword_count = static_cast<uint32_t>(value.dwords.size());
+	const auto descriptor = pointer + uint64_t {request.layer} * key.layer_stride + key.table_offset;
+	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords)) ||
+	    DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	EXIT_IF(heap >= m_bindless_resources.size());
+	// A T# a plain binding would refuse keeps the placeholder: the key may name a record the
+	// game never meant to sample.
+	const auto tsharp  = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const auto type    = tsharp.Type();
+	const bool layered = type == Prospero::ImageType::kColor1DArray ||
+	                     type == Prospero::ImageType::kColor2DArray ||
+	                     type == Prospero::ImageType::kColor2DMsaaArray ||
+	                     type == Prospero::ImageType::kCube;
+	const auto layers  = layered ? static_cast<uint32_t>(tsharp.Depth()) + 1u : 1u;
+	if (tsharp.BaseArray5() >= layers || tsharp.MinLod() > tsharp.LastLevel() * 256u ||
+	    tsharp.BaseLevel() > tsharp.LastLevel()) {
+		static uint32_t reported = 0;
+		if (reported++ < 8u) {
+			LOGF("bindless key names an unsupported T#: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+		}
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	auto& cache   = m_context.GetTextureCache();
+	auto  binding = ResolveTexture(m_bindless_resources[heap], value);
+	auto& image   = cache.GetImage(binding.image_id);
+	if (image.info.IsDepth() || image.info.data.Empty()) {
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	const auto view = cache.FindTexture(binding.image_id, binding.desc);
+	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkImageView>(view));
+	auto       slot   = translation.FindSlot(binding.image_id, handle);
+	if (slot == BindlessTranslation::NoSlot) {
+		slot = translation.AllocateSlot(binding.image_id, handle);
+		if (slot == BindlessTranslation::NoSlot) {
+			static bool reported = false;
+			if (!std::exchange(reported, true)) {
+				LOGF("bindless image slots are exhausted; later keys sample the placeholder\n");
+			}
+			return BindlessTranslation::PlaceholderSlot;
+		}
+		table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
+	}
+	return slot;
+}
+
+void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
+	auto& table = m_context.GetBindlessTable();
+	if (!table.Created()) {
+		return;
+	}
+	KYTY_PROFILER_FUNCTION();
+	constexpr uint32_t budget = 512;
+	buffer.EndRendering();
+	table.MakeFeedbackVisible(buffer.Handle());
+	m_bindless_feedback.clear();
+	table.TakeFeedback(m_bindless_feedback, budget);
+	if (m_bindless_feedback.empty()) {
+		return;
+	}
+	auto& translation = table.Translation();
+	if (m_context.GetTextureCache().DeletionEpoch() != m_bindless_deletion_epoch) {
+		ValidateBindlessSlots();
+	}
+	for (const auto entry: m_bindless_feedback) {
+		BindlessTranslation::Request request;
+		if (!translation.Decode(entry, request)) continue;
+		translation.Translate(entry, ResolveBindlessKey(request.heap, request));
+	}
+	table.FlushTranslation();
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -980,6 +1175,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.reserve(write_count);
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	bool                                    bindless = false;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1035,6 +1231,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;
+		}
+		if (!descriptors.bindless_heaps.empty()) {
+			CommitBindlessImages(descriptors, vk_buffer);
+			bindless = true;
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -1145,6 +1345,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (bindless) {
+		const auto set = m_context.GetBindlessTable().Set();
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             ShaderRecompiler::IR::BindlessDescriptorSet, 1, &set, 0,
+		                             nullptr);
 	}
 }
 
