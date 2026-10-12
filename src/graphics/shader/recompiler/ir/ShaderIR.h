@@ -184,6 +184,9 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	// The key selects a slot of the bindless image array through the translation table
+	// (ResourceSnapshot::BindlessUse); there are no enumerated candidates.
+	bool                          bindless          = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };
