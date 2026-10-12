@@ -124,7 +124,7 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
-	// Descriptor set 1 (IR::BindlessDescriptorSet) when an image is bindless.
+	// Descriptor set 2 (IR::BindlessDescriptorSet) when an image is bindless.
 	uint32_t bindless_images_variable      = 0;
 	uint32_t bindless_images_type          = 0;
 	uint32_t bindless_images_pointer_type  = 0;

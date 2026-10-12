@@ -220,7 +220,8 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u));
 	if (image.bindless && array_index != 0u) {
-		// The slot the key's translation entry names (EmitImageAccess), in the set-1 array.
+		// The slot the key's translation entry names (EmitImageAccess), in the bindless set's
+		// array.
 		return DescriptorElementPointer(state, state.bindless_images_pointer_type,
 		                                state.bindless_images_variable, array_index, *kind,
 		                                resource, "bindless image array was not emitted");
