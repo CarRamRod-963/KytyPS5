@@ -261,6 +261,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	m_download_images.erase(id);
+	++m_deletion_epoch;
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
 		// Only the last image to acquire an HTile range releases its clear state.
 		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);

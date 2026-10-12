@@ -67,6 +67,8 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Advances with every deleted image; holders of image views revalidate when it changes.
+	[[nodiscard]] uint64_t DeletionEpoch() const noexcept { return m_deletion_epoch; }
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -274,6 +276,7 @@ private:
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

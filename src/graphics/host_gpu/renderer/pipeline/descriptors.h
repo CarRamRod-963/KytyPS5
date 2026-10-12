@@ -46,6 +46,10 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// The bindless heaps the stage samples through (BindlessTranslation) and its flattened SRT
+	// with their regions patched in; empty when the stage has no bindless images.
+	std::vector<uint32_t>                 bindless_heaps;
+	std::vector<uint32_t>                 bindless_srt;
 };
 
 [[nodiscard]] vk::DescriptorType
