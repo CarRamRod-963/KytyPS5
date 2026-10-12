@@ -1266,8 +1266,18 @@ void TestIndexedPointerImageTable() {
           Case::InclusiveChild, Case::MismatchedPair, Case::DifferentLaneMask,
           Case::ExtraUse, Case::UnboundedChoice, Case::MissingOuterWitness, Case::WrongOuterWitness,
           Case::CyclicChoice, Case::ExcessiveDomain}) {
+    // Without the nested proof the table is not enumerated: the image becomes a bindless heap,
+    // or reads as null when the pointer halves come from different loads.
     auto invalid = make(variant);
-    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
+    invalid->PlanAndTrack();
+    const auto invalid_plan = ExtractResourcePlan(invalid->program);
+    const auto &invalid_source =
+        invalid_plan.descriptor_sources[invalid_plan.info.images[0].source].indirect_descriptor;
+    Check(invalid_plan.info.images.size() == 1u &&
+              (variant == Case::MismatchedPair
+                   ? !invalid_source.has_value()
+                   : invalid_source.has_value() && invalid_source->bindless &&
+                         !invalid_source->pointer_table),
         "nested table accepted an unproved domain, mismatched pointer pair or unguarded use");
   }
 
@@ -3648,12 +3658,22 @@ void TestPerLanePointerImageReadsNull() {
       {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
   MemoryInfo vector;
   vector.kind = ResourceKind::Buffer;
+  vector.idxen = true; // BUFFER_LOAD_DWORDX2 v[0:1], v_index, s[V#], 0 idxen
   const auto record = fixture.Emit(ValueOpcode::LoadBufferU32x2,
       {instances, lane, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(vector, 0x100));
+  // The halves reach the waterfall through the EXEC-masked write (a Select whose other arm
+  // keeps the stale VGPR, itself written under an earlier mask), and the high half is the sign
+  // extension of bit 47.
+  const auto stale = fixture.Emit(ValueOpcode::IAdd32, {lane, Value(1u)});
   std::array<Value, 2> pointer;
   for (uint32_t word = 0; word < pointer.size(); ++word) {
-    const auto part = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {record, Value(word)});
-    pointer[word] = fixture.Emit(ValueOpcode::ReadFirstLane, {part, Value(true)});
+    auto part = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {record, Value(word)});
+    if (word == 1u) {
+      part = fixture.Emit(ValueOpcode::BitFieldSExtract, {part, Value(0u), Value(16u)});
+    }
+    const auto older  = fixture.Emit(ValueOpcode::SelectU32, {Value(true), Value(0u), stale});
+    const auto masked = fixture.Emit(ValueOpcode::SelectU32, {Value(true), part, older});
+    pointer[word] = fixture.Emit(ValueOpcode::ReadFirstLane, {masked, Value(true)});
   }
   const auto layer = fixture.Emit(ValueOpcode::IMul32, {fixture.UserData(4), Value(0x170u)});
   const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -3679,17 +3699,21 @@ void TestPerLanePointerImageReadsNull() {
   }
   fixture.PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture.program);
-  // The three null descriptors share one image resource.
-  Check(!plan.info.images.empty(), "per-lane pointer images were not tracked");
-  for (const auto& image : plan.info.images) {
+  Check(plan.info.images.size() == 3, "per-lane pointer images were not tracked");
+  for (uint32_t table = 0; table < plan.info.images.size(); ++table) {
+    const auto& image = plan.info.images[table];
     Check(image.source < plan.descriptor_sources.size(), "per-lane pointer image has no source");
     const auto& source = plan.descriptor_sources[image.source];
-    Check(!source.indirect_descriptor.has_value() &&
-              std::all_of(source.dwords.begin(), source.dwords.begin() + source.dword_count,
-                          [](const Value& word) {
-                            return word.IsImmediate() && word.U32() == 0u;
-                          }),
-          "per-lane pointer image did not read as the null descriptor");
+    Check(source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless,
+          "per-lane pointer image is not a bindless descriptor");
+    const auto& indirect = *source.indirect_descriptor;
+    Check(indirect.pointer_offset == 0u && indirect.table_offset == 64u * table &&
+              indirect.table_stride == 0x170u && indirect.layer_count == BindlessLayerCount &&
+              indirect.sources.empty(),
+          "bindless descriptor did not describe the record pointer and layer layout");
+    Check(indirect.table_source < plan.descriptor_sources.size() &&
+              plan.descriptor_sources[indirect.table_source].dword_count == 4u,
+          "bindless descriptor lost its record V#");
   }
 }
 
