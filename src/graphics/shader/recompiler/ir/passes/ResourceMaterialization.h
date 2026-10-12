@@ -34,6 +34,8 @@ struct ResourceSpecialization {
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
+		// Resolved at run time through the bindless translation table (no candidates).
+		bool                          bindless                   = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
