@@ -151,7 +151,10 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
 	const auto kind = *IR::DescriptorBindingForImage(state.program.info.images[resource]);
-	state.builder.AddFunction(spv::OpLoad, state.images[IR::ImageBindingIndex(kind)].type,
+	state.builder.AddFunction(spv::OpLoad,
+	                          state.program.info.images[resource].bindless
+	                              ? state.bindless_images_type
+	                              : state.images[IR::ImageBindingIndex(kind)].type,
 	                          image, pointer);
 	if (array_index != 0u) {
 		DecorateNonUniformDescriptor(state, image,
@@ -203,6 +206,12 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value());
+	if (image.bindless && array_index != 0u) {
+		// The slot the key's translation entry names (EmitImageAccess), in the set-1 array.
+		return DescriptorElementPointer(state, state.bindless_images_pointer_type,
+		                                state.bindless_images_variable, array_index, *kind,
+		                                resource, "bindless image array was not emitted");
+	}
 	if (array_index == 0u) {
 		array_index = ConstantU32(state, image.descriptor_index + mip);
 	}

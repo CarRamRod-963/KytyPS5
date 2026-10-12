@@ -243,6 +243,41 @@ void DefineDescriptors(EmitterState& state) {
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
+	// Bindless images read their slot through descriptor set 1; all bindless images of a
+	// program share one array, so they must be of one image type.
+	if (const auto bindless = std::ranges::find_if(
+	        info.images, [](const IR::ImageResource& image) { return image.bindless; });
+	    bindless != info.images.end()) {
+		const auto DefineBindless = [&](uint32_t type, const char* name, uint32_t binding,
+		                                spv::StorageClass storage) {
+			const auto variable =
+			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+			state.builder.AddName(variable, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			                            IR::BindlessDescriptorSet);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+			return variable;
+		};
+		state.bindless_images_type = ImageType(state, *bindless);
+		for (const auto& image: info.images) {
+			if (image.bindless && ImageType(state, image) != state.bindless_images_type) {
+				EXIT("bindless images of one program are of different image types");
+			}
+		}
+		state.bindless_images_pointer_type =
+		    TypePointer(state, spv::StorageClassUniformConstant, state.bindless_images_type);
+		state.bindless_images_variable = DefineBindless(
+		    state.builder.Type(spv::OpTypeArray, state.bindless_images_type,
+		                       ConstantU32(state, IR::BindlessImageSlots)),
+		    "bindless_images", IR::BindlessImagesBinding, spv::StorageClassUniformConstant);
+		state.bindless_translation_variable =
+		    DefineBindless(StorageBufferType(state, state.storage_buffers[2]),
+		                   "bindless_translation", IR::BindlessTranslationBinding,
+		                   spv::StorageClassStorageBuffer);
+		state.bindless_feedback_variable =
+		    DefineBindless(StorageBufferType(state, state.storage_buffers[2]), "bindless_feedback",
+		                   IR::BindlessFeedbackBinding, spv::StorageClassStorageBuffer);
+	}
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
 	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
