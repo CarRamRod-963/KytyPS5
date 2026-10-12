@@ -415,6 +415,21 @@ public:
 		std::vector<std::pair<const IndirectDescriptorPlan*, Value>> buffer_selections;
 		for (const auto& plan: m_indirect_descriptors) {
 			auto key = plan.key;
+			if (plan.bindless) {
+				if (!plan.bindless_layer.IsEmpty()) {
+					auto*      block = plan.handle->Parent();
+					const auto where = std::ranges::find_if(
+					    block->Instructions(), [&](const Inst& inst) { return &inst == plan.handle; });
+					const auto scaled = Value(&*block->PrependNewInst(
+					    where, ValueOpcode::IMul32, {plan.key, Value(BindlessLayerCount)}));
+					key = Value(&*block->PrependNewInst(where, ValueOpcode::IAdd32,
+					                                    {scaled, plan.bindless_layer}));
+				}
+				plan.handle->SetArg(0, key);
+				for (uint32_t word = 1; word < plan.handle->NumArgs(); ++word)
+					plan.handle->SetArg(word, Value(0u));
+				continue;
+			}
 			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
 			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
 				auto* block = plan.handle->Parent();
@@ -584,6 +599,10 @@ private:
 		bool table_indexed = false;
 		const Inst* table_read = nullptr;
 		const Inst* selection_anchor = nullptr;
+		// Bindless: the key is the record index of the pointer load; the layer (when the T#
+		// offset carries one) joins it when the handle is patched.
+		bool  bindless = false;
+		Value bindless_layer;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -1068,6 +1087,8 @@ private:
 				    (!shared_image_heap && (a.table_offset != b.table_offset ||
 				                           a.table_immediate != b.table_immediate ||
 				                           a.table_stride != b.table_stride)) || a.indexed != b.indexed ||
+				    a.pointer_offset != b.pointer_offset || a.bindless != b.bindless ||
+				    a.layer_count != b.layer_count ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.signed_count != b.signed_count ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
@@ -3268,6 +3289,188 @@ private:
 		return true;
 	}
 
+	// One half of a 64-bit pointer: a dword of an untyped, indexed vector buffer load (both halves
+	// from one LoadBufferU32x2) that V_READFIRSTLANE made uniform, possibly masked (sext of bit 47,
+	// an AND) and written under EXEC (a Select whose other arm keeps the old VGPR value).
+	bool BindlessPointerHalf(Value value, uint32_t component, const Inst*& load,
+	                         uint32_t& pointer_offset) const {
+		const auto strip = [&](const Inst* inst) {
+			uint32_t immediate = 0;
+			uint32_t width     = 0;
+			for (;;) {
+				// The pointer is loop-carried through the waterfall over equal pointers.
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+					const auto invariant =
+					    ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(inst)));
+					if (invariant.IsEmpty()) break;
+					inst = invariant.TryInstruction();
+					continue;
+				}
+				if (inst != nullptr && inst->NumArgs() >= 2u &&
+				    ((inst->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+				      ImmediateU32(inst->Arg(1), immediate)) ||
+				     ((inst->GetOpcode() == ValueOpcode::BitFieldUExtract ||
+				       inst->GetOpcode() == ValueOpcode::BitFieldSExtract) &&
+				      inst->NumArgs() == 3u && ImmediateU32(inst->Arg(1), immediate) &&
+				      immediate == 0u && ImmediateU32(inst->Arg(2), width) && width >= 16u))) {
+					inst = inst->Arg(0).Resolve().TryInstruction();
+					continue;
+				}
+				break;
+			}
+			return inst;
+		};
+		const auto* inst = strip(value.Resolve().TryInstruction());
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadFirstLane) return false;
+		inst = strip(inst->Arg(0).Resolve().TryInstruction());
+		// The value may be written under EXEC (a Select whose other arm keeps the stale VGPR of
+		// the lanes the write left out) or merged by control flow (a Phi). The half is the load
+		// the latest write of an active lane comes from: a Select's taken arm is searched first,
+		// and the arms of a Phi that reach a load must agree.
+		const auto find = [&](auto& self, const Inst* current, uint32_t depth) -> const Inst* {
+			current = strip(current);
+			if (current == nullptr || depth > 8u) return nullptr;
+			switch (current->GetOpcode()) {
+				case ValueOpcode::CompositeExtractU32x2: return current;
+				case ValueOpcode::SelectU32: {
+					if (current->NumArgs() != 3u) return nullptr;
+					const auto* taken =
+					    self(self, current->Arg(1).Resolve().TryInstruction(), depth + 1u);
+					return taken != nullptr
+					           ? taken
+					           : self(self, current->Arg(2).Resolve().TryInstruction(), depth + 1u);
+				}
+				case ValueOpcode::Phi: {
+					const Inst* merged = nullptr;
+					for (uint32_t index = 0; index < current->NumArgs(); ++index) {
+						const auto* arm =
+						    self(self, current->Arg(index).Resolve().TryInstruction(), depth + 1u);
+						if (arm == nullptr) continue;
+						if (merged != nullptr && merged != arm &&
+						    !EquivalentValue(m_program, Value(const_cast<Inst*>(merged)),
+						                     Value(const_cast<Inst*>(arm)))) {
+							return nullptr;
+						}
+						merged = merged == nullptr ? arm : merged;
+					}
+					return merged;
+				}
+				default: return nullptr;
+			}
+		};
+		inst = find(find, inst, 0u);
+		uint32_t extracted = 0;
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::CompositeExtractU32x2 ||
+		    !ImmediateU32(inst->Arg(1), extracted) || extracted != component)
+			return false;
+		inst = inst->Arg(0).Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadBufferU32x2 ||
+		    inst->NumArgs() != 5u)
+			return false;
+		const auto flags = inst->Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size()) return false;
+		const auto& memory  = m_program.memory_info[flags.index];
+		uint32_t    voffset = 1u;
+		uint32_t    soffset = 0u;
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || memory.data_bits != 32u ||
+		    !ImmediateU32(inst->Arg(2), voffset) || voffset != 0u ||
+		    !ImmediateU32(inst->Arg(3), soffset) || memory.offset > INT32_MAX || soffset > INT32_MAX)
+			return false;
+		load           = inst;
+		pointer_offset = static_cast<uint32_t>(memory.offset) + soffset + component * 4u;
+		return true;
+	}
+
+	// A T# behind a 64-bit pointer that a vector buffer load fetches per lane and V_READFIRSTLANE
+	// makes uniform for the scalar loads (a waterfall over the lanes' records; Ghost of Yotei
+	// 617c7166f3308810: an instance's material record, T#s at pointer + layer * 0x170 +
+	// 0/64/192). The host cannot enumerate the records a draw reaches, so the descriptor is
+	// bindless: the shader looks its key up at run time (DescriptorSource::IndirectDescriptor).
+	bool TryMakeBindlessPointerImage(Inst& handle, const DescriptorSource& descriptor,
+	                                 IndirectDescriptorPlan& plan) {
+		// An R128 T# (four words read) is not a supported bindless descriptor.
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    plan.read_dwords != 8u)
+			return false;
+		plan             = {};
+		plan.read_dwords = 8u;
+		const Inst* address      = nullptr;
+		Value       layer;
+		uint32_t    first        = 0;
+		uint32_t    layer_stride = 0;
+		for (uint32_t dword = 0; dword < 8u; ++dword) {
+			const auto* read         = descriptor.dwords[dword].Resolve().TryInstruction();
+			uint32_t    memory_index = 0;
+			const auto* memory = read != nullptr && read->GetOpcode() == ValueOpcode::LoadAddressU32
+			                         ? ScalarReadMemory(*read, memory_index)
+			                         : nullptr;
+			Value    current_layer;
+			uint32_t offset = 0;
+			uint32_t stride = 0;
+			// The T# offset behind the pointer is an immediate, or layer * stride (+ immediate).
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(memory_index, *read) ||
+			    !(ImmediateU32(read->Arg(1), offset) ||
+			      MatchTableOffset(read->Arg(1), current_layer, offset, stride)) ||
+			    uint64_t {offset} + memory->offset > UINT32_MAX - 32u ||
+			    !UsesOnlyImageDescriptors(*read))
+				return false;
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			const auto  at      = offset + static_cast<uint32_t>(memory->offset);
+			if (dword == 0u) {
+				address      = current;
+				first        = at;
+				layer        = current_layer;
+				layer_stride = stride;
+			} else if (current == nullptr || address == nullptr ||
+			           !EquivalentValue(m_program, Value(const_cast<Inst*>(address)),
+			                            Value(const_cast<Inst*>(current))) ||
+			           at != first + dword * 4u || stride != layer_stride ||
+			           layer.IsEmpty() != current_layer.IsEmpty() ||
+			           (!layer.IsEmpty() && !EquivalentValue(m_program, layer, current_layer))) {
+				return false;
+			}
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = read;
+		}
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    address->NumArgs() != 2u || (first & 3u) != 0u ||
+		    (!layer.IsEmpty() && (layer_stride == 0u || (layer_stride & 3u) != 0u)))
+			return false;
+		const Inst* low         = nullptr;
+		const Inst* high        = nullptr;
+		uint32_t    low_offset  = 0;
+		uint32_t    high_offset = 0;
+		if (!BindlessPointerHalf(address->Arg(0), 0u, low, low_offset) ||
+		    !BindlessPointerHalf(address->Arg(1), 1u, high, high_offset) || low != high ||
+		    high_offset != low_offset + 4u || (low_offset & 3u) != 0u)
+			return false;
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*low, table_source) || table_source.dword_count != 4u)
+			return false;
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.bindless       = true;
+		indirect.layer_count    = layer.IsEmpty() ? 1u : BindlessLayerCount;
+		indirect.table_source   = InternSource(table_source);
+		indirect.pointer_offset = low_offset;
+		indirect.table_offset   = first;
+		indirect.table_stride   = layer.IsEmpty() ? 0u : layer_stride;
+		DescriptorSource source;
+		source.dword_count = 8u;
+		source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), 4u, source.dwords.begin() + 4u);
+		source.indirect_descriptor = indirect;
+		plan.handle         = &handle;
+		plan.source         = InternSource(source);
+		plan.key            = low->Arg(1);
+		plan.bindless       = true;
+		plan.bindless_layer = layer;
+		plan.retain_reads   = true;
+		plan.reads.fill(nullptr);
+		return true;
+	}
+
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -3784,14 +3987,16 @@ private:
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
 					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
+					                  TryMakeIndirectBuffer(*handle, descriptor, plan) ||
+					                  TryMakeBindlessPointerImage(*handle, descriptor, plan)))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
 								Fail(flags.pc, "shared descriptor read has incompatible keys");
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
-					} else if (!sampler && !buffer_store && PerLanePointerDescriptor(*handle)) {
+					} else if (handle->GetOpcode() == ValueOpcode::GetImageResource &&
+					           PerLanePointerDescriptor(*handle)) {
 						// Until bindless descriptors exist, such an image samples as null.
 						if (!m_per_lane_pointer_warned) {
 							std::fprintf(stderr,
