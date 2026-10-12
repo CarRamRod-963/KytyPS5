@@ -249,6 +249,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	m_download_images.erase(id);
+	++m_deletion_epoch;
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(image.info.metadata.range.address);
 	}
