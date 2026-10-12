@@ -3897,6 +3897,34 @@ void TestPerLanePointerImageReadsNull() {
               plan.descriptor_sources[indirect.table_source].dword_count == 4u,
           "bindless descriptor lost its record V#");
   }
+  // Materialization describes the heap for the renderer instead of enumerating records.
+  std::array<uint32_t, 5> user_data{0x1000u, 8u << 16u, 100u, 0u, 3u};
+  LinearTestMemory memory;
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "bindless image did not materialize");
+  Check(snapshot.bindless_uses.size() == 3 && snapshot.images.size() == 3 &&
+            snapshot.flattened_srt.size() >= 6,
+        "bindless materialization did not describe one heap per root");
+  for (uint32_t table = 0; table < 3; ++table) {
+    const auto& use = snapshot.bindless_uses[table];
+    Check(use.resource == table && use.base == 0x1000u && use.size == 800u &&
+              use.record_stride == 8u && use.pointer_offset == 0u &&
+              use.table_offset == 64u * table && use.layer_stride == 0x170u &&
+              use.layer_count == BindlessLayerCount &&
+              use.mapping_offset + 2u <= snapshot.flattened_srt.size(),
+          "bindless heap description does not match the plan");
+    Check(specialization.images[table].bindless &&
+              specialization.images[table].indirect_root == table &&
+              specialization.images[table].indirect_mapping_offset == use.mapping_offset &&
+              snapshot.images[table].dwords[0] == 0u && snapshot.images[table].dwords[1] == 0u,
+          "bindless root did not sample the null image with its mapping");
+  }
 }
 
 void TestUniformScalarBufferImage() {
