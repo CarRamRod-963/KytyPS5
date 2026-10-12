@@ -32214,6 +32214,53 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
   return test;
 }
 
+// A T# behind a record pointer a vector load fetches per lane (Ghost of Yotei's material
+// records): the image is bindless, sampled through descriptor set 2 with a key looked up in
+// the translation table, so the module declares that set and no enumerated candidates.
+TestCase BindlessPointerImageSample() {
+  using O = ShaderOpcode;
+  std::vector<u32> code = {
+      // v[2:3] = instances[v0].pointer (V# in s[8:11]), uniform in s[16:17]
+      EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(2, 2, 0),
+      EncodeSopp(0x0c, 0),
+      EncodeVop1(0x02, 16, Vgpr(2)), EncodeVop1(0x02, 17, Vgpr(3)),
+      // T# at pointer + 0
+      EncodeSmem0(0x03, 20, 8), EncodeSmem1(0, 125),
+      EncodeSopp(0x0c, 0),
+      EncodeVop1(0x01, 4, InlineU32(0)), EncodeVop1(0x01, 5, InlineU32(0)),
+      // image_sample v6, v[4:5], s[20:27], s[12:15]
+      EncodeMimg0(0x20, 1), EncodeMimg1(6, 4, 5, 3),
+      EncodeSopp(0x0c, 0),
+  };
+  AppendStoreVgpr(&code, 6, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BindlessPointerImageSample";
+  test.code = code;
+  test.initial = {0};
+  test.expected = {0};
+  test.opcodes = {O::BUFFER_LOAD_DWORDX2, O::S_WAITCNT, O::V_READFIRSTLANE_B32,
+                  O::V_READFIRSTLANE_B32, O::S_LOAD_DWORDX8, O::S_WAITCNT, O::V_MOV_B32,
+                  O::V_MOV_B32, O::IMAGE_SAMPLE, O::S_WAITCNT, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.has_user_data = true;
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  // s[8:11]: the instance records, 100 of 8 bytes; s[12:15]: a plain S#.
+  test.user_data[8] = 0x1000u;
+  test.user_data[9] = 8u << 16u;
+  test.user_data[10] = 100u;
+  test.user_data[11] = 0x5204u;
+  test.compile_only = true;
+  test.required_spirv = {"bindless_images", "bindless_translation", "bindless_feedback"};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 // Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
 // min(delta, 64). The profile period picks the host clock shift.
 std::vector<TestCase> ScalarMemRealtimeCases() {
@@ -44135,6 +44182,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(64, false, true));
 
   AddCase(IntegerAddSubMul);
+  AddCase(BindlessPointerImageSample);
   AddCase(BitwiseOps);
   AddCase(Shifts);
   AddCase(ScalarZeroShiftWithRuntimeCount);
