@@ -10841,6 +10841,12 @@ public:
                                                          placed, 1);
       RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
                                                          source, 0);
+      // A recycled backing keeps an earlier image's texels: start the target from zero.
+      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
+                                         whole.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, mip ? 2u : 1u,
+                                          0, mip ? 1u : 2u},
+                                         {});
       vk::ClearValue red{};
       red.color.float32 = std::array{1.0f, 0.0f, 0.0f, 1.0f};
       TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
