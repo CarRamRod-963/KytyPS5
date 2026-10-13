@@ -306,6 +306,66 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	// Names the first resource whose specialization changed between a shader's last permutation
+	// and the one about to be compiled, so a shader that keeps compiling can be understood.
+	static void LogPermutationDifference(const char* stage_name, uint64_t hash,
+	                                     const ShaderRecompiler::IR::ResourceSpecialization& old,
+	                                     const ShaderRecompiler::IR::ResourceSpecialization& now) {
+		if (old.buffers.size() != now.buffers.size() || old.images.size() != now.images.size() ||
+		    old.samplers.size() != now.samplers.size()) {
+			LOGF("Permutation: %s %016" PRIx64 " resource counts buffers %zu->%zu images %zu->%zu "
+			     "samplers %zu->%zu\n",
+			     stage_name, hash, old.buffers.size(), now.buffers.size(), old.images.size(),
+			     now.images.size(), old.samplers.size(), now.samplers.size());
+			return;
+		}
+		for (size_t i = 0; i < now.buffers.size(); ++i) {
+			const auto& a = old.buffers[i];
+			const auto& b = now.buffers[i];
+			if (a == b) continue;
+			LOGF("Permutation: %s %016" PRIx64 " buffer %zu stride %u->%u format %u->%u swizzle "
+			     "%u->%u zero_oob %d->%d root %u->%u mapping %u->%u iterations %u->%u\n",
+			     stage_name, hash, i, a.packed_stride, b.packed_stride,
+			     static_cast<uint32_t>(a.descriptor_format), static_cast<uint32_t>(b.descriptor_format),
+			     a.descriptor_swizzle, b.descriptor_swizzle, a.zero_stride_oob ? 1 : 0,
+			     b.zero_stride_oob ? 1 : 0, a.indirect_root, b.indirect_root,
+			     a.indirect_mapping_offset, b.indirect_mapping_offset, a.indirect_search_iterations,
+			     b.indirect_search_iterations);
+			return;
+		}
+		for (size_t i = 0; i < now.images.size(); ++i) {
+			const auto& a = old.images[i];
+			const auto& b = now.images[i];
+			if (a == b) continue;
+			LOGF("Permutation: %s %016" PRIx64 " image %zu numeric %u->%u dimension %u->%u mips "
+			     "%u->%u conversion %u->%u swizzle %u->%u root %u->%u mapping %u->%u iterations "
+			     "%u->%u cube %d->%d fmask %d->%d bindless %d->%d\n",
+			     stage_name, hash, i, static_cast<uint32_t>(a.numeric_class),
+			     static_cast<uint32_t>(b.numeric_class), static_cast<uint32_t>(a.dimension),
+			     static_cast<uint32_t>(b.dimension), a.mip_count, b.mip_count,
+			     static_cast<uint32_t>(a.conversion_format), static_cast<uint32_t>(b.conversion_format),
+			     a.shader_swizzle, b.shader_swizzle, a.indirect_root, b.indirect_root,
+			     a.indirect_mapping_offset, b.indirect_mapping_offset, a.indirect_search_iterations,
+			     b.indirect_search_iterations, a.cube ? 1 : 0, b.cube ? 1 : 0, a.fmask ? 1 : 0,
+			     b.fmask ? 1 : 0, a.bindless ? 1 : 0, b.bindless ? 1 : 0);
+			return;
+		}
+		for (size_t i = 0; i < now.samplers.size(); ++i) {
+			const auto& a = old.samplers[i];
+			const auto& b = now.samplers[i];
+			if (a == b) continue;
+			LOGF("Permutation: %s %016" PRIx64 " sampler %zu root %u->%u mapping %u->%u iterations "
+			     "%u->%u\n",
+			     stage_name, hash, i, a.indirect_root, b.indirect_root, a.indirect_mapping_offset,
+			     b.indirect_mapping_offset, a.indirect_search_iterations,
+			     b.indirect_search_iterations);
+			return;
+		}
+		LOGF("Permutation: %s %016" PRIx64 " specialization equal; push data or function code "
+		     "changed\n",
+		     stage_name, hash);
+	}
+
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
@@ -469,6 +529,11 @@ struct PipelineCache::ProgramCache {
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+		}
+		if (!entry->second.permutations.empty() && graphics_debug_dump_enabled()) {
+			LogPermutationDifference(stage_name, params.hash,
+			                         entry->second.permutations.back().specialization,
+			                         entry->second.specialization);
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
