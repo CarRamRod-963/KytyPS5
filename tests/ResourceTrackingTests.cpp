@@ -2405,6 +2405,18 @@ void TestBoundedComputeImageLoop() {
               specialization.images[0].indirect_search_iterations == 0u,
           "empty compute loop bound retained unreachable image candidates");
   }
+  // A large table is not enumerated: the renderer resolves its keys through a bindless heap of
+  // direct records.
+  user_data[2] = 64u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.bindless_uses.size() == 1u && snapshot.images.size() == 1u &&
+            specialization.images.size() == 1u && specialization.images[0].bindless &&
+            snapshot.bindless_uses[0].pointer_offset == BindlessUse::NoPointer &&
+            snapshot.bindless_uses[0].record_stride == 32u &&
+            snapshot.bindless_uses[0].size == 64u * 32u &&
+            snapshot.bindless_uses[0].base + snapshot.bindless_uses[0].table_offset == table &&
+            snapshot.bindless_uses[0].layer_count == 1u,
+        "large compute image table was not described as a direct bindless heap");
   user_data[2] = 65537u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "oversized compute loop bound was accepted for image enumeration");
