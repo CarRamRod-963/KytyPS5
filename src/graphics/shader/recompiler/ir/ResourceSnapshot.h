@@ -35,6 +35,10 @@ struct UniformFill {
 // the translation table and patches [region, entry count] into the flattened SRT at
 // mapping_offset; the shader looks key = record * layer_count + layer up there.
 struct BindlessUse {
+	// pointer_offset of a table whose records hold the T# itself (at base + key * record_stride +
+	// table_offset) instead of a pointer to it.
+	static constexpr uint32_t NoPointer = UINT32_MAX;
+
 	uint32_t resource       = 0;
 	uint64_t base           = 0;
 	uint64_t size           = 0;
