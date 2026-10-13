@@ -20,6 +20,10 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+// An image table with more keys than this is not enumerated: its program would bake the
+// candidate array and recompile whenever the table's contents change (Ghost of Yotei streams
+// hundreds of entries), so the renderer resolves the keys the GPU asks for instead.
+constexpr size_t BindlessTableKeys = 32u;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -832,6 +836,38 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 	}
 
+	if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+		// A large table of T#s at base + key * stride: a bindless heap of direct records. A
+		// selector only narrows which keys the host enumerates; the shader still forms the key
+		// itself, so the heap covers every record up to the largest key.
+		const uint64_t records =
+		    keys.empty() ? 0u : uint64_t {*std::ranges::max_element(keys)} + 1u;
+		if (sources.empty() && indirect.workgroup_axis == UINT32_MAX &&
+		    indirect.pointer_offset == UINT32_MAX && keys.size() > BindlessTableKeys &&
+		    dword_count == 8u && indirect.table_stride != 0u &&
+		    (indirect.table_stride & 3u) == 0u && (indirect.table_offset & 3u) == 0u &&
+		    (indirect.table_immediate & 3u) == 0u && records * indirect.table_stride <= UINT32_MAX) {
+			const auto mapping_offset = snapshot.flattened_srt.size();
+			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			snapshot.bindless_uses.push_back(
+			    {.resource       = resource_index,
+			     .base           = table_base,
+			     .size           = records * indirect.table_stride,
+			     .record_stride  = indirect.table_stride,
+			     .pointer_offset = BindlessUse::NoPointer,
+			     .table_offset   = indirect.table_offset + indirect.table_immediate,
+			     .layer_stride   = 0u,
+			     .layer_count    = 1u,
+			     .mapping_offset = static_cast<uint32_t>(mapping_offset)});
+			descriptors[resource_index]     = {.dword_count = dword_count};
+			auto& root                      = specializations[resource_index];
+			root.indirect_root              = resource_index;
+			root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+			root.indirect_search_iterations = 0u;
+			root.bindless                   = true;
+			return true;
+		}
+	}
 	// The program bakes the search depth and the candidate array size, so a table whose entry
 	// count changes with the scene (Ghost of Yotei's streaming tables: 69 then 80 candidates)
 	// would compile a permutation per change. Both are padded to a power of two; the shader
