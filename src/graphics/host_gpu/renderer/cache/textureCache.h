@@ -175,6 +175,8 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Orders native image writes against guest metadata reads (see Image).
+	uint64_t                                          m_event_sequence = 0;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

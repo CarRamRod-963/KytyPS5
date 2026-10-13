@@ -702,6 +702,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
+	// The copy below carries the native content, and with it the metadata's staleness.
+	replacement.native_write_sequence  = cached.native_write_sequence;
+	replacement.metadata_read_sequence = cached.metadata_read_sequence;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
@@ -1084,8 +1087,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
+	bool metadata_written = false;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		metadata_written = true;
+	}
+	if (m_buffer_cache.ConsumeCpuModified(range.address, range.size)) {
+		metadata_written = true;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		// Rendering natively leaves the guest's metadata as it was, so a clear code already read
+		// before a later native write is stale: honouring it again would wipe what was rendered.
+		// Metadata the GPU wrote since (a new clear) is read afresh.
+		if (!metadata_written && image.metadata_read_sequence != 0 &&
+		    image.native_write_sequence > image.metadata_read_sequence) {
+			return;
+		}
+		image.metadata_read_sequence = ++m_event_sequence;
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
@@ -1475,6 +1495,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	image.native_write_sequence = ++m_event_sequence;
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

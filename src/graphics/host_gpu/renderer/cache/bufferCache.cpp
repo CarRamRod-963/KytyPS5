@@ -635,6 +635,14 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
+	bool modified = false;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false, [&](uint64_t, uint64_t) noexcept { modified = true; },
+	    []() noexcept {});
+	return modified;
+}
+
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

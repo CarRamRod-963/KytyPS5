@@ -137,6 +137,11 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// TextureCache event sequence numbers: the last native GPU write to the image and the last
+	// time its guest color metadata was read for a clear code. Native rendering leaves the guest
+	// metadata untouched, so a code read before a later native write describes an older surface.
+	uint64_t         native_write_sequence  = 0;
+	uint64_t         metadata_read_sequence = 0;
 
 private:
 	friend struct ImageTestAccess;
