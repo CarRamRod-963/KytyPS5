@@ -56,8 +56,18 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	DestroyRecycledImages();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+}
+
+void GraphicContext::DestroyRecycledImages() {
+	std::scoped_lock lock(recycled_images_mutex);
+	for (const auto& recycled: recycled_images) {
+		vmaDestroyImage(allocator, recycled.image, recycled.allocation);
+	}
+	recycled_images.clear();
+	recycled_image_bytes = 0;
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -150,17 +160,31 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	{
+		std::scoped_lock lock(recycled_images_mutex);
+		const auto       recycled =
+		    std::find_if(recycled_images.begin(), recycled_images.end(),
+		                 [&](const RecycledImage& candidate) { return candidate.info == image_info; });
+		if (recycled != recycled_images.end()) {
+			image.image      = recycled->image;
+			image.allocation = recycled->allocation;
+			recycled_image_bytes -= recycled->bytes;
+			recycled_images.erase(recycled);
+		}
+	}
+	if (image.image == nullptr) {
+		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+            &alloc_info, &native_image, &image.allocation, nullptr));
+		image.image                   = native_image;
+		if (result != vk::Result::eSuccess) {
+			LogMemoryBudget();
+			return false;
+		}
 	}
 
 	image.format     = image_info.format;
@@ -171,6 +195,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.samples    = static_cast<uint32_t>(image_info.samples);
 	image.usage      = image_info.usage;
 	image.flags      = image_info.flags;
+	image.create_info = image_info;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
 
@@ -181,7 +206,27 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	VmaAllocationInfo allocation_info {};
+	vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+	const uint64_t bytes = allocation_info.size;
+	// Only a chain-free create info can be compared by value.
+	if (image.create_info.pNext == nullptr && bytes <= RecycledImageBytesLimit) {
+		std::scoped_lock lock(recycled_images_mutex);
+		while (!recycled_images.empty() && (recycled_images.size() >= RecycledImageLimit ||
+		                                    recycled_image_bytes + bytes > RecycledImageBytesLimit)) {
+			const auto& oldest = recycled_images.front();
+			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+			recycled_image_bytes -= oldest.bytes;
+			recycled_images.erase(recycled_images.begin());
+		}
+		recycled_images.push_back({.info       = image.create_info,
+		                           .image      = image.image,
+		                           .allocation = image.allocation,
+		                           .bytes      = bytes});
+		recycled_image_bytes += bytes;
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }
