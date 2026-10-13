@@ -1941,7 +1941,8 @@ void TestGuardedDirectImageTable() {
     user_data = {static_cast<uint32_t>(records.base), 0u};
     runtime.userdata = &records;
     Check(MaterializeResources(finite, runtime, snapshot, specialization) &&
-              records.descriptor_reads == count && snapshot.images.size() == std::max(count, 1u) + 1u,
+              records.descriptor_reads == count &&
+              snapshot.images.size() == std::bit_ceil(std::max(count, 1u)) + 1u,
           "finite bit table probed beyond its mask bound or lost a null row");
     if (count == 0u) {
       Check(std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
@@ -2390,12 +2391,13 @@ void TestBoundedComputeImageLoop() {
   memory.fail_address = UINT64_MAX;
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
+    // Candidate slots are padded to a power of two so a changed count rarely recompiles.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count &&
-              specialization.images.size() == count &&
+              snapshot.images.size() == std::bit_ceil(count) &&
+              specialization.images.size() == std::bit_ceil(count) &&
               snapshot.flattened_srt[
                   specialization.images[0].indirect_mapping_offset] == count &&
-              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+              snapshot.images[count - 1u].dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
   for (const uint32_t count : {0u, UINT32_MAX}) {
@@ -3277,7 +3279,9 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
+            memory.reads == 4u && memory.descriptor_reads == 3u &&
+            // The root and its two candidates are padded to a power of two with a null slot.
+            snapshot.images.size() == 4u &&
             snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
             snapshot.images[2].dwords[0] == 0x600u,
         "packed selector did not extract before clamping or read outside its sixteen records");
@@ -3294,7 +3298,7 @@ void TestUniformizedMaterialImageKeys() {
                       base_offset + immediate + record * 16u, &word, sizeof(word));
     }
     Check(MaterializeResources(immediate == 8u ? packed : unaligned, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x200u &&
+              snapshot.images.size() == 4u && snapshot.images[0].dwords[0] == 0x200u &&
               snapshot.images[1].dwords[0] == 0x400u && snapshot.images[2].dwords[0] == 0x600u &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair<uint64_t, uint64_t>{base + base_offset + immediate, 244u}) !=

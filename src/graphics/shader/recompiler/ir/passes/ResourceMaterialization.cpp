@@ -828,11 +828,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 	}
 
+	// The program bakes the search depth and the candidate array size, so a table whose entry
+	// count changes with the scene (Ghost of Yotei's streaming tables: 69 then 80 candidates)
+	// would compile a permutation per change. Both are padded to a power of two; the shader
+	// searches the count the SRT holds, and spare candidate slots hold null descriptors.
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto selected_keys = byte_keys ? std::span<const uint32_t>(byte_offsets)
 	                                    : std::span<const uint32_t>(keys);
 	const auto key_count = sources.empty() ? selected_keys.size() : sources.size();
-	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
+	const auto padded_keys = std::bit_ceil(std::max<size_t>(key_count, 1u));
+	snapshot.flattened_srt.resize(mapping_offset + 1u + padded_keys * 2u, 0u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
 		const auto key = sources.empty() ? selected_keys[entry] : entry;
@@ -865,10 +870,17 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		const auto unique = descriptors.size() - children_begin + 1u;
+		for (auto padded = std::bit_ceil(unique); descriptors.size() - children_begin + 1u < padded;) {
+			descriptors.push_back({.dword_count = dword_count});
+			auto child          = root_resource;
+			child.indirect_root = resource_index;
+			specializations.push_back(child);
+		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(padded_keys);
 	}
 	return true;
 }
