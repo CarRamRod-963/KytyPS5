@@ -12,6 +12,7 @@
 
 #include <array>
 #include <optional>
+#include <unordered_map>
 #include <span>
 #include <vector>
 
@@ -225,6 +226,7 @@ private:
 	void                      ValidateBindlessSlots();
 	[[nodiscard]] uint32_t    ResolveBindlessKey(uint32_t                            heap,
 	                                             const BindlessTranslation::Request& request);
+	void                      FillBindlessHeap(uint32_t heap);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -242,6 +244,15 @@ private:
 	std::vector<ShaderRecompiler::IR::ImageResource> m_bindless_resources;
 	uint64_t                              m_bindless_deletion_epoch = 0;
 	std::vector<uint32_t>                 m_bindless_feedback;
+	// Slots keys resolved to, by the address of the record's T# block: a heap of new instance
+	// records over the same materials fills its region from here instead of waiting for the
+	// GPU to flag every key again.
+	struct BindlessResolved {
+		uint32_t layer = 0;
+		uint32_t slot  = 0;
+		ImageId  image;
+	};
+	std::unordered_map<uint64_t, std::vector<BindlessResolved>> m_bindless_resolved;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
