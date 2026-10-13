@@ -276,6 +276,8 @@ private:
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Orders native image writes against guest metadata reads (see Image).
+	uint64_t                                          m_event_sequence = 0;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
