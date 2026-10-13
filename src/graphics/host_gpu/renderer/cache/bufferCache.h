@@ -80,6 +80,9 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	// Reports whether the CPU wrote the range since the last upload or consumption, and arms the
+	// range so the next CPU write is reported again.
+	[[nodiscard]] bool ConsumeCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
 	// until a GPU write or download.
