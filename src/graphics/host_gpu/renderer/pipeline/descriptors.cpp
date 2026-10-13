@@ -991,12 +991,18 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	auto&       translation = table.Translation();
 	const auto& key         = translation.GetHeap(heap).key;
 	uint64_t    pointer     = 0;
-	const auto  record = key.base + uint64_t {request.record} * key.record_stride + key.pointer_offset;
-	const bool readable = LibKernel::Memory::TryReadBacking(record, &pointer, sizeof(pointer));
-	// The shader sign-extends bit 47; the bits above it carry what the game stores there.
-	pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
-	if (!readable || pointer == 0) {
-		return BindlessTranslation::PlaceholderSlot;
+	const auto  record = key.base + uint64_t {request.record} * key.record_stride;
+	if (key.pointer_offset == ShaderRecompiler::IR::BindlessUse::NoPointer) {
+		// The record holds the T# block itself.
+		pointer = record;
+	} else {
+		const bool readable = LibKernel::Memory::TryReadBacking(record + key.pointer_offset, &pointer,
+		                                                        sizeof(pointer));
+		// The shader sign-extends bit 47; the bits above it carry what the game stores there.
+		pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
+		if (!readable || pointer == 0) {
+			return BindlessTranslation::PlaceholderSlot;
+		}
 	}
 	ShaderRecompiler::IR::DescriptorValue value;
 	value.dword_count = static_cast<uint32_t>(value.dwords.size());
@@ -1061,10 +1067,12 @@ void RenderExecutor::FillBindlessHeap(uint32_t heap) {
 	const auto  key         = found.key;
 	bool        filled      = false;
 	for (uint32_t record = 0; record < found.records; ++record) {
-		uint64_t   pointer = 0;
-		const auto address = key.base + uint64_t {record} * key.record_stride + key.pointer_offset;
-		if (!LibKernel::Memory::TryReadBacking(address, &pointer, sizeof(pointer))) continue;
-		pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
+		uint64_t   pointer = key.base + uint64_t {record} * key.record_stride;
+		if (key.pointer_offset != ShaderRecompiler::IR::BindlessUse::NoPointer) {
+			if (!LibKernel::Memory::TryReadBacking(pointer + key.pointer_offset, &pointer,
+			                                       sizeof(pointer))) continue;
+			pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
+		}
 		const auto resolved = m_bindless_resolved.find(pointer + key.table_offset);
 		if (pointer == 0 || resolved == m_bindless_resolved.end()) continue;
 		for (const auto& entry: resolved->second) {
