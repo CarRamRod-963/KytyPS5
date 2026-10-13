@@ -925,6 +925,7 @@ void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
 		if (heap >= m_bindless_resources.size()) {
 			m_bindless_resources.resize(heap + 1u);
 			m_bindless_resources[heap] = program.info.images[use.resource];
+			FillBindlessHeap(heap);
 		}
 		const auto& found = translation.GetHeap(heap);
 		words[0]          = found.region;
@@ -1044,7 +1045,38 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		}
 		table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
 	}
+	auto& resolved = m_bindless_resolved[pointer + key.table_offset];
+	if (std::ranges::find(resolved, request.layer, &BindlessResolved::layer) == resolved.end()) {
+		resolved.push_back({request.layer, slot, binding.image_id});
+	}
 	return slot;
+}
+
+// A new heap's records point at material blocks whose keys may have resolved through an
+// earlier heap: those translations are written right away.
+void RenderExecutor::FillBindlessHeap(uint32_t heap) {
+	auto&       table       = m_context.GetBindlessTable();
+	auto&       translation = table.Translation();
+	const auto& found       = translation.GetHeap(heap);
+	const auto  key         = found.key;
+	bool        filled      = false;
+	for (uint32_t record = 0; record < found.records; ++record) {
+		uint64_t   pointer = 0;
+		const auto address = key.base + uint64_t {record} * key.record_stride + key.pointer_offset;
+		if (!LibKernel::Memory::TryReadBacking(address, &pointer, sizeof(pointer))) continue;
+		pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
+		const auto resolved = m_bindless_resolved.find(pointer + key.table_offset);
+		if (pointer == 0 || resolved == m_bindless_resolved.end()) continue;
+		for (const auto& entry: resolved->second) {
+			const auto& slot = translation.GetSlot(entry.slot);
+			if (entry.layer >= key.layer_count || !slot.InUse() || slot.image != entry.image) continue;
+			translation.Translate(found.region + record * key.layer_count + entry.layer, entry.slot);
+			filled = true;
+		}
+	}
+	if (filled) {
+		table.FlushTranslation();
+	}
 }
 
 void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
