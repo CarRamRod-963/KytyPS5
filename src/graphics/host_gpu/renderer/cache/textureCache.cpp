@@ -740,14 +740,28 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 namespace BcAlias {
 
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
-	return requested.guest_format != cached.guest_format &&
-	       requested.IsBlock() != cached.IsBlock() &&
-	       requested.tile_mode == cached.tile_mode &&
-	       requested.bytes_per_block == cached.bytes_per_block &&
-	       requested.samples == 1 && cached.samples == 1 &&
-	       (requested.data != cached.data || requested.resources != cached.resources ||
-	        requested.BlockExtent() != cached.BlockExtent()) &&
-	       !TextureCache::SameBacking(cached, requested, false);
+	if (requested.tile_mode != cached.tile_mode || requested.samples != 1 || cached.samples != 1 ||
+	    TextureCache::SameBacking(cached, requested, false)) {
+		return false;
+	}
+	const bool block_alias =
+	    requested.guest_format != cached.guest_format &&
+	    requested.IsBlock() != cached.IsBlock() &&
+	    requested.bytes_per_block == cached.bytes_per_block &&
+	    (requested.data != cached.data || requested.resources != cached.resources ||
+	     requested.BlockExtent() != cached.BlockExtent());
+	// The same bytes seen through texels of another width: a shader fills a 2048x2048 RG16F map
+	// through a 512x512 view of 16-byte texels (Ghost of Yotei's cloud maps). Rows and height
+	// agree, so the guest bytes carry the content from one view to the other.
+	const bool wide_texel_alias =
+	    !requested.IsBlock() && !cached.IsBlock() &&
+	    requested.bytes_per_block != cached.bytes_per_block && requested.data == cached.data &&
+	    requested.resources == cached.resources && requested.resources.levels == 1 &&
+	    requested.extent.height == cached.extent.height &&
+	    requested.extent.depth == cached.extent.depth &&
+	    uint64_t {requested.extent.width} * requested.bytes_per_block ==
+	        uint64_t {cached.extent.width} * cached.bytes_per_block;
+	return block_alias || wide_texel_alias;
 }
 
 bool Publish(TextureCache& cache, Image& image) {
