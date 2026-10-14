@@ -359,21 +359,31 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
             snapshot.flattened_srt[mapping + 17u] == 2u &&
             snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 144u}},
         "dense image mapping lost its null slot, trimmed length or coherent read dependency");
+  // A sub-DWORD affine stride reaches every DWORD start. The table also holds T#s of other
+  // image operations, so an unsupported format there reads as null; a usable one is a candidate.
   for (const uint32_t stride : {1u, 2u}) {
     auto subdword = MakeIndirectImageFixture(false, stride, 0u, 0u, nested);
     subdword->PlanAndTrack();
     const auto subdword_plan = ExtractResourcePlan(subdword->program);
-    auto subdword_memory = memory;
-    auto subdword_runtime = runtime;
-    subdword_runtime.userdata = &subdword_memory;
-    ResourceSnapshot subdword_snapshot;
-    ResourceSpecialization subdword_specialization;
-    Check(!MaterializeResources(subdword_plan, subdword_runtime, subdword_snapshot,
-                               subdword_specialization) &&
-              std::ranges::any_of(subdword_snapshot.images, [&](const auto &image) {
-                return image.dwords == unreachable;
-              }),
-          "sub-DWORD affine stride skipped a reachable unsupported descriptor");
+    for (const bool usable : {false, true}) {
+      auto subdword_memory = memory;
+      auto reachable = descriptor;
+      reachable[0] += 2u;
+      if (usable)
+        std::copy(reachable.begin(), reachable.end(), subdword_memory.words.begin() + 0x1064u / 4u);
+      auto subdword_runtime = runtime;
+      subdword_runtime.userdata = &subdword_memory;
+      ResourceSnapshot subdword_snapshot;
+      ResourceSpecialization subdword_specialization;
+      const auto has = [&](const std::array<uint32_t, 8> &words) {
+        return std::ranges::any_of(subdword_snapshot.images,
+                                   [&](const auto &image) { return image.dwords == words; });
+      };
+      Check(MaterializeResources(subdword_plan, subdword_runtime, subdword_snapshot,
+                                 subdword_specialization) &&
+                !has(unreachable) && has(reachable) == usable,
+            "sub-DWORD affine stride skipped a reachable descriptor or kept an unusable one");
+    }
   }
   const auto original_specialization = specialization;
   std::fill_n(memory.words.begin() + 0x1040u / 4u, 8u, 0u);
@@ -4180,11 +4190,22 @@ void TestCompactScalarImageTable() {
     const bool shared = sharing == Sharing::SameBlock || sharing == Sharing::Dominating;
     if ((sharing != Sharing::None && !shared) ||
         (pairing != Pairing::SameKey && pairing != Pairing::MixedUses)) {
-      Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-                std::ranges::any_of(snapshot.images, [&](const auto &image) {
-                  return std::equal(poison.begin(), poison.end(), image.dwords.begin());
-                }),
+      // A heap without a selector also holds T#s of other image operations, so the unsupported
+      // poison reads as null; a usable record in its place shows that the heap domain reaches it.
+      const auto has = [&](uint32_t first_word) {
+        return std::ranges::any_of(snapshot.images,
+                                   [&](const auto &image) { return image.dwords[0] == first_word; });
+      };
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && !has(poison[0]),
+            "unpaired image use kept a descriptor its operation cannot use");
+      const auto at = memory.words.begin() + (0x1000u + 0x17cu) / 4u;
+      at[0] = 0x1ffu;
+      at[1] = static_cast<uint32_t>(F::k32_32_32_32Float) << 20u;
+      at[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && has(0x1ffu),
             "unpaired image use silently inherited a narrower sampler domain");
+      std::copy(poison.begin(), poison.end(), at);
       if (sharing == Sharing::Sibling)
         Check(memory.selector_attempts == 0u,
               "inactive sibling selector owner introduced a new specialization read");
