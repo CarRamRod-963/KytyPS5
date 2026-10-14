@@ -2430,6 +2430,14 @@ void TestBoundedComputeImageLoop() {
             snapshot.bindless_uses[0].base + snapshot.bindless_uses[0].table_offset == table &&
             snapshot.bindless_uses[0].layer_count == 1u,
         "large compute image table was not described as a direct bindless heap");
+  // A snapshot is evaluated again and again; a re-evaluation replaces the heaps
+  // rather than appending uses whose mapping offsets no longer exist in the
+  // rebuilt flattened SRT.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.bindless_uses.size() == 1u &&
+            snapshot.bindless_uses[0].mapping_offset + 2u <=
+                snapshot.flattened_srt.size(),
+        "re-evaluation accumulated stale bindless heap uses");
   user_data[2] = 65537u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "oversized compute loop bound was accepted for image enumeration");
