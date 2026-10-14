@@ -67,7 +67,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		// A guest read of GPU-written memory tends to continue through the following pages, so
+		// one readback fetches the GPU-modified extent from the faulting page instead of a GPU
+		// round trip per page.
+		constexpr uint64_t fault_window = uint64_t {1} << 20u;
+		m_buffer_cache.ReadMemoryAround(fault_vaddr, fault_window);
 	}
 	return true;
 }
