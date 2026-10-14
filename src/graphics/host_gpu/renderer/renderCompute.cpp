@@ -472,6 +472,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The guest clears color metadata with compute; the texture cache reads the clear code
+	// back on the next bind of the target. Submitting now keeps that readback a short copy
+	// instead of a flush of everything recorded since.
+	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
+		m_context.GetCommandScheduler().Flush();
+	}
 	ResetBindings();
 }
 
@@ -541,6 +547,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The guest clears color metadata with compute; the texture cache reads the clear code
+	// back on the next bind of the target. Submitting now keeps that readback a short copy
+	// instead of a flush of everything recorded since.
+	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
+		m_context.GetCommandScheduler().Flush();
+	}
 	ResetBindings();
 }
 

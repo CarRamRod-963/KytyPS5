@@ -87,6 +87,12 @@ public:
 	// can tell a fresh guest write (a re-applied metadata clear) from the bytes it already
 	// honoured.
 	[[nodiscard]] uint64_t WatchedWriteSequence(uint64_t vaddr, uint64_t size);
+	// Whether a watched range was bound for GPU writing since the last call: the host reads
+	// such a range soon (a clear code), and a readback of a pending writer flushes the whole
+	// recorded command buffer, so the recorder submits early instead.
+	[[nodiscard]] bool ConsumeWatchedWritePending() noexcept {
+		return std::exchange(m_watched_write_pending, false);
+	}
 	void               ProcessFaultBuffer();
 	void               SynchronizeBda(const RangeSet& mapped);
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
@@ -150,6 +156,7 @@ private:
 	};
 	std::vector<WatchedRange>                         m_watched_ranges;
 	uint64_t                                          m_watched_write_sequence = 0;
+	bool                                              m_watched_write_pending  = false;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

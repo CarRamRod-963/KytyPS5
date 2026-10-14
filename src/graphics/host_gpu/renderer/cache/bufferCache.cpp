@@ -521,7 +521,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 		for (auto& watched: m_watched_ranges) {
 			if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
-				watched.sequence = ++m_watched_write_sequence;
+				watched.sequence        = ++m_watched_write_sequence;
+				m_watched_write_pending = true;
 			}
 		}
 	}
