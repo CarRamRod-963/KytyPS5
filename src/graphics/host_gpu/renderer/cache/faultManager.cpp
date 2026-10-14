@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 
 #include <bit>
 #include <cinttypes>
@@ -135,7 +136,15 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+			// The access that faulted is lost for its dispatch; streaming then touches the
+			// pages after it. Caching the rest of the page's 16 MiB block (the mapped part)
+			// keeps the following accesses from faulting one page at a time.
+			constexpr uint64_t FaultBlock = uint64_t {1} << 24u;
+			const auto block_end = (address & ~(FaultBlock - 1u)) + FaultBlock;
+			const auto mapped_size =
+			    Libs::LibKernel::Memory::MappedRangeSize(address, block_end - address);
+			fault_ranges.Add(address,
+			                 mapped_size != 0 ? mapped_size : BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
