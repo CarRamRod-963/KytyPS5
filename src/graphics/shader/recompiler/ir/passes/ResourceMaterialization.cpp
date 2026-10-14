@@ -94,6 +94,31 @@ bool PlaceableImageDescriptor(const DescriptorValue& descriptor) {
 	return (base & (alignment - 1u)) == 0u;
 }
 
+// Whether an image operation can use a T# with this format; it mirrors the format checks of
+// BuildResourceSpecialization. FMASK surfaces are only supported through a direct image load.
+bool ImageDescriptorFormatUsable(const ImageResource& use, const DescriptorValue& descriptor) {
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	if (Prospero::IsFmaskTextureFormat(format)) {
+		return false;
+	}
+	if (use.atomic) {
+		return use.atomic64 ? format == Prospero::BufferFormat::k32_32UInt
+		                    : format == Prospero::BufferFormat::k32UInt ||
+		                          format == Prospero::BufferFormat::k32SInt ||
+		                          format == Prospero::BufferFormat::k32Float;
+	}
+	const auto numeric_class =
+	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	if (numeric_class == Prospero::TextureNumericClass::Unsupported) {
+		return false;
+	}
+	if (use.resource_class == ImageResourceClass::Storage) {
+		return numeric_class != Prospero::TextureNumericClass::Sint ||
+		       RawSignedStorageFormat(use, format) != Prospero::BufferFormat::kInvalid;
+	}
+	return !use.depth_compare || numeric_class == Prospero::TextureNumericClass::Float;
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -1812,12 +1837,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
-				        // A broad heap also contains resources for other typed image operations.
+				        // A broad heap also contains resources for other typed image operations;
+				        // a selector names exactly the records the shader uses, so a malformed one
+				        // still fails the specialization.
 				        if (NullImageDescriptor(value) ||
 				            !ValidImageDescriptor(value, image.r128) ||
 				            !PlaceableImageDescriptor(value) ||
 				            (table_candidates &&
-				             DescriptorDimension(value, image.dimension) != image.dimension))
+				             (DescriptorDimension(value, image.dimension) != image.dimension ||
+				              (!indirect.selector && !ImageDescriptorFormatUsable(image, value)))))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
