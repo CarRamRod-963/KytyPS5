@@ -88,6 +88,11 @@ public:
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// A counter that advances whenever the GPU is bound to write bytes of the watched range.
+	// Unlike the GPU-modified state, a readback of the range does not consume it, so a consumer
+	// can tell a fresh guest write (a re-applied metadata clear) from the bytes it already
+	// honoured.
+	[[nodiscard]] uint64_t WatchedWriteSequence(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
@@ -143,6 +148,13 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	struct WatchedRange {
+		uint64_t address;
+		uint64_t size;
+		uint64_t sequence;
+	};
+	std::vector<WatchedRange>                         m_watched_ranges;
+	uint64_t                                          m_watched_write_sequence = 0;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
