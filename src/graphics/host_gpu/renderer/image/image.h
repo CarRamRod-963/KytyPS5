@@ -166,6 +166,7 @@ public:
 	// metadata untouched, so a code read before a later native write describes an older surface.
 	uint64_t         native_write_sequence  = 0;
 	uint64_t         metadata_read_sequence = 0;
+	uint64_t         metadata_write_sequence = 0;
 
 private:
 	friend struct ImageTestAccess;
