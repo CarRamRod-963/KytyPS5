@@ -817,6 +817,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges == nullptr ? 0 : g_virtual_ranges->ClampRangeSize(vaddr, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
 	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.
