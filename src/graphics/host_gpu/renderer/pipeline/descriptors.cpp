@@ -657,6 +657,45 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return {id, nullptr, std::move(desc)};
 }
 
+TextureBinding
+RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+                                   const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto&          texture_cache = m_context.GetTextureCache();
+	TextureMemoKey key {};
+	std::copy_n(value.dwords.begin(), key.words.size(), key.words.begin());
+	key.traits = uint64_t {resource.written} | uint64_t {resource.read} << 1u |
+	             uint64_t {resource.atomic} << 2u | uint64_t {resource.atomic64} << 3u |
+	             uint64_t {resource.r128} << 4u | uint64_t {resource.depth_compare} << 5u |
+	             uint64_t {static_cast<uint8_t>(resource.resource_class)} << 8u |
+	             uint64_t {static_cast<uint8_t>(resource.mip_mode)} << 16u |
+	             uint64_t {static_cast<uint8_t>(resource.dimension)} << 24u |
+	             uint64_t {static_cast<uint8_t>(resource.numeric_class)} << 32u |
+	             uint64_t {value.dword_count} << 40u;
+	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
+		auto&      entry   = found->second;
+		const bool changed = texture_cache.LayoutChangedSince(
+		    entry.stamp, entry.desc.info.data.address, entry.desc.info.data.size);
+		auto* image = changed ? nullptr : texture_cache.m_slot_images.try_get(entry.image_id);
+		if (image != nullptr && image->registered && !image->binding.needs_rebind &&
+		    !image->depth_id) {
+			entry.stamp               = texture_cache.LayoutNow();
+			image->tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+			texture_cache.TouchImage(*image);
+			texture_cache.MaterializeColorClear(entry.image_id, entry.desc,
+			                                    entry.desc.metadata_base_layer);
+			return {entry.image_id, nullptr, entry.desc};
+		}
+		m_texture_memo.erase(found);
+	}
+	auto binding = ResolveTexture(resource, value);
+	if (m_texture_memo.size() >= 8192u) {
+		m_texture_memo.clear();
+	}
+	m_texture_memo.insert_or_assign(
+	    key, TextureMemoEntry {binding.image_id, binding.desc, texture_cache.LayoutNow()});
+	return binding;
+}
+
 static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
@@ -727,7 +766,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveTextureMemo(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -865,7 +904,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
 			old_image.binding = {};
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i] = ResolveTextureMemo(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
