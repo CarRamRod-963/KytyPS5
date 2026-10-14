@@ -2374,10 +2374,13 @@ void TestBoundedComputeImageLoop() {
       const auto post_plan = post_test_plan(post, count);
       memory.descriptor_reads = 0u;
       memory.fail_address = table + count * 32u;
+      // Candidate slots are padded to a power of two; the spare slots hold null descriptors.
       Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
-                memory.descriptor_reads == count && snapshot.images.size() == count &&
+                memory.descriptor_reads == count && snapshot.images.size() == std::bit_ceil(count) &&
                 snapshot.images.front().dwords[0] == 0x100u &&
-                snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+                snapshot.images[count - 1u].dwords[0] == 0x100u + count - 1u &&
+                std::all_of(snapshot.images.begin() + count, snapshot.images.end(),
+                            [](const DescriptorValue &image) { return image.dwords[0] == 0u; }),
             "post-tested image loop did not enumerate precisely zero through bound minus one");
     }
   }
@@ -2431,7 +2434,7 @@ void TestBoundedComputeImageLoop() {
     const auto length = count > 1u && count <= INT32_MAX ? count - 1u : 0u;
     Check(MaterializeResources(nonzero, runtime, snapshot, specialization) &&
               memory.descriptor_reads == length &&
-              snapshot.images.size() == std::max(1u, length) + 1u &&
+              snapshot.images.size() == std::bit_ceil(std::max(1u, length)) + 1u &&
               snapshot.images[0].dwords[0] == (length != 0u ? 0x101u : 0u),
           "nonzero-start image loop read index zero or mishandled its signed bound");
     Check(std::ranges::find(snapshot.specialization_reads,
@@ -2739,7 +2742,7 @@ void TestDescendingImageRange() {
               (bitmap_data[6] == 0u || memory.watched_dwords ==
                   std::min(bitmap_data[6] * 4u, MaxIndirectDescriptorProbes)) &&
               memory.descriptor_reads == keys.size() &&
-              snapshot.images.size() == std::max<size_t>(keys.size(), 1u),
+              snapshot.images.size() == std::bit_ceil(std::max<size_t>(keys.size(), 1u)),
           "bitmap selector lost bounded reads or retained unreachable descriptors");
     for (uint32_t first = 0; first < bitmap_data[6] * 4u; first += MaxIndirectDescriptorProbes)
       Check(std::ranges::find(snapshot.specialization_reads,
@@ -3320,7 +3323,7 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(merged, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 4u &&
             snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
             snapshot.images[2].dwords[0] == 0x600u,
         "merged nibble selector did not preserve its sixteen-record domain and lower-half projection");
@@ -4191,7 +4194,9 @@ void TestCompactScalarImageTable() {
       memory.selector_attempts = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "paired compact image/sampler table did not materialize");
-      Check(snapshot.images.size() == (shared ? 6u : 3u) && snapshot.samplers.size() == 3u &&
+      // Candidate slots are padded to a power of two; the spare slots hold null descriptors.
+      Check(snapshot.images.size() == std::bit_ceil(shared ? 6u : 3u) &&
+                snapshot.samplers.size() == std::bit_ceil(3u) &&
                 memory.selector_attempts == 1u,
             "paired table omitted an image, index-list value or OOB zero key");
       for (const auto &image : snapshot.images) {
@@ -4269,7 +4274,16 @@ void TestCompactScalarImageTable() {
       std::vector<uint32_t> samplers;
       for (const auto &sampler : snapshot.samplers) samplers.push_back(sampler.dwords[0]);
       std::ranges::sort(samplers);
-      Check(images == expected && samplers == expected_samplers,
+      // Candidate slots are padded to a power of two; the spare slots hold null descriptors.
+      const auto matches = [](std::vector<uint32_t> actual, const std::vector<uint32_t> &wanted) {
+        for (const auto value : wanted) {
+          const auto found = std::ranges::find(actual, value);
+          if (found == actual.end()) return false;
+          actual.erase(found);
+        }
+        return std::ranges::all_of(actual, [](uint32_t value) { return value == 0u; });
+      };
+      Check(matches(images, expected) && matches(samplers, expected_samplers),
             "shared selector domain mixed descriptor fields or retained stale keys");
       std::vector<std::pair<uint64_t, uint64_t>> reads;
       const auto expect_read = [&](uint32_t offset) {
@@ -4391,7 +4405,7 @@ void TestScalarBufferSelectorDomain() {
   ResourceSpecialization specialization;
   memory.watched_address = 0x1000u + 144u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
+            snapshot.images.size() == 4u && memory.watched_reads == 1u && // 3 keys padded to 4
             memory.watched_dwords == 9u && snapshot.images[0].dwords[0] == 0x100u &&
             snapshot.images[2].dwords[0] == 0x102u,
         "scalar selector interpreted batched padding or omitted the OOB zero key");
@@ -4401,7 +4415,7 @@ void TestScalarBufferSelectorDomain() {
   const auto scaled_lane = make_plan(true, false, true);
   memory.words[176u / 4u] = UINT32_MAX;
   Check(MaterializeResources(scaled_lane, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images.size() == 4u && snapshot.images[0].dwords[0] == 0x100u &&
             snapshot.images[1].dwords[0] == 0x101u && snapshot.images[2].dwords[0] == 0x102u,
         "scaling after lane selection lost wrapped offsets, clamped keys, or the OOB zero key");
   memory.words[176u / 4u] = 2u;
@@ -4813,9 +4827,14 @@ void TestCountedRowImageSelector() {
     }
     std::ranges::sort(image_addresses);
     image_addresses.erase(std::unique(image_addresses.begin(), image_addresses.end()), image_addresses.end());
-    Check(snapshot.images.size() == image_addresses.size() &&
-              std::ranges::all_of(snapshot.images, [&](const DescriptorValue &image) {
+    // Candidate slots are padded to a power of two; the spare slots hold null descriptors.
+    Check(snapshot.images.size() == std::bit_ceil(image_addresses.size()) &&
+              std::ranges::count_if(snapshot.images, [&](const DescriptorValue &image) {
                 return std::ranges::find(image_addresses, image.dwords[0]) != image_addresses.end();
+              }) == std::ssize(image_addresses) &&
+              std::ranges::all_of(snapshot.images, [&](const DescriptorValue &image) {
+                return image.dwords[0] == 0u ||
+                    std::ranges::find(image_addresses, image.dwords[0]) != image_addresses.end();
               }), "counted rows lost a selected image or retained an unrelated descriptor");
   };
   check({});
@@ -5143,8 +5162,10 @@ void TestSharedAppendSelectorBounds() {
     memory.words[0x804u / 4u] = counts[1];
     const auto expected = counts[1];
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == std::max(expected, 1u) &&
-              (expected == 0u || snapshot.images.back().dwords[0] == 0x100u + expected),
+              snapshot.images.size() == std::bit_ceil(std::max(expected, 1u)) &&
+              (expected == 0u || std::ranges::any_of(snapshot.images, [&](const DescriptorValue &image) {
+                return image.dwords[0] == 0x100u + expected;
+              })),
           "disjoint shared append lists or refreshed counts selected unrelated material keys");
   }
   memory.words[0x800u / 4u] = 24u;
@@ -6227,7 +6248,7 @@ void TestBoundedFormattedBufferStore() {
     memory.words[72] = count;
     memory.reads = memory.watched_reads = 0;
     memory.watched_address = memory.base + 128u;
-    Check(materialize() && snapshot.buffers.size() == std::max(1u, count),
+    Check(materialize() && snapshot.buffers.size() == std::bit_ceil(std::max(1u, count)),
           "uniform buffer table count did not refresh or left stale descriptors");
     Check(count != 0u || memory.watched_reads == 0u,
           "an empty loop probed its unreachable descriptor table");
@@ -6277,7 +6298,7 @@ void TestBoundedFormattedBufferStore() {
     memory.watched_reads = 0;
     const bool negative = count != 3u;
     Check(MaterializeResources(signed_plan, runtime, snapshot, specialization) &&
-              snapshot.buffers.size() == (negative ? 1u : count) &&
+              snapshot.buffers.size() == (negative ? 1u : std::bit_ceil(count)) &&
               (!negative || memory.watched_reads == 0u),
           "signed loop bound did not preserve empty negative and populated positive domains");
   }
@@ -7176,8 +7197,10 @@ void TestGpuSelectedFormattedRecordStore() {
         memory.words[table_offset / 4u + row * 4u + word] = populated ? descriptor[word] : 0u;
     }
     memory.reads = 0u;
+    // Two candidates and the null slot, padded to a power of two.
     Check(wide_materialize() && memory.reads == 32u &&
-              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 2u : 0u),
+              snapshot.buffers.size() ==
+                  wide_plan.info.buffers.size() + (populated ? std::bit_ceil(2u + 1u) - 1u : 0u),
           "finite RGBA16 table read GPU keys or retained stale null/active candidates");
   }
   const auto wide_mapping = specialization.buffers[wide_root].indirect_mapping_offset;
@@ -7388,12 +7411,19 @@ void TestFiniteBufferSelection() {
                      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 5u,
+  // Five candidates padded to a power of two.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == std::bit_ceil(5u),
         "finite buffer selection lost table roots after DCE or probed outside its domain");
   for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
+    // Without a proven domain the raw store falls back to a table-bounded address store.
     auto invalid = make(variant);
-    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "finite buffer selection accepted an unproved EXEC or selector domain");
+    invalid->PlanAndTrack();
+    Check(invalid->program.has_address_writes &&
+              std::ranges::any_of(invalid->program.memory_info, [](const MemoryInfo &memory) {
+                return memory.kind == ResourceKind::IndirectBuffer;
+              }),
+          "finite buffer selection accepted an unproved EXEC or selector domain");
   }
 }
 
@@ -7471,12 +7501,13 @@ void TestPackedScalarBufferSelection() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
-  Check(materialize() && snapshot.buffers.size() == 19u && memory.reads == 20u &&
+  Check(materialize() && snapshot.buffers.size() == 32u && memory.reads == 20u &&
             memory.watched_reads == 1u && memory.watched_dwords == 256u,
         "packed scalar lookup did not batch its read and deduplicate writable candidates");
   Check(std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 0x1c0u, uint64_t{1024u}}) != snapshot.specialization_reads.end() &&
             std::ranges::all_of(snapshot.buffers, [&](const DescriptorValue& value) {
+              if (value.dwords[0] == 0u) return true; // A padded null candidate slot.
               const auto key = (value.dwords[0] - 0x100000u) / 0x10000u;
               return std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 64u + key * 16u, uint64_t{16u}}) != snapshot.specialization_reads.end();
@@ -7492,10 +7523,16 @@ void TestPackedScalarBufferSelection() {
   memory.words[17] = 4u << 16u;
   memory.words[19] |= 3u << 28u;
   Check(!materialize(), "indexed DWORD write accepted raw byte bounds");
+  // A cross-byte shift, leafless cycle or indexed byte offset proves no key domain; the store
+  // still goes through the table-loaded V#'s device address, bounded by the table's V#s.
   for (auto bad : {0u, 1u, 2u}) {
     auto invalid = make(bad == 0u ? 28u : 24u, bad == 1u, bad == 2u ? 4u : 0u);
-    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
-               "packed selector accepted a cross-byte shift, leafless cycle, or indexed byte offset");
+    invalid->PlanAndTrack();
+    Check(invalid->program.has_address_writes &&
+              std::ranges::any_of(invalid->program.memory_info, [](const MemoryInfo &memory) {
+                return memory.kind == ResourceKind::IndirectBuffer;
+              }),
+          "unproved packed selector did not fall back to a table-bounded address store");
   }
   auto mixed = make(24u, false, 0u, true);
   mixed->PlanAndTrack();
@@ -7931,7 +7968,8 @@ void TestFiniteImageWaterfall() {
       memory.reads = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "finite waterfall resource plan could not refresh its scalar descriptor leaves");
-      Check(snapshot.images.size() == (count == 0u ? 1u : 3u) &&
+      // Two candidates and the null slot, padded to a power of two.
+      Check(snapshot.images.size() == (count == 0u ? 1u : std::bit_ceil(3u)) &&
                 (count == 0u ? memory.reads == 0u : memory.reads != 0u),
             "finite waterfall leaves froze empty table bounds or retained stale image candidates");
       if (count != 0u) populated = specialization;
