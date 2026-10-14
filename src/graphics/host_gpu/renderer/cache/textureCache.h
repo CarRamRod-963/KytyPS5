@@ -43,10 +43,24 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// The view's base layer before an overlap moved it: the layer whose metadata a clear reads.
+		uint32_t metadata_base_layer = 0;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
+	// Which image a descriptor resolves to changes only when an image overlapping its memory is
+	// inserted, registered, unregistered, deleted, expanded or given a stencil plane. A stamp
+	// taken at a lookup can later be asked whether such a change touched a range since.
+	struct LayoutStamp {
+		uint64_t sequence = 0;
+		uint64_t resets   = 0;
+	};
+	[[nodiscard]] LayoutStamp LayoutNow() const noexcept {
+		return {m_layout_sequence, m_layout_resets};
+	}
+	[[nodiscard]] bool LayoutChangedSince(LayoutStamp stamp, uint64_t address,
+	                                      uint64_t size) const noexcept;
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -177,6 +191,15 @@ private:
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// Orders native image writes against guest metadata reads (see Image).
 	uint64_t                                          m_event_sequence = 0;
+	struct LayoutChange {
+		uint64_t sequence;
+		uint64_t address;
+		uint64_t size;
+	};
+	void                      NoteLayoutChange(uint64_t address, uint64_t size);
+	std::vector<LayoutChange> m_layout_changes;
+	uint64_t                  m_layout_sequence                                = 0;
+	uint64_t                  m_layout_resets                                  = 0;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

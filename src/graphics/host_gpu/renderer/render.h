@@ -177,6 +177,32 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// ResolveTexture through a memo of (T#, resource traits) -> image, valid while the texture
+	// cache's layout generation holds; the per-bind maintenance (touch, clear materialization)
+	// still runs for a hit.
+	[[nodiscard]] TextureBinding
+	ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+	                   const ShaderRecompiler::IR::DescriptorValue& value);
+	struct TextureMemoKey {
+		std::array<uint32_t, 8> words;
+		uint64_t                traits;
+		bool                    operator==(const TextureMemoKey&) const = default;
+	};
+	struct TextureMemoKeyHash {
+		size_t operator()(const TextureMemoKey& key) const noexcept {
+			uint64_t hash = key.traits * 0x9E3779B97F4A7C15ull;
+			for (const auto word: key.words) {
+				hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+			}
+			return static_cast<size_t>(hash ^ (hash >> 32u));
+		}
+	};
+	struct TextureMemoEntry {
+		ImageId                   image_id;
+		TextureCache::ImageDesc   desc;
+		TextureCache::LayoutStamp stamp;
+	};
+	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
