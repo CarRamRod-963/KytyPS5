@@ -25,6 +25,7 @@
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -85,7 +86,26 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 		case vk::Format::eR32Sfloat:
 		case vk::Format::eR32G32Sfloat:
 		case vk::Format::eR32G32B32A32Sfloat:
-		case vk::Format::eB10G11R11UfloatPack32: break;
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32B32A32Sint: break;
 		default: return false;
 	}
 	const float          rgb   = (code & 0x80u) != 0 ? 1.0f : 0.0f;
@@ -111,6 +131,23 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 			std::reverse(channels.begin(), channels.end());
 			break;
 		default: break;
+	}
+	// A DCC "1" clears an integer channel to its maximum value (radv's fast-clear rule), e.g.
+	// Ghost of Yotei clears its R32_UINT material-id target to all ones.
+	const std::string_view numeric = vk::componentNumericFormat(format, 0);
+	if (numeric == "UINT" || numeric == "SINT") {
+		for (uint8_t component = 0; component < components; component++) {
+			const auto bits = vk::componentBits(format, component);
+			const bool one  = channels[component] != 0.0f;
+			if (numeric == "SINT") {
+				clear.int32[component] =
+				    one ? static_cast<int32_t>((uint64_t {1} << (bits - 1u)) - 1u) : 0;
+			} else {
+				clear.uint32[component] =
+				    one ? static_cast<uint32_t>((uint64_t {1} << bits) - 1u) : 0u;
+			}
+		}
+		return true;
 	}
 	clear.float32 = channels;
 	return true;
@@ -705,6 +742,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	// The copy below carries the native content, and with it the metadata's staleness.
 	replacement.native_write_sequence  = cached.native_write_sequence;
 	replacement.metadata_read_sequence = cached.metadata_read_sequence;
+	replacement.metadata_write_sequence = cached.metadata_write_sequence;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
@@ -1087,7 +1125,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	bool metadata_written = false;
+	// Another reader may already have downloaded the metadata and consumed its GPU-modified
+	// state, so the watched write sequence is what tells a re-applied clear from a stale one.
+	const auto write_sequence   = m_buffer_cache.WatchedWriteSequence(range.address, range.size);
+	bool       metadata_written = false;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 		metadata_written = true;
@@ -1101,6 +1142,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Rendering natively leaves the guest's metadata as it was, so a clear code already read
 		// before a later native write is stale: honouring it again would wipe what was rendered.
 		// Metadata the GPU wrote since (a new clear) is read afresh.
+		if (write_sequence != image.metadata_write_sequence) {
+			metadata_written              = true;
+			image.metadata_write_sequence = write_sequence;
+		}
 		if (!metadata_written && image.metadata_read_sequence != 0 &&
 		    image.native_write_sequence > image.metadata_read_sequence) {
 			return;

@@ -82,6 +82,11 @@ public:
 	// range so the next CPU write is reported again.
 	[[nodiscard]] bool ConsumeCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// A counter that advances whenever the GPU is bound to write bytes of the watched range.
+	// Unlike the GPU-modified state, a readback of the range does not consume it, so a consumer
+	// can tell a fresh guest write (a re-applied metadata clear) from the bytes it already
+	// honoured.
+	[[nodiscard]] uint64_t WatchedWriteSequence(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBda(const RangeSet& mapped);
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
@@ -138,6 +143,13 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct WatchedRange {
+		uint64_t address;
+		uint64_t size;
+		uint64_t sequence;
+	};
+	std::vector<WatchedRange>                         m_watched_ranges;
+	uint64_t                                          m_watched_write_sequence = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

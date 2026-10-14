@@ -519,6 +519,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		for (auto& watched: m_watched_ranges) {
+			if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
+				watched.sequence = ++m_watched_write_sequence;
+			}
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -625,6 +630,19 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+uint64_t BufferCache::WatchedWriteSequence(uint64_t vaddr, uint64_t size) {
+	uint64_t sequence = 0;
+	bool     watched  = false;
+	for (const auto& range: m_watched_ranges) {
+		if (range.address == vaddr && range.size == size) watched = true;
+		if (vaddr < range.address + range.size && range.address < vaddr + size) {
+			sequence = std::max(sequence, range.sequence);
+		}
+	}
+	if (!watched) m_watched_ranges.push_back({vaddr, size, 0u});
+	return sequence;
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
