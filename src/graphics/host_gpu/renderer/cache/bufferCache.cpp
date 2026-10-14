@@ -321,6 +321,32 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 "\n",
+		     vaddr);
+	}
+	// The dirty-range query runs on the GPU thread with the readback: the range set is only
+	// serialized there, and a guest thread faulting on a read arrives from anywhere.
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, window] {
+		const auto page  = vaddr & ~(CACHING_PAGESIZE - 1u);
+		const auto query = std::min(window, UINT64_MAX - page);
+		uint64_t   base  = vaddr;
+		uint64_t   size  = 1;
+		m_gpu_modified_ranges.ForEachInRange(page, query, [&](uint64_t begin, uint64_t end) {
+			if (begin <= vaddr && vaddr < end) {
+				base = begin;
+				size = end - begin;
+			}
+		});
+		auto& buffer = m_slot_buffers[FindBuffer(base, size)];
+		if (DownloadBufferMemory<false>(buffer, base, size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
+		}
+	});
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
