@@ -41006,8 +41006,17 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
         [](const auto &image) {
           return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
         });
+    // Candidate slots are padded to a power of two so a table whose count changes with the
+    // scene keeps its permutation; the spare slots hold null descriptors, never probed records.
+    const auto populated_count = std::ranges::count_if(compiled.program.info.images,
+        [&](const auto &image) {
+          const auto resource = static_cast<u32>(&image - compiled.program.info.images.data());
+          return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+              compiled.resources.images[resource].dwords[0] != 0u;
+        });
     Require(test.name, "bounded descriptor rows",
-            rows == 0u ? sampled_count <= members : sampled_count == rows * members,
+            populated_count == rows * members &&
+            sampled_count == members * std::bit_ceil(std::max(rows, 1u)),
             "the runtime count lost a row or probed record padding");
     std::vector<VulkanHarness::Image> images(compiled.program.info.images.size());
     u32 storage_index = 0;
