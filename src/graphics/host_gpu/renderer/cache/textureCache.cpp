@@ -238,13 +238,35 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return BindingType::Texture;
 }
 
+void TextureCache::NoteLayoutChange(uint64_t address, uint64_t size) {
+	if (size == 0) return;
+	constexpr size_t MaxChanges = 4096;
+	if (m_layout_changes.size() >= MaxChanges) {
+		m_layout_changes.clear();
+		++m_layout_resets;
+	}
+	m_layout_changes.push_back({++m_layout_sequence, address, size});
+}
+
+bool TextureCache::LayoutChangedSince(LayoutStamp stamp, uint64_t address,
+                                      uint64_t size) const noexcept {
+	if (stamp.resets != m_layout_resets) return true;
+	for (auto it = m_layout_changes.rbegin(); it != m_layout_changes.rend(); ++it) {
+		if (it->sequence <= stamp.sequence) break;
+		if (address < it->address + it->size && it->address < address + size) return true;
+	}
+	return false;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	NoteLayoutChange(info.data.address, info.data.size);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	RegisterImage(id);
 	return id;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
+	NoteLayoutChange(m_slot_images[id].info.data.address, m_slot_images[id].info.data.size);
 	auto& image = m_slot_images[id];
 	const auto& data  = image.info.data;
 	if (image.registered || data.Empty()) {
@@ -264,6 +286,7 @@ void TextureCache::RegisterImage(ImageId id) {
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
+	NoteLayoutChange(m_slot_images[id].info.data.address, m_slot_images[id].info.data.size);
 	auto& image = m_slot_images[id];
 	image.HeapChanged();
 	UntrackImage(id);
@@ -285,6 +308,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
+	NoteLayoutChange(m_slot_images[id].info.data.address, m_slot_images[id].info.data.size);
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -915,6 +939,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	NoteLayoutChange(info.data.address, info.data.size);
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -1256,6 +1281,9 @@ ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) con
 }
 
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+	NoteLayoutChange(stencil.address, stencil.size);
+	NoteLayoutChange(m_slot_images[depth_id].info.data.address,
+	                 m_slot_images[depth_id].info.data.size);
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
 	}
@@ -1312,6 +1340,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	desc.metadata_base_layer       = metadata_base_layer;
 
 	ImageId result {};
 	{
