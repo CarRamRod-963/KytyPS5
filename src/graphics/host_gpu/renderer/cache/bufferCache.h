@@ -53,6 +53,9 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Reads back the GPU-modified range containing vaddr, from its page to at most window
+	// bytes past vaddr, or just the byte at vaddr when no GPU-modified range contains it.
+	void                                       ReadMemoryAround(uint64_t vaddr, uint64_t window);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
