@@ -1398,12 +1398,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
-			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// ESVertCount describes input vertices, independently of lane ordinals.
+			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave. The prologue
+			// rebuilds EXEC as the low ESVertCount lanes (s_bfm), so the count must reach the
+			// highest active lane: Vulkan does not pack a partial subgroup into its low lanes, and
+			// a lane above the population count would export no position (Ghost of Yotei's
+			// instanced foliage drew nondeterministic triangles).
+			const auto lane_count = [&](IR::U32 mask) {
+				return entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::FindUMsb32, {mask})),
+				                     IR::U32(IR::Value(1u)));
+			};
+			auto vertex_count = lane_count(initial_lo);
+			if (options.wave_size == 64u) {
+				vertex_count = entry_ir.Select(
+				    entry_ir.ULessThan(IR::U32(IR::Value(0u)), initial_hi),
+				    entry_ir.IAdd(lane_count(initial_hi), IR::U32(IR::Value(32u))), vertex_count);
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      entry_ir.BitwiseOr(active_lane_count(), IR::U32(IR::Value(1u << 28u))));
+			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
 			// Vulkan adds an indirect record's bases to the indices; the hardware passes them
 			// only in the user SGPRs the packet patches. SH_NOP leaves those SGPRs unchanged;
 			// it does not make the record's bases zero.
