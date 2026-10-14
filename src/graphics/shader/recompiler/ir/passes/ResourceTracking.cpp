@@ -3957,6 +3957,8 @@ private:
 				}
 				const auto flags = inst.Flags<MemoryFlags>();
 				const auto& memory = m_program.memory_info[flags.index];
+				// A store plan carries its own bounds contract; it never copies a load's twin plan.
+				const bool buffer_store = BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write;
 				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
 					auto* handle = value.Resolve().TryInstruction();
 					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
@@ -3964,7 +3966,7 @@ private:
 					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
 					uint32_t bad_dword = 0;
 					if (ValidateSource(descriptor, bad_dword)) return;
-					if (const auto* twin = FindTwinPlan(*handle)) {
+					if (const auto* twin = buffer_store ? nullptr : FindTwinPlan(*handle)) {
 						auto copy   = *twin;
 						copy.handle = handle;
 						m_indirect_descriptors.push_back(std::move(copy));
