@@ -1805,6 +1805,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	// A snapshot is evaluated repeatedly; the heaps found this time replace the previous ones,
+	// whose mapping offsets belong to the flattened SRT just rebuilt.
+	snapshot.bindless_uses.clear();
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
