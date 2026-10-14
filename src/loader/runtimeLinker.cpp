@@ -547,6 +547,7 @@ struct GuestStackFrame {
 };
 
 static bool IsReadableRange(uint64_t addr, uint64_t size);
+static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info);
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
@@ -649,6 +650,57 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Host frames above the fault, as module+offset: a fault raised from inside the host (a
+// software-originated exception in ntdll, a library call on a guest thread) names no guest
+// code, and the unwinder walks through the exception dispatcher back to the frame that
+// faulted first.
+static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info.native_context == nullptr) {
+		return;
+	}
+	CONTEXT context = *static_cast<const CONTEXT*>(info.native_context);
+	std::printf("host frames:\n");
+	for (int depth = 0; depth < 48; depth++) {
+		const auto pc                    = static_cast<uint64_t>(context.Rip);
+		char       module_name[MAX_PATH] = "";
+		void*      module_base           = nullptr;
+		if (RtlPcToFileHeader(reinterpret_cast<void*>(pc), &module_base) != nullptr) {
+			GetModuleFileNameA(static_cast<HMODULE>(module_base), module_name, sizeof(module_name));
+		}
+		const char* base_name = std::strrchr(module_name, '\\');
+		base_name             = base_name != nullptr ? base_name + 1 : module_name;
+		if (module_base != nullptr) {
+			std::printf("  %2d %s+0x%" PRIx64 " (0x%016" PRIx64 ")\n", depth, base_name,
+			            pc - reinterpret_cast<uint64_t>(module_base), pc);
+		} else {
+			std::printf("  %2d 0x%016" PRIx64 "\n", depth, pc);
+		}
+		DWORD64 image_base = 0;
+		auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+		if (function == nullptr) {
+			// A leaf function or code without unwind data (guest code): the return address
+			// is at the stack pointer.
+			if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) {
+				break;
+			}
+			context.Rip = *reinterpret_cast<const uint64_t*>(context.Rsp);
+			context.Rsp += sizeof(uint64_t);
+		} else {
+			void*   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+			                 &handler_data, &establisher, nullptr);
+		}
+		if (context.Rip == 0 || !IsReadableRange(context.Rip, 1)) {
+			break;
+		}
+	}
+#else
+	(void)info;
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -707,6 +759,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		PrintHostBacktrace(*info);
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
