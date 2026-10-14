@@ -1879,6 +1879,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				return SpecializationFail("buffer write overlaps its descriptor selection");
 		}
 	}
+	// A snapshot is evaluated repeatedly; the heaps found this time replace the previous ones,
+	// whose mapping offsets belong to the flattened SRT just rebuilt.
+	snapshot.bindless_uses.clear();
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
