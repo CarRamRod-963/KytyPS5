@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include <xbyak/xbyak.h>
 
 #include <bit>
 #include <cstdio>
@@ -301,6 +302,63 @@ void TestNativeNestedSrtRefresh() {
   pointer_high.Instruction()->SetArg(1, Value(8u));
   Check(ExtractResourcePlan(program).srt_code == nullptr,
         "native SRT accepted nonadjacent nested pointer words");
+}
+
+void TestGeneralWalkerScopedMemo() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A chain of selects whose arms both use the previous link: without a memo
+  // inside conditional regions the compiled code doubles at every link.
+  std::array<uint32_t, 8> table{0x11u, 0x12u, 0x13u, 0x14u,
+                                0x15u, 0x16u, 0x17u, 0x18u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto control = emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  constexpr uint32_t Links = 24;
+  auto link = control;
+  for (uint32_t index = 0; index < Links; ++index) {
+    const auto chosen = emit(ValueOpcode::IEqual32, {control, Value(index)});
+    link = emit(ValueOpcode::SelectU32,
+                {chosen, emit(ValueOpcode::IAdd32, {link, Value(1u)}),
+                 emit(ValueOpcode::IAdd32, {link, Value(2u)})});
+  }
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto offset =
+      emit(ValueOpcode::ShiftLeftLogical32,
+           {emit(ValueOpcode::BitwiseAnd32, {link, Value(7u)}), Value(2u)});
+  const auto value =
+      emit(ValueOpcode::LoadAddressU32, {root, offset, Value(0u), Value(true)});
+  value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  program.srt_reads.push_back({value, 0u});
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_general_code != nullptr,
+        "select chain did not compile the general walker");
+  Check(plan.srt_general_code->getSize() < (64u << 10u),
+        "compiled select chain re-emits shared values inside its arms");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t selector : {0u, 5u, 23u, 99u}) {
+    user_data[2] = selector;
+    const SrtRuntime runtime{.user_data = user_data};
+    // Every link adds 2 except the selected one, which adds 1.
+    const uint32_t expected =
+        selector + 2u * Links - (selector < Links ? 1u : 0u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt ==
+                  std::vector<uint32_t>{table[expected & 7u]},
+          "compiled select chain returned the wrong value");
+  }
 }
 
 void TestGeneralNativeSrtWalker() {
@@ -1467,6 +1525,7 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestGeneralNativeSrtWalker();
+  TestGeneralWalkerScopedMemo();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();
