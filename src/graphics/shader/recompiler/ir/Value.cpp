@@ -211,11 +211,7 @@ void Inst::SetParent(Block* block) {
 	parent = block;
 }
 
-void Inst::SetArg(size_t index, Value value) {
-	const auto old = Arg(index);
-	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
-		RemoveUse(old_inst, index);
-	}
+void Inst::StoreArg(size_t index, Value value) {
 	if (num_args <= InlineArity) {
 		fixed_args[index] = value;
 	} else if (num_args == PhiArity) {
@@ -223,6 +219,14 @@ void Inst::SetArg(size_t index, Value value) {
 	} else {
 		large_args[index] = value;
 	}
+}
+
+void Inst::SetArg(size_t index, Value value) {
+	const auto old = Arg(index);
+	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
+		RemoveUse(old_inst, index);
+	}
+	StoreArg(index, value);
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -238,9 +242,16 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Every use moves at once: the users' operand slots are rewritten in place and the
+	// use records are appended to the replacement in order. Retiring them one by one
+	// would scan this list once per use, quadratic in the number of uses.
+	auto old_uses = std::move(uses);
+	uses.clear();
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		use.user->StoreArg(use.operand, replacement);
+	}
+	if (auto* target = replacement.TryInstruction(); target != nullptr) {
+		target->uses.insert(target->uses.end(), old_uses.begin(), old_uses.end());
 	}
 	Invalidate();
 	if (preserve) {
@@ -263,10 +274,13 @@ void Inst::AddUse(Inst* used, size_t operand) {
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	// Recent uses are the usual ones to go: search from the back.
+	const auto found =
+	    std::ranges::find_if(used->uses.rbegin(), used->uses.rend(), [&](const Use& use) {
+		    return use.user == this && use.operand == operand;
+	    });
+	EXIT_IF(found == used->uses.rend());
+	used->uses.erase(std::next(found).base());
 }
 
 void Inst::ClearArgs() {
