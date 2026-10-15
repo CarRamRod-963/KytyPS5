@@ -57,7 +57,6 @@ public:
 
 	constexpr BitArray() = default;
 	BitArray(const BitArray& other): BitArray(other, 0, N) {}
-	BitArray& operator=(const BitArray&) = delete;
 
 	BitArray(const BitArray& other, size_t start, size_t end) {
 		ForEachWord(start, end, [&](size_t word, uint64_t mask) {
@@ -189,6 +188,41 @@ public:
 
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
+
+	// Copies word by word with the same atomic accesses, so a lock-free reader never sees a torn
+	// word (the shadow protection bits of RegionManager are assigned under its lock).
+	BitArray& operator=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, other.Load(word));
+		}
+		return *this;
+	}
+
+	BitArray& operator^=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) ^ other.Load(word));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] BitArray operator^(const BitArray& other) const {
+		BitArray result(*this);
+		result ^= other;
+		return result;
+	}
+
+	BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) | other.Load(word));
+		}
+		return *this;
+	}
+
+	[[nodiscard]] BitArray operator|(const BitArray& other) const {
+		BitArray result(*this);
+		result |= other;
+		return result;
+	}
 
 	[[nodiscard]] BitArray operator~() const {
 		BitArray result;
