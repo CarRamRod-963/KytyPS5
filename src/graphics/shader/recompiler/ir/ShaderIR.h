@@ -729,6 +729,10 @@ struct ResourcePlan {
 	// the runtime's readers. Falls back to the interpreter when a run fails.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_general_code;
 	mutable std::vector<uint8_t>          jit_visited;
+	// Memo arrays of the compiled walker's EXEC-factor assumptions: plain and clean.
+	uint32_t                                                   jit_assumptions = 0;
+	mutable std::vector<std::vector<EvaluationContext::Entry>> jit_assume_values;
+	mutable std::vector<EvaluationContext::Entry*>             jit_assume_bases;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
