@@ -82,6 +82,9 @@ void CompileSrtWalker(ResourcePlan& program);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// Compiles the general walker for plans the simple walker does not cover.
+void CompileGeneralSrtWalker(ResourcePlan& program);
+void CompileSrtWalkers(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
@@ -162,6 +165,7 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	int                              RunGeneralWalker(std::vector<uint32_t>& flat);
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

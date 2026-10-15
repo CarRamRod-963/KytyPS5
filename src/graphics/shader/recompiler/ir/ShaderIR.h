@@ -738,6 +738,10 @@ struct ResourcePlan {
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// The general compiled walker: control-flow plans and computed offsets, reading through
+	// the runtime's readers. Falls back to the interpreter when a run fails.
+	std::unique_ptr<Xbyak::CodeGenerator> srt_general_code;
+	mutable std::vector<uint8_t>          jit_visited;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
