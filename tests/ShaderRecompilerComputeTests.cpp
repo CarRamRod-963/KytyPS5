@@ -2981,8 +2981,9 @@ public:
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
-          // An end-of-pipe label lands when its submission completes: the parser
-          // submits the pending work and moves on without writing or waiting.
+          // An end-of-pipe label lands when its submission completes: the
+          // parser submits the pending work and moves on without writing or
+          // waiting.
           const auto cb_db_tick = gpu_scheduler.CurrentTick();
           auto cb_db_release =
               make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
@@ -3041,8 +3042,8 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
-      // The completed labels are written by GPU-thread commands queued behind the
-      // previous one.
+      // The completed labels are written by GPU-thread commands queued behind
+      // the previous one.
       gpu.SendCommandSync([] {});
       Require("GpuCommandLane", "deferred timestamp write",
               cb_db_release_label >= timestamp_before &&
