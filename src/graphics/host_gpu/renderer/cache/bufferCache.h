@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -108,6 +110,11 @@ public:
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
+	// Called before every submission on the GPU thread: records downloads of the hot read-back
+	// pages the GPU wrote since the last submission, published into guest memory when the
+	// submission completes, so the guest finds them clean instead of faulting into a
+	// synchronous readback that drains the queue.
+	void               RecordAsyncDownloads();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -157,6 +164,30 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	// Pages the guest recently read back (a read fault, a CPU write into GPU-dirty bytes or a
+	// scalar read): the GPU tends to write them every frame and the guest to read them right
+	// after, so their next GPU writes are downloaded ahead of the guest. The epoch advances on
+	// every GPU write of the page; a publish is valid only at the epoch it was recorded at.
+	struct HotPage {
+		uint64_t                               touched;
+		std::shared_ptr<std::atomic<uint64_t>> epoch;
+	};
+	void TouchHotPages(uint64_t vaddr, uint64_t size);
+	void NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	void DrainPublished();
+	std::map<uint64_t, HotPage>                       m_hot_pages;
+	uint64_t                                          m_hot_touch_sequence = 0;
+	RangeSet                                          m_pending_async;
+	// Ranges a publish cleaned, with the epoch it was valid at: the GPU thread drops their exact
+	// dirty intervals unless the page was written again since (the new intervals overlap).
+	struct Published {
+		uint64_t                               address;
+		uint64_t                               size;
+		uint64_t                               epoch;
+		std::shared_ptr<std::atomic<uint64_t>> epoch_ptr;
+	};
+	std::mutex                                        m_published_mutex;
+	std::vector<Published>                            m_published;
 	struct WatchedRange {
 		uint64_t address;
 		uint64_t size;
