@@ -311,6 +311,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		TouchHotPages(vaddr, size);
+		DrainPublished();
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
@@ -321,6 +323,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 	});
 }
+
 
 void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -341,9 +344,196 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 				size = end - begin;
 			}
 		});
+		TouchHotPages(base, size);
+		DrainPublished();
 		auto& buffer = m_slot_buffers[FindBuffer(base, size)];
 		if (DownloadBufferMemory<false>(buffer, base, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
+		}
+	});
+}
+
+// The hot set is small: a few hundred pages the game reads back every frame.
+static constexpr size_t   MaxHotPages        = 512;
+static constexpr uint64_t MaxHotTouchPages   = 16;
+static constexpr uint64_t MaxAsyncDownload   = uint64_t {4} << 20u;
+
+void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
+	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
+	const auto last  = std::min(Common::AlignUp(vaddr + size, CACHING_PAGESIZE),
+	                            first + MaxHotTouchPages * CACHING_PAGESIZE);
+	const auto touch = ++m_hot_touch_sequence;
+	for (auto page = first; page < last; page += CACHING_PAGESIZE) {
+		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
+			it->second.touched = touch;
+			continue;
+		}
+		if (m_hot_pages.size() >= MaxHotPages) {
+			auto oldest = m_hot_pages.begin();
+			for (auto it = m_hot_pages.begin(); it != m_hot_pages.end(); ++it) {
+				if (it->second.touched < oldest->second.touched) {
+					oldest = it;
+				}
+			}
+			m_hot_pages.erase(oldest);
+		}
+		m_hot_pages.emplace(page, HotPage {touch, std::make_shared<std::atomic<uint64_t>>(0)});
+	}
+}
+
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (m_hot_pages.empty()) {
+		return;
+	}
+	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
+	const auto touch = ++m_hot_touch_sequence;
+	for (auto it = m_hot_pages.lower_bound(first); it != m_hot_pages.end() && it->first < vaddr + size;
+	     ++it) {
+		// A page served asynchronously never faults again, so the GPU writes keep it hot; it
+		// ages out once the GPU stops writing it.
+		it->second.touched = touch;
+		// The epoch advances before the write is marked GPU-dirty (SynchronizeBuffer): a publish
+		// that reads the old epoch under the region lock completes before the mark and a later
+		// one sees the new epoch and keeps the page dirty.
+		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
+		m_pending_async.Add(it->first, CACHING_PAGESIZE);
+	}
+}
+
+void BufferCache::DrainPublished() {
+	std::vector<Published> published;
+	{
+		std::lock_guard lock(m_published_mutex);
+		published.swap(m_published);
+	}
+	for (const auto& entry: published) {
+		if (entry.epoch_ptr->load(std::memory_order_acquire) == entry.epoch) {
+			m_gpu_modified_ranges.Subtract(entry.address, entry.size);
+		}
+	}
+}
+
+void BufferCache::RecordAsyncDownloads() {
+	if (!GuestGpu::IsGpuThread()) {
+		return;
+	}
+	DrainPublished();
+	if (m_pending_async.Empty() || m_scheduler.Current().IsInvalid()) {
+		return;
+	}
+	struct Interval {
+		uint64_t address;
+		uint64_t size;
+		uint64_t offset;
+		BufferId buffer;
+	};
+	struct PageRecord {
+		uint64_t                               page;
+		uint64_t                               epoch;
+		std::shared_ptr<std::atomic<uint64_t>> epoch_ptr;
+	};
+	std::vector<Interval>   intervals;
+	std::vector<PageRecord> pages;
+	uint64_t                total = 0;
+	m_pending_async.ForEach([&](uint64_t start, uint64_t end) {
+		for (auto page = start; page < end; page += CACHING_PAGESIZE) {
+			const auto hot = m_hot_pages.find(page);
+			if (hot == m_hot_pages.end() ||
+			    !m_memory_tracker.IsRegionGpuModified(page, CACHING_PAGESIZE)) {
+				continue;
+			}
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			bool any = false;
+			m_gpu_modified_ranges.ForEachInRange(
+			    page, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t last) {
+				    intervals.push_back({begin, last - begin, total, *owner});
+				    total += Common::AlignUp(last - begin, 64);
+				    any = true;
+			    });
+			if (any) {
+				pages.push_back({page, hot->second.epoch->load(std::memory_order_acquire),
+				                 hot->second.epoch});
+			}
+		}
+	});
+	m_pending_async.Clear();
+	if (intervals.empty() || total > MaxAsyncDownload) {
+		return;
+	}
+	auto [mapped, offset] = m_download_buffer.Map(total, 64, false);
+	if (mapped == nullptr) {
+		return;
+	}
+	m_download_buffer.Commit();
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	std::sort(intervals.begin(), intervals.end(),
+	          [](const Interval& a, const Interval& b) { return a.buffer < b.buffer; });
+	std::vector<vk::BufferCopy> copies;
+	for (size_t i = 0; i < intervals.size();) {
+		const auto  id     = intervals[i].buffer;
+		const auto& buffer = m_slot_buffers[id];
+		copies.clear();
+		for (; i < intervals.size() && intervals[i].buffer == id; ++i) {
+			const auto& interval = intervals[i];
+			copies.emplace_back(interval.address - buffer.CpuAddress(), offset + interval.offset,
+			                    interval.size);
+		}
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before,
+		                       0, nullptr);
+		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+		                  static_cast<uint32_t>(copies.size()), copies.data());
+	}
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = m_download_buffer.Handle();
+	after.offset              = offset;
+	after.size                = total;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, total, intervals = std::move(intervals),
+	                                    pages = std::move(pages)] {
+		m_download_buffer.Invalidate(offset, total);
+		std::vector<Published> published;
+		for (const auto& page: pages) {
+			m_memory_tracker.PublishGpuModified(
+			    page.page, CACHING_PAGESIZE,
+			    [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
+			    [&](uint64_t address, uint64_t bytes) noexcept {
+				    for (const auto& interval: intervals) {
+					    const auto begin = std::max(address, interval.address);
+					    const auto end   = std::min(address + bytes, interval.address + interval.size);
+					    if (begin < end) {
+						    LibKernel::Memory::WriteBacking(
+						        begin, mapped + interval.offset + (begin - interval.address),
+						        end - begin);
+					    }
+				    }
+				    published.push_back({address, bytes, page.epoch, page.epoch_ptr});
+			    });
+		}
+		if (!published.empty()) {
+			std::lock_guard lock(m_published_mutex);
+			m_published.insert(m_published.end(), published.begin(), published.end());
 		}
 	});
 }
@@ -543,6 +733,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	if (is_written) {
+		NoteGpuWrite(vaddr, size);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
