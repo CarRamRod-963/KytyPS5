@@ -159,6 +159,7 @@ private:
 
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
+	void StoreArg(size_t index, Value value);
 	void ClearArgs();
 
 	static constexpr uint8_t InlineArity = 4;
