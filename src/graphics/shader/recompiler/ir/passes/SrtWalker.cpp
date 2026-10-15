@@ -402,6 +402,8 @@ struct GeneralWalkerContext {
 	uint64_t frame = 0;
 	// Stack pointers saved by nested logical operators that tolerate an unknown operand.
 	uint64_t saved_sp[16] = {};
+	// Memo arrays of the EXEC-factor assumptions: 2 * mask index + clean.
+	ResourcePlan::EvaluationContext::Entry** assume_values = nullptr;
 };
 static_assert(offsetof(GeneralWalkerContext, user_data) == 0);
 static_assert(offsetof(GeneralWalkerContext, user_data_count) == 8);
@@ -416,6 +418,7 @@ static_assert(offsetof(GeneralWalkerContext, clean_generation) == 72);
 static_assert(offsetof(GeneralWalkerContext, scratch) == 80);
 static_assert(offsetof(GeneralWalkerContext, frame) == 88);
 static_assert(offsetof(GeneralWalkerContext, saved_sp) == 96);
+static_assert(offsetof(GeneralWalkerContext, assume_values) == 224);
 
 static bool KYTY_SYSV_ABI GeneralWalkerRead(GeneralWalkerContext* context, uint64_t address,
                                             uint64_t clean) {
@@ -552,8 +555,7 @@ public:
 				const auto& block = program.control_flow[index];
 				auto& next = position + 1 < order.size() ? labels[order[position + 1]] : m_finished;
 				code.L(labels[index]);
-				m_emitted.clear();
-				m_emitted_clean.clear();
+				m_base.by_mode.clear();
 				m_scopes.clear();
 				code.mov(code.rax, code.qword[code.rbx + 48]);
 				code.cmp(code.byte[code.rax + index], 0);
@@ -619,6 +621,7 @@ public:
 			return false;
 		}
 		program.srt_general_code = std::move(code_holder);
+		program.jit_assumptions  = static_cast<uint32_t>(m_masks.size());
 		return true;
 	}
 
@@ -647,6 +650,10 @@ private:
 				default: return false;
 			}
 			code.mov(code.rax, immediate);
+			return true;
+		}
+		if (!m_assume.empty() && value == m_masks[m_assume.back()]) {
+			code.mov(code.eax, 1);
 			return true;
 		}
 		const auto* inst = value.TryInstruction();
@@ -742,31 +749,98 @@ private:
 	// Values whose memo slot is known to hold the current generation: those emitted
 	// unconditionally earlier in the block, and those emitted earlier in every enclosing
 	// conditional region. A region's set is dropped when the region ends because a later
-	// path may skip it.
-	struct Scope {
+	// path may skip it. Each mode (plain, or under an EXEC-factor assumption) has its own
+	// memo array and therefore its own sets.
+	struct Sets {
 		std::unordered_set<const Inst*> emitted;
 		std::unordered_set<const Inst*> emitted_clean;
 	};
+	struct Scope {
+		std::unordered_map<uint32_t, Sets> by_mode;
+	};
+
+	static constexpr uint32_t NoAssumption = ~0u;
+
+	uint32_t Assumption() const { return m_assume.empty() ? NoAssumption : m_assume.back(); }
 
 	std::unordered_set<const Inst*>& Emitted() {
-		if (!m_scopes.empty()) {
-			auto& scope = m_scopes.back();
-			return m_clean_depth > 0 ? scope.emitted_clean : scope.emitted;
-		}
-		return m_clean_depth > 0 ? m_emitted_clean : m_emitted;
+		auto& sets = (m_scopes.empty() ? m_base : m_scopes.back()).by_mode[Assumption()];
+		return m_clean_depth > 0 ? sets.emitted_clean : sets.emitted;
 	}
 
 	bool IsEmitted(const Inst* inst) const {
+		const auto mode  = Assumption();
 		const bool clean = m_clean_depth > 0;
-		if ((clean ? m_emitted_clean : m_emitted).contains(inst)) return true;
+		const auto has   = [&](const Scope& scope) {
+			const auto found = scope.by_mode.find(mode);
+			return found != scope.by_mode.end() &&
+			       (clean ? found->second.emitted_clean : found->second.emitted).contains(inst);
+		};
+		if (has(m_base)) return true;
 		for (const auto& scope: m_scopes) {
-			if ((clean ? scope.emitted_clean : scope.emitted).contains(inst)) return true;
+			if (has(scope)) return true;
 		}
 		return false;
 	}
 
 	void PushScope() { m_scopes.emplace_back(); }
 	void PopScope() { m_scopes.pop_back(); }
+
+	// A region that either completes or fails its enclosing context: what it emitted
+	// dominates what follows it.
+	void PopScopeMerging() {
+		auto scope = std::move(m_scopes.back());
+		m_scopes.pop_back();
+		auto& parent = m_scopes.empty() ? m_base : m_scopes.back();
+		for (auto& [mode, sets]: scope.by_mode) {
+			auto& target = parent.by_mode[mode];
+			target.emitted.merge(sets.emitted);
+			target.emitted_clean.merge(sets.emitted_clean);
+		}
+	}
+
+	uint32_t AssumptionIndex(Value mask) {
+		for (uint32_t index = 0; index < m_masks.size(); ++index) {
+			if (m_masks[index] == mask) return index;
+		}
+		m_masks.push_back(mask);
+		return static_cast<uint32_t>(m_masks.size() - 1);
+	}
+
+	// Evaluates a value under the assumption that `mask` holds (the mask is true, selects
+	// on it take their true arm), as the interpreter's active evaluator does. Unknown or
+	// failure continues at `unknown` with the stack and the memo base of the enclosing
+	// mode restored.
+	bool EmitAssumed(Value value, Value mask, Xbyak::Label& unknown) {
+		auto& code = *m_code;
+		if (m_tolerant_depth >= 16) return false;
+		const auto slot = 96 + m_tolerant_depth++ * 8;
+		code.mov(code.qword[code.rbx + slot], code.rsp);
+		m_assume.push_back(AssumptionIndex(mask.Resolve()));
+		PushScope();
+		code.push(code.r12);
+		LoadMemoBase(code.r12);
+		Xbyak::Label restore, done;
+		auto* const  previous = m_fail;
+		m_fail                = &restore;
+		const bool emitted    = Emit(value);
+		m_fail                = previous;
+		PopScopeMerging();
+		m_assume.pop_back();
+		--m_tolerant_depth;
+		if (!emitted) return false;
+		code.pop(code.r12);
+		code.jmp(done, Code::T_NEAR);
+		code.L(restore);
+		code.mov(code.rsp, code.qword[code.rbx + slot]);
+		LoadMemoBase(code.r12);
+		if (m_clean_evaluator) {
+			code.mov(code.r14, code.qword[code.rbx + (m_clean_depth > 0 ? 72 : 32)]);
+		}
+		code.jmp(unknown, Code::T_NEAR);
+		code.L(done);
+		return true;
+	}
 
 	// A value computed from user data and constants alone: evaluating it where the
 	// interpreter would not changes nothing observable.
@@ -860,7 +934,13 @@ private:
 	// Loads the memo base of the current mode: the clean or the normal context.
 	void LoadMemoBase(const Xbyak::Reg64& reg) {
 		auto& code = *m_code;
-		code.mov(reg, code.qword[code.rbx + (m_clean_depth > 0 ? 64 : 24)]);
+		if (!m_assume.empty()) {
+			code.mov(reg, code.qword[code.rbx + 224]);
+			code.mov(reg, code.qword[reg + (2 * m_assume.back() + (m_clean_depth > 0 ? 1 : 0)) *
+			                                   sizeof(void*)]);
+		} else {
+			code.mov(reg, code.qword[code.rbx + (m_clean_depth > 0 ? 64 : 24)]);
+		}
 	}
 
 	// Clean mode swaps the memo base and generation for the clean evaluator's; without a
@@ -1071,9 +1151,21 @@ private:
 				code.jc(*m_fail, Code::T_NEAR);
 				return true;
 			}
+			case ValueOpcode::ReadFirstLane: {
+				if (inst.NumArgs() != 2) return false;
+				const auto mask = inst.Arg(1).Resolve();
+				if (!m_assume.empty() && m_masks[m_assume.back()] == mask) {
+					return Emit(inst.Arg(0));
+				}
+				return EmitAssumed(inst.Arg(0), mask, *m_fail);
+			}
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::SelectU1:
 			case ValueOpcode::SelectF32: {
+				if (!m_assume.empty() && inst.NumArgs() == 3 &&
+				    inst.Arg(0).Resolve() == m_masks[m_assume.back()]) {
+					return Emit(inst.Arg(1));
+				}
 				Xbyak::Label otherwise, done;
 				if (!HoistShared(inst)) return false;
 				EnterClean();
@@ -1133,11 +1225,16 @@ private:
 				EmitCompare(&Code::setge);
 				return true;
 			case ValueOpcode::LogicalAnd: {
-				// A false left operand decides without the right one; an unknown left operand
-				// needs the interpreter's EXEC-factor evaluation, so such plans stay with it.
-				if (MayBeUnknown(inst.Arg(0))) return false;
-				Xbyak::Label zero, done;
-				if (!Emit(inst.Arg(0))) return false;
+				// A false left operand decides without the right one. An unknown left operand
+				// still decides the conjunction when the right one is false, plainly or under
+				// the assumption that the left EXEC factor holds; otherwise it is unknown.
+				Xbyak::Label zero, done, left_unknown;
+				const bool   tolerant = MayBeUnknown(inst.Arg(0));
+				if (tolerant) {
+					if (!EmitTolerant(inst.Arg(0), left_unknown)) return false;
+				} else if (!Emit(inst.Arg(0))) {
+					return false;
+				}
 				code.test(code.eax, code.eax);
 				code.jz(zero, Code::T_NEAR);
 				PushScope();
@@ -1148,6 +1245,21 @@ private:
 				code.setne(code.al);
 				code.movzx(code.eax, code.al);
 				code.jmp(done, Code::T_NEAR);
+				if (tolerant) {
+					Xbyak::Label right_unknown;
+					code.L(left_unknown);
+					if (!EmitTolerant(inst.Arg(1), right_unknown)) return false;
+					code.test(code.eax, code.eax);
+					code.jz(zero, Code::T_NEAR);
+					code.L(right_unknown);
+					// The interpreter evaluates the assumed operand through the clean evaluator.
+					EnterClean();
+					const bool assumed = EmitAssumed(inst.Arg(1), inst.Arg(0), *m_fail);
+					LeaveClean();
+					if (!assumed) return false;
+					code.test(code.eax, code.eax);
+					code.jnz(*m_fail, Code::T_NEAR);
+				}
 				code.L(zero);
 				code.xor_(code.eax, code.eax);
 				code.L(done);
@@ -1345,9 +1457,10 @@ private:
 	Xbyak::Label                              m_exit;
 	static constexpr size_t                   MaxCodeSize = 4u << 20u;
 
-	std::unordered_set<const Inst*>           m_emitted;
-	std::unordered_set<const Inst*>           m_emitted_clean;
+	Scope                                     m_base;
 	std::vector<Scope>                        m_scopes;
+	std::vector<Value>                        m_masks;
+	std::vector<uint32_t>                     m_assume;
 	std::unordered_map<const Inst*, bool>     m_pure;
 	bool                                      m_clean_evaluator = false;
 	int                                       m_clean_depth     = 0;
@@ -2242,6 +2355,16 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	auto& clean_context = m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
 	clean_context.values.resize(m_program.evaluation_value_count);
 	flat.assign(m_program.srt_reads.size(), 0u);
+	const auto assumptions = m_program.jit_assumptions * 2u;
+	m_program.jit_assume_values.resize(assumptions);
+	m_program.jit_assume_bases.resize(assumptions);
+	for (uint32_t index = 0; index < assumptions; ++index) {
+		auto& values = m_program.jit_assume_values[index];
+		if (values.size() != m_program.evaluation_value_count) {
+			values.assign(m_program.evaluation_value_count, {});
+		}
+		m_program.jit_assume_bases[index] = values.data();
+	}
 	GeneralWalkerContext context {
 	    .user_data        = m_runtime.user_data.data(),
 	    .user_data_count  = m_runtime.user_data.size(),
@@ -2253,6 +2376,7 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	    .runtime          = &m_runtime,
 	    .clean_values     = clean_context.values.data(),
 	    .clean_generation = clean_context.generation,
+	    .assume_values    = m_program.jit_assume_bases.data(),
 	};
 	using Walker = bool KYTY_SYSV_ABI (*)(GeneralWalkerContext*);
 	if (!m_program.srt_general_code->getCode<Walker>()(&context)) {
