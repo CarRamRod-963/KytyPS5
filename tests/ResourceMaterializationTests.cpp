@@ -361,6 +361,78 @@ void TestGeneralWalkerScopedMemo() {
   }
 }
 
+void TestGeneralWalkerAssumesExecFactor() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A lane read under an EXEC factor the walker cannot evaluate: selects on
+  // that factor take their true arm, and a conjunction with it is false when
+  // its right operand is false under the same assumption.
+  std::array<uint32_t, 8> table{0x11u, 0x12u, 0x13u, 0x14u,
+                                0x15u, 0x16u, 0x17u, 0x18u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 4> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u,
+                                    0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 4;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto lane =
+      emit(ValueOpcode::GetBuiltin,
+           {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+            Value(0u)});
+  const auto active = emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+  const auto index = emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  const auto masked = emit(ValueOpcode::SelectU32, {active, index, Value(7u)});
+  const auto uniform = emit(ValueOpcode::ReadFirstLane, {masked, active});
+  // The conjunction is false whenever the selector word is not 3, even though
+  // its left operand is unknown.
+  const auto undef = emit(ValueOpcode::UndefU1, {});
+  const auto gate = emit(
+      ValueOpcode::LogicalAnd,
+      {undef, emit(ValueOpcode::IEqual32,
+                   {emit(ValueOpcode::SelectU32, {undef, index, Value(3u)}),
+                    Value(3u)})});
+  const auto chosen = emit(ValueOpcode::SelectU32, {gate, Value(5u), uniform});
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto value =
+      emit(ValueOpcode::LoadAddressU32,
+           {root, emit(ValueOpcode::ShiftLeftLogical32, {chosen, Value(2u)}),
+            Value(0u), Value(true)});
+  value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  program.srt_reads.push_back({value, 0u});
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_general_code != nullptr,
+        "lane read under an EXEC factor did not compile the general walker");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t selector : {0u, 2u, 6u}) {
+    user_data[2] = selector;
+    const SrtRuntime runtime{.user_data = user_data};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{table[selector]},
+          "compiled walker did not assume the EXEC factor");
+    auto code = std::move(plan.srt_general_code);
+    ResourceSnapshot interpreted;
+    Check(MaterializeResources(plan, runtime, interpreted, specialization) &&
+              interpreted.flattened_srt == snapshot.flattened_srt,
+          "interpreter and compiled walker disagree under an assumption");
+    plan.srt_general_code = std::move(code);
+  }
+  // Selector 3 leaves the conjunction unknown: neither evaluator can
+  // materialize.
+  user_data[2] = 3u;
+  Check(!MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                              specialization),
+        "compiled walker decided an unknown conjunction");
+}
+
 void TestGeneralNativeSrtWalker() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Two tables; user data holds a pointer to each and a selector/index word.
@@ -1526,6 +1598,7 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestGeneralNativeSrtWalker();
   TestGeneralWalkerScopedMemo();
+  TestGeneralWalkerAssumesExecFactor();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();
