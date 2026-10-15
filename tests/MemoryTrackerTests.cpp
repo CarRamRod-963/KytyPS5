@@ -616,8 +616,8 @@ void TestPublishGpuModifiedHonoursAccept() {
   Check(tracker.IsRegionGpuModified(address, page_size),
         "publish test setup did not mark the page GPU-dirty");
 
-  // A rejected publish (the GPU wrote the page again after the download) keeps the dirty state
-  // and writes nothing.
+  // A rejected publish (the GPU wrote the page again after the download) keeps
+  // the dirty state and writes nothing.
   int writes = 0;
   tracker.PublishGpuModified(
       address, page_size * 2, [] { return false; },
@@ -626,7 +626,8 @@ void TestPublishGpuModifiedHonoursAccept() {
             Protection(memory) == PAGE_NOACCESS,
         "rejected publish changed the GPU dirty state");
 
-  // An accepted publish reports exactly the dirty page and cleans it; the clean page is skipped.
+  // An accepted publish reports exactly the dirty page and cleans it; the clean
+  // page is skipped.
   uint64_t written_address = 0;
   uint64_t written_size = 0;
   tracker.PublishGpuModified(
@@ -641,6 +642,49 @@ void TestPublishGpuModifiedHonoursAccept() {
   Check(!tracker.IsRegionGpuModified(address, page_size * 2) &&
             Protection(memory) == PAGE_READONLY,
         "accepted publish did not restore write-only tracking");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestGpuModifiedReadablePages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  // A clean page is not kept readable: there is no pending write to wait for.
+  tracker.SetGpuModifiedReadable(address, page_size, true);
+  Check(!tracker.IsGpuModifiedReadable(address, page_size),
+        "clean page became stale-readable");
+
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(Protection(memory) == PAGE_NOACCESS,
+        "GPU dirty page was readable by default");
+
+  // Readable while the pending write has not executed: reads pass, writes still
+  // fault.
+  tracker.SetGpuModifiedReadable(address, page_size, true);
+  Check(tracker.IsGpuModifiedReadable(address, page_size) &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "stale-readable page did not become read-only");
+  tracker.SetGpuModifiedReadable(address, page_size, false);
+  Check(!tracker.IsGpuModifiedReadable(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "stale-readable page did not return to no-access");
+
+  // Publishing the write clears the readable state with the dirty state.
+  tracker.SetGpuModifiedReadable(address, page_size, true);
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  Check(!tracker.IsGpuModifiedReadable(address, page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "unmark left the stale-readable state behind");
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
@@ -1251,6 +1295,7 @@ int main(int argc, char **argv) {
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestPublishGpuModifiedHonoursAccept();
+  TestGpuModifiedReadablePages();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
