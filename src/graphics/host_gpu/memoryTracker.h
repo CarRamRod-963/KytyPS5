@@ -62,6 +62,25 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
+	// Publishes GPU-written bytes that an asynchronous download delivered. For each tracker
+	// page range of [vaddr, size) that is still GPU-dirty, `accept` decides under the region lock
+	// whether the downloaded bytes are current; if so `write` copies them into the guest and the
+	// range becomes clean. A range `accept` rejects (the GPU wrote it again since the download)
+	// keeps its dirty state for a later readback. Safe from any thread.
+	template <typename Accept, typename Write>
+	void PublishGpuModified(uint64_t vaddr, uint64_t size, Accept&& accept, Write&& write) {
+		static_assert(std::is_nothrow_invocable_v<Write&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			if (!accept()) {
+				return;
+			}
+			manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
+			    manager->GetCpuAddr() + offset, bytes, write);
+		});
+	}
+
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
