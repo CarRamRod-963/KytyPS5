@@ -2982,6 +2982,7 @@ public:
       alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
       alignas(uint64_t) uint64_t cb_db_release_label = UINT64_MAX;
       bool parser_kept_nonblocking_boundaries = false;
+      uint64_t timestamp_before = 0;
       bool host_resource_retired = false;
       bool cpu_unmap_did_not_submit = false;
       std::jthread no_gpu_wait([&] {
@@ -3005,19 +3006,22 @@ public:
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
+          // An end-of-pipe label lands when its submission completes: the parser
+          // submits the pending work and moves on without writing or waiting.
           const auto cb_db_tick = gpu_scheduler.CurrentTick();
           auto cb_db_release =
               make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
           Pm4Execution cb_db_execution;
           const auto cb_db_result =
               processor->Process(cb_db_execution, cb_db_release);
-          const bool cb_db_release_did_not_submit =
+          const bool cb_db_release_deferred =
               cb_db_result == Pm4ProcessResult::Complete &&
-              cb_db_release_label == 0 &&
-              gpu_scheduler.CurrentTick() == cb_db_tick;
+              cb_db_release_label == UINT64_MAX &&
+              gpu_scheduler.CurrentTick() == cb_db_tick + 1;
 
+          timestamp_before = Sync::ReadReferenceClock();
           for (const auto gcr : {0u, 1u << 9u}) {
-            const auto before = Sync::ReadReferenceClock();
+            const auto timestamp_tick = gpu_scheduler.CurrentTick();
             auto timestamp =
                 make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
             Pm4Execution timestamp_execution;
@@ -3025,11 +3029,10 @@ public:
                 processor->Process(timestamp_execution, timestamp);
             Require("GpuCommandLane", "timestamp write",
                     timestamp_result == Pm4ProcessResult::Complete &&
-                        cb_db_release_label >= before &&
-                        cb_db_release_label <= Sync::ReadReferenceClock() &&
-                        gpu_scheduler.CurrentTick() == cb_db_tick,
-                    "timestamp write failed, returned an invalid time, or "
-                    "submitted extra GPU work");
+                        cb_db_release_label == UINT64_MAX &&
+                        gpu_scheduler.CurrentTick() == timestamp_tick + 1,
+                    "timestamp write landed before its submission completed or "
+                    "did not submit the pending work");
           }
 
           auto gds_interrupt_only =
@@ -3040,7 +3043,7 @@ public:
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
               cache_and_counter_did_not_submit &&
-              cb_db_release_did_not_submit &&
+              cb_db_release_deferred &&
               interrupt_result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
               interrupt_only_gds_label == UINT64_MAX;
@@ -3059,7 +3062,17 @@ public:
                   vk::Result::eSuccess,
               "failed to release the blocked GPU timeline");
       no_gpu_wait.join();
-      gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+      gpu.SendCommandSync([&] {
+        gpu_scheduler.Finish();
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      // The completed labels are written by GPU-thread commands queued behind the
+      // previous one.
+      gpu.SendCommandSync([] {});
+      Require("GpuCommandLane", "deferred timestamp write",
+              cb_db_release_label >= timestamp_before &&
+                  cb_db_release_label <= Sync::ReadReferenceClock(),
+              "timestamp write failed or returned an invalid time");
       m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
       Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
               parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
@@ -3072,21 +3085,23 @@ public:
               "submission behavior");
 
       alignas(uint64_t) uint64_t release_label = 0;
+      alignas(uint64_t) uint64_t clock_label = 0;
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
+      const auto clock_before = Sync::ReadReferenceClock();
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
-        const auto clock_before = Sync::ReadReferenceClock();
+        const auto clock_tick = gpu_scheduler.CurrentTick();
         processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
-                                     &release_label, UINT64_MAX, 2);
+                                     &clock_label, UINT64_MAX, 2);
         Require("GpuCommandLane", "EOP reference clock with interrupt",
-                release_label >= clock_before &&
-                    release_label <= Sync::ReadReferenceClock(),
-                "clock write with writeback and interrupt lost its data");
+                gpu_scheduler.CurrentTick() == clock_tick + 1,
+                "clock write with writeback and interrupt did not submit");
 
+        // Every data label defers its write to the submission it ends; an
+        // interrupt-only release (selector 1 on the graphics queue) writes nothing.
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
-          release_label = 0;
           auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
           Pm4Execution immediate_execution;
           const auto immediate_tick = gpu_scheduler.CurrentTick();
@@ -3094,10 +3109,8 @@ public:
               processor->Process(immediate_execution, immediate);
           Require("GpuCommandLane", "32-bit release boundary",
                   immediate_result == Pm4ProcessResult::Complete &&
-                      gpu_scheduler.CurrentTick() ==
-                          immediate_tick + (interrupt == 1 || interrupt == 2) &&
-                      release_label == (interrupt == 1 ? 0 : 0x11223344u),
-                  "label-only release submitted work or interrupt release lost its boundary");
+                      gpu_scheduler.CurrentTick() == immediate_tick + 1,
+                  "release did not submit the pending work");
         }
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
@@ -3134,6 +3147,11 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
+      gpu.SendCommandSync([] {});
+      Require("GpuCommandLane", "deferred EOP reference clock",
+              clock_label >= clock_before &&
+                  clock_label <= Sync::ReadReferenceClock(),
+              "clock write with writeback and interrupt lost its data");
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
