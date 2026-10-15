@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <optional>
@@ -305,6 +307,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
+	m_context.GetBufferCache().RecordAsyncDownloads();
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
