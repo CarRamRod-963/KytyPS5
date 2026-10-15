@@ -26,6 +26,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// Keeps (or stops keeping) GPU-dirty pages readable while their pending write has not
+	// executed; see RegionManager::SetStaleReadable.
+	void               SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool readable);
+	[[nodiscard]] bool IsGpuModifiedReadable(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
