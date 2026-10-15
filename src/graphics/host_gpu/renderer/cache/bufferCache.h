@@ -114,7 +114,7 @@ public:
 	// pages the GPU wrote since the last submission, published into guest memory when the
 	// submission completes, so the guest finds them clean instead of faulting into a
 	// synchronous readback that drains the queue.
-	void               RecordAsyncDownloads();
+	void RecordAsyncDownloads();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -172,12 +172,14 @@ private:
 		uint64_t                               touched;
 		std::shared_ptr<std::atomic<uint64_t>> epoch;
 	};
-	void TouchHotPages(uint64_t vaddr, uint64_t size);
-	void NoteGpuWrite(uint64_t vaddr, uint64_t size);
-	void DrainPublished();
-	std::map<uint64_t, HotPage>                       m_hot_pages;
-	uint64_t                                          m_hot_touch_sequence = 0;
-	RangeSet                                          m_pending_async;
+	void                        TouchHotPages(uint64_t vaddr, uint64_t size);
+	std::vector<uint64_t>       m_keep_readable;
+	std::vector<uint64_t>       m_make_unreadable;
+	void                        NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	void                        DrainPublished();
+	std::map<uint64_t, HotPage> m_hot_pages;
+	uint64_t                    m_hot_touch_sequence = 0;
+	RangeSet                    m_pending_async;
 	// Ranges a publish cleaned, with the epoch it was valid at: the GPU thread drops their exact
 	// dirty intervals unless the page was written again since (the new intervals overlap).
 	struct Published {
@@ -186,8 +188,8 @@ private:
 		uint64_t                               epoch;
 		std::shared_ptr<std::atomic<uint64_t>> epoch_ptr;
 	};
-	std::mutex                                        m_published_mutex;
-	std::vector<Published>                            m_published;
+	std::mutex             m_published_mutex;
+	std::vector<Published> m_published;
 	struct WatchedRange {
 		uint64_t address;
 		uint64_t size;

@@ -102,12 +102,37 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Gpu) {
+				m_stale_readable.UnsetRange(start, end);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
 		}
+	}
+
+	// A GPU-dirty page whose guest bytes are still current (every earlier GPU write of it was
+	// published before the pending one was recorded) stays readable: the guest sees what the
+	// console would show before the pending write executes, and the publish of that write
+	// refreshes the bytes in place. Pages that lose that property become unreadable again.
+	void SetStaleReadable(uint64_t offset, uint64_t size, bool readable) {
+		const auto [start, end] = GetPageRange(offset, size);
+		if (readable) {
+			if (RegionBits(m_gpu_dirty, start, end).None()) {
+				return;
+			}
+			m_stale_readable.SetRange(start, end);
+			UpdateProtection<false, true>();
+		} else {
+			m_stale_readable.UnsetRange(start, end);
+			UpdateProtection<true, true>();
+		}
+	}
+	[[nodiscard]] bool IsStaleReadable(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(offset, size);
+		return m_stale_readable.FirstRangeFrom(start).first < end;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -120,6 +145,9 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Gpu) {
+				m_stale_readable.UnsetRange(start, end);
+			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -136,7 +164,7 @@ public:
 private:
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -173,6 +201,7 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	RegionBits   m_stale_readable;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

@@ -94,4 +94,19 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool readable) {
+	Iterate<false>(vaddr, size,
+	               [readable](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		               std::scoped_lock lock(manager->lock);
+		               manager->SetStaleReadable(offset, bytes, readable);
+	               });
+}
+
+bool MemoryTracker::IsGpuModifiedReadable(uint64_t vaddr, uint64_t size) {
+	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return manager->IsStaleReadable(offset, bytes);
+	});
+}
+
 } // namespace Libs::Graphics
