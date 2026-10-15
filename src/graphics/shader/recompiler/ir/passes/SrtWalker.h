@@ -51,6 +51,9 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 void CompileSrtWalker(ResourcePlan& program);
+// Compiles the general walker for plans the simple walker does not cover.
+void CompileGeneralSrtWalker(ResourcePlan& program);
+void CompileSrtWalkers(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
@@ -131,6 +134,7 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	int                              RunGeneralWalker(std::vector<uint32_t>& flat);
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
