@@ -983,30 +983,21 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
-	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
-	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
-			std::memcpy(address, value, size);
-		}
-	};
-	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
+	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS. A label lands
+	// when its submission completes, then the interrupt follows it.
 	switch (data_sel) {
 		case 0: break;
-		case 1: {
-			const auto value = static_cast<uint32_t>(data);
-			write_label(&value, sizeof(value));
-			break;
-		}
+		case 1:
+			WriteLabelAtEndOfPipe(static_cast<uint32_t*>(address), static_cast<uint32_t>(data),
+			                      interrupt, interrupt_context_id);
+			return;
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: write_label(&data, sizeof(data)); break;
+		case 2:
+			WriteLabelAtEndOfPipe(static_cast<uint64_t*>(address), data, interrupt,
+			                      interrupt_context_id);
+			return;
 		case 5: {
-			GetScheduler().Finish();
+			SynchronizeGpu();
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
@@ -1017,11 +1008,36 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 	if (interrupt) {
-		GetScheduler().DeferPriorityOperation(
-		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
-			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-		    });
+		TriggerEopEventAtEndOfPipe(interrupt_context_id);
 	}
+}
+
+template <typename T>
+void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
+                                             uint32_t interrupt_context_id) {
+	// An end-of-pipe label means every command before it finished. Writing it when the
+	// submission completes makes the guest's wait cover the GPU, so the results it reads next
+	// are already published instead of faulting into a synchronous readback of unsubmitted
+	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
+	auto& gpu = m_renderer.GetGpu();
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, &gpu, dst, value, with_interrupt,
+	                                       event_id  = m_interrupt_event_id, interrupt_context_id] {
+		gpu.SendCommand([&renderer, dst, value, with_interrupt, event_id, interrupt_context_id] {
+			std::memcpy(dst, &value, sizeof(T));
+			if (with_interrupt) {
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+	});
+	GetScheduler().Flush();
+}
+
+void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+	(void)CurrentBuffer().Handle();
+	GetScheduler().DeferPriorityOperation(
+	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
+		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+	    });
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1131,6 +1147,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::SynchronizeGpu() {
+	GetScheduler().Finish();
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
