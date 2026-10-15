@@ -200,10 +200,13 @@ void Inst::AddUse(Inst* used, size_t operand) {
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	// Recent uses are the usual ones to go: search from the back.
+	const auto found =
+	    std::ranges::find_if(used->uses.rbegin(), used->uses.rend(), [&](const Use& use) {
+		    return use.user == this && use.operand == operand;
+	    });
+	EXIT_IF(found == used->uses.rend());
+	used->uses.erase(std::next(found).base());
 }
 
 void Inst::ClearArgs() {
