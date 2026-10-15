@@ -3006,8 +3006,9 @@ public:
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
-          // An end-of-pipe label lands when its submission completes: the parser
-          // submits the pending work and moves on without writing or waiting.
+          // An end-of-pipe label lands when its submission completes: the
+          // parser submits the pending work and moves on without writing or
+          // waiting.
           const auto cb_db_tick = gpu_scheduler.CurrentTick();
           auto cb_db_release =
               make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
@@ -3042,8 +3043,7 @@ public:
           const auto interrupt_result =
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
-              cache_and_counter_did_not_submit &&
-              cb_db_release_deferred &&
+              cache_and_counter_did_not_submit && cb_db_release_deferred &&
               interrupt_result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
               interrupt_only_gds_label == UINT64_MAX;
@@ -3066,8 +3066,8 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
-      // The completed labels are written by GPU-thread commands queued behind the
-      // previous one.
+      // The completed labels are written by GPU-thread commands queued behind
+      // the previous one.
       gpu.SendCommandSync([] {});
       Require("GpuCommandLane", "deferred timestamp write",
               cb_db_release_label >= timestamp_before &&
@@ -3093,14 +3093,15 @@ public:
         processor->BufferInit();
 
         const auto clock_tick = gpu_scheduler.CurrentTick();
-        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4,
-                                     &clock_label, UINT64_MAX, 2);
+        processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4, &clock_label,
+                                      UINT64_MAX, 2);
         Require("GpuCommandLane", "EOP reference clock with interrupt",
                 gpu_scheduler.CurrentTick() == clock_tick + 1,
                 "clock write with writeback and interrupt did not submit");
 
         // Every data label defers its write to the submission it ends; an
-        // interrupt-only release (selector 1 on the graphics queue) writes nothing.
+        // interrupt-only release (selector 1 on the graphics queue) writes
+        // nothing.
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
           auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
           Pm4Execution immediate_execution;
