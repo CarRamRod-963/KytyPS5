@@ -326,7 +326,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
-
 void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -356,9 +355,9 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 }
 
 // The hot set is small: a few hundred pages the game reads back every frame.
-static constexpr size_t   MaxHotPages        = 512;
-static constexpr uint64_t MaxHotTouchPages   = 16;
-static constexpr uint64_t MaxAsyncDownload   = uint64_t {4} << 20u;
+static constexpr size_t   MaxHotPages      = 512;
+static constexpr uint64_t MaxHotTouchPages = 16;
+static constexpr uint64_t MaxAsyncDownload = uint64_t {4} << 20u;
 
 void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
@@ -389,8 +388,8 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
 	const auto touch = ++m_hot_touch_sequence;
-	for (auto it = m_hot_pages.lower_bound(first); it != m_hot_pages.end() && it->first < vaddr + size;
-	     ++it) {
+	for (auto it = m_hot_pages.lower_bound(first);
+	     it != m_hot_pages.end() && it->first < vaddr + size; ++it) {
 		// A page served asynchronously never faults again, so the GPU writes keep it hot; it
 		// ages out once the GPU stops writing it.
 		it->second.touched = touch;
@@ -399,6 +398,13 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		// one sees the new epoch and keeps the page dirty.
 		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
 		m_pending_async.Add(it->first, CACHING_PAGESIZE);
+		// A clean page keeps its (current) bytes readable while the recorded write is pending;
+		// a page still holding an unpublished write must fault into a readback instead.
+		if (m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE)) {
+			m_make_unreadable.push_back(it->first);
+		} else {
+			m_keep_readable.push_back(it->first);
+		}
 	}
 }
 
@@ -456,8 +462,8 @@ void BufferCache::RecordAsyncDownloads() {
 				    any = true;
 			    });
 			if (any) {
-				pages.push_back({page, hot->second.epoch->load(std::memory_order_acquire),
-				                 hot->second.epoch});
+				pages.push_back(
+				    {page, hot->second.epoch->load(std::memory_order_acquire), hot->second.epoch});
 			}
 		}
 	});
@@ -495,8 +501,8 @@ void BufferCache::RecordAsyncDownloads() {
 		before.offset              = 0;
 		before.size                = buffer.Size();
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before,
-		                       0, nullptr);
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                       nullptr);
 		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
 		                  static_cast<uint32_t>(copies.size()), copies.data());
 	}
@@ -509,35 +515,37 @@ void BufferCache::RecordAsyncDownloads() {
 	after.offset              = offset;
 	after.size                = total;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total, intervals = std::move(intervals),
-	                                    pages = std::move(pages)] {
-		m_download_buffer.Invalidate(offset, total);
-		std::vector<Published> published;
-		for (const auto& page: pages) {
-			m_memory_tracker.PublishGpuModified(
-			    page.page, CACHING_PAGESIZE,
-			    [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
-			    [&](uint64_t address, uint64_t bytes) noexcept {
-				    for (const auto& interval: intervals) {
-					    const auto begin = std::max(address, interval.address);
-					    const auto end   = std::min(address + bytes, interval.address + interval.size);
-					    if (begin < end) {
-						    LibKernel::Memory::WriteBacking(
-						        begin, mapped + interval.offset + (begin - interval.address),
-						        end - begin);
-					    }
-				    }
-				    published.push_back({address, bytes, page.epoch, page.epoch_ptr});
-			    });
-		}
-		if (!published.empty()) {
-			std::lock_guard lock(m_published_mutex);
-			m_published.insert(m_published.end(), published.begin(), published.end());
-		}
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
+		    m_download_buffer.Invalidate(offset, total);
+		    std::vector<Published> published;
+		    for (const auto& page: pages) {
+			    m_memory_tracker.PublishGpuModified(
+			        page.page, CACHING_PAGESIZE,
+			        [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
+			        [&](uint64_t address, uint64_t bytes) noexcept {
+				        for (const auto& interval: intervals) {
+					        const auto begin = std::max(address, interval.address);
+					        const auto end =
+					            std::min(address + bytes, interval.address + interval.size);
+					        if (begin < end) {
+						        LibKernel::Memory::WriteBacking(
+						            begin, mapped + interval.offset + (begin - interval.address),
+						            end - begin);
+					        }
+				        }
+				        published.push_back({address, bytes, page.epoch, page.epoch_ptr});
+			        });
+		    }
+		    if (!published.empty()) {
+			    std::lock_guard lock(m_published_mutex);
+			    m_published.insert(m_published.end(), published.begin(), published.end());
+		    }
+	    });
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -739,6 +747,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteGpuWrite(vaddr, size);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	for (const auto page: m_make_unreadable) {
+		m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, false);
+	}
+	for (const auto page: m_keep_readable) {
+		m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, true);
+	}
+	m_make_unreadable.clear();
+	m_keep_readable.clear();
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
