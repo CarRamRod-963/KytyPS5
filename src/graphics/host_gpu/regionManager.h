@@ -80,6 +80,8 @@ public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
+		m_writable.Fill();
+		m_readable.Fill();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -98,18 +100,42 @@ public:
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
-		auto&      bits = GetBits<source>();
-		RegionBits changed = enable ? RegionBits(~bits, start, end) : RegionBits(bits, start, end);
+		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Gpu) {
+				m_stale_readable.UnsetRange(start, end);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>(changed);
+			UpdateProtection<!enable, false>();
 		} else {
-			UpdateProtection<enable, true>(changed);
+			UpdateProtection<enable, true>();
 		}
+	}
+
+	// A GPU-dirty page whose guest bytes are still current (every earlier GPU write of it was
+	// published before the pending one was recorded) stays readable: the guest sees what the
+	// console would show before the pending write executes, and the publish of that write
+	// refreshes the bytes in place. Pages that lose that property become unreadable again.
+	void SetStaleReadable(uint64_t offset, uint64_t size, bool readable) {
+		const auto [start, end] = GetPageRange(offset, size);
+		if (readable) {
+			if (RegionBits(m_gpu_dirty, start, end).None()) {
+				return;
+			}
+			m_stale_readable.SetRange(start, end);
+			UpdateProtection<false, true>();
+		} else {
+			m_stale_readable.UnsetRange(start, end);
+			UpdateProtection<true, true>();
+		}
+	}
+	[[nodiscard]] bool IsStaleReadable(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(offset, size);
+		return m_stale_readable.FirstRangeFrom(start).first < end;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -122,10 +148,13 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Gpu) {
+				m_stale_readable.UnsetRange(start, end);
+			}
 			if constexpr (source == DirtySource::Cpu) {
-				UpdateProtection<true, false>(mask);
+				UpdateProtection<true, false>();
 			} else {
-				UpdateProtection<false, true>(mask);
+				UpdateProtection<false, true>();
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -136,12 +165,16 @@ public:
 	TrackingSpinLock lock;
 
 private:
-	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
 	template <bool track, bool is_read>
-	void UpdateProtection(RegionBits& changed) {
-		if (!changed.None()) {
-			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+	void UpdateProtection() {
+		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
+		auto&      previous   = is_read ? m_readable : m_writable;
+		auto       mask       = protection ^ previous;
+		if (mask.None()) {
+			return;
 		}
+		previous = protection;
+		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>
@@ -171,6 +204,9 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	RegionBits   m_stale_readable;
+	RegionBits   m_writable;
+	RegionBits   m_readable;
 };
 
 } // namespace Libs::Graphics
