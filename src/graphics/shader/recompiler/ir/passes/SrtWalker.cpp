@@ -554,6 +554,7 @@ public:
 				code.L(labels[index]);
 				m_emitted.clear();
 				m_emitted_clean.clear();
+				m_scopes.clear();
 				code.mov(code.rax, code.qword[code.rbx + 48]);
 				code.cmp(code.byte[code.rax + index], 0);
 				code.je(next, Xbyak::CodeGenerator::T_NEAR);
@@ -661,10 +662,13 @@ private:
 		const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 		const auto slot =
 		    static_cast<uint32_t>(index) * sizeof(ResourcePlan::EvaluationContext::Entry);
-		if (Emitted().contains(inst)) {
+		if (IsEmitted(inst)) {
 			code.mov(code.rax, code.qword[code.r12 + slot]);
 			return true;
 		}
+		// The code may not grow without bound: a plan that re-emits shared values in many
+		// nested regions is left to the interpreter.
+		if (code.getSize() > MaxCodeSize) return false;
 		Xbyak::Label compute, done;
 		code.mov(code.rax, code.qword[code.r12 + slot + 8]);
 		code.cmp(code.rax, code.r14);
@@ -676,7 +680,7 @@ private:
 		code.mov(code.qword[code.r12 + slot], code.rax);
 		code.mov(code.qword[code.r12 + slot + 8], code.r14);
 		code.L(done);
-		if (m_conditional == 0 && !IsUndef(*inst)) Emitted().insert(inst);
+		if (!IsUndef(*inst)) Emitted().insert(inst);
 		return true;
 	}
 
@@ -717,9 +721,9 @@ private:
 		Xbyak::Label restore, done;
 		auto* const  previous = m_fail;
 		m_fail                = &restore;
-		++m_conditional;
+		PushScope();
 		const bool emitted = Emit(value);
-		--m_conditional;
+		PopScope();
 		m_fail = previous;
 		--m_tolerant_depth;
 		if (!emitted) return false;
@@ -735,8 +739,122 @@ private:
 		return true;
 	}
 
+	// Values whose memo slot is known to hold the current generation: those emitted
+	// unconditionally earlier in the block, and those emitted earlier in every enclosing
+	// conditional region. A region's set is dropped when the region ends because a later
+	// path may skip it.
+	struct Scope {
+		std::unordered_set<const Inst*> emitted;
+		std::unordered_set<const Inst*> emitted_clean;
+	};
+
 	std::unordered_set<const Inst*>& Emitted() {
+		if (!m_scopes.empty()) {
+			auto& scope = m_scopes.back();
+			return m_clean_depth > 0 ? scope.emitted_clean : scope.emitted;
+		}
 		return m_clean_depth > 0 ? m_emitted_clean : m_emitted;
+	}
+
+	bool IsEmitted(const Inst* inst) const {
+		const bool clean = m_clean_depth > 0;
+		if ((clean ? m_emitted_clean : m_emitted).contains(inst)) return true;
+		for (const auto& scope: m_scopes) {
+			if ((clean ? scope.emitted_clean : scope.emitted).contains(inst)) return true;
+		}
+		return false;
+	}
+
+	void PushScope() { m_scopes.emplace_back(); }
+	void PopScope() { m_scopes.pop_back(); }
+
+	// A value computed from user data and constants alone: evaluating it where the
+	// interpreter would not changes nothing observable.
+	bool IsPure(const Inst& inst) {
+		if (const auto found = m_pure.find(&inst); found != m_pure.end()) return found->second;
+		bool pure = false;
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::GetShaderBase:
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::ConditionRef:
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2:
+			case ValueOpcode::CompositeConstructU64:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::IAdd64:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::ISub64:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::UMulHi:
+			case ValueOpcode::UMin32:
+			case ValueOpcode::UMax32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseAnd64:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftLeftLogical64:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightLogical64:
+			case ValueOpcode::ShiftRightArithmetic32:
+			case ValueOpcode::ShiftRightArithmetic64:
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::BitFieldSExtract:
+			case ValueOpcode::BitFieldInsert:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectF32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalXor:
+			case ValueOpcode::LogicalNot: {
+				pure = true;
+				for (size_t index = 0; index < inst.NumArgs() && pure; ++index) {
+					const auto* arg = inst.Arg(index).TryInstruction();
+					pure            = arg == nullptr || IsPure(*arg);
+				}
+				break;
+			}
+			default: break;
+		}
+		m_pure.emplace(&inst, pure);
+		return pure;
+	}
+
+	void CollectUses(Value value, std::unordered_map<const Inst*, Value>& uses, size_t& budget) {
+		auto* const inst = value.TryInstruction();
+		if (inst == nullptr || IsEmitted(inst) || uses.contains(inst) || budget == 0) return;
+		--budget;
+		uses.emplace(inst, value);
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			CollectUses(inst->Arg(index), uses, budget);
+		}
+	}
+
+	// Values both arms of a select need are evaluated before the branch when that is
+	// unobservable; otherwise each arm emits its own copy, which doubles the code at every
+	// link of a select chain.
+	bool HoistShared(const Inst& select) {
+		std::unordered_map<const Inst*, Value> left;
+		std::unordered_map<const Inst*, Value> right;
+		size_t                                 budget = 4096;
+		CollectUses(select.Arg(1), left, budget);
+		CollectUses(select.Arg(2), right, budget);
+		for (const auto& [inst, value]: left) {
+			if (right.contains(inst) && IsPure(*inst) && !IsEmitted(inst) && !Emit(value)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	// Loads the memo base of the current mode: the clean or the normal context.
@@ -957,18 +1075,21 @@ private:
 			case ValueOpcode::SelectU1:
 			case ValueOpcode::SelectF32: {
 				Xbyak::Label otherwise, done;
+				if (!HoistShared(inst)) return false;
 				EnterClean();
 				const bool predicate = Emit(inst.Arg(0));
 				LeaveClean();
 				if (!predicate) return false;
 				code.test(code.eax, code.eax);
 				code.jz(otherwise, Code::T_NEAR);
-				++m_conditional;
+				PushScope();
 				const bool branches = Emit(inst.Arg(1));
+				PopScope();
 				code.jmp(done, Code::T_NEAR);
 				code.L(otherwise);
+				PushScope();
 				const bool other = branches && Emit(inst.Arg(2));
-				--m_conditional;
+				PopScope();
 				code.L(done);
 				return other;
 			}
@@ -990,9 +1111,9 @@ private:
 				code.test(code.eax, code.eax);
 				code.jz(one, Code::T_NEAR);
 				code.push(code.rax);
-				++m_conditional;
+				PushScope();
 				const bool right = Emit(inst.Arg(1));
-				--m_conditional;
+				PopScope();
 				if (!right) return false;
 				code.mov(code.rcx, code.rax);
 				code.pop(code.rax);
@@ -1019,9 +1140,9 @@ private:
 				if (!Emit(inst.Arg(0))) return false;
 				code.test(code.eax, code.eax);
 				code.jz(zero, Code::T_NEAR);
-				++m_conditional;
+				PushScope();
 				const bool right = Emit(inst.Arg(1));
-				--m_conditional;
+				PopScope();
 				if (!right) return false;
 				code.test(code.eax, code.eax);
 				code.setne(code.al);
@@ -1040,18 +1161,18 @@ private:
 					if (!EmitTolerant(inst.Arg(0), left_unknown)) return false;
 					code.test(code.eax, code.eax);
 					code.jnz(one, Code::T_NEAR);
-					++m_conditional;
+					PushScope();
 					const bool emitted = Emit(inst.Arg(1));
-					--m_conditional;
+					PopScope();
 					if (!emitted) return false;
 					code.test(code.eax, code.eax);
 					code.setne(code.al);
 					code.movzx(code.eax, code.al);
 					code.jmp(done, Code::T_NEAR);
 					code.L(left_unknown);
-					++m_conditional;
+					PushScope();
 					const bool again = Emit(inst.Arg(1));
-					--m_conditional;
+					PopScope();
 					if (!again) return false;
 					code.test(code.eax, code.eax);
 					code.jz(*m_fail, Code::T_NEAR);
@@ -1060,9 +1181,9 @@ private:
 					if (!Emit(inst.Arg(0))) return false;
 					code.test(code.eax, code.eax);
 					code.jnz(one, Code::T_NEAR);
-					++m_conditional;
+					PushScope();
 					const bool emitted = Emit(inst.Arg(1));
-					--m_conditional;
+					PopScope();
 					if (!emitted) return false;
 					code.test(code.eax, code.eax);
 					code.setne(code.al);
@@ -1106,9 +1227,9 @@ private:
 		// [rsp] = incoming value, [rsp + 8] = found; reachable predecessors must agree.
 		code.push(0);
 		code.push(0);
-		++m_conditional;
 		for (size_t index = 0; index < predecessors.size(); ++index) {
 			Xbyak::Label skip, first;
+			PushScope();
 			code.mov(code.rax, code.qword[code.rbx + 48]);
 			code.cmp(code.byte[code.rax + predecessors[index]], 0);
 			code.je(skip, Code::T_NEAR);
@@ -1122,8 +1243,8 @@ private:
 			code.mov(code.qword[code.rsp], code.rax);
 			code.mov(code.qword[code.rsp + 8], 1);
 			code.L(skip);
+			PopScope();
 		}
-		--m_conditional;
 		code.cmp(code.qword[code.rsp + 8], 0);
 		code.je(*m_fail, Code::T_NEAR);
 		code.pop(code.rax);
@@ -1222,9 +1343,12 @@ private:
 	Xbyak::Label                              m_finished;
 	Xbyak::Label                              m_failed;
 	Xbyak::Label                              m_exit;
+	static constexpr size_t                   MaxCodeSize = 4u << 20u;
+
 	std::unordered_set<const Inst*>           m_emitted;
 	std::unordered_set<const Inst*>           m_emitted_clean;
-	int                                       m_conditional     = 0;
+	std::vector<Scope>                        m_scopes;
+	std::unordered_map<const Inst*, bool>     m_pure;
 	bool                                      m_clean_evaluator = false;
 	int                                       m_clean_depth     = 0;
 	int                                       m_tolerant_depth  = 0;
