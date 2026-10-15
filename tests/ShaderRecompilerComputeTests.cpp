@@ -3196,6 +3196,7 @@ public:
       alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
       alignas(uint64_t) uint64_t cb_db_release_label = UINT64_MAX;
       bool parser_kept_nonblocking_boundaries = false;
+      uint64_t timestamp_before = 0;
       bool host_resource_retired = false;
       bool cpu_unmap_did_not_submit = false;
       std::jthread no_gpu_wait([&] {
@@ -3218,19 +3219,22 @@ public:
               result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == tick_before;
 
+          // An end-of-pipe label lands when its submission completes: the parser
+          // submits the pending work and moves on without writing or waiting.
           const auto cb_db_tick = gpu_scheduler.CurrentTick();
           auto cb_db_release =
               make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
           Pm4Execution cb_db_execution;
           const auto cb_db_result =
               processor->Process(cb_db_execution, cb_db_release);
-          const bool cb_db_release_did_not_submit =
+          const bool cb_db_release_deferred =
               cb_db_result == Pm4ProcessResult::Complete &&
-              cb_db_release_label == 0 &&
-              gpu_scheduler.CurrentTick() == cb_db_tick;
+              cb_db_release_label == UINT64_MAX &&
+              gpu_scheduler.CurrentTick() == cb_db_tick + 1;
 
+          timestamp_before = Sync::ReadReferenceClock();
           for (const auto gcr : {0u, 1u << 9u}) {
-            const auto before = Sync::ReadReferenceClock();
+            const auto timestamp_tick = gpu_scheduler.CurrentTick();
             auto timestamp =
                 make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
             Pm4Execution timestamp_execution;
@@ -3238,11 +3242,10 @@ public:
                 processor->Process(timestamp_execution, timestamp);
             Require("GpuCommandLane", "timestamp write",
                     timestamp_result == Pm4ProcessResult::Complete &&
-                        cb_db_release_label >= before &&
-                        cb_db_release_label <= Sync::ReadReferenceClock() &&
-                        gpu_scheduler.CurrentTick() == cb_db_tick,
-                    "timestamp write failed, returned an invalid time, or "
-                    "submitted extra GPU work");
+                        cb_db_release_label == UINT64_MAX &&
+                        gpu_scheduler.CurrentTick() == timestamp_tick + 1,
+                    "timestamp write landed before its submission completed or "
+                    "did not submit the pending work");
           }
 
           auto gds_interrupt_only =
@@ -3253,7 +3256,7 @@ public:
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
               cache_event_did_not_submit &&
-              cb_db_release_did_not_submit &&
+              cb_db_release_deferred &&
               interrupt_result == Pm4ProcessResult::Complete &&
               gpu_scheduler.CurrentTick() == interrupt_tick &&
               interrupt_only_gds_label == UINT64_MAX;
@@ -3272,7 +3275,17 @@ public:
                   vk::Result::eSuccess,
               "failed to release the blocked GPU timeline");
       no_gpu_wait.join();
-      gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+      gpu.SendCommandSync([&] {
+        gpu_scheduler.Finish();
+        gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
+      });
+      // The completed labels are written by GPU-thread commands queued behind the
+      // previous one.
+      gpu.SendCommandSync([] {});
+      Require("GpuCommandLane", "deferred timestamp write",
+              cb_db_release_label >= timestamp_before &&
+                  cb_db_release_label <= Sync::ReadReferenceClock(),
+              "timestamp write failed or returned an invalid time");
       m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
       Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
               parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
@@ -3284,38 +3297,59 @@ public:
               "submission behavior");
 
       alignas(uint64_t) uint64_t release_label = 0;
+      alignas(uint64_t) uint64_t clock_label = 0;
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
       bool release_mem_submission_counts = false;
+      alignas(uint64_t) std::array<uint64_t, 42> action_labels{};
+      std::array<uint32_t, 42> action_data_sels{};
+      size_t action_count = 0;
+      const auto clock_before = Sync::ReadReferenceClock();
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
         // Every end-of-pipe and end-of-shader action, with or without GL2
-        // writeback, writes each label size and submits nothing for its interrupt.
+        // writeback, defers each label size to the submission it ends.
         for (const uint32_t action : {0x04u, 0x14u, 0x28u, 0x2bu, 0x2du, 0x2fu, 0x30u}) {
           for (const uint32_t gcr : {0u, 1u << 9u}) {
             for (const uint32_t data_sel : {1u, 2u, 3u}) {
-              release_label = 0;
-              const auto clock_before = Sync::ReadReferenceClock();
-              auto release = make_release_mem(data_sel, 2, &release_label,
+              auto release = make_release_mem(data_sel, 2, &action_labels[action_count],
                                               0x1122334455667788ull, action, gcr);
               release[3] |= 1u; // ADDRESS_LO starts at bit 2.
+              action_data_sels[action_count++] = data_sel;
               Pm4Execution release_execution;
               const auto release_tick = gpu_scheduler.CurrentTick();
               const auto release_result =
                   processor->Process(release_execution, release);
-              bool label_written =
-                  release_label == (data_sel == 1 ? 0x55667788ull : 0x1122334455667788ull);
-              if (data_sel == 3) {
-                label_written = release_label >= clock_before &&
-                                release_label <= Sync::ReadReferenceClock();
-              }
               Require("GpuCommandLane", "release with write-confirm interrupt",
                       release_result == Pm4ProcessResult::Complete &&
-                          label_written &&
-                          gpu_scheduler.CurrentTick() == release_tick,
-                      "an end-of-pipe action lost its label or submitted work");
+                          gpu_scheduler.CurrentTick() == release_tick + 1,
+                      "an end-of-pipe action did not submit the pending work");
             }
           }
+        }
+
+        const auto clock_tick = gpu_scheduler.CurrentTick();
+        auto clock = make_release_mem(3, 2, &clock_label, UINT64_MAX, 0x04u);
+        Pm4Execution clock_execution;
+        const auto clock_result = processor->Process(clock_execution, clock);
+        Require("GpuCommandLane", "EOP reference clock with interrupt",
+                clock_result == Pm4ProcessResult::Complete &&
+                    gpu_scheduler.CurrentTick() == clock_tick + 1,
+                "clock write with writeback and interrupt did not submit");
+
+        // Every data label defers its write to the submission it ends; an
+        // interrupt-only release (selector 1 on the graphics queue) writes nothing
+        // and rides on the end-of-slice flush.
+        for (const auto interrupt : {0u, 3u, 1u, 2u}) {
+          auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
+          Pm4Execution immediate_execution;
+          const auto immediate_tick = gpu_scheduler.CurrentTick();
+          const auto immediate_result =
+              processor->Process(immediate_execution, immediate);
+          Require("GpuCommandLane", "32-bit release boundary",
+                  immediate_result == Pm4ProcessResult::Complete &&
+                      gpu_scheduler.CurrentTick() == immediate_tick + (interrupt == 1 ? 0 : 1),
+                  "release did not submit the pending work");
         }
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
@@ -3342,6 +3376,22 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
+      gpu.SendCommandSync([] {});
+      Require("GpuCommandLane", "deferred EOP reference clock",
+              clock_label >= clock_before &&
+                  clock_label <= Sync::ReadReferenceClock(),
+              "clock write with writeback and interrupt lost its data");
+      bool action_labels_written = action_count == action_labels.size();
+      for (size_t i = 0; i < action_count; i++) {
+        const auto label = action_labels[i];
+        action_labels_written &=
+            action_data_sels[i] == 3
+                ? label >= clock_before && label <= Sync::ReadReferenceClock()
+                : label == (action_data_sels[i] == 1 ? 0x55667788ull
+                                                     : 0x1122334455667788ull);
+      }
+      Require("GpuCommandLane", "deferred release labels", action_labels_written,
+              "an end-of-pipe action lost its label");
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(gds_label) == 0,
@@ -4138,10 +4188,19 @@ public:
           2, 0, reinterpret_cast<void *>(address), label_value, 0);
       gpu.Submit(packet);
       gpu.WaitForIdle();
+      // The label lands when its submission completes, after the stream is idle.
       uint64_t label = 0;
-      return LibKernel::Memory::TryReadBacking(address, &label,
-                                               sizeof(label)) &&
-             label == label_value;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!(LibKernel::Memory::TryReadBacking(address, &label,
+                                                 sizeof(label)) &&
+               label == label_value) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      // Its store (on the GPU thread for a watched page) has finished.
+      gpu.SendCommandSync([] {});
+      return label == label_value;
     };
     LibKernel::Memory::InstallGpuResources(&resources);
     const bool label_beside_stored =
@@ -4204,6 +4263,10 @@ public:
       uint64_t suspended_tick = 0;
       std::binary_semaphore parked{0};
       bool signalled = false;
+      // Guest labels on a page nothing else uses; the parked one is written
+      // when its submission completes, behind the parked copies.
+      constexpr uint64_t release_label_address = fault_base + 0x2c000;
+      constexpr uint64_t parked_label_address = fault_base + 0x2c100;
       LibKernel::Memory::InstallGpuResources(&resources);
       gpu.SendCommandSync([&] {
         auto &texture_cache = resources.GetTextureCache();
@@ -4235,16 +4298,37 @@ public:
         const auto release = [&](uint32_t gcr_cntl, uint64_t address,
                                  const std::array<uint32_t, 4> &expected,
                                  bool label_write = true) {
+          // A guest label: a host label written on the GPU thread would land
+          // only after this command returns.
           uint64_t label = 0;
+          LibKernel::Memory::WriteBacking(release_label_address, &label,
+                                          sizeof(label));
+          // Unwatched, so the completion thread stores it (the GPU thread is
+          // busy running this command).
+          (void)resources.InvalidateMemory(release_label_address,
+                                           sizeof(label));
           auto packet =
-              label_write ? make_interrupt_packet(2, 0, &label, label_value, 0)
-                          : make_interrupt_packet(0, 2, nullptr, 0, 0);
+              label_write
+                  ? make_interrupt_packet(
+                        2, 0, reinterpret_cast<void *>(release_label_address),
+                        label_value, 0)
+                  : make_interrupt_packet(0, 2, nullptr, 0, 0);
           packet[1] |= gcr_cntl << 12u;
           Pm4Execution execution;
           std::array<uint32_t, 4> guest{};
           if (processor->Process(execution, packet) !=
-                  Pm4ProcessResult::Complete ||
-              label != (label_write ? label_value : 0)) {
+              Pm4ProcessResult::Complete) {
+            return false;
+          }
+          // The label lands when its submission completes, after the
+          // publications of that submission's downloads.
+          auto &scheduler = resources.GetCommandScheduler();
+          scheduler.Flush();
+          scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+          std::memcpy(&label,
+                      reinterpret_cast<const void *>(release_label_address),
+                      sizeof(label));
+          if (label != (label_write ? label_value : 0)) {
             return false;
           }
           std::memcpy(guest.data(), reinterpret_cast<const void *>(address),
@@ -4368,13 +4452,15 @@ public:
         (void)shader_write(shared_page + 0x800, {8, 4, 1}, linear);
         resources.GetCommandScheduler().DeferPriorityOperation(
             [&] { parked.acquire(); });
-        uint64_t label = 0;
-        auto packet = make_interrupt_packet(2, 0, &label, label_value, 0);
+        (void)resources.InvalidateMemory(parked_label_address,
+                                         sizeof(uint64_t));
+        auto packet = make_interrupt_packet(
+            2, 0, reinterpret_cast<void *>(parked_label_address), label_value,
+            0);
         packet[1] |= (1u << 9u) << 12u;
         Pm4Execution execution;
         signalled = processor->Process(execution, packet) ==
-                        Pm4ProcessResult::Complete &&
-                    label == label_value;
+                    Pm4ProcessResult::Complete;
         // A download recorded without a submit, as ProcessDownloadImages
         // leaves it, is submitted by the read that needs it.
         TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
@@ -4383,9 +4469,8 @@ public:
         suspended_tick = resources.GetCommandScheduler().CurrentTick();
         TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       });
-      // The label landed at once. A read waits for the copies instead of
-      // faulting in a loop, and so does an invalidation beside them before
-      // host I/O.
+      // A read waits for the copies instead of faulting in a loop, and so
+      // does an invalidation beside them before host I/O.
       const auto faults = g_handled_gpu_faults.load();
       std::array<uint32_t, 4> read{};
       std::atomic<bool> read_done{false};
@@ -4426,6 +4511,19 @@ public:
                   texture_cache.WriteBackTick(suspended_address, 1) ==
                       suspended_tick,
               "a landed copy cleared another pending write-back");
+      const auto label_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      const auto parked_label = [] {
+        uint64_t value = 0;
+        (void)LibKernel::Memory::TryReadBacking(parked_label_address, &value,
+                                                sizeof(value));
+        return value;
+      };
+      while (parked_label() != label_value &&
+             std::chrono::steady_clock::now() < label_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      signalled &= parked_label() == label_value;
       const auto wait_faults = g_handled_gpu_faults.load() - faults;
       const bool unsubmitted =
           resources.GetCommandScheduler().CurrentTick() == suspended_tick;
@@ -4444,7 +4542,8 @@ public:
               signalled && waited && read == written && wait_faults < 16 &&
                   stored &&
                   !TextureCacheTestAccess::WriteBacksPending(texture_cache),
-              "a GL2 label waited for its copies, or an access did not");
+              "a GL2 label never landed, or an access did not wait for the "
+              "copies");
       resources.UnmapMemory(large_address, large_size);
       Require("GpuCommandLane", "storage readback large release",
               LibKernel::Memory::KernelMunmap(large_address, large_size) == 0 &&
