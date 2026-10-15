@@ -28,6 +28,10 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// Keeps (or stops keeping) GPU-dirty pages readable while their pending write has not
+	// executed; see RegionManager::SetStaleReadable.
+	void               SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool readable);
+	[[nodiscard]] bool IsGpuModifiedReadable(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Queue after changing ownership; a concurrent drain must not consume an event
 	// before the dirty pages it describes become visible.
