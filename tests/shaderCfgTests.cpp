@@ -13342,6 +13342,52 @@ void TestMaskedShiftConstantPropagation() {
         "a variable shift count was treated as a constant");
 }
 
+void TestReplaceUsesKeepsOrder() {
+  using namespace ShaderRecompiler::IR;
+  // Replacing a value moves its uses to the replacement in their original order
+  // and retires them from the replaced instruction; the users read the
+  // replacement.
+  Block block;
+  auto &first =
+      block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  auto &second =
+      block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  auto &keep =
+      block.AppendNewInst(ValueOpcode::IAdd32, {Value(&second), Value(1u)});
+  std::vector<Inst *> users;
+  for (uint32_t index = 0; index < 8; ++index) {
+    users.push_back(&block.AppendNewInst(ValueOpcode::IAdd32,
+                                         {Value(&first), Value(index)}));
+  }
+  auto &both =
+      block.AppendNewInst(ValueOpcode::IAdd32, {Value(&first), Value(&first)});
+  first.ReplaceUsesWith(Value(&second));
+  Check(!first.HasUses() && first.GetOpcode() == ValueOpcode::Identity &&
+            first.Arg(0) == Value(&second),
+        "replaced value kept uses or did not become an alias");
+  const auto &uses = second.Uses();
+  Check(uses.size() == 12 && uses[0].user == &keep &&
+            uses[1].user == users[0] && uses[8].user == users[7] &&
+            uses[9].user == &both && uses[9].operand == 0 &&
+            uses[10].user == &both && uses[10].operand == 1 &&
+            uses[11].user == &first,
+        "moved uses are out of order or incomplete");
+  for (const auto *user : users) {
+    Check(user->Arg(0) == Value(&second),
+          "user still reads the replaced value");
+  }
+  Check(both.Arg(0) == Value(&second) && both.Arg(1) == Value(&second),
+        "user with two operands of the replaced value was not rewritten");
+  // Retiring a use from the middle of the list keeps the others.
+  both.SetArg(1, Value(7u));
+  Check(second.Uses().size() == 11 && both.Arg(1) == Value(7u) &&
+            std::ranges::none_of(second.Uses(),
+                                 [&](const Use &use) {
+                                   return use.user == &both && use.operand == 1;
+                                 }),
+        "retired use remained on the value");
+}
+
 void TestU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
 
@@ -17270,6 +17316,7 @@ int main() {
   TestLateConstantPropagation();
   TestRepeatedBitcastPropagation();
   TestMaskedShiftConstantPropagation();
+  TestReplaceUsesKeepsOrder();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
