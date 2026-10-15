@@ -105,6 +105,8 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	template <typename T>
+	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);

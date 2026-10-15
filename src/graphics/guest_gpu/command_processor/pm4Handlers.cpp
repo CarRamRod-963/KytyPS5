@@ -2260,7 +2260,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+		// A written label submits on its own; the interrupt-only release of the graphics
+		// queue still needs its boundary.
+		if (interrupt_selector == 0x01 && !cp.IsAsyncComputeQueue()) {
 			cp.BufferFlush();
 		}
 

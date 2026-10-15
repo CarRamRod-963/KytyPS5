@@ -1077,11 +1077,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
-
-		if (with_interrupt) {
-			TriggerEopEventAtEndOfPipe(interrupt_context_id);
-		}
+		WriteLabelAtEndOfPipe(dst, data, with_interrupt, interrupt_context_id);
 	};
 
 	switch (event_write_source) {
@@ -1120,11 +1116,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
-
-					if (with_interrupt) {
-						TriggerEopEventAtEndOfPipe(interrupt_context_id);
-					}
+					WriteLabelAtEndOfPipe(dst, static_cast<uint64_t>(value), with_interrupt,
+					                      interrupt_context_id);
 				};
 
 				switch (cache_action) {
@@ -1219,6 +1212,27 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id);
+}
+
+
+template <typename T>
+void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
+                                             uint32_t interrupt_context_id) {
+	// An end-of-pipe label means every command before it finished. Writing it when the
+	// submission completes makes the guest's wait cover the GPU, so the results it reads next
+	// are already published instead of faulting into a synchronous readback of unsubmitted
+	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
+	auto& gpu = m_renderer.GetGpu();
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, &gpu, dst, value, with_interrupt,
+	                                       event_id  = m_interrupt_event_id, interrupt_context_id] {
+		gpu.SendCommand([&renderer, dst, value, with_interrupt, event_id, interrupt_context_id] {
+			std::memcpy(dst, &value, sizeof(T));
+			if (with_interrupt) {
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+	});
+	GetScheduler().Flush();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1328,12 +1342,18 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	// The flip label is an end-of-pipe write: it lands when the submission completes.
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, &gpu = m_renderer.GetGpu(),
+	                                       dst = static_cast<uint32_t*>(dst_gpu_addr), value,
+	                                       request] {
+		gpu.SendCommand([&renderer, dst, value, request] {
+			std::memcpy(dst, &value, sizeof(value));
+			renderer.GetVideoOut().CompleteFlip(request);
+		});
+	});
 	GetScheduler().Flush();
 }
 
@@ -1354,15 +1374,18 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	EXIT_IF(dst_gpu_addr == nullptr);
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	(void)command.Handle();
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
-		    renderer.GetVideoOut().CompleteFlip(request);
-		    renderer.TriggerInterrupt(event_id, 0);
-	    });
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, &gpu = m_renderer.GetGpu(),
+	                                       dst      = static_cast<uint32_t*>(dst_gpu_addr), value,
+	                                       event_id = m_interrupt_event_id, request] {
+		gpu.SendCommand([&renderer, dst, value, event_id, request] {
+			std::memcpy(dst, &value, sizeof(value));
+			renderer.GetVideoOut().CompleteFlip(request);
+			renderer.TriggerInterrupt(event_id, 0);
+		});
+	});
 	GetScheduler().Flush();
 }
 
