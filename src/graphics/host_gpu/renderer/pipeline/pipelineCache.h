@@ -4,10 +4,12 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -15,6 +17,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -22,6 +25,7 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class CommandScheduler;
 
 namespace HW {
 class Context;
@@ -104,10 +108,15 @@ struct ShaderProgram {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	// Without a scheduler to retire replaced pipelines, every pipeline is built optimized on
+	// first use.
+	explicit PipelineCache(GraphicContext& graphics, CommandScheduler* scheduler = nullptr);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Joins the background compiles. Their pipeline layouts reference the renderer's bindless
+	// set layout, so the owner calls this before destroying it.
+	void StopBackgroundCompiles();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -172,6 +181,7 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	CommandScheduler*             m_scheduler;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
@@ -180,23 +190,40 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Optimized builds of pipelines that are in use unoptimized, by compile ticket. Pipelines are
+	// never evicted, so the pointers stay valid.
+	std::unique_ptr<PipelineCompileQueue>         m_compile_queue;
+	std::unordered_map<uint64_t, Pipeline*>       m_pending_optimized;
+	std::vector<PipelineCompileQueue::Completion> m_completed;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
+	void InstallOptimizedPipelines();
 };
 
+inline uint64_t PipelineCompileHandle(vk::Pipeline pipeline) {
+	return std::bit_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+}
+
+inline vk::Pipeline PipelineFromCompileHandle(uint64_t handle) {
+	return std::bit_cast<VkPipeline>(handle);
+}
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// Creates the pipeline layout and a pipeline that is usable right away. With
+// `defer_optimization`, the pipeline may be unoptimized; the returned job then builds the
+// optimized one (see PipelineCache::DeferOptimization).
+PipelineCompileQueue::Job CreatePipelineInternal(
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
+    std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
+    const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, bool defer_optimization);
+PipelineCompileQueue::Job
+CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                       const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
+                       vk::PipelineCache driver_cache, bool defer_optimization);
 
 } // namespace Libs::Graphics
 

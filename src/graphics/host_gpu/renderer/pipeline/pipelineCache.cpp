@@ -34,6 +34,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -620,15 +621,26 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 };
 
-PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)),
+PipelineCache::PipelineCache(GraphicContext& graphics, CommandScheduler* scheduler)
+    : m_graphics(graphics), m_scheduler(scheduler),
+      m_program_cache(std::make_unique<ProgramCache>(graphics)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	ShaderRecompiler::Spirv::SetMaximalReconvergence(graphics.maximal_reconvergence_enabled);
 	InitializeDriverCache();
+	if (m_scheduler != nullptr && Config::AsyncPipelinesEnabled()) {
+		// Driver compilers are multithreaded themselves; two builds at a time keep the CPU
+		// available for the guest.
+		const auto threads = std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 2u);
+		m_compile_queue    = std::make_unique<PipelineCompileQueue>(
+		    threads, [device = graphics.device](uint64_t handle) {
+			    device.destroyPipeline(PipelineFromCompileHandle(handle), nullptr);
+		    });
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	StopBackgroundCompiles();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -642,6 +654,58 @@ PipelineCache::~PipelineCache() {
 	destroy(m_compute_pipelines);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	}
+}
+
+void PipelineCache::StopBackgroundCompiles() {
+	if (m_compile_queue == nullptr) {
+		return;
+	}
+	if (!m_pending_optimized.empty()) {
+		LOGF("PipelineCache: dropping %zu pending optimized pipeline builds\n",
+		     m_pending_optimized.size());
+	}
+	// Results that were not installed are destroyed here; their pipelines keep the unoptimized
+	// handles.
+	m_compile_queue->Stop();
+	m_pending_optimized.clear();
+}
+
+void PipelineCache::DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job) {
+	if (!job) {
+		return;
+	}
+	const auto ticket = m_compile_queue->Enqueue(std::move(job));
+	m_pending_optimized.emplace(ticket, &pipeline);
+}
+
+// Replaces unoptimized pipelines whose optimized builds finished. Runs on the GPU thread while
+// a command buffer is being recorded: command buffers recorded so far may have bound the old
+// handle, so it is destroyed once the current command buffer has completed.
+void PipelineCache::InstallOptimizedPipelines() {
+	if (m_pending_optimized.empty() || !m_scheduler->Active()) {
+		return;
+	}
+	m_completed.clear();
+	m_compile_queue->TakeCompleted(m_completed);
+	for (const auto& completion: m_completed) {
+		const auto entry = m_pending_optimized.find(completion.ticket);
+		EXIT_IF(entry == m_pending_optimized.end());
+		auto& pipeline = *entry->second;
+		m_pending_optimized.erase(entry);
+		if (completion.handle == 0) {
+			LOGF("PipelineCache: optimized build failed; keeping unoptimized pipeline %p\n",
+			     static_cast<void*>(pipeline.pipeline));
+			continue;
+		}
+		const auto unoptimized = pipeline.pipeline;
+		pipeline.pipeline      = PipelineFromCompileHandle(completion.handle);
+		m_scheduler->DeferOperation([device = m_graphics.device, unoptimized] {
+			device.destroyPipeline(unoptimized, nullptr);
+		});
+	}
+	if (!m_completed.empty()) {
+		CheckpointDriverCache();
 	}
 }
 
@@ -1126,6 +1190,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
+	InstallOptimizedPipelines();
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return *iter->second;
 	}
@@ -1142,13 +1207,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	{
+	auto job = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
-	}
+		return CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                              ps_input_info, programs, static_params, m_driver_cache,
+		                              m_compile_queue != nullptr);
+	}();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1156,6 +1222,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	DeferOptimization(*iter->second, std::move(job));
 	CheckpointDriverCache();
 
 	return *iter->second;
@@ -1168,6 +1235,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	InstallOptimizedPipelines();
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;
@@ -1178,19 +1246,20 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	{
+	auto job = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                       m_driver_cache);
-	}
+		return CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                              m_driver_cache, m_compile_queue != nullptr);
+	}();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	DeferOptimization(*iter->second, std::move(job));
 	CheckpointDriverCache();
 
 	return *iter->second;
