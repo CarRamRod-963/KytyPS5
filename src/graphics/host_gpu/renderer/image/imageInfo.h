@@ -89,6 +89,8 @@ struct ImageInfo {
 
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
+	// The sized data starts on its DataAlignment(): a T# a binding can place.
+	[[nodiscard]] bool                             DataPlaced() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
