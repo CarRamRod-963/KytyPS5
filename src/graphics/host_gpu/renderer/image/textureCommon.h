@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <optional>
+
 namespace Libs::Graphics {
 
 struct RenderTargetFormatInfo {
@@ -21,6 +23,8 @@ struct SurfaceFormatInfo {
 
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
                                                   Prospero::ColorComponentMapping host_to_storage);
+// The host format a T# format samples through, if any; the Get form exits without one.
+std::optional<SurfaceFormatInfo> TextureFindSurfaceFormatInfo(Prospero::BufferFormat format);
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
