@@ -353,8 +353,9 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Root and two candidates of one class, padded to a power of two.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
+            snapshot.images.size() == 4u && memory.watched_reads == 1u &&
             memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
@@ -619,10 +620,11 @@ void TestBoundedImageViewEligibility() {
   for (const bool r128 : {false, true}) {
     plan.info.images[0].r128 = r128;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (r128 ? 3u : 4u) &&
+              // Two or three candidates of one class with the root, padded to a power of two.
+              snapshot.images.size() == 4u &&
               snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 17u] == 0u &&
               snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-              snapshot.images.back().dwords == descriptor(0x24u, Type::kColor2D),
+              snapshot.images[r128 ? 2u : 3u].dwords == descriptor(0x24u, Type::kColor2D),
           "invalid heap texture view survived normalization or removed valid neighbors");
   }
   plan.info.images[0].r128 = false;
@@ -1052,8 +1054,10 @@ void TestNestedPointerImageTable() {
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Image candidates of one class are padded to a power of two with the root.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.images.size() == std::bit_ceil(count + 1u) &&
+            snapshot.samplers.size() == count + 1u,
         "bounded nested pointer table lost image/sampler candidates or read the GPU selector");
   for (uint32_t row = 0; row < count; ++row)
     Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
@@ -1099,7 +1103,7 @@ void TestNestedPointerImageTable() {
   *at(objects + 0x430u + 0x3d0u) = 10u + count;
   *at(objects + 0x430u + 0x3f8u) = count;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count && snapshot.samplers.size() == count &&
+            snapshot.images.size() == std::bit_ceil(count) && snapshot.samplers.size() == count &&
             snapshot.images[1].dwords[0] == 10u + count && snapshot.samplers[1].dwords[0] == count,
         "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
   *at(table) = objects;
@@ -1111,7 +1115,8 @@ void TestNestedPointerImageTable() {
   *at(static_cast<uint32_t>(memory.watched_address)) = objects;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_reads != 0u && memory.watched_dwords == 1u &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.images.size() == std::bit_ceil(count + 1u) &&
+            snapshot.samplers.size() == count + 1u,
         "partial pointer row was skipped or read beyond its scalar buffer bounds");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
   Check(snapshot.flattened_srt[mapping] == count + 1u &&
@@ -1333,7 +1338,8 @@ void TestIndexedPointerImageTable() {
                           .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  // Six candidates of one class and the root, padded to a power of two.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 8u,
         "indexed pointer/child domain lost candidates or read poisoned child padding");
   const auto captured = [&](uint64_t address, uint64_t bytes) {
     return std::ranges::any_of(snapshot.specialization_reads, [&](const auto& span) {
@@ -1357,7 +1363,7 @@ void TestIndexedPointerImageTable() {
           "nested composite key mixed parent rows or child records");
   const auto original = specialization;
   user_data[2] = 100u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 8u,
         "nested parent enumeration included unreachable poison rows");
   user_data[2] = 2u;
   *at(table) = objects + row_bytes;
@@ -1439,7 +1445,7 @@ void TestIndexedPointerImageTable() {
   *at(table) = objects;
   *at(table + 4u) = 0xbeef0001u;
   *at(count_address) = *at(count_address + 4u) = 2u;
-  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 8u,
         "finite parent choices lost their runtime count and enumerated unavailable rows");
   const auto& counted_indirect = *counted_plan.descriptor_sources[counted_plan.info.images[0].source].indirect_descriptor;
   Check(counted_indirect.table_maximum == 3u && !counted_indirect.key_count.IsEmpty() &&
@@ -1449,7 +1455,7 @@ void TestIndexedPointerImageTable() {
   masked->PlanAndTrack();
   const auto masked_plan = ExtractResourcePlan(masked->program);
   Check(!masked_plan.descriptor_sources[masked_plan.info.images[0].source].indirect_descriptor->key_count.IsEmpty() &&
-            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 8u,
         "inactive preserved selector value discarded the selected lane's runtime count");
   memory.watched_address = high + table;
   for (const uint32_t count : {0u, 1u, 2u, 4u, 5u}) {
@@ -1457,7 +1463,7 @@ void TestIndexedPointerImageTable() {
     counted_data[2] = std::min(count, 4u);
     memory.watched_reads = 0u;
     Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u + 3u * std::min(count, 4u) &&
+              snapshot.images.size() == std::bit_ceil(1u + 3u * std::min(count, 4u)) &&
               (count != 0u || memory.watched_reads == 0u),
           "finite parent count refresh lost candidates, ignored its static cap or read an empty domain");
   }
@@ -7542,6 +7548,169 @@ void TestGpuSelectedFormattedRecordStore() {
   }
 }
 
+// Ghost of Yotei (PPSA26344) CS 0x05ad2860238fcce8 samples T#s at +0 and +32 of
+// 440-byte object records whose row the GPU picks. The rows are enumerated in table
+// order and the scene streams objects in, so candidates of different numeric
+// classes interleave differently from scene to scene. Each class must form one
+// contiguous run padded to a power of two, so a scene with one more texture of a
+// class already present specializes like the scene before it.
+void TestImageTableClassGroupingStability() {
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using T = Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  const auto texture = [](uint32_t identity, F format) {
+    return std::array<uint32_t, 8>{identity, uint32_t(format) << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (uint32_t(T::kColor2D) << 28u),
+        0u, 0u, 0u, 0u};
+  };
+  // The root and its children form runs of one class each: no class appears in two
+  // runs, the root's run comes first and every run (the first one with the root) is
+  // a power of two long, spares included.
+  const auto grouped = [](const ResourceSpecialization &specialization, size_t roots) {
+    std::vector<std::pair<TextureNumericClass, uint32_t>> runs{
+        {specialization.images[0].numeric_class, 1u}};
+    for (size_t image = roots; image < specialization.images.size(); ++image) {
+      const auto type = specialization.images[image].numeric_class;
+      if (type == runs.back().first) ++runs.back().second;
+      else runs.emplace_back(type, 1u);
+    }
+    return std::ranges::all_of(runs, [&](const auto &run) {
+      return std::has_single_bit(run.second) &&
+             std::ranges::count_if(runs, [&](const auto &other) { return other.first == run.first; }) == 1;
+    });
+  };
+
+  // A bounded table of 440-byte records probed every 8 bytes (no static key bound).
+  {
+    auto fixture = MakeIndirectImageFixture(false, 440u, 0u, 32u);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    constexpr uint32_t table = 0x4000u;
+    LinearTestMemory memory;
+    memory.words.resize((table + 16u * 440u - memory.base) / 4u);
+    memory.fail_address = 0x3000u; // The GPU selector stays on the GPU.
+    const auto materialize = [&](std::span<const F> rows,
+                                 ResourceSnapshot &snapshot,
+                                 ResourceSpecialization &specialization) {
+      std::fill(memory.words.begin(), memory.words.end(), 0u);
+      for (uint32_t row = 0; row < rows.size(); ++row) {
+        const auto value = texture(0x100u + row * 0x10u, rows[row]);
+        std::copy(value.begin(), value.end(),
+                  memory.words.begin() +
+                      (table + row * 440u + 32u - memory.base) / 4u);
+      }
+      const std::array<uint32_t, 8> data{0x3000u,
+                                         16u << 16u,
+                                         1u,
+                                         0u,
+                                         table,
+                                         440u << 16u,
+                                         uint32_t(rows.size()),
+                                         0u};
+      const SrtRuntime runtime{.user_data = data,
+                               .userdata = &memory,
+                               .read_specialization_memory =
+                                   ReadLinearTestMemory};
+      if (!MaterializeResources(plan, runtime, snapshot, specialization))
+        return false;
+      // Every row's key still selects that row's T#.
+      const auto mapping = specialization.images[0].indirect_mapping_offset;
+      for (uint32_t row = 0; row < rows.size(); ++row) {
+        const auto ordinal =
+            snapshot.flattened_srt[mapping + 1u + (row * 440u + 32u) / 4u];
+        if (ordinal == 0u ||
+            snapshot.images[plan.info.images.size() - 1u + ordinal].dwords !=
+                texture(0x100u + row * 0x10u, rows[row]))
+          return false;
+      }
+      return true;
+    };
+    // Four float and two uint textures, interleaved; then one more float
+    // texture in the middle of the table.
+    const std::array before{F::k32Float, F::k32UInt,  F::k32Float,
+                            F::k32UInt,  F::k32Float, F::k32Float};
+    const std::array after{F::k32Float, F::k32UInt,  F::k32Float, F::k32Float,
+                           F::k32UInt,  F::k32Float, F::k32Float};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization first, second, third;
+    Check(materialize(before, snapshot, first) &&
+              grouped(first, plan.info.images.size()) &&
+              first.images.size() == plan.info.images.size() + 7u + 2u,
+          "bounded image table did not group its candidates by class into "
+          "power-of-two runs");
+    Check(materialize(after, snapshot, second) && second == first,
+          "one more same-class texture in a bounded image table changed the "
+          "specialization");
+    // A class not present before legitimately changes the program.
+    const std::array signed_row{F::k32Float, F::k32UInt, F::k32Float,
+                                F::k32Float, F::k32UInt, F::k32Float,
+                                F::k32SInt};
+    Check(
+        materialize(signed_row, snapshot, third) && third != first &&
+            grouped(third, plan.info.images.size()),
+        "a new candidate class did not re-specialize the bounded image table");
+  }
+
+  // A key-list table of 32 T#s (a five-bit key): the root is row 0's texture.
+  {
+    auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false,
+                                            ValueOpcode::ImageSampleRaw, true);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    // Rows past the scene repeat its first texture.
+    const auto row_texture = [&](std::span<const F> rows, uint32_t row) {
+      return row < rows.size() ? texture(0x100u + row * 0x10u, rows[row])
+                               : texture(0x100u, rows[0]);
+    };
+    const auto materialize = [&](std::span<const F> rows,
+                                 ResourceSpecialization &specialization) {
+      std::fill(memory.words.begin(), memory.words.end(), 0u);
+      for (uint32_t row = 0; row < 32u; ++row) {
+        const auto value = row_texture(rows, row);
+        std::copy(value.begin(), value.end(),
+                  memory.words.begin() + (0x2000u - memory.base) / 4u +
+                      row * 8u);
+      }
+      const std::array<uint32_t, 8> data{0x3000u, 4u << 16u, 32u, 0u,
+                                         0x2000u, 0u,        0u,  0u};
+      const SrtRuntime runtime{.user_data = data,
+                               .userdata = &memory,
+                               .read_specialization_memory =
+                                   ReadLinearTestMemory};
+      ResourceSnapshot snapshot;
+      if (!MaterializeResources(plan, runtime, snapshot, specialization))
+        return false;
+      const auto mapping = specialization.images[0].indirect_mapping_offset;
+      for (uint32_t row = 0; row < 32u; ++row) {
+        const auto ordinal = snapshot.flattened_srt[mapping + 2u + row * 2u];
+        const auto image =
+            ordinal == 0u ? 0u : plan.info.images.size() - 1u + ordinal;
+        if (snapshot.flattened_srt[mapping + 1u + row * 2u] != row ||
+            snapshot.images[image].dwords != row_texture(rows, row))
+          return false;
+      }
+      return true;
+    };
+    const std::array before{F::k32UInt, F::k32Float, F::k32UInt, F::k32Float,
+                            F::k32Float};
+    const std::array after{F::k32UInt, F::k32Float, F::k32Float,
+                           F::k32UInt, F::k32Float, F::k32Float};
+    ResourceSpecialization first, second;
+    Check(materialize(before, first) &&
+              grouped(first, plan.info.images.size()) &&
+              first.images[0].numeric_class == TextureNumericClass::Uint &&
+              first.images[plan.info.images.size()].numeric_class ==
+                  TextureNumericClass::Uint,
+          "key-list image table did not lead with the root's class or group "
+          "its candidates");
+    Check(materialize(after, second) && second == first,
+          "one more same-class texture in a key-list image table changed the "
+          "specialization");
+  }
+}
+
 // Ghost of Yotei (PPSA26344) CS 0x8457901d80b91921: a wave-uniform object key
 // selects one record of a 592-byte table that holds a store V# (+448) and an
 // object pointer (+0) whose T# and S# the shader samples. Both enumerate the
@@ -9563,6 +9732,8 @@ int main() {
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("record table specialization stability",
         TestRecordTableSpecializationStability);
+    Run("image table class grouping stability",
+        TestImageTableClassGroupingStability);
     Run("structured buffer stride specialization",
         TestStructuredBufferStrideSpecialization);
     Run("finite buffer selection", TestFiniteBufferSelection);
