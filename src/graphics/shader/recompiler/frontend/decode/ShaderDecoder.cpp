@@ -620,6 +620,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
