@@ -115,6 +115,9 @@ struct ImageInfo {
 	uint64_t                      tiled_slice_stride = 0;
 	uint32_t                      first_tail_level   = 16;
 
+	// Null when the layout was computed; otherwise what the description lacks, and the layout
+	// fields are unspecified. UpdateSize exits on a failure.
+	[[nodiscard]] const char*                      TryUpdateSize();
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] ImageLinearLayout                LinearLayout() const;
