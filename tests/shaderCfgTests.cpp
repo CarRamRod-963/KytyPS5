@@ -8624,6 +8624,130 @@ void TestStructuredBufferStrideIsRuntimeData() {
         "a zero V# stride lost its own specialization");
 }
 
+void TestUnboundBufferSharesTypedSpecialization() {
+  namespace IR = ShaderRecompiler::IR;
+  // buffer_load_format_x v2, v0, s[0:3] idxen; buffer_store_dword v2, v0,
+  // s[4:7] idxen
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x00),    EncodeMubuf1(2, 0, 0), EncodeMubuf0(0x1c),
+      EncodeMubuf1(2, 1, 0), 0xbf810000u,
+  };
+  // The format reads X only: a constant-one W selector is never read.
+  const auto load_word3 =
+      DstSel(4, 0, 0, 1) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 12u);
+  const auto store_word3 =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u);
+  const std::array<uint32_t, 4> typed_load{0x10000u, 4u << 16u, 64u,
+                                           load_word3};
+  const std::array<uint32_t, 4> typed_store{0x20000u, 16u << 16u, 64u,
+                                            store_word3};
+  const std::array<uint32_t, 4> null{};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto translate = [&] {
+    return ShaderRecompiler::TranslateProgram(shader, options);
+  };
+  const auto plan = IR::ExtractResourcePlan(translate().program);
+  const auto materialize = [&](const std::array<uint32_t, 4> &load,
+                               const std::array<uint32_t, 4> &store) {
+    std::array<uint32_t, 8> user_data{};
+    std::copy(load.begin(), load.end(), user_data.begin());
+    std::copy(store.begin(), store.end(), user_data.begin() + 4);
+    const IR::SrtRuntime runtime{.user_data = user_data};
+    IR::ResourceSnapshot snapshot;
+    IR::ResourceSpecialization specialization;
+    Check(IR::MaterializeResources(plan, runtime, snapshot, specialization),
+          "buffer resources did not materialize");
+    return specialization;
+  };
+  const auto typed = materialize(typed_load, typed_store);
+  const auto null_load = materialize(null, typed_store);
+  const auto null_both = materialize(null, null);
+  Check(typed.buffers.size() == 2u && !typed.buffers[0].unbound &&
+            null_load.buffers[0].unbound && !null_load.buffers[1].unbound &&
+            null_load != typed && null_both.buffers[1].unbound,
+        "a null V# was not specialized as an unbound buffer");
+  // Every V# the renderer binds as the null buffer is unbound, and any layout
+  // reading zero out of bounds serves it.
+  const std::array<uint32_t, 4> no_records{0x10000u, 4u << 16u, 0u, load_word3};
+  const std::array<uint32_t, 4> no_base{0u, 4u << 16u, 64u, load_word3};
+  const auto empty = materialize(no_records, typed_store);
+  const auto baseless = materialize(no_base, typed_store);
+  Check(empty.buffers[0].unbound && baseless.buffers[0].unbound &&
+            IR::SpecializationServes(plan, typed, empty) &&
+            IR::SpecializationServes(plan, typed, baseless) &&
+            IR::SpecializationServes(plan, null_load, empty) &&
+            IR::SpecializationServes(plan, empty, null_load) &&
+            IR::SpecializationServes(plan, empty, typed),
+        "V#s without records or base were not served as unbound buffers");
+  // A typed module serves the unbound case; an unbound module never serves a
+  // typed buffer.
+  Check(IR::SpecializationServes(plan, typed, null_load) &&
+            IR::SpecializationServes(plan, typed, null_both) &&
+            !IR::SpecializationServes(plan, null_load, typed) &&
+            !IR::SpecializationServes(plan, null_both, null_load),
+        "typed and unbound buffer specializations were matched wrongly");
+  // A read constant-one selector makes the typed out-of-bounds value nonzero.
+  auto one_load = typed_load;
+  one_load[3] = DstSel(1, 0, 0, 0) |
+                (static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 12u);
+  const auto one = materialize(one_load, typed_store);
+  Check(!IR::SpecializationServes(plan, one, null_load),
+        "a typed buffer reading constant one served an unbound buffer");
+  // ... and an unbound V# reading constant one keeps its format and swizzle.
+  auto one_empty = one_load;
+  one_empty[2] = 0u;
+  const auto one_unbound = materialize(one_empty, typed_store);
+  Check(one_unbound.buffers[0].unbound &&
+            one_unbound.buffers[0].descriptor_swizzle == DstSel(1, 0, 0, 0) &&
+            !IR::SpecializationServes(plan, typed, one_unbound) &&
+            !IR::SpecializationServes(plan, null_load, one_unbound) &&
+            IR::SpecializationServes(plan, one, one_unbound) &&
+            IR::SpecializationServes(plan, one_unbound, one),
+        "an unbound buffer reading constant one lost its out-of-bounds value");
+
+  // The pipeline cache: null, typed, null, typed toggles compile two modules
+  // when the null case comes first and one when the typed case does; with
+  // independent toggles the unbound buffers adopt the typed layouts compiled
+  // so far.
+  const auto count_modules =
+      [&](const std::vector<IR::ResourceSpecialization> &sequence) {
+        std::vector<IR::ResourceSpecialization> modules;
+        for (const auto &current : sequence) {
+          if (std::ranges::any_of(modules, [&](const auto &compiled) {
+                return IR::SpecializationServes(plan, compiled, current);
+              }))
+            continue;
+          auto compiled = current;
+          for (auto it = modules.rbegin(); it != modules.rend(); ++it)
+            IR::AdoptServingBuffers(plan, compiled, *it);
+          modules.push_back(compiled);
+        }
+        return modules.size();
+      };
+  const auto null_store = materialize(typed_load, null);
+  Check(count_modules({null_load, typed, null_load, typed}) == 2u &&
+            count_modules({typed, null_load, typed, null_both}) == 1u &&
+            count_modules({null_both, null_load, null_store, typed, null_both,
+                           null_store}) == 3u,
+        "unbound buffers did not reuse typed modules");
+
+  // Both modules validate. The typed one keeps its runtime bounds checks
+  // (OpArrayLength), which the renderer's null binding makes fail for every
+  // access; the unbound one folds the load to zero.
+  const auto typed_module =
+      ShaderRecompiler::CompileProgram(translate(), options, typed, 0u);
+  const auto null_module =
+      ShaderRecompiler::CompileProgram(translate(), options, null_load, 0u);
+  CheckSpirvBinaryValidates(typed_module.spirv);
+  CheckSpirvBinaryValidates(null_module.spirv);
+  Check(SpirvContainsOpcode(typed_module.spirv, 68) &&
+            null_module.spirv != typed_module.spirv &&
+            !null_module.program.info.buffers[0].runtime_stride,
+        "typed and unbound buffer modules did not keep their access forms");
+}
+
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
@@ -16995,6 +17119,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestStructuredBufferStrideIsRuntimeData();
+  TestUnboundBufferSharesTypedSpecialization();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
