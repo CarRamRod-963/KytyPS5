@@ -261,6 +261,10 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+	bindings.memory_strides =
+	    std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
+		    return buffer.runtime_stride && buffer.descriptor_index != UINT32_MAX;
+	    });
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
