@@ -347,7 +347,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	r.image_id  = cache.FindImage(r.desc, false, m_depth_target_lookup);
 	BindRenderTarget(r.image_id);
 }
 
