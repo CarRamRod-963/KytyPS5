@@ -121,7 +121,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		// The shader adds the byte offset to every address and bounds it by the binding, so an
+		// offset of the whole range makes every access out of bounds: loads read the
+		// out-of-bounds value and stores are dropped, as for a V# without records.
+		constexpr uint32_t NullRange = 16;
+		buffer_offset                = NullRange;
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, NullRange};
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
