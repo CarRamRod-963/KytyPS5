@@ -154,6 +154,44 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	return representative;
 }
 
+namespace {
+
+// Loads the 16-bit stride word of a buffer binding (a SPIR-V id) from the shader data.
+uint32_t EmitMemoryStrideAt(EmitterState& state, uint32_t binding) {
+	const auto& bindings = state.program.bindings;
+	const auto  start    = bindings.MemoryStrideDword() +
+	                       (bindings.UsesPushData() ? bindings.push_data_start_dword : 0u);
+	const auto  word     = EmitShaderDataDwordLoadAt(
+	    state, EmitAddU32(state, ConstantU32(state, start),
+	                      Binary(state, spv::OpShiftRightLogical, TypeU32(state), binding,
+	                             ConstantU32(state, 1))));
+	const auto shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), binding, ConstantU32(state, 1)),
+	           ConstantU32(state, 4));
+	return EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(state, word, shift,
+	                                                          ConstantU32(state, 16u));
+}
+
+} // namespace
+
+uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess* access) {
+	const auto  packed = StorageBufferPackedStride(state, mem);
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	if (!buffer.runtime_stride) return ConstantU32(state, packed & 0x3fffu);
+	if (access != nullptr && access->stride != 0u) return access->stride;
+	const auto binding = buffer.descriptor_index;
+	if (binding == UINT32_MAX || !state.program.bindings.memory_strides) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer stride word was not laid out");
+	}
+	if (binding < state.memory_strides.size() && state.memory_strides[binding] != 0u) {
+		return state.memory_strides[binding];
+	}
+	return EmitMemoryStrideAt(state, ConstantU32(state, binding));
+}
+
 void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
@@ -177,6 +215,27 @@ void EmitMemoryBindings(EmitterState& state) {
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 			state.memory_byte_sizes[i + lane] =
 			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
+		}
+	}
+	state.memory_strides.assign(count, 0u);
+	if (!state.program.bindings.memory_strides) return;
+	std::vector<bool> runtime_strides(count);
+	for (const auto& buffer: state.program.info.buffers) {
+		if (buffer.runtime_stride && buffer.descriptor_index != UINT32_MAX &&
+		    !dynamic_offsets[buffer.descriptor_index])
+			runtime_strides[buffer.descriptor_index] = true;
+	}
+	for (uint32_t i = 0; i < count; i += 2u) {
+		const auto lanes = std::min(2u, count - i);
+		if (std::none_of(runtime_strides.begin() + i, runtime_strides.begin() + i + lanes,
+		                 [](bool runtime) { return runtime; }))
+			continue;
+		const auto word =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.MemoryStrideDword() + i / 2u);
+		for (uint32_t lane = 0; lane < lanes; ++lane) {
+			if (!runtime_strides[i + lane]) continue;
+			state.memory_strides[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 16u), ConstantU32(state, 16u));
 		}
 	}
 }
@@ -272,6 +331,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    state, word, shift, ConstantU32(state, 8));
 		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
+		if (mem.kind == IR::ResourceKind::Buffer &&
+		    state.program.info.buffers.at(mem.resource).runtime_stride) {
+			access.stride = EmitMemoryStrideAt(state, array_index);
+		}
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
 		access.length      = state.memory_byte_sizes[static_index];

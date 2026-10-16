@@ -1918,6 +1918,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
         offset << ((index % 4u) * 8u);
   }
+  ShaderRecompiler::IR::FillBufferStrides(result.program.info,
+                                          result.program.bindings, resources,
+                                          packed_user_data);
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
 }
@@ -2040,6 +2043,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::FillBufferStrides(result.program.info,
+                                          result.program.bindings, resources,
+                                          packed_user_data);
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
 }
@@ -44233,6 +44239,9 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
           compiled.packed_user_data[compiled.program.bindings.memory_offset_dword + binding / 4u] |=
               prefix << ((binding % 4u) * 8u);
       }
+      ShaderRecompiler::IR::FillBufferStrides(
+          compiled.program.info, compiled.program.bindings, compiled.resources,
+          compiled.packed_user_data);
       auto output_buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
       vulkan.Dispatch(test, compiled, output_buffer);
       CompareWords(test, "row keys, mixed formats, empty-One, partial payloads, prefixes and byte canaries",
@@ -47027,6 +47036,9 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.program.wave_size = wave_size;
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ShaderRecompiler::IR::FillBufferStrides(
+          compiled.program.info, compiled.program.bindings, compiled.resources,
+          compiled.packed_user_data);
       ValidateSpirv(test.name, compiled.spirv);
       const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
       const auto image_opcode = fetch ? "OpImageFetch" : gather ? "OpImageGather"
@@ -47244,6 +47256,9 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.program.wave_size = wave_size;
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ShaderRecompiler::IR::FillBufferStrides(
+          compiled.program.info, compiled.program.bindings, compiled.resources,
+          compiled.packed_user_data);
       ValidateSpirv(test.name, compiled.spirv);
       const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
       Require(test.name, "native array writes per dimension and swizzle run",
