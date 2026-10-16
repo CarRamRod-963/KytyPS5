@@ -1599,6 +1599,66 @@ static bool DerivePlanState(ResourcePlan& plan) {
 	return true;
 }
 
+// Whether every formatted untyped read of a base buffer returns zero out of bounds: only a
+// constant-one selector makes an out-of-bounds component nonzero. A plan without component
+// masks counts every component.
+static bool FormattedOutOfBoundsZero(const ResourcePlan& program, uint32_t resource,
+                                     uint32_t swizzle) {
+	const uint32_t components = resource < program.formatted_components.size()
+	                                ? program.formatted_components[resource]
+	                                : 0xfu;
+	for (uint32_t component = 0; component < 4u; ++component) {
+		if (((components >> component) & 1u) != 0u && GetDstSel(swizzle, component) == 1u)
+			return false;
+	}
+	return true;
+}
+
+// Whether a module compiled with `compiled` behaves as one compiled with `current`. The flag
+// itself never changes the module, so the same layout always does. An unbound buffer is bound as
+// the null buffer behind an offset past its end, so every access of any layout misses: loads
+// read the out-of-bounds value, stores and atomics are dropped. Another layout of a direct
+// buffer therefore behaves identically whenever both layouts read zero out of bounds.
+static bool ServesBuffer(const ResourcePlan& program, uint32_t resource,
+                         const ResourceSpecialization::Buffer& compiled,
+                         const ResourceSpecialization::Buffer& current) {
+	auto layout    = compiled;
+	layout.unbound = current.unbound;
+	if (layout == current) return true;
+	return current.unbound && resource < program.info.buffers.size() &&
+	       compiled.indirect_root == BufferResource::NoIndirectBuffer &&
+	       current.indirect_root == BufferResource::NoIndirectBuffer &&
+	       compiled.indirect_mapping_offset == current.indirect_mapping_offset &&
+	       compiled.indirect_search_iterations == current.indirect_search_iterations &&
+	       FormattedOutOfBoundsZero(program, resource, compiled.descriptor_swizzle) &&
+	       FormattedOutOfBoundsZero(program, resource, current.descriptor_swizzle);
+}
+
+bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
+                          const ResourceSpecialization& current) {
+	if (compiled.buffers.size() != current.buffers.size() || compiled.images != current.images ||
+	    compiled.samplers != current.samplers)
+		return false;
+	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
+		if (compiled.buffers[i] != current.buffers[i] &&
+		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i]))
+			return false;
+	}
+	return true;
+}
+
+void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& target,
+                         const ResourceSpecialization& donor) {
+	if (donor.buffers.size() != target.buffers.size()) return;
+	for (uint32_t i = 0; i < target.buffers.size(); ++i) {
+		if (target.buffers[i].unbound && !donor.buffers[i].unbound &&
+		    ServesBuffer(program, i, donor.buffers[i], target.buffers[i])) {
+			target.buffers[i]         = donor.buffers[i];
+			target.buffers[i].unbound = true;
+		}
+	}
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1607,6 +1667,16 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.formatted_components.assign(program.info.buffers.size(), 0u);
+	for (const auto& memory: program.memory_info) {
+		if (memory.kind != ResourceKind::Buffer || !memory.formatted || memory.typed ||
+		    memory.resource >= plan.formatted_components.size())
+			continue;
+		const auto end = std::min(
+		    memory.component_index + std::max(memory.data_dwords, memory.component_count), 4u);
+		for (uint32_t component = memory.component_index; component < end; ++component)
+			plan.formatted_components[memory.resource] |= static_cast<uint8_t>(1u << component);
+	}
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
@@ -1912,6 +1982,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		// The renderer binds a direct V# without base or records as the null buffer, which every
+		// access misses, so other layouts of the buffer can serve it (see SpecializationServes).
+		buffer.unbound = i < program.info.buffers.size() &&
+		                 buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+		                 !Source(program, base.source)->indirect_descriptor.has_value() &&
+		                 (descriptor.Base48() == 0u || descriptor.GetSize() == 0u);
 	}
 	// A spare candidate is never selected; it takes the layout of the first real candidate so
 	// that candidates sharing one layout keep a single dynamically indexed access.
@@ -2402,14 +2478,15 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 // Binds every plan field: one added later fails to compile here until it is stored or derived.
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
-	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	       selector_groups, control_flow, control_phis, srt_reads, source_reads, formatted_components,
+	       capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
 	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
-	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
-	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);
+	      selector_groups, control_flow, srt_reads, source_reads, formatted_components,
+	      capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info,
+	      uniform_fill);
 }
 
 } // namespace

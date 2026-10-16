@@ -19,6 +19,9 @@ struct ResourceSpecialization {
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;
+		// A direct V# the renderer binds as the null buffer (no base or no records), where every
+		// access is out of bounds. It never changes the module; SpecializationServes uses it.
+		bool                   unbound                         = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
@@ -65,6 +68,18 @@ bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePl
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
+// Whether a module compiled for `compiled` behaves exactly as one compiled for `current`
+// would. Equal layouts do; so does any layout of an unbound direct buffer when both layouts read
+// zero out of bounds, since an unbound buffer is bound so that every access is out of bounds
+// (loads read the out-of-bounds value, stores and atomics are dropped).
+bool SpecializationServes(const ResourcePlan& program, const ResourceSpecialization& compiled,
+                          const ResourceSpecialization& current);
+
+// Gives the unbound buffers of `target` the bound layouts of `donor` that serve them, so a
+// module compiled for `target` also serves those bound cases.
+void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& target,
+                         const ResourceSpecialization& donor);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
