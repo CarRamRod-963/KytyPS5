@@ -785,6 +785,40 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					}
 					return true;
 				}
+				// Children behind parent pointers the GPU reads are whatever those pointers lead
+				// to in this draw (Ghost of Yotei's material records: 4 instance rows x 255
+				// layers), so a large domain is not enumerated: its program would bake the
+				// candidates and recompile for every material. The renderer resolves the keys the
+				// GPU asks for; key = row * child count + child is the heap's record * layer_count
+				// + layer.
+				if (pointer != nullptr && dword_count == 8u && read_dwords == 8u &&
+				    child_count != 0u && count * child_count > BindlessTableKeys &&
+				    image.resource_class == ImageResourceClass::Sampled && !image.written &&
+				    !image.atomic && !image.depth_compare && !image.cube &&
+				    image.dimension == Decoder::ImageDimension::Dim2D && step != 0u &&
+				    step <= UINT32_MAX && count * step <= UINT32_MAX && first <= UINT32_MAX - 8u &&
+				    (first & 3u) == 0u && (pointer->offset & 3u) == 0u &&
+				    (pointer->stride & 3u) == 0u) {
+					const auto mapping_offset = snapshot.flattened_srt.size();
+					snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+					snapshot.bindless_uses.push_back(
+					    {.resource       = resource_index,
+					     .base           = table_base,
+					     .size           = count * step,
+					     .record_stride  = static_cast<uint32_t>(step),
+					     .pointer_offset = static_cast<uint32_t>(first),
+					     .table_offset   = pointer->offset,
+					     .layer_stride   = pointer->stride,
+					     .layer_count    = child_count,
+					     .mapping_offset = static_cast<uint32_t>(mapping_offset)});
+					descriptors[resource_index]     = {.dword_count = dword_count};
+					auto& root                      = specializations[resource_index];
+					root.indirect_root              = resource_index;
+					root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+					root.indirect_search_iterations = 0u;
+					root.bindless                   = true;
+					return true;
+				}
 			}
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
