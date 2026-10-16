@@ -219,6 +219,9 @@ private:
 		TextureCache::LayoutStamp stamp;
 	};
 	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
+	// Render-target image lookups per color slot and for depth (TextureCache::ImageLookup).
+	std::array<TextureCache::ImageLookup, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_lookups;
+	TextureCache::ImageLookup                                           m_depth_target_lookup;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
