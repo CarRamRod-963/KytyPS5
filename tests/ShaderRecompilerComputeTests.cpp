@@ -8040,6 +8040,81 @@ public:
               "invalidation failed to refresh the native image");
       DestroyBuffer(&fault_readback);
 
+      // A CPU write beside a multi-page image unwatches only the page the
+      // image shares with it. Later stores into the image's own bytes on that
+      // page no longer fault, so the image must stay maybe-dirty until a
+      // refresh compares its edges, at both ends.
+      constexpr uint64_t edge_image_offset = 0x2e00800;
+      constexpr uint64_t edge_image_bytes = 0x4000;
+      constexpr uint32_t edge_old = 0x0ed90001u;
+      constexpr uint32_t edge_new = 0x0ed90002u;
+      for (uint64_t offset = 0; offset < edge_image_bytes;
+           offset += sizeof(edge_old)) {
+        std::memcpy(memory + edge_image_offset + offset, &edge_old,
+                    sizeof(edge_old));
+      }
+      auto edge_desc =
+          MakeLinearDesc(base + edge_image_offset, edge_image_bytes,
+                         vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                         Prospero::ImageType::kColor2D, {64, 64, 1}, 1, 4, 1);
+      const auto edge_image = texture_cache.FindImage(edge_desc);
+      (void)texture_cache.FindTexture(edge_image, edge_desc);
+      Require(name, "edge-page image watch",
+              texture_cache.GetImage(edge_image).IsTracked() &&
+                  !texture_cache.GetImage(edge_image).IsCpuDirty(),
+              "the multi-page image was not watched after its upload");
+      struct EdgeCase {
+        const char *step;
+        uint64_t beside;
+        uint64_t inside;
+      };
+      const EdgeCase edge_cases[] = {
+          {"head", edge_image_offset - 0x700, edge_image_offset + 0x10},
+          {"tail", edge_image_offset + edge_image_bytes + 0x100,
+           edge_image_offset + edge_image_bytes - sizeof(edge_new)},
+      };
+      vk::BufferImageCopy edge_copy{};
+      edge_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      edge_copy.imageExtent = {64, 64, 1};
+      for (const auto &edge : edge_cases) {
+        Require(
+            name, edge.step,
+            resources.HandleFault(PageFaultAccess::Write, base + edge.beside) &&
+                texture_cache.GetImage(edge_image).IsTracked() &&
+                texture_cache.GetImage(edge_image).IsMaybeCpuDirty() &&
+                !texture_cache.GetImage(edge_image).IsDefinitelyCpuDirty(),
+            std::string("a write beside the image's ") + edge.step +
+                " page left the unwatched image bytes trusted");
+        Libs::LibKernel::Memory::WriteBacking(base + edge.inside, &edge_new,
+                                              sizeof(edge_new));
+        const auto edge_refreshed = texture_cache.FindImage(edge_desc);
+        (void)texture_cache.FindTexture(edge_refreshed, edge_desc);
+        texture_cache.UpdateImage(edge_refreshed);
+        Require(
+            name, edge.step,
+            edge_refreshed == edge_image &&
+                texture_cache.GetImage(edge_image).IsTracked() &&
+                !texture_cache.GetImage(edge_image).IsCpuDirty(),
+            std::string("the image did not refresh after a store into its ") +
+                edge.step + " page");
+      }
+      auto edge_readback = CreateHostBuffer(
+          name, edge_image_bytes, vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(edge_image_bytes / sizeof(u32), 0));
+      texture_cache.GetImage(edge_image)
+          .Download({&edge_copy, 1}, edge_readback.buffer, 0, edge_image_bytes);
+      HostReadBarrier(edge_readback.buffer, edge_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto edge_texels =
+          ReadBuffer(name, edge_readback, edge_image_bytes / sizeof(u32));
+      Require(name, "edge-page refresh contents",
+              edge_texels[0x10 / sizeof(u32)] == edge_new &&
+                  edge_texels.back() == edge_new && edge_texels[1] == edge_old,
+              "the image kept stale bytes from an unwatched edge page");
+      DestroyBuffer(&edge_readback);
+
       constexpr uint64_t publish_image_offset = 0x26000;
       constexpr uint64_t publish_buffer_offset = 0x26010;
       constexpr uint32_t publish_image_value = 0x31415926u;
