@@ -569,7 +569,8 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
-		if (!entry->second.permutations.empty() && graphics_debug_dump_enabled()) {
+		// One line per re-translation (never per draw), so it is always on.
+		if (!entry->second.permutations.empty()) {
 			LogPermutationDifference(stage_name, params.hash,
 			                         entry->second.permutations.back().specialization,
 			                         entry->second.specialization);
