@@ -162,6 +162,17 @@ static_assert(!HasPolicyTileImageBacking<TileManager>);
 static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
+// A cached image serves a request only when its mips and its layers each cover
+// it; the lexicographic ordering let a 4-mip single-layer image pass for a
+// 16-layer request.
+static_assert(!ImageSubresources{4, 1}.Covers(ImageSubresources{1, 16}));
+static_assert(!ImageSubresources{1, 16}.Covers(ImageSubresources{4, 1}));
+static_assert(ImageSubresources{4, 16}.Covers(ImageSubresources{4, 1}));
+static_assert(ImageSubresources{4, 16}.Covers(ImageSubresources{1, 16}));
+static_assert(ImageSubresources{2, 6}.Covers(ImageSubresources{2, 6}));
+static_assert(!ImageSubresources{2, 6}.Covers(ImageSubresources{3, 6}));
+static_assert(!ImageSubresources{2, 6}.Covers(ImageSubresources{2, 7}));
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
