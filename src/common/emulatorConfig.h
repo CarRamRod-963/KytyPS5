@@ -88,6 +88,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
+	bool                   async_pipelines_enabled     = true;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
@@ -156,6 +157,7 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
+bool AsyncPipelinesEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool TrophyEnabled();
