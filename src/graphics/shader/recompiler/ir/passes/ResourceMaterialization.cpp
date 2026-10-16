@@ -70,6 +70,25 @@ bool NullBufferDescriptor(Value value) {
 	return true;
 }
 
+// A texture can only be placed at a base aligned to its tile block; a table record that is not
+// (stale or unrelated data) is not a texture the shader samples.
+bool PlaceableImageDescriptor(const DescriptorValue& descriptor) {
+	const auto base =
+	    ((descriptor.dwords[0] | (uint64_t {descriptor.dwords[1]} << 32u)) & 0xFFFFFFFFFFull) << 8u;
+	uint64_t alignment = 0;
+	switch (static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu)) {
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B: alignment = 256u; break;
+		case Prospero::TileMode::kStandard4KB: alignment = 4096u; break;
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget: alignment = 65536u; break;
+		default: return false;
+	}
+	return (base & (alignment - 1u)) == 0u;
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -1655,6 +1674,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            !PlaceableImageDescriptor(value) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
