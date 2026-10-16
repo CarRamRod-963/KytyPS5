@@ -18663,9 +18663,10 @@ public:
         scheduler.Finish();
         return ReadBuffer(name, stencil_readback, extent * extent / 4);
       };
-      const std::array stencil_pipelines{
-          pipeline(true, 2, 2, false, true).pipeline,
-          pipeline(true, 2, 2, false, false).pipeline};
+      // Cached pipelines are compared by identity: a background optimized build
+      // may replace the handle of a pipeline first built unoptimized.
+      const std::array stencil_pipelines{&pipeline(true, 2, 2, false, true),
+                                         &pipeline(true, 2, 2, false, false)};
       const auto check_stencil = [&](const char *label, bool back_face,
                                      uint8_t initial, uint8_t written) {
         vk::ClearValue clear{};
@@ -18675,7 +18676,7 @@ public:
              0, 1, 0, 1}, clear);
         const auto &selected = pipeline(true, 2, 2, false, !back_face);
         Require(name, "dynamic stencil pipeline reuse",
-                selected.pipeline == stencil_pipelines[back_face],
+                &selected == stencil_pipelines[back_face],
                 "stencil enable, operations or references changed the graphics pipeline");
         draw(selected);
         const auto result = read_stencil();
@@ -18920,7 +18921,7 @@ public:
         float alpha;
       };
       uint64_t broadcast_program = 0;
-      vk::Pipeline broadcast_pipeline{};
+      const PipelineCache::Pipeline *broadcast_pipeline = nullptr;
       for (const auto test : {
           AlphaBlendCase{false, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
           AlphaBlendCase{true, Prospero::BlendFactor::kSrcAlpha, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
@@ -18942,10 +18943,10 @@ public:
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
                   broadcast_program == 0 || (programs.pixel.id == broadcast_program &&
-                                              selected.pipeline == broadcast_pipeline),
+                                              &selected == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
           broadcast_program = programs.pixel.id;
-          broadcast_pipeline = selected.pipeline;
+          broadcast_pipeline = &selected;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
         draw(selected, 3, std::bit_cast<std::array<u32, 4>>(destination));

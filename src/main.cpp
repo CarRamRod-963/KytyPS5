@@ -95,6 +95,10 @@ static void PrintUsage() {
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf(
+	    "  --no-async-pipelines                 Build missing pipelines optimized at once,\n"
+	    "                                       not unoptimized first with an optimized build\n"
+	    "                                       in the background.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -214,6 +218,7 @@ static constexpr Flag FLAGS[] = {
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
+    {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
