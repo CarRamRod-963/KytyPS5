@@ -39740,9 +39740,16 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
                     std::vector<std::pair<uint64_t, uint64_t>>{{count_address, 4}},
             "count refresh repeated a memory read or retained an old descriptor capacity");
     if (count == 0) initial_specialization = specialization;
-    Require(test.name, "capacity is not specialization",
-            specialization == initial_specialization,
-            "changing record capacity would recompile the cached shader");
+    // A V# without records is bound as the null buffer (`unbound`), which never
+    // changes the module: the permutation compiled for either capacity serves
+    // the other.
+    Require(
+        test.name, "capacity is not specialization",
+        SpecializationServes(plan, initial_specialization, specialization) &&
+            SpecializationServes(plan, specialization,
+                                 initial_specialization) &&
+            specialization.buffers[2].unbound == (records == 0u),
+        "changing record capacity would recompile the cached shader");
     test.initial.assign(5 + 5 * records, 0xdeadbeefu);
     for (const u32 threads : {2u, 3u, 65u}) {
       test.initial[1] = count;

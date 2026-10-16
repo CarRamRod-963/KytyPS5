@@ -303,9 +303,11 @@ struct PipelineCache::ProgramCache {
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
-				    candidate.specialization != specialization) {
+				if (layout.push_data_start_dword !=
+				        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                 layout.ShaderDataDwords()) ||
+				    !ShaderRecompiler::IR::SpecializationServes(
+				        resource_plan, candidate.specialization, specialization)) {
 					continue;
 				}
 				if constexpr (HasCalls) {
@@ -360,12 +362,15 @@ struct PipelineCache::ProgramCache {
 			const auto& b = now.buffers[i];
 			if (a == b) continue;
 			LOGF("Permutation: %s %016" PRIx64 " buffer %zu stride %u->%u format %u->%u swizzle "
-			     "%u->%u zero_oob %d->%d root %u->%u mapping %u->%u iterations %u->%u\n",
+			     "%u->%u zero_oob %d->%d scalar_empty %d->%d unbound %d->%d root %u->%u mapping "
+			     "%u->%u iterations %u->%u\n",
 			     stage_name, hash, i, a.packed_stride, b.packed_stride,
-			     static_cast<uint32_t>(a.descriptor_format), static_cast<uint32_t>(b.descriptor_format),
-			     a.descriptor_swizzle, b.descriptor_swizzle, a.zero_stride_oob ? 1 : 0,
-			     b.zero_stride_oob ? 1 : 0, a.indirect_root, b.indirect_root,
-			     a.indirect_mapping_offset, b.indirect_mapping_offset, a.indirect_search_iterations,
+			     static_cast<uint32_t>(a.descriptor_format),
+			     static_cast<uint32_t>(b.descriptor_format), a.descriptor_swizzle,
+			     b.descriptor_swizzle, a.zero_stride_oob ? 1 : 0, b.zero_stride_oob ? 1 : 0,
+			     a.scalar_empty ? 1 : 0, b.scalar_empty ? 1 : 0, a.unbound ? 1 : 0,
+			     b.unbound ? 1 : 0, a.indirect_root, b.indirect_root, a.indirect_mapping_offset,
+			     b.indirect_mapping_offset, a.indirect_search_iterations,
 			     b.indirect_search_iterations);
 			return;
 		}
@@ -575,8 +580,17 @@ struct PipelineCache::ProgramCache {
 			                         entry->second.permutations.back().specialization,
 			                         entry->second.specialization);
 		}
+		// Unbound buffers take the typed layouts already compiled for them, so this module also
+		// serves those bound cases.
+		auto specialization = entry->second.specialization;
+		for (auto it = entry->second.permutations.rbegin(); it != entry->second.permutations.rend();
+		     ++it) {
+			if (std::ranges::equal(it->function_code, entry->second.FunctionCode()))
+				ShaderRecompiler::IR::AdoptServingBuffers(entry->second.resource_plan,
+				                                          specialization, it->specialization);
+		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
