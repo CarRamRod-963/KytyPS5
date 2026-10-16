@@ -729,6 +729,8 @@ struct ResourcePlan {
 	// the runtime's readers. Falls back to the interpreter when a run fails.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_general_code;
 	mutable std::vector<uint8_t>          jit_visited;
+	// The block graph has a cycle: the compiled walker runs the interpreter's fixpoint.
+	bool jit_loops = false;
 	// Memo arrays of the compiled walker's EXEC-factor assumptions: plain and clean.
 	uint32_t                                                   jit_assumptions = 0;
 	mutable std::vector<std::vector<EvaluationContext::Entry>> jit_assume_values;
