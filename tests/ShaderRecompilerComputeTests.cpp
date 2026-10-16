@@ -21458,6 +21458,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_LOAD_SSHORT:
   case Opcode::BUFFER_LOAD_SHORT_D16:
   case Opcode::BUFFER_LOAD_SHORT_D16_HI:
+  case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+  case Opcode::BUFFER_LOAD_SBYTE_D16:
+  case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
   case Opcode::BUFFER_LOAD_DWORDX2:
   case Opcode::BUFFER_LOAD_DWORDX3:
   case Opcode::BUFFER_LOAD_DWORDX4:
@@ -31633,6 +31636,32 @@ TestCase BufferLoadVariants() {
           {O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT,
            O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2,
            O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// D16 byte loads zero- or sign-extend the byte to 16 bits and write one half of
+// the VGPR, keeping the other half (Ghost of Yotei uses BUFFER_LOAD_UBYTE_D16).
+TestCase BufferLoadByteD16() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  for (u32 reg = 1; reg <= 4; ++reg)
+    AppendVMovLiteral(&code, reg, 0xabcd1234u);
+  // Byte 3 is 0x80, byte 1 is 0x7f.
+  AppendVMovU32(&code, 20, 3);
+  AppendBufferLoadOpcode(&code, 0x20, 1, 20); // UBYTE_D16
+  AppendBufferLoadOpcode(&code, 0x22, 2, 20); // SBYTE_D16
+  AppendBufferLoadOpcode(&code, 0x23, 4, 20); // SBYTE_D16_HI
+  AppendVMovU32(&code, 20, 1);
+  AppendBufferLoadOpcode(&code, 0x21, 3, 20); // UBYTE_D16_HI
+  for (u32 reg = 1; reg <= 4; ++reg)
+    AppendStoreVgpr(&code, reg, reg - 1u);
+  AppendEnd(&code);
+  return {"BufferLoadByteD16",
+          code,
+          {0x80ff7f01u},
+          {0xabcd0080u, 0xabcdff80u, 0x007f1234u, 0xff801234u},
+          {O::V_MOV_B32, O::BUFFER_LOAD_UBYTE_D16, O::BUFFER_LOAD_UBYTE_D16_HI,
+           O::BUFFER_LOAD_SBYTE_D16, O::BUFFER_LOAD_SBYTE_D16_HI,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -43297,6 +43326,7 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(BufferLoadD16Captured(opcode));
   for (const u32 wave : {32u, 64u})
     cases.push_back(BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
+  AddCase(BufferLoadByteD16);
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
