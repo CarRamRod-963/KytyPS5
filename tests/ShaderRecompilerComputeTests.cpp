@@ -34051,6 +34051,33 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
   return cases;
 }
 
+// BUFFER_LOAD_FORMAT_D16_HI_X (Ghost of Yotei) loads into the high half of the
+// VGPR and keeps the low half.
+std::vector<TestCase> BufferFormatD16HiXCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  std::vector<TestCase> cases;
+  {
+    TestCase test;
+    test.name = "BufferLoadFormatD16HiXFloat32";
+    AppendVMovLiteral(&test.code, 0, 0xabcd1234u);
+    AppendVMovU32(&test.code, 1, 0);
+    test.code.push_back(EncodeMubuf0(0x26u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, 1));
+    AppendStoreVgpr(&test.code, 0, 2);
+    AppendEnd(&test.code);
+    test.initial = {0x3f000000u, 0xdeadbeefu, 0u, 0xcafef00du};
+    test.expected = {0x3f000000u, 0xdeadbeefu, 0x38001234u, 0xcafef00du};
+    test.user_data =
+        MakeStructuredStorageBufferData(4, 4, false, BufferFormat(F::k32Float));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_HI_X,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
 std::vector<TestCase> BufferLoadFormatD16VectorCases() {
   using F = Prospero::BufferFormat;
   using O = ShaderOpcode;
@@ -44437,6 +44464,9 @@ std::vector<TestCase> MakeCases() {
   for (auto &test : BufferStoreFormatD16Cases()) {
     cases.push_back(std::move(test));
   }
+  for (auto &test : BufferFormatD16HiXCases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : FormattedStoreConversionCases()) {
     cases.push_back(std::move(test));
   }
@@ -50522,6 +50552,9 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : BufferStoreFormatD16Cases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferFormatD16HiXCases()) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : FormattedStoreConversionCases()) {
