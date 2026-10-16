@@ -1864,15 +1864,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations;
 				        // a selector names exactly the records the shader uses, so a malformed one
-				        // still fails the specialization. A sample of a T# whose channels all select
-				        // 0 reads 0 at any address.
+				        // still fails the specialization. Another dimension is only nulled in a
+				        // bounded table: an address table's 1D candidates stay typed for unfiltered
+				        // reads and writes (BuildResourceSpecialization checks the other uses). A
+				        // sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (image.sample_access_only && !image.depth_compare &&
 				             DescriptorImageSwizzle(value) == 0u) ||
 				            !PlaceableImageDescriptor(value) ||
-				            (table_candidates &&
-				             (DescriptorDimension(value, image.dimension) != image.dimension ||
-				              (!indirect.selector && !ImageDescriptorFormatUsable(image, value)))))
+				            (bounded_table &&
+				             DescriptorDimension(value, image.dimension) != image.dimension) ||
+				            (table_candidates && !indirect.selector &&
+				             !ImageDescriptorFormatUsable(image, value)))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
