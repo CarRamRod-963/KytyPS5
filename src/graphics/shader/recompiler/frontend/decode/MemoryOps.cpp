@@ -80,6 +80,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true},
     {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true},
     {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true},
 };
 
@@ -329,9 +331,11 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 	DecodeVectorGpr(vdata, inst.dst);
 	// D16 formats pack two 16-bit components into each VGPR.
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XY) {
+	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XY ||
+	    inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XY) {
 		inst.data_components = 2u;
-	} else if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZ) {
+	} else if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZ ||
+	           inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XYZ) {
 		inst.data_components = 3u;
 	} else if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZW ||
 	           inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XYZW) {

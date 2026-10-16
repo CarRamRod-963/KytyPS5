@@ -33335,6 +33335,66 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
   return cases;
 }
 
+// D16 formatted stores of 2-4 components read them packed two per VGPR; a
+// format with more components than the store zero-fills the rest.
+std::vector<TestCase> BufferStoreFormatD16MultiCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct StoreCase {
+    const char *name;
+    u32 opcode;
+    O decoded;
+    F format;
+    std::array<u32, 2> expected;
+  };
+  constexpr StoreCase inputs[] = {
+      {"BufferStoreFormatD16XY",
+       0x85u,
+       O::BUFFER_STORE_FORMAT_D16_XY,
+       F::k16_16Float,
+       {0x3c003800u, 0xcafef00du}},
+      {"BufferStoreFormatD16XYZ",
+       0x86u,
+       O::BUFFER_STORE_FORMAT_D16_XYZ,
+       F::k16_16_16_16Float,
+       {0x3c003800u, 0x0000b800u}},
+      {"BufferStoreFormatD16XYZW",
+       0x87u,
+       O::BUFFER_STORE_FORMAT_D16_XYZW,
+       F::k16_16_16_16Float,
+       {0x3c003800u, 0xc000b800u}},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 66, 0x3c003800u); // X = 0.5, Y = 1.0
+    AppendVMovLiteral(&test.code, 67, 0xc000b800u); // Z = -0.5, W = -2.0
+    AppendVMovU32(&test.code, 65, 1);
+    test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false));
+    test.code.push_back(EncodeMubuf1(66, 0, 65));
+    AppendEnd(&test.code);
+    test.initial = {0xdeadbeefu, 0xdeadbeefu, 0xffffffffu,
+                    0xcafef00du, 0xdeadbeefu, 0xdeadbeefu};
+    test.expected = test.initial;
+    if (input.format == F::k16_16Float) {
+      test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+      test.expected = {0xdeadbeefu, input.expected[0], 0xcafef00du};
+      test.user_data = MakeStructuredStorageBufferData(
+          4, 3, false, BufferFormat(input.format));
+    } else {
+      test.expected[2] = input.expected[0];
+      test.expected[3] = input.expected[1];
+      test.user_data = MakeStructuredStorageBufferData(
+          8, 3, false, BufferFormat(input.format));
+    }
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, input.decoded, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
 std::vector<TestCase> FormattedStoreConversionCases() {
   using F = Prospero::BufferFormat;
   using O = ShaderOpcode;
@@ -43391,6 +43451,9 @@ std::vector<TestCase> MakeCases() {
   for (auto &test : BufferStoreFormatD16Cases()) {
     cases.push_back(std::move(test));
   }
+  for (auto &test : BufferStoreFormatD16MultiCases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : FormattedStoreConversionCases()) {
     cases.push_back(std::move(test));
   }
@@ -49348,6 +49411,9 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : BufferStoreFormatD16Cases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferStoreFormatD16MultiCases()) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : FormattedStoreConversionCases()) {
