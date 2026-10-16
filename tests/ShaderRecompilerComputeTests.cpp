@@ -12043,9 +12043,13 @@ public:
         (void)context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         const auto &info = input.stage.program->info;
-        const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
-          return buffer.indirect_resources.size() == material_rows;
-        });
+        // The null root and the materials, padded to a power of two with null
+        // spares.
+        const auto root =
+            std::ranges::find_if(info.buffers, [](const auto &buffer) {
+              return buffer.indirect_resources.size() ==
+                     std::bit_ceil(material_rows);
+            });
         const auto &bindings = input.stage.program->bindings;
         const auto native_count = bindings.descriptor_counts[
             static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
@@ -40582,8 +40586,23 @@ void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
     test.compute_info.lds_size_dwords = 0;
     test.compute_info.thread_ids_num = 1;
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "finite destination count", compiled.resources.buffers.size() == 6u,
-            "selector lost a destination or retained a dynamic descriptor load");
+    // The input and five destinations; the candidate slots are padded to a
+    // power of two with null spares, which no key selects.
+    const auto &buffers = compiled.resources.buffers;
+    Require(
+        test.name, "finite destination count",
+        buffers.size() == 1u + std::bit_ceil(5u) &&
+            std::all_of(buffers.begin() + 6, buffers.end(),
+                        [](const auto &descriptor) {
+                          return descriptor.dwords[0] == 0u;
+                        }) &&
+            std::ranges::none_of(
+                compiled.program.memory_info,
+                [](const ShaderRecompiler::IR::MemoryInfo &memory) {
+                  return memory.kind ==
+                         ShaderRecompiler::IR::ResourceKind::IndirectBuffer;
+                }),
+        "selector lost a destination or retained a dynamic descriptor load");
     for (const auto& descriptor : compiled.resources.buffers)
       test.storage_buffer_ranges.emplace_back(descriptor.dwords[0], descriptor.dwords[2] * 4u);
     for (u32 key = 0; key < 5u; ++key) {
