@@ -265,7 +265,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	EXIT_IF(rt_slot >= m_color_target_lookups.size());
+	r.image_id = texture_cache.FindImage(r.desc, exact_format, m_color_target_lookups[rt_slot]);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }

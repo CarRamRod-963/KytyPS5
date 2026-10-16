@@ -45,6 +45,8 @@ public:
 		BindingType   type = BindingType::Texture;
 		// The view's base layer before an overlap moved it: the layer whose metadata a clear reads.
 		uint32_t metadata_base_layer = 0;
+
+		bool operator==(const ImageDesc&) const = default;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -61,10 +63,24 @@ public:
 	}
 	[[nodiscard]] bool LayoutChangedSince(LayoutStamp stamp, uint64_t address,
 	                                      uint64_t size) const noexcept;
+	// One caller's last FindImage: the description it passed, the description and image it got
+	// back, and the layout stamp from before the lookup.
+	struct ImageLookup {
+		ImageDesc   input;
+		ImageDesc   output;
+		ImageId     image;
+		LayoutStamp stamp;
+		bool        exact_format = false;
+		bool        valid        = false;
+	};
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// FindImage for a caller that looks up the same description repeatedly (a render target
+	// while its registers are unchanged): an equal description resolves to the remembered image
+	// while no image overlapping its memory changed layout since that lookup.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format, ImageLookup& lookup);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -145,6 +161,9 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
+	// FindImage; sole_owner, when given, tells whether the result is the only image overlapping
+	// the description's memory and matched it without an overlap resolution.
+	[[nodiscard]] ImageId LookupImage(ImageDesc& desc, bool exact_format, bool* sole_owner);
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
