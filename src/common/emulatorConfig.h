@@ -93,6 +93,7 @@ struct ConfigOptions {
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	uint32_t               flush_draws                 = 0; // 0 is off
+	bool                   async_pipelines_enabled     = true;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -169,6 +170,7 @@ bool ReadbackTiledImagesEnabled();
 bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 uint32_t GetFlushDraws();
+bool AsyncPipelinesEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();

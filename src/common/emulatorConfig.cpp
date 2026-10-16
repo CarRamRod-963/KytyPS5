@@ -221,6 +221,10 @@ uint32_t GetFlushDraws() {
 	return g_config->flush_draws;
 }
 
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
