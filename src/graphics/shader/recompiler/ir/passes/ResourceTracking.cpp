@@ -304,7 +304,8 @@ private:
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
 		}
-		const auto cached = values.emplace(inst, UINT32_MAX).first;
+		// Recursive evaluation inserts more values; element references stay valid.
+		auto&      cached = values.emplace(inst, UINT32_MAX).first->second;
 		auto result = UINT32_MAX;
 		const auto arg = [&](uint32_t index) { return Evaluate(inst->Arg(index), current); };
 		switch (inst->GetOpcode()) {
@@ -352,10 +353,10 @@ private:
 		}
 		// Only unsupported values and cycles need free variables.
 		if (result == UINT32_MAX) {
-			if (cached->second == UINT32_MAX) cached->second = Unknown(value.GetType());
-			return cached->second;
+			if (cached == UINT32_MAX) cached = Unknown(value.GetType());
+			return cached;
 		}
-		cached->second = result;
+		cached = result;
 		return result;
 	}
 
@@ -367,10 +368,25 @@ private:
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
-	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
-	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
+	// One proof performs a few hundred thousand node lookups on large shaders.
+	struct KeyHash {
+		static size_t Mix(uint64_t seed, uint64_t value) {
+			return static_cast<size_t>((seed ^ value) * 0x9e3779b97f4a7c15ull + (seed >> 29u));
+		}
+		size_t operator()(const std::array<uint32_t, 3>& key) const {
+			return Mix(Mix(key[0], key[1]), key[2]);
+		}
+		size_t operator()(const std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>& key) const {
+			const auto [op, flags, left, right] = key;
+			return Mix(Mix(Mix(static_cast<uint64_t>(op), flags), left), right);
+		}
+	};
+
+	std::array<std::unordered_map<const Inst*, uint32_t>, 2>       m_values;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, KeyHash> m_nodes_by_key;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, KeyHash> m_choices;
+	std::unordered_map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t, KeyHash>
+	    m_predicates;
 };
 
 class Tracker {
@@ -396,12 +412,17 @@ public:
 		FoldBoundedLoopSelectors();
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
+		// Proofs read only Phis, compares, selects and logic; from here until the plans are
+		// applied, tracking adds instructions but rewrites none of those.
+		m_increment_proofs_valid = true;
 		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
 			}
 		}
+		m_increment_proofs_valid = false;
+		m_increment_proofs.clear();
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -1855,14 +1876,28 @@ private:
 				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
 				       Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			if (IncrementGuarded(*phi, *step, *compare, stops)) return compare;
 		}
 		return {};
+	}
+
+	// Every handle keyed by one induction repeats the same increment proof, and each proof
+	// evaluates the guard of every edge between the increment and the loop header.
+	bool IncrementGuarded(const Inst& phi, const Inst& step, const Inst& compare,
+	                      const auto& stops) const {
+		const auto key = std::array {&phi, &step, &compare};
+		if (m_increment_proofs_valid) {
+			if (const auto found = m_increment_proofs.find(key); found != m_increment_proofs.end())
+				return found->second;
+		}
+		LoopBoundProof proof(m_program, phi, compare);
+		const bool guarded = GuardedOnEntry(step.Parent(), stops, [&](const EdgePredicate& edge) {
+			return proof.Excludes(edge.condition, edge.positive);
+		});
+		if (m_increment_proofs_valid) m_increment_proofs.emplace(key, guarded);
+		return guarded;
 	}
 
 	uint32_t PostTestLoopMaximum(Value key) const {
@@ -4668,6 +4703,8 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
+	mutable std::map<std::array<const Inst*, 3>, bool> m_increment_proofs;
+	bool                                               m_increment_proofs_valid  = false;
 	bool m_per_lane_pointer_warned = false;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
