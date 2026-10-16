@@ -6745,11 +6745,13 @@ void TestGpuSelectedBufferRecords() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+    // Each root's four candidates are padded to seven (with the root, a power of two).
+    constexpr uint32_t padded = std::bit_ceil(4u + 1u) - 1u;
     for (const uint32_t size : {0u, 384u + aligned_bias, 0u, 384u + aligned_bias}) {
       user_data[2] = size;
       memory.reads = 0u;
       Check(materialize() && memory.reads == (size == 0u ? 0u : 8u) &&
-                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 8u),
+                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 2u * padded),
             "affine table refresh read GPU selector bytes, unrelated fields or stale candidates");
     }
     for (uint32_t member = 0; member < 2u; ++member) {
@@ -6764,7 +6766,7 @@ void TestGpuSelectedBufferRecords() {
         const auto index = evaluate_key(evaluate_key, selections[root]->Arg(0), key) >> 2u;
         Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] == slot + 1u,
               "wrapped GPU record key selected the wrong physical descriptor");
-        const auto candidate = plan.info.buffers.size() + member * 4u + slot;
+        const auto candidate = plan.info.buffers.size() + member * padded + slot;
         Check(snapshot.buffers[candidate].dwords[0] == 0x100000u + member * 0x10000u + slot * 0x1000u,
               "affine table read a stride192 row instead of a reachable stride64 member");
         Check(std::ranges::find(snapshot.specialization_reads,
@@ -6782,7 +6784,7 @@ void TestGpuSelectedBufferRecords() {
     user_data[2] = 428u + aligned_bias;
     memory.reads = 0u;
     Check(materialize() && memory.reads == 9u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+              snapshot.buffers.size() == plan.info.buffers.size() + 2u * padded &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + aligned_bias + 416u, uint64_t{12u}}) !=
                   snapshot.specialization_reads.end(),
@@ -7070,7 +7072,8 @@ void TestGpuSelectedFormattedRecordStore() {
     user_data[2] = count;
     memory.reads = 0u;
     Check(materialize() && memory.reads == count &&
-              snapshot.buffers.size() == plan.info.buffers.size() + count,
+              snapshot.buffers.size() ==
+                  plan.info.buffers.size() + (count == 0u ? 0u : std::bit_ceil(count + 1u) - 1u),
           "exact formatted records read GPU selector bytes, row padding or stale candidates");
   }
   const auto mapping = specialization.buffers[root].indirect_mapping_offset;
@@ -7100,7 +7103,7 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
   Check(materialize() && memory.watched_dwords == 3u &&
             snapshot.flattened_srt[specialization.buffers[root].indirect_mapping_offset] == 5u &&
-            snapshot.buffers.size() == plan.info.buffers.size() + 5u,
+            snapshot.buffers.size() == plan.info.buffers.size() + std::bit_ceil(5u + 1u) - 1u,
         "partial direct V# did not zero-fill its missing format DWORD");
   user_data[1] = 592u << 16u;
   user_data[2] = 6u;
@@ -7319,6 +7322,190 @@ void TestGpuSelectedFormattedRecordStore() {
               indirect->key_count == Value(32u),
           "lane-varying or multiple-axis first incorrectly narrowed the finite descriptor domain");
   }
+}
+
+// Ghost of Yotei (PPSA26344) CS 0x8457901d80b91921: a wave-uniform object key
+// selects one record of a 592-byte table that holds a store V# (+448) and an
+// object pointer (+0) whose T# and S# the shader samples. Both enumerate the
+// scene's object list, so the specialization must not bake the number of
+// distinct store V#s or where the table's key maps happen to end.
+void TestRecordTableSpecializationStability() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  auto fixture = std::make_unique<Fixture>();
+  auto &f = *fixture;
+  std::array<Value, 4> table_words, selector_words;
+  for (uint32_t word = 0; word < 4u; ++word) {
+    table_words[word] = f.UserData(word);
+    selector_words[word] = f.UserData(4u + word);
+  }
+  const auto table = f.Buffer(table_words);
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto packed = f.Emit(
+      ValueOpcode::LoadBufferU32,
+      {f.Buffer(selector_words), lane, Value(0u), Value(0u), Value(true)},
+      f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x1bcu));
+  const auto key =
+      f.Emit(ValueOpcode::ReadLane,
+             {f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(16u)}),
+              Value(0u)});
+  const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(592u)});
+  std::array<Value, 2> pointer;
+  for (uint32_t word = 0; word < 2u; ++word)
+    pointer[word] = f.Emit(
+        ValueOpcode::ReadConstBuffer, {table, offset},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u},
+                    0x1f4u));
+  const auto object = f.Address(pointer[0], pointer[1]);
+  const auto load = [&](uint32_t first, uint32_t width, uint32_t pc) {
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < width; ++word)
+      words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+                           {object, Value(0u), Value(0u), Value(true)},
+                           f.AddMemory({.kind = ResourceKind::ScalarAddress,
+                                        .offset = first + word * 4u},
+                                       pc));
+    return words;
+  };
+  const auto image = f.Image(load(976u, 8u, 0x1110u));
+  const auto sampler_words = load(1016u, 4u, 0x1108u);
+  f.Emit(ValueOpcode::ImageSampleRaw,
+         {image,
+          f.Sampler({sampler_words[0], sampler_words[1], sampler_words[2],
+                     sampler_words[3]}),
+          f.ImageAddress(), Value(true)},
+         f.AddMemory({.kind = ResourceKind::Image,
+                      .image_dimension = Decoder::ImageDimension::Dim2D},
+                     0x1128u));
+  std::array<Value, 4> store_words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    store_words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                               f.AddMemory({.kind = ResourceKind::ScalarBuffer,
+                                            .offset = 448u + word * 4u,
+                                            .component_index = word,
+                                            .component_count = 4u},
+                                           0x2e8u));
+  f.Emit(ValueOpcode::StoreBufferU32,
+         {f.Buffer(store_words), lane, Value(0u), Value(0u), Value(0x7fu),
+          Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer,
+                      .formatted = true,
+                      .idxen = true,
+                      .coherent = true},
+                     0x1618u));
+  f.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(f.program);
+  uint32_t store_root = UINT32_MAX;
+  for (uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource)
+    if (plan.descriptor_sources[plan.info.buffers[resource].source]
+            .indirect_descriptor)
+      store_root = resource;
+  Check(store_root != UINT32_MAX && plan.info.images.size() == 1u &&
+            plan.descriptor_sources[plan.info.images[0].source]
+                .indirect_descriptor,
+        "record table fixture lost its store or image candidate root");
+
+  constexpr uint32_t records = 0x2000u, objects = 0x10000u,
+                     object_stride = 0x500u;
+  LinearTestMemory memory;
+  memory.words.resize((objects + 80u * object_stride - memory.base) / 4u);
+  memory.fail_address =
+      0x1800u; // The GPU selector is not readable on the host.
+  const auto at = [&](uint64_t address) {
+    return memory.words.begin() + (address - memory.base) / 4u;
+  };
+  // Rows below `rows` have an object; those from `first_store` on have a
+  // distinct byte-buffer V#, the others a null one. Every object has its own T#
+  // and the same S#.
+  const auto scene = [&](uint32_t rows, uint32_t first_store, uint32_t base) {
+    std::fill(at(records), memory.words.end(), 0u);
+    for (uint32_t row = 0; row < rows; ++row) {
+      const auto record = records + row * 592u;
+      const auto object_address = objects + row * object_stride;
+      *at(record) = object_address;
+      if (row >= first_store) {
+        const std::array<uint32_t, 4> store{
+            base + row * 0x100u, 1u << 16u, 256u,
+            (uint32_t(Prospero::BufferFormat::k8SInt) << 12u) |
+                DstSel(4, 0, 0, 0)};
+        std::copy(store.begin(), store.end(), at(record + 448u));
+      }
+      const std::array<uint32_t, 8> texture{
+          0x100u + row, uint32_t(Prospero::BufferFormat::k32Float) << 20u,
+          0u,           DstSel(4, 0, 0, 1) | (9u << 28u),
+          0u,           0u,
+          0u,           0u};
+      std::copy(texture.begin(), texture.end(), at(object_address + 976u));
+      const std::array<uint32_t, 4> sampler{0u, 0x00fff000u, 0u, 0u};
+      std::copy(sampler.begin(), sampler.end(), at(object_address + 1016u));
+    }
+    return std::array<uint32_t, 8>{records, 592u << 16u, rows, 0x5204u,
+                                   0x1800u, 4u << 16u,   64u,  0x5204u};
+  };
+  const auto materialize = [&](uint32_t rows, uint32_t first_store,
+                               uint32_t base, ResourceSnapshot &snapshot,
+                               ResourceSpecialization &specialization) {
+    const auto user_data = scene(rows, first_store, base);
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = ReadLinearTestMemory,
+                             .userdata = &memory,
+                             .read_specialization_memory =
+                                 ReadLinearTestMemory};
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  ResourceSnapshot first_snapshot, snapshot;
+  ResourceSpecialization first, specialization;
+  // 33 store targets; the store key map ends at row 39.
+  Check(materialize(40u, 7u, 0x100000u, first_snapshot, first) &&
+            first.images[0].bindless &&
+            first_snapshot.bindless_uses.size() == 1u,
+        "record table objects were not resolved through a bindless heap");
+  // Another scene: 45 store targets elsewhere in memory; the key maps end at
+  // row 59.
+  Check(materialize(60u, 15u, 0x180000u, snapshot, specialization) &&
+            specialization == first,
+        "a changed object list baked its store candidate count or key map "
+        "lengths");
+  // Key maps past the next power of two move the maps that follow them (here
+  // the sampler's), but neither the store candidates nor the heap's mapping
+  // words.
+  Check(materialize(72u, 27u, 0x200000u, snapshot, specialization) &&
+            specialization.buffers == first.buffers &&
+            specialization.images == first.images &&
+            snapshot.bindless_uses.size() == 1u &&
+            snapshot.bindless_uses[0].mapping_offset ==
+                first_snapshot.bindless_uses[0].mapping_offset,
+        "a longer object list changed the store candidates or moved the heap's "
+        "mapping words");
+  // The candidates share one layout (one dynamically indexed access); spare
+  // slots are null and no key selects them.
+  const auto mapping =
+      specialization.buffers[store_root].indirect_mapping_offset;
+  const auto first_child = static_cast<uint32_t>(plan.info.buffers.size());
+  std::vector<uint32_t> selected(snapshot.buffers.size());
+  for (uint32_t row = 0; row < snapshot.flattened_srt[mapping]; ++row)
+    if (const auto ordinal = snapshot.flattened_srt[mapping + 1u + row];
+        ordinal != 0u)
+      ++selected[first_child + ordinal - 1u];
+  uint32_t children = 0u, spares = 0u;
+  for (uint32_t resource = first_child; resource < snapshot.buffers.size();
+       ++resource) {
+    if (specialization.buffers[resource].indirect_root != store_root)
+      continue;
+    ++children;
+    const bool null =
+        std::ranges::all_of(snapshot.buffers[resource].dwords,
+                            [](uint32_t word) { return word == 0u; });
+    spares += null;
+    Check(specialization.buffers[resource] ==
+                  specialization.buffers[first_child] &&
+              specialization.buffers[resource].packed_stride == 1u &&
+              (selected[resource] == 0u) == null,
+          "store candidates or their spare slots did not share one selected "
+          "layout");
+  }
+  Check(children == 63u && spares == 63u - 45u,
+        "store candidates were not padded to a power of two");
 }
 
 void TestFiniteBufferSelection() {
@@ -9083,6 +9270,8 @@ int main() {
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
+    Run("record table specialization stability",
+        TestRecordTableSpecializationStability);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);

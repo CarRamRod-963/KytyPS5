@@ -594,6 +594,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
+                                   uint32_t bindless_mapping, std::vector<uint32_t>& padding,
                                    Normalize&& normalize) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
@@ -617,6 +618,27 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			specializations.push_back(child);
 		}
 		return ordinal;
+	};
+	// Spare candidate slots hold null descriptors: the program bakes the candidate count, so it
+	// is padded to a power of two and a table whose contents change with the scene does not
+	// compile a permutation per change. No key maps to a spare slot.
+	const auto pad_candidates = [&] {
+		const auto unique = descriptors.size() - children_begin + 1u;
+		for (auto padded = std::bit_ceil(unique); descriptors.size() - children_begin + 1u < padded;) {
+			padding.push_back(static_cast<uint32_t>(descriptors.size()));
+			descriptors.push_back({.dword_count = dword_count});
+			auto child          = root_resource;
+			child.indirect_root = resource_index;
+			specializations.push_back(child);
+		}
+	};
+	// A heap's two words live at a place fixed by the plan, so the mapping offsets the program
+	// bakes do not move with the length of other tables' key maps.
+	const auto bindless_words = [&] {
+		if (bindless_mapping != UINT32_MAX) return bindless_mapping;
+		const auto offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		snapshot.flattened_srt.resize(offset + 2u, 0u);
+		return offset;
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -674,8 +696,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (table_value.dword_count != 4u || table.Type() != 0u || table.Stride() == 0u ||
 				    table.SwizzleEnabled() || table.AddTid() || table_size > UINT32_MAX)
 					return false;
-				const auto mapping_offset = snapshot.flattened_srt.size();
-				snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+				const auto mapping_offset = bindless_words();
 				snapshot.bindless_uses.push_back({.resource       = resource_index,
 				                                  .base           = table_base,
 				                                  .size           = table_size,
@@ -776,8 +797,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				    step <= UINT32_MAX && count * step <= UINT32_MAX && first <= UINT32_MAX - 8u &&
 				    (first & 3u) == 0u && (pointer->offset & 3u) == 0u &&
 				    (pointer->stride & 3u) == 0u) {
-					const auto mapping_offset = snapshot.flattened_srt.size();
-					snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+					const auto mapping_offset = bindless_words();
 					snapshot.bindless_uses.push_back(
 					    {.resource       = resource_index,
 					     .base           = table_base,
@@ -850,8 +870,15 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (descriptors.size() == children_begin) {
 				snapshot.flattened_srt.resize(mapping_offset);
 			} else {
-				snapshot.flattened_srt[mapping_offset] =
-				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
+				const auto entries = snapshot.flattened_srt.size() - mapping_offset - 1u;
+				snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries);
+				// The key map ends at the last row with a candidate; its reserved length is a
+				// power of two so that the maps after it keep their offsets.
+				snapshot.flattened_srt.resize(mapping_offset + 1u + std::bit_ceil(entries), 0u);
+				// Store candidates are bound buffers; tables of them are as large as the scene's
+				// object list (Ghost of Yotei CS 0x8457901d80b91921: about 60 per scene).
+				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>)
+					pad_candidates();
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -909,8 +936,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    dword_count == 8u && indirect.table_stride != 0u &&
 		    (indirect.table_stride & 3u) == 0u && (indirect.table_offset & 3u) == 0u &&
 		    (indirect.table_immediate & 3u) == 0u && records * indirect.table_stride <= UINT32_MAX) {
-			const auto mapping_offset = snapshot.flattened_srt.size();
-			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			const auto mapping_offset = bindless_words();
 			snapshot.bindless_uses.push_back(
 			    {.resource       = resource_index,
 			     .base           = table_base,
@@ -973,12 +999,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 		const auto unique = descriptors.size() - children_begin + 1u;
-		for (auto padded = std::bit_ceil(unique); descriptors.size() - children_begin + 1u < padded;) {
-			descriptors.push_back({.dword_count = dword_count});
-			auto child          = root_resource;
-			child.indirect_root = resource_index;
-			specializations.push_back(child);
-		}
+		pad_candidates();
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -1767,6 +1788,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};
+	// Every image table may become a bindless heap; its two words are reserved ahead of the
+	// variable-length key maps.
+	std::vector<uint32_t> bindless_mapping(program.info.images.size(), UINT32_MAX);
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto* source = Source(program, program.info.images[i].source);
+		if (source == nullptr || !source->indirect_descriptor) continue;
+		bindless_mapping[i] = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		snapshot.flattened_srt.resize(bindless_mapping[i] + 2u, 0u);
+	}
+	std::vector<uint32_t> padding;
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1782,7 +1813,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers,
+					        snapshot.buffers, specialization.buffers, UINT32_MAX, padding,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
@@ -1818,6 +1849,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	// A spare candidate is never selected; it takes the layout of the first real candidate so
+	// that candidates sharing one layout keep a single dynamically indexed access.
+	for (const auto spare: padding) {
+		const auto root = specialization.buffers[spare].indirect_root;
+		for (uint32_t candidate = static_cast<uint32_t>(program.info.buffers.size());
+		     candidate < specialization.buffers.size(); ++candidate) {
+			if (specialization.buffers[candidate].indirect_root != root ||
+			    std::ranges::all_of(snapshot.buffers[candidate].dwords,
+			                        [](uint32_t word) { return word == 0u; }))
+				continue;
+			specialization.buffers[spare] = specialization.buffers[candidate];
+			break;
+		}
+	}
 	// A snapshot is evaluated repeatedly; the heaps found this time replace the previous ones,
 	// whose mapping offsets belong to the flattened SRT just rebuilt.
 	snapshot.bindless_uses.clear();
@@ -1852,7 +1897,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool table_candidates = bounded_table || indirect.sources.empty();
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
+			        specialization.images, bindless_mapping[i], padding,
+			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations;
 				        // a selector names exactly the records the shader uses, so a malformed one
 				        // still fails the specialization. Another dimension is only nulled in a
@@ -1894,7 +1940,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.samplers[i] = {.dword_count = 4u};
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
-				        specialization.samplers,
+				        specialization.samplers, UINT32_MAX, padding,
 				        [](DescriptorValue&) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
