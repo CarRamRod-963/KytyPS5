@@ -1026,6 +1026,40 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t value) {
+	auto&      state = ctx.state;
+	const auto bda   = GetBdaPointer(state, address);
+	EmitIfCondition(
+	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0)), [&]() {
+		    const auto         pointer   = state.builder.AllocateId();
+		    constexpr uint32_t alignment = sizeof(uint32_t);
+		    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                              bda);
+		    state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+		                              alignment);
+	    });
+}
+
+// A raw DWORD store through a GPU-selected V#: the same address and bounds rules as an indirect
+// load, written through the device address of the selected buffer.
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(ctx, inst);
+		const auto valid_format =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0));
+		EmitIfCondition(
+		    state,
+		    AndCondition(state, valid_format, IndirectBufferInBounds(state, buffer, 0u, 4u, false)),
+		    [&]() {
+			    StoreBdaDword(ctx,
+			                  Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+			                         ConstantU64(state, ~uint64_t {3})),
+			                  ctx.Arg(inst, inst.NumArgs() - 2));
+		    });
+	});
+}
+
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1669,6 +1703,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst);
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
