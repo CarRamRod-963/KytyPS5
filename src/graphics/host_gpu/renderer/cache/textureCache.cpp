@@ -441,6 +441,10 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else {
+		// Stores into the image's own bytes on the unwatched page no longer fault. Hash the edges
+		// while the page is still watched and compare them at the next refresh.
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
@@ -458,6 +462,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else {
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
