@@ -636,6 +636,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		features13.shaderIntegerDotProduct     = supported13.shaderIntegerDotProduct;
 		features13.computeFullSubgroups        = supported13.computeFullSubgroups;
 	}
+	// Lets the pipeline cache ask for a driver-cached pipeline without compiling it.
+	features13.pipelineCreationCacheControl = supported13.pipelineCreationCacheControl;
+	graphics.pipeline_creation_cache_control_enabled =
+	    features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
