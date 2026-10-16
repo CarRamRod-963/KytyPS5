@@ -1841,6 +1841,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		// Only whether the stride is zero changes the module; the value is a shader-data word.
+		if (stride != 0u) packed_stride = (packed_stride & ~0x3fffu) | 1u;
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
 		buffer.descriptor_format =
@@ -2001,6 +2003,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		auto& buffer                      = buffers[index];
 		buffer.packed_stride              = source.packed_stride;
+		buffer.runtime_stride             = (source.packed_stride & 0x3fffu) != 0u;
 		buffer.descriptor_format          = source.descriptor_format;
 		buffer.descriptor_swizzle         = source.descriptor_swizzle;
 		buffer.indirect_root              = source.indirect_root;
@@ -2234,6 +2237,24 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+}
+
+void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
+                       const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
+	if (!bindings.memory_strides) return;
+	EXIT_IF(shader_data.size() < bindings.ShaderDataDwords() ||
+	        snapshot.buffers.size() < info.buffers.size());
+	for (uint32_t resource = 0; resource < info.buffers.size(); ++resource) {
+		const auto& buffer = info.buffers[resource];
+		if (!buffer.runtime_stride || buffer.descriptor_index == UINT32_MAX) continue;
+		// Spare candidates (never selected) may carry no descriptor; their stride is zero.
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[resource], descriptor) ||
+		    descriptor.Type() != 0)
+			continue;
+		bindings.PackMemoryStride(shader_data, buffer.descriptor_index,
+		                          descriptor.PackedStride() & 0x3fffu);
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

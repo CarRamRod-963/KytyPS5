@@ -112,6 +112,7 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	std::vector<uint32_t>                              memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -436,6 +437,8 @@ struct MemoryResourceAccess {
 	uint32_t              descriptor_index = 0;
 	uint32_t              length           = 0;
 	uint32_t              byte_offset      = 0;
+	// Runtime V# stride of a dynamically selected binding (0: use the static binding's).
+	uint32_t              stride           = 0;
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
@@ -445,6 +448,9 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
                                    uint32_t search_iterations, uint32_t default_resource);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
+// The V# stride of a buffer access: a constant, or the binding's shader-data stride word.
+uint32_t EmitBufferStride(EmitterState& state, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess* access);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

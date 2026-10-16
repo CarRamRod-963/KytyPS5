@@ -8501,6 +8501,58 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestStructuredBufferStrideIsRuntimeData() {
+  // buffer_load_dword v2, v0, s[0:3] idxen; buffer_store_dword v2, v0, s[4:7]
+  // idxen
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x0c),    EncodeMubuf1(2, 0, 0), EncodeMubuf0(0x1c),
+      EncodeMubuf1(2, 1, 0), 0xbf810000u,
+  };
+  const auto user_data = [](uint32_t load_stride, uint32_t store_stride) {
+    const auto word3 =
+        DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u);
+    return std::array<uint32_t, 8>{0x10000u, load_stride << 16u,  64u, word3,
+                                   0x20000u, store_stride << 16u, 64u, word3};
+  };
+  const auto compile = [&](const std::array<uint32_t, 8> &words) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = words;
+    return RecompileForTest(shader, options);
+  };
+  const auto first = compile(user_data(32u, 192u));
+  CheckSpirvBinaryValidates(first.spirv);
+  const auto &info = first.program.info;
+  const auto &bindings = first.program.bindings;
+  Check(info.buffers.size() == 2u && info.buffers[0].runtime_stride &&
+            info.buffers[1].runtime_stride &&
+            (info.buffers[0].packed_stride & 0x3fffu) == 1u &&
+            (info.buffers[1].packed_stride & 0x3fffu) == 1u &&
+            bindings.memory_strides &&
+            bindings.ShaderDataDwords() == bindings.MemoryStrideDword() + 1u,
+        "structured buffers did not take their V# stride from shader data");
+  // The renderer fills one 16-bit stride word per binding from the snapshot.
+  std::vector<uint32_t> shader_data(bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::FillBufferStrides(info, bindings, first.resources,
+                                          shader_data);
+  const auto word = shader_data[bindings.MemoryStrideDword()];
+  const auto stride_of = [&](uint32_t resource) {
+    return (word >> (info.buffers[resource].descriptor_index * 16u)) & 0xffffu;
+  };
+  Check(stride_of(0) == 32u && stride_of(1) == 192u,
+        "buffer stride words did not hold the V# strides of their bindings");
+  // Other strides reuse the module: the stride is not baked.
+  const auto other = compile(user_data(8u, 36u));
+  Check(other.spirv == first.spirv,
+        "a different structured-buffer stride compiled another shader module");
+  // A zero stride still changes the access form (no index term, raw OOB rule).
+  const auto zero = compile(user_data(0u, 192u));
+  Check(zero.spirv != first.spirv &&
+            !zero.program.info.buffers[0].runtime_stride &&
+            zero.program.info.buffers[1].runtime_stride,
+        "a zero V# stride lost its own specialization");
+}
+
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
@@ -16829,6 +16881,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopBreakContinue();
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
+  TestStructuredBufferStrideIsRuntimeData();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();

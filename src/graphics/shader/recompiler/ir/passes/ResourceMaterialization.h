@@ -9,6 +9,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // ResourceSnapshot and therefore do not create shader permutations.
 struct ResourceSpecialization {
 	struct Buffer {
+		// V# stride layout; the stride field is 1 for any nonzero stride (the stride itself is
+		// read at run time, see FillBufferStrides).
 		uint32_t               packed_stride                   = 0;
 		Prospero::BufferFormat descriptor_format               = Prospero::BufferFormat::kInvalid;
 		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
@@ -60,6 +62,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+
+// Writes the V# stride of every buffer binding with a runtime stride into the shader data.
+void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
+                       const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
