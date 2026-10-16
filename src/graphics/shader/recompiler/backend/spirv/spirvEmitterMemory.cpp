@@ -81,18 +81,21 @@ uint32_t BufferLane(EmitterState& state) {
 	              ConstantU32(state, 63));
 }
 
-uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                           const MemoryResourceAccess* access) {
 	auto&      state  = ctx.state;
 	const auto packed = StorageBufferPackedStride(state, mem);
-	const auto stride = packed & 0x3fffu;
+	const auto zero   = ConstantU32(state, 0);
 	auto       index  = ctx.Arg(inst, 1);
 	if ((packed & (1u << 20u)) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
-	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	const bool has_stride = (packed & 0x3fffu) != 0u;
+	const bool swizzle    = has_stride && (packed & (1u << 14u)) != 0u;
+	// A zero index needs no stride: index * stride is zero and so is the swizzled index part.
+	const auto stride = has_stride && index != zero ? EmitBufferStride(state, mem, access) : zero;
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
-	                              swizzle ? ConstantBool(state, true) : 0u,
+	                              stride, swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
 }
@@ -250,12 +253,13 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                     uint32_t prefix = 0) {
+                     const MemoryResourceAccess* access = nullptr) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
+		auto       prefix   = access != nullptr ? access->byte_offset : 0u;
 		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
-		                            BufferByteAddress(ctx, inst, mem), prefix);
+		                            BufferByteAddress(ctx, inst, mem, access), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
 		return Select(ctx.state, TypeU32(ctx.state),
 		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
@@ -275,9 +279,9 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                    uint32_t prefix = 0) {
+                    const MemoryResourceAccess* access = nullptr) {
 	return Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
-	              ByteAddress(ctx, inst, mem, prefix), ConstantU32(ctx.state, 2));
+	              ByteAddress(ctx, inst, mem, access), ConstantU32(ctx.state, 2));
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -364,21 +368,28 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	    !sources[buffer.source].indirect_descriptor->indexed) return payload_in_bounds;
 	const auto bytes = Binary(state, spv::OpIMul, TypeU32(state), resource.length,
 	                          ConstantU32(state, resource.element_bits / 8u));
+	const auto nonempty =
+	    Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset);
+	// Record zero is in range whenever the binding has a byte past the offset.
+	if (ctx.Arg(inst, 1) == ConstantU32(state, 0u)) {
+		return AndCondition(state, payload_in_bounds, nonempty);
+	}
 	const auto available = Binary(state, spv::OpISub, TypeU32(state), bytes, resource.byte_offset);
 	// Test the original index before multiplication can wrap. A truncated binding
 	// may omit final-record padding; the payload check below still checks every byte.
-	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
-	    ConstantU32(state, buffer.packed_stride & 0x3fffu));
+	const auto last_record =
+	    Binary(state, spv::OpUDiv, TypeU32(state),
+	           Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
+	           EmitBufferStride(state, mem, &resource));
 	return AndCondition(state, payload_in_bounds,
-	    AndCondition(state,
-	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, resource.byte_offset),
-	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
+	                    AndCondition(state, nonempty,
+	                                 Binary(state, spv::OpULessThanEqual, TypeBool(state),
+	                                        ctx.Arg(inst, 1), last_record)));
 }
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	const auto index = DwordIndex(ctx, inst, mem, &resource);
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -394,7 +405,7 @@ uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                              const MemoryResourceAccess& resource, uint32_t bits,
                              bool sign_extend) {
-	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto address = ByteAddress(ctx, inst, mem, &resource);
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
@@ -557,7 +568,7 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t bits, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
-	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto address = ByteAddress(ctx, inst, mem, &resource);
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
@@ -630,7 +641,7 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	const auto index     = DwordIndex(ctx, inst, mem, &resource);
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
 	    EmitMemoryElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
@@ -705,7 +716,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 	PreparedFormattedMemory plan;
 	plan.info      = info;
 	plan.resource  = resource;
-	const auto start = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto start = ByteAddress(ctx, inst, mem, &resource);
 	// Check the whole, unaligned format span before aligning the actual memory address.
 	const auto end = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), start,
 	                        ConstantU32(ctx.state, info.byte_size - 1u));
@@ -1368,8 +1379,8 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	};
 	if (!mem.IsCoherentBufferPairLoad(inst.GetOpcode())) return scalar();
 
-	const auto first  = ByteAddress(ctx, inst, mem, resource.byte_offset);
-	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), resource.byte_offset);
+	const auto first  = ByteAddress(ctx, inst, mem, &resource);
+	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), &resource);
 	const auto wide =
 	    PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3],
 	                                       resource.non_uniform ? resource.descriptor_index : 0u);
