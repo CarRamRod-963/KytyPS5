@@ -614,6 +614,11 @@ add_executable(bindless_translation_tests EXCLUDE_FROM_ALL
 target_link_libraries(bindless_translation_tests common fmt::fmt)
 target_include_directories(bindless_translation_tests PRIVATE ${inc_headers})
 
+add_executable(guest_write_set_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestWriteSetTests.cpp"
+)
+target_include_directories(guest_write_set_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.cpp"
@@ -672,6 +677,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
+	add_test(NAME guest_write_set COMMAND $<TARGET_FILE:guest_write_set_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
@@ -767,6 +773,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		bindless_translation_tests
+		guest_write_set_tests
 		pipeline_compile_queue_tests
 		memory_tracker_tests
 		page_manager_tests
