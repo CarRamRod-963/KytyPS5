@@ -46,6 +46,8 @@ struct TileBlockLayout {
 	uint32_t        block_width       = 0;
 	uint32_t        block_height      = 0;
 	uint32_t        block_depth       = 0;
+
+	bool operator==(const TileBlockLayout&) const = default;
 };
 
 struct TileTextureElementLayout {
@@ -58,6 +60,8 @@ struct TileTextureBlockLayout {
 	TileBlockLayout block;
 	uint32_t        texel_width  = 1;
 	uint32_t        texel_height = 1;
+
+	bool operator==(const TileTextureBlockLayout&) const = default;
 };
 
 enum class TileSurfaceDimension : uint32_t {
