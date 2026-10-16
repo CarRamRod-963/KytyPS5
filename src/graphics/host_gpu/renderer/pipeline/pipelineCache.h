@@ -128,6 +128,9 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		// A stage's resources could not be specialized for this draw's guest data; the draw
+		// must be skipped (see ResourceSnapshot::unavailable).
+		bool unavailable = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};

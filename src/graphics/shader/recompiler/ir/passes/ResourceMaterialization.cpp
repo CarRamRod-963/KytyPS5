@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
@@ -29,6 +30,20 @@ constexpr size_t BindlessTableKeys = 32u;
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
+	return false;
+}
+
+// The draw's guest data cannot be enumerated (see ResourceSnapshot::unavailable). The data can
+// stay that way for many draws, so only the first reports are printed.
+bool SpecializationUnavailable(uint64_t shader_hash, ResourceSnapshot& snapshot,
+                               std::string_view message) {
+	snapshot.unavailable = true;
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1u, std::memory_order_relaxed) < 64u) {
+		std::fprintf(stderr, "shader resource specialization unavailable: hash=%016llx %.*s\n",
+		             static_cast<unsigned long long>(shader_hash), static_cast<int>(message.size()),
+		             message.data());
+	}
 	return false;
 }
 
@@ -387,15 +402,26 @@ bool EvaluateIndirectCount(const DescriptorSource::IndirectDescriptor& indirect,
 	return true;
 }
 
+// `unavailable` is set when the keys depend on guest data that cannot be enumerated: unmapped
+// memory, a runtime count beyond the probe limit or a key range past 32 bits.
 bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
                          const DescriptorValue& material_value, const SrtRuntime& runtime,
-                         SrtWalker& clean, std::vector<uint32_t>& keys) {
+                         SrtWalker& clean, std::vector<uint32_t>& keys, bool& unavailable) {
 	const auto* selector = &*indirect.selector;
 	keys.clear();
+	unavailable           = false;
+	const auto data_limit = [&] {
+		unavailable = true;
+		return false;
+	};
+	const auto read_scalar = [&](uint64_t base, uint64_t size, uint64_t offset,
+	                             std::span<uint32_t> words) {
+		return ReadScalarTable(base, size, offset, runtime, words) || data_limit();
+	};
 	const auto read_selector = [&](uint64_t base, uint64_t size, uint64_t offset,
 	                               std::span<uint32_t> words) {
-		return selector->global ? ReadTable(base, size, offset, runtime, words)
-		                        : ReadScalarTable(base, size, offset, runtime, words);
+		return selector->global ? ReadTable(base, size, offset, runtime, words) || data_limit()
+		                        : read_scalar(base, size, offset, words);
 	};
 	const auto read_keys = [&](uint64_t base, uint64_t size, uint64_t first,
 	                           uint64_t step, uint64_t count) {
@@ -428,19 +454,21 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		const auto& rows = *selector->rows;
 		DescriptorValue count_value;
 		ShaderBufferResource counts, material;
-		if (!clean.EvaluateDescriptor(rows.source, count_value) ||
-		    !DecodeBufferDescriptor(count_value, counts) ||
+		if (!clean.EvaluateDescriptor(rows.source, count_value)) return data_limit();
+		if (!DecodeBufferDescriptor(count_value, counts) ||
 		    !DecodeBufferDescriptor(material_value, material) || selector->stride != 4u ||
-		    selector->offset != 0u || rows.stride == 0u || (rows.stride & 3u) != 0u ||
-		    counts.GetSize() / 4u > MaxIndirectDescriptorProbes) return false;
+		    selector->offset != 0u || rows.stride == 0u || (rows.stride & 3u) != 0u)
+			return false;
+		if (counts.GetSize() / 4u > MaxIndirectDescriptorProbes) return data_limit();
 		std::vector<uint32_t> lengths(counts.GetSize() / 4u);
-		if (!ReadScalarTable(counts.Base48(), counts.GetSize(), 0u, runtime, lengths)) return false;
+		if (!read_scalar(counts.Base48(), counts.GetSize(), 0u, lengths)) return false;
 		uint32_t total = 0;
 		for (size_t row = 0; row < lengths.size(); ++row) {
 			const auto length = lengths[row];
 			if (length > MaxIndirectDescriptorProbes - total ||
 			    (length != 0u && uint64_t {row} * rows.stride + uint64_t {length} * 4u >
-			                         UINT32_MAX + 1ull)) return false;
+			                         UINT32_MAX + 1ull))
+				return data_limit();
 			total += length;
 		}
 		keys.reserve(total);
@@ -460,7 +488,7 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 			// Coalesce small gaps, but interpret only selected prefixes. The strict
 			// reader captures the entire fetched span for writable-alias rejection.
 			batch.resize(end - first);
-			if (!ReadScalarTable(material.Base48(), material.GetSize(), first * 4u, runtime, batch))
+			if (!read_scalar(material.Base48(), material.GetSize(), first * 4u, batch))
 				return false;
 			for (; row < next; ++row) {
 				if (lengths[row] == 0u) continue;
@@ -472,9 +500,11 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		ShaderBufferResource material;
 		std::array<uint32_t, 4> masks {};
 		uint32_t first = 0, count = 0;
-		if (!DecodeBufferDescriptor(material_value, material) ||
-		    !clean.Evaluate(indirect.selector_first, first) ||
-		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count != masks.size() * 32u ||
+		if (!DecodeBufferDescriptor(material_value, material)) return false;
+		if (!clean.Evaluate(indirect.selector_first, first) ||
+		    !EvaluateIndirectCount(indirect, runtime, clean, count))
+			return data_limit();
+		if (count != masks.size() * 32u ||
 		    selector->stride != sizeof(masks) || selector->offset != 0u ||
 		    material.Type() != 0u || material.Stride() != sizeof(masks) ||
 		    material.SwizzleEnabled() || material.AddTid() || material.OutOfBounds() != 0u ||
@@ -485,8 +515,8 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 			// at 128 keys. Bound scratch memory, preserving each coherent read's capture.
 			for (uint64_t first_word = 0; first_word < words; first_word += keys.size()) {
 				keys.resize(std::min<uint64_t>(words - first_word, MaxIndirectDescriptorProbes));
-				if (!ReadScalarTable(material.Base48(), material.GetSize(), first_word * 4u,
-				                     runtime, keys)) return false;
+				if (!read_scalar(material.Base48(), material.GetSize(), first_word * 4u, keys))
+					return false;
 				for (size_t word = 0; word < keys.size(); ++word) masks[word % masks.size()] |= keys[word];
 				if (std::ranges::all_of(masks, [](uint32_t mask) { return mask == UINT32_MAX; })) break;
 			}
@@ -507,7 +537,7 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		for (const auto [offset, size]: selector->byte_ranges) {
 			if (size > MaxIndirectDescriptorProbes || ((offset | size) & 3u) != 0u) return false;
 			keys.resize(size / 4u);
-			if (!ReadScalarTable(base, UINT64_MAX, offset, runtime, keys)) return false;
+			if (!read_scalar(base, UINT64_MAX, offset, keys)) return false;
 			for (const auto word: keys)
 				for (uint32_t shift = 0; shift < 32u; shift += 8u)
 					selected[(word >> shift) & 255u] = true;
@@ -529,7 +559,7 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		}
 		if (!clean.Evaluate(indirect.selector_first, first) ||
 		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count > MaxIndirectDescriptorProbes)
-			return false;
+			return data_limit();
 		// SMEM uses its instruction's byte stride; V# stride only supplies its bounds.
 		const auto step = selector->stride != 0u ? selector->stride : material.Stride();
 		if (selector->stride == 0u &&
@@ -537,21 +567,21 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		     material.OutOfBounds() != 0u || uint64_t {selector->offset} + 4u > step ||
 		     uint64_t {first} + count > material.NumRecords())) return false;
 		const auto last = count != 0u ? uint64_t {first} + count - 1u : 0u;
-		if (last > UINT32_MAX) return false;
+		if (last > UINT32_MAX) return data_limit();
 		const auto end = count != 0u ? last * step + selector->offset + 4u : 0u;
 		if (end > uint64_t {UINT32_MAX} + 1u ||
 		    (indirect.workgroup_axis == UINT32_MAX && end > size))
-			return false;
+			return data_limit();
 		if (!read_keys(base, size, uint64_t {first} * step + selector->offset, step, count))
 			return false;
 	} else if (!indirect.selector_mask.IsEmpty()) {
 		uint32_t mask = 0;
 		uint32_t count = 0;
-		if (material_value.dword_count != 2u ||
-		    !clean.Evaluate(indirect.selector_mask, mask) ||
-		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count == 0u || count > 32u) {
-			return false;
-		}
+		if (material_value.dword_count != 2u) return false;
+		if (!clean.Evaluate(indirect.selector_mask, mask) ||
+		    !EvaluateIndirectCount(indirect, runtime, clean, count))
+			return data_limit();
+		if (count == 0u || count > 32u) return false;
 		if (count < 32u) mask &= (1u << count) - 1u;
 		const auto material_base =
 		    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
@@ -588,8 +618,10 @@ bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
 		    ? material.GetSize() - selector->offset : 0u;
 		const auto count = std::min(domain_count,
 		    available < 4u ? 0u : (available - 4u) / selector->stride + 1u);
-		if (count > MaxIndirectDescriptorProbes ||
-		    !read_keys(material.Base48(), material.GetSize(), selector->offset, selector->stride, count)) return false;
+		if (count > MaxIndirectDescriptorProbes) return data_limit();
+		if (!read_keys(material.Base48(), material.GetSize(), selector->offset, selector->stride,
+		               count))
+			return false;
 		if (count < domain_count) keys.push_back(0u); // An out-of-bounds scalar read returns zero.
 	}
 	if (selector->byte_ranges.empty()) {
@@ -737,9 +769,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	DescriptorValue table_value;
 	ShaderBufferResource table;
-	const auto failed = [&](std::string_view reason, std::string_view details = {}) {
+	const auto describe = [&](std::string_view reason, std::string_view details) {
 		const auto* pointer = indirect.pointer_table ? &*indirect.pointer_table : nullptr;
-		return SpecializationFail(fmt::format(
+		return fmt::format(
 		    "indirect {} resource={} source={} table_source={} words={:08x},{:08x},{:08x},{:08x} "
 		    "base={:#x} size={} type={} runtime_stride={} records={} swizzle={} addtid={} oob={} "
 		    "maximum={} offset={} immediate={} record_bytes={} child_count={} child_stride={} "
@@ -752,11 +784,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    indirect.table_offset, indirect.table_immediate, indirect.table_record_bytes,
 		    pointer != nullptr ? pointer->count : 1u, pointer != nullptr ? pointer->stride : 0u,
 		    pointer != nullptr ? pointer->offset : 0u, pointer != nullptr && pointer->indexed,
-		    descriptors.size(), details));
+		    descriptors.size(), details);
+	};
+	const auto failed = [&](std::string_view reason, std::string_view details = {}) {
+		return SpecializationFail(describe(reason, details));
+	};
+	// Failures caused by this draw's guest data rather than by the shader.
+	const auto unavailable = [&](std::string_view reason, std::string_view details = {}) {
+		return SpecializationUnavailable(program.shader_hash, snapshot, describe(reason, details));
 	};
 	const auto read_failed = [&](std::string_view reason, uint32_t row, uint32_t child,
 	                             uint64_t base, uint64_t offset, size_t bytes) {
-		return failed(reason, fmt::format("row={} child={} read_base={:#x} read_offset={:#x} "
+		return unavailable(reason, fmt::format("row={} child={} read_base={:#x} read_offset={:#x} "
 		                                 "read_address={:#x} requested_bytes={}", row, child, base, offset,
 		    (base & AddressMask & ~uint64_t {3}) + (offset & ~uint64_t {3}), bytes));
 	};
@@ -771,7 +810,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if ((selector != nullptr && (byte_keys || !selector_keys->resolved) &&
 		     !clean.EvaluateDescriptor(selector->source, material_value)) ||
 		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
-			return false;
+			return unavailable("table evaluation");
 		}
 		if (table_value.dword_count == 2u) {
 			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
@@ -852,7 +891,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                                       : uint64_t {1} << 32u;
 			if (!indirect.key_count.IsEmpty()) {
 				uint32_t key_count = 0u;
-				if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
+				if (!EvaluateIndirectCount(indirect, runtime, clean, key_count))
+					return unavailable("key count evaluation");
 				domain = std::min(domain, uint64_t {key_count});
 			}
 			if (indexed_pointer &&
@@ -910,8 +950,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
-			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
-				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
+			if (child_count == 0u) return failed("candidate count");
+			if (!image_heap && count * child_count > MaxIndirectDescriptorProbes)
+				return unavailable("candidate count", fmt::format("rows={} limit={}", count,
+				                                                  MaxIndirectDescriptorProbes));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
 			auto& heap_words = program.material_keys;
@@ -942,7 +984,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
-						                     std::span(candidate.dwords).first(read_dwords))) return false;
+						                     std::span(candidate.dwords).first(read_dwords)))
+							return read_failed("table row read", word, child, table_base,
+							                   table_offset, descriptor_bytes);
 					} else {
 						const auto table_word = table_offset / 4u;
 						std::copy_n(heap_words.begin() + table_word,
@@ -983,15 +1027,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
-			if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
-			if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first_key))
-				return false;
-			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
+			if (!EvaluateIndirectCount(indirect, runtime, clean, key_count) ||
+			    (!indirect.selector_first.IsEmpty() &&
+			     !clean.Evaluate(indirect.selector_first, first_key)))
+				return unavailable("key range evaluation");
+			if (indirect.table_stride == 0u) return false;
+			if (key_count > MaxIndirectDescriptorProbes ||
 			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
 			         uint64_t {indirect.table_offset} + indirect.table_immediate +
 			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
-				return false;
+				return unavailable("key range",
+				                   fmt::format("first={} count={} limit={}", first_key, key_count,
+				                               MaxIndirectDescriptorProbes));
 			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), first_key);
@@ -1000,7 +1048,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
 			if (!selector_keys->resolved) {
-				if (!ResolveSelectorKeys(indirect, material_value, runtime, clean, keys)) return false;
+				bool data_limit = false;
+				if (!ResolveSelectorKeys(indirect, material_value, runtime, clean, keys,
+				                         data_limit)) {
+					const auto details = fmt::format(
+					    "selector_source={} stride={} offset={} workgroup_axis={} limit={}",
+					    selector->source, selector->stride, selector->offset,
+					    indirect.workgroup_axis, MaxIndirectDescriptorProbes);
+					return data_limit ? unavailable("selector keys", details)
+					                  : failed("selector keys", details);
+				}
 				selector_keys->resolved = true;
 			}
 		}
@@ -1076,7 +1133,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
 			}
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
-			return false;
+			return unavailable("candidate evaluation", fmt::format("entry={}", entry));
 		}
 		if (!normalize(candidate))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
@@ -1886,6 +1943,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
+	snapshot.unavailable = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -1914,9 +1972,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
 			if ((!active.empty() && !active[source]) ||
 			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
-			if ((runtime.indirect_args_address & 3u) != 0u ||
-			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
-			               observed, workgroup_counts)) return false;
+			if ((runtime.indirect_args_address & 3u) != 0u) return false;
+			if (!ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u, observed,
+			               workgroup_counts))
+				return SpecializationUnavailable(
+				    program.shader_hash, snapshot,
+				    fmt::format("dispatch arguments at {:#x}", runtime.indirect_args_address));
 			observed.workgroup_counts = workgroup_counts;
 			break;
 		}
@@ -1953,6 +2014,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	};
 	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
 	                                 size_t candidates) {
+		// An unavailable candidate set has already named its reason.
+		if (snapshot.unavailable) return false;
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};

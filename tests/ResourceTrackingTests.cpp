@@ -6941,6 +6941,83 @@ void TestWorkgroupSelectedBufferRecords() {
         "a plan without workgroup counts read the indirect argument pointer");
 }
 
+// Ghost of Yotei (PPSA26344) CS 0xd108b276bb7c5f0f selects one 192-byte record
+// per workgroup through a 12-byte selector row, as above. An open-world run
+// exited after 41 minutes when one dispatch's selection could not be
+// enumerated: which records it reaches depends on that dispatch's guest data,
+// not on the shader. Such a refresh still fails, but reports itself as
+// unavailable so that the renderer skips the dispatch; a malformed selected V#
+// still fails as unsupported, and the next dispatch with readable data
+// specializes normally.
+void TestUnavailableWorkgroupSelection() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  auto fixture = MakeBufferRecordFixture(1u, false, true, 0u, false, true);
+  const auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  constexpr uint32_t table = 256u, selector = 0x1000u, records = 16u;
+  memory.words.resize((selector + records * 12u) / 4u);
+  for (uint32_t row = 0; row < 2u; ++row) {
+    for (uint32_t member = 0; member < 2u; ++member) {
+      const auto first = (table + row * 192u + 160u + member * 16u) / 4u;
+      memory.words[first] = 0x100000u + row * 0x1000u + member * 0x10000u;
+      memory.words[first + 1u] = (member == 0u ? 8u : 1u) << 16u;
+      memory.words[first + 2u] = 16u;
+      memory.words[first + 3u] =
+          member == 0u
+              ? (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                    Libs::Graphics::DstSel(4, 5, 6, 7)
+              : 0x5204u;
+    }
+  }
+  const std::array<uint32_t, 4> numeric_descriptor{0x640u, 3u, 0x3ba3d70au,
+                                                   0x3a23d70au};
+  std::copy(numeric_descriptor.begin(), numeric_descriptor.end(),
+            memory.words.begin() + (table + 304u) / 4u);
+  const std::array<uint32_t, 8> user_data{
+      uint32_t(memory.base) + table,    192u << 16u, 2u,      0x5204u,
+      uint32_t(memory.base) + selector, 12u << 16u,  records, 0x5204u};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = ReadLinearTestMemory,
+                           .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory,
+                           .indirect_args_address = memory.base};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&](uint32_t groups, uint32_t second_key,
+                               uint64_t fail_offset) {
+    memory.words[0] = groups;
+    memory.words[1] = memory.words[2] = 1u;
+    memory.words[selector / 4u] = 0u;
+    memory.words[selector / 4u + 3u] = second_key;
+    memory.fail_address =
+        fail_offset == UINT64_MAX ? UINT64_MAX : memory.base + fail_offset;
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  // Two distinct rows per operation: the root and one candidate (no spare
+  // slots).
+  Check(materialize(2u, 1u, UINT64_MAX) && !snapshot.unavailable &&
+            snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+        "workgroup selection fixture did not specialize both rows");
+  const auto valid = specialization;
+  Check(!materialize(MaxIndirectDescriptorProbes + 1u, 1u, UINT64_MAX) &&
+            snapshot.unavailable,
+        "a workgroup count beyond the probe limit was reported as an "
+        "unsupported shader");
+  Check(!materialize(2u, 1u, selector + 12u) && snapshot.unavailable,
+        "an unmapped selector row was reported as an unsupported shader");
+  Check(!materialize(2u, 1u, table + 192u + 160u) && snapshot.unavailable,
+        "an unmapped selected record was reported as an unsupported shader");
+  Check(!materialize(2u, 1u, 0u) && snapshot.unavailable,
+        "unmapped dispatch arguments were reported as an unsupported shader");
+  Check(!materialize(2u, 22369622u, UINT64_MAX) && !snapshot.unavailable,
+        "a selected numeric descriptor was reported as unavailable data "
+        "instead of failing");
+  Check(materialize(2u, 1u, UINT64_MAX) && !snapshot.unavailable &&
+            specialization == valid,
+        "a readable dispatch after unavailable ones kept the failure or "
+        "changed specialization");
+}
+
 void TestGpuSelectedFormattedRecordStore() {
   namespace Prospero = Libs::Graphics::Prospero;
   enum class Prefix { None, Forward, Reversed, Lane, TwoAxes };
@@ -9503,6 +9580,7 @@ int main() {
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
+    Run("unavailable workgroup selection", TestUnavailableWorkgroupSelection);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("record table specialization stability",
         TestRecordTableSpecializationStability);
