@@ -1158,7 +1158,7 @@ void TestIndexedPointerImageTable() {
   enum class Case { Valid, ReverseSigned, MissingParent, WrongParent, MissingChild,
                     InclusiveChild, MismatchedPair, DifferentLaneMask, ExtraUse,
                     UnboundedChoice, MissingOuterWitness, WrongOuterWitness, CyclicChoice,
-                    ExcessiveDomain, Counted, MissingCount, DifferentCount, MaskedCount, UnprovenMask };
+                    ExcessiveDomain, LargeChild, Counted, MissingCount, DifferentCount, MaskedCount, UnprovenMask };
   const auto make = [](Case variant = Case::Valid) {
     auto fixture = std::make_unique<Fixture>();
     std::array<Value, 4> table_words;
@@ -1257,7 +1257,9 @@ void TestIndexedPointerImageTable() {
     const auto range = variant == Case::MissingChild ? Value(true)
         : fixture->Emit(variant == Case::InclusiveChild ? ValueOpcode::ULessThanEqual32
                                                       : ValueOpcode::ULessThan32,
-                        {child, Value(variant == Case::ExcessiveDomain ? MaxIndirectDescriptorProbes : 3u)});
+                        {child, Value(variant == Case::ExcessiveDomain ? MaxIndirectDescriptorProbes
+                                     : variant == Case::LargeChild    ? 255u
+                                                                      : 3u)});
     const auto active = fixture->Emit(ValueOpcode::LogicalAnd, {parent, range});
     const auto extended = fixture->Emit(ValueOpcode::SelectU32,
         {active, fixture->Emit(ValueOpcode::BitFieldSExtract, {high, Value(0u), Value(16u)}), Value(0u)});
@@ -1473,6 +1475,72 @@ void TestIndexedPointerImageTable() {
               !MaterializeResources(unproved_plan, counted_runtime, snapshot, specialization) && memory.watched_reads == 0u,
           "finite choice borrowed a missing or different leaf's count or pruned an unproven inactive arm");
   }
+
+  // Ghost of Yotei 617c7166f3308810 bounds the child (material layer) by 255: 2
+  // rows x 255 children would bake hundreds of candidates read through pointers
+  // that change per draw, a permutation per material. Such a domain is a
+  // bindless heap with the nested key layout.
+  auto layered = make(Case::LargeChild);
+  layered->PlanAndTrack();
+  const auto layered_plan = ExtractResourcePlan(layered->program);
+  const auto &layered_indirect =
+      *layered_plan.descriptor_sources[layered_plan.info.images[0].source]
+           .indirect_descriptor;
+  Check(layered_plan.info.images.size() == 1u &&
+            layered_indirect.pointer_table &&
+            layered_indirect.pointer_table->indexed &&
+            layered_indirect.pointer_table->count == 255u &&
+            !layered_indirect.bindless,
+        "large child domain was not planned as a nested pointer table");
+  LinearTestMemory heap;
+  heap.base += high;
+  heap.words.resize((objects + 4u * row_bytes - 0x1000u) / 4u, 0xdeadbeefu);
+  const auto heap_at = [&](uint32_t address) {
+    return heap.words.begin() + (address - 0x1000u) / 4u;
+  };
+  for (uint32_t row = 0; row < 2u; ++row) {
+    *heap_at(table + row * stride) = objects + row * row_bytes;
+    *heap_at(table + row * stride + 4u) = 0xbeef0001u;
+    const auto image = image_words(10u + row);
+    std::copy(image.begin(), image.end(),
+              heap_at(objects + row * row_bytes + 64u));
+  }
+  std::array<uint32_t, 4> layered_data{table, 1u | (stride << 16u), 2u,
+                                       0x5204u};
+  const SrtRuntime layered_runtime{.user_data = layered_data,
+                                   .userdata = &heap,
+                                   .read_specialization_memory =
+                                       ReadLinearTestMemory};
+  ResourceSnapshot layered_snapshot;
+  ResourceSpecialization layered_specialization;
+  Check(MaterializeResources(layered_plan, layered_runtime, layered_snapshot,
+                             layered_specialization) &&
+            layered_snapshot.images.size() == 1u &&
+            layered_snapshot.bindless_uses.size() == 1u &&
+            layered_specialization.images.size() == 1u &&
+            layered_specialization.images[0].bindless,
+        "large nested child domain was enumerated instead of resolved through "
+        "a bindless heap");
+  const auto &use = layered_snapshot.bindless_uses[0];
+  Check(use.resource == 0u && use.base == high + table &&
+            use.size == 2u * stride && use.record_stride == stride &&
+            use.pointer_offset == 0u && use.table_offset == 64u &&
+            use.layer_stride == 368u && use.layer_count == 255u &&
+            layered_specialization.images[0].indirect_mapping_offset ==
+                use.mapping_offset &&
+            use.mapping_offset + 2u <= layered_snapshot.flattened_srt.size() &&
+            layered_snapshot.images[0].dwords[0] == 0u,
+        "bindless heap of a nested table does not describe the parent rows and "
+        "child layers");
+  // Another material behind the pointers keeps the program.
+  const auto layered_original = layered_specialization;
+  *heap_at(table) = objects + row_bytes;
+  *heap_at(objects + row_bytes + 64u) = 42u;
+  Check(
+      MaterializeResources(layered_plan, layered_runtime, layered_snapshot,
+                           layered_specialization) &&
+          layered_specialization == layered_original,
+      "a nested bindless heap re-specialized when its parent pointers changed");
 }
 
 void TestGuardedDirectImageTable() {
