@@ -296,11 +296,20 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
+		// Refreshes resources and specialization for a draw. False only when the draw's guest
+		// data cannot be specialized (an unsupported shader still exits).
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                               specialization)) {
+				return true;
+			}
+			EXIT_IF(!resources.unavailable);
+			return false;
+		}
+
+		// Requires a successful Materialize for the current draw.
 		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+		Permutation* FindPermutation(uint32_t push_data_cursor) {
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword !=
@@ -343,6 +352,21 @@ struct PipelineCache::ProgramCache {
 	};
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
+
+	// A draw whose GPU-selected resources cannot be enumerated (unmapped guest memory, more
+	// probes than the host reads) is skipped rather than run with descriptors that may name
+	// the wrong memory; the shader's next draw is specialized afresh.
+	template <typename InputInfo>
+	static ShaderProgram SkipUnavailableDraw(ShaderType stage, uint64_t hash,
+	                                         InputInfo& input_info) {
+		input_info.stage = {};
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1u, std::memory_order_relaxed) < 64u) {
+			std::printf("Shader %u %016" PRIx64 ": resources unavailable for this draw, skipped\n",
+			            static_cast<uint32_t>(stage), hash);
+		}
+		return {};
+	}
 
 	// Names the first resource whose specialization changed between a shader's last permutation
 	// and the one about to be compiled, so a shader that keeps compiling can be understood.
@@ -480,11 +504,12 @@ struct PipelineCache::ProgramCache {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
 			Permutation* permutation = nullptr;
-			if (cached.call_source) {
-				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
-			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+			if (cached.call_source) source_changed = cached.RefreshCallSource(runtime);
+			if (!source_changed) {
+				if (!cached.Materialize(runtime))
+					return SkipUnavailableDraw(stage, params.hash, input_info);
+				permutation = cached.call_source ? cached.FindPermutation<true>(push_data_cursor)
+				                                 : cached.FindPermutation<false>(push_data_cursor);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -563,12 +588,13 @@ struct PipelineCache::ProgramCache {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!entry->second.Materialize(runtime))
+				return SkipUnavailableDraw(stage, params.hash, input_info);
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+			if (!entry->second.Materialize(runtime))
+				return SkipUnavailableDraw(stage, params.hash, input_info);
+			if (const auto* permutation = entry->second.FindPermutation<true>(push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -1022,9 +1048,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.unavailable = !result.pixel;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.unavailable = result.unavailable || !result.vertex[i];
 	}
 	return result;
 }

@@ -65,7 +65,8 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
-// Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// Refreshes cached resources and specialization in place. A failed refresh must not be used;
+// snapshot.unavailable tells a failure caused by the draw's guest data from an unsupported shader.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
