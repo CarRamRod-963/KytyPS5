@@ -87,7 +87,9 @@ struct MemoryInfo {
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
-		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
+		// A D16 formatted X load converts its component to the 16-bit VGPR form.
+		if (data_bits == 16u)
+			return formatted ? opcode == ValueOpcode::LoadBufferU32 : opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
 		       (formatted ? opcode == ValueOpcode::LoadBufferU32
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
@@ -97,9 +99,12 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
-	// A raw DWORD store through a GPU-selected V# is written through its device address.
+	// A raw byte/short/DWORD store through a GPU-selected V# is written through its device address.
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
-		return !typed && !formatted && data_bits == 32u && opcode == ValueOpcode::StoreBufferU32;
+		return !typed && !formatted &&
+		       ((opcode == ValueOpcode::StoreBufferU32 && data_bits == 32u) ||
+		        (opcode == ValueOpcode::StoreBufferU16 && data_bits == 16u) ||
+		        (opcode == ValueOpcode::StoreBufferU8 && data_bits == 8u));
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
