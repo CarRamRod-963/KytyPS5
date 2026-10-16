@@ -61,6 +61,10 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	// Set when a refresh fails only because of this draw's guest data: a GPU-selected candidate
+	// set reads memory that is not mapped or needs more probes than the host enumerates. The
+	// shader is supported; the draw that supplied the data cannot be specialized.
+	bool unavailable = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
