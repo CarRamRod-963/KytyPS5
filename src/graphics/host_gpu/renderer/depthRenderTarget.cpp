@@ -272,7 +272,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	if (!m_context.GetResolveCache().FindDepth(z, r.desc, r.image_id)) {
 		r.desc     = MakeDepthTargetDesc(buffer, z);
-		r.image_id = m_context.GetTextureCache().FindImage(r.desc);
+		r.image_id = m_context.GetTextureCache().FindImage(r.desc, false, m_depth_target_lookup);
 		m_context.GetResolveCache().SetDepth(z, r.desc, r.image_id);
 	}
 	r.depth_clear_enable      = has_depth && rc.depth_clear_enable;
