@@ -1797,6 +1797,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	// A GPU-selected store candidate whose range covers descriptor memory this dispatch reads is
+	// not the buffer the shader writes (it would overwrite its own descriptors): a table record the
+	// key never selects can hold a heap-wide V#. Such candidates are null, so the renderer's
+	// write-overlap check applies to the candidates that remain.
+	for (uint32_t i = 0; i < snapshot.buffers.size() && i < specialization.buffers.size(); ++i) {
+		const auto root = specialization.buffers[i].indirect_root;
+		if (root >= program.info.buffers.size() || !program.info.buffers[root].written) continue;
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) continue;
+		const auto base = descriptor.Base48();
+		const auto size = descriptor.GetSize();
+		if (base == 0u || size == 0u) continue;
+		for (const auto [address, bytes]: snapshot.specialization_reads) {
+			if (bytes != 0u && address < base + size && base < address + bytes) {
+				snapshot.buffers[i].dwords.fill(0u);
+				break;
+			}
+		}
+	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
