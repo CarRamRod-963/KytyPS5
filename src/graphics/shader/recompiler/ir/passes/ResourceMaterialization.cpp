@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <type_traits>
 #include <unordered_set>
 
@@ -218,6 +219,21 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
 	const auto last = (descriptor.dwords[3] >> 16u) & 0xfu;
 	return last - base + 1u;
+}
+
+// What decides whether two typed candidates of one image root can share a dynamically indexed
+// access: the numeric class (it selects the binding array), the dimension and the cube flag, as
+// BuildResourceSpecialization derives them.
+std::array<uint32_t, 3> ImageCandidateClass(const ImageResource&   image,
+                                            const DescriptorValue& descriptor) {
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	auto numeric_class = Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	if (image.resource_class == ImageResourceClass::Storage &&
+	    (image.atomic || RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid))
+		numeric_class = Prospero::TextureNumericClass::Uint;
+	return {static_cast<uint32_t>(numeric_class),
+	        static_cast<uint32_t>(DescriptorDimension(descriptor, image.dimension)),
+	        DescriptorIsCube(descriptor) ? 1u : 0u};
 }
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
@@ -595,6 +611,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
                                    uint32_t bindless_mapping, std::vector<uint32_t>& padding,
+                                   std::vector<std::pair<uint32_t, uint32_t>>& class_spares,
                                    Normalize&& normalize) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
@@ -631,6 +648,82 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			child.indirect_root = resource_index;
 			specializations.push_back(child);
 		}
+	};
+	// Image candidates of one class share a dynamically indexed access only while their ordinals
+	// are contiguous, and the program bakes where each class starts. A table enumerated in row
+	// order (Ghost of Yotei's 440-byte object records, probed every 8 bytes) interleaves classes
+	// differently with every object streamed in, so each scene compiled a new program with another
+	// switch arm. The children are therefore grouped by class - the root's class first, since the
+	// root is ordinal 0 - and each group is padded to a power of two with null spares that take the
+	// group's class (class_spares: spare, donor). Growing a group within its power of two leaves
+	// the specialization unchanged; a new class still changes it. The keys in the map
+	// (entry_stride words apart from map_first) are renumbered.
+	const auto group_image_candidates = [&](size_t map_first, size_t map_entries,
+	                                        size_t entry_stride) {
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			const auto& image = program.info.images[resource_index];
+			const auto  count = descriptors.size() - children_begin;
+			if (count == 0u) return true;
+			using Class = std::array<uint32_t, 3>;
+			std::vector<std::pair<Class, uint32_t>> order(count);
+			const auto&                             root = descriptors[resource_index];
+			std::optional<Class>                    lead;
+			if (!NullImageDescriptor(root)) lead = ImageCandidateClass(image, root);
+			// A null root takes the class of the first typed candidate, i.e. of the first group.
+			for (uint32_t child = 0; child < count && NullImageDescriptor(root); ++child) {
+				const auto& value = descriptors[children_begin + child];
+				if (NullImageDescriptor(value)) continue;
+				const auto type = ImageCandidateClass(image, value);
+				if (!lead || type < *lead) lead = type;
+			}
+			if (!lead) return true;
+			// Null children (only behind a typed root) take the root's class as well.
+			for (uint32_t child = 0; child < count; ++child) {
+				const auto& value = descriptors[children_begin + child];
+				order[child] = {NullImageDescriptor(value) ? *lead : ImageCandidateClass(image, value),
+				                child};
+			}
+			std::ranges::stable_sort(order, [&](const auto& a, const auto& b) {
+				return std::pair {a.first != *lead, a.first} < std::pair {b.first != *lead, b.first};
+			});
+			// Dynamic-mip candidates never share an access; spares would only add switch arms.
+			const bool pad = image.mip_mode != ImageMipMode::Dynamic;
+			std::vector<DescriptorValue> grouped;
+			std::vector<Specialization>  grouped_specializations;
+			std::vector<uint32_t>        renumber(count + 1u, 0u);
+			auto child_template          = root_resource;
+			child_template.indirect_root = resource_index;
+			for (size_t first = 0; first < count;) {
+				auto last = first;
+				while (last < count && order[last].first == order[first].first) ++last;
+				const auto donor = static_cast<uint32_t>(children_begin + grouped.size());
+				for (auto member = first; member < last; ++member) {
+					renumber[order[member].second + 1u] = static_cast<uint32_t>(grouped.size() + 1u);
+					grouped.push_back(descriptors[children_begin + order[member].second]);
+					grouped_specializations.push_back(specializations[children_begin + order[member].second]);
+				}
+				// The root (ordinal 0) belongs to the lead group.
+				const bool lead_group = first == 0u;
+				const auto members = last - first + (lead_group ? 1u : 0u);
+				for (auto slots = pad ? std::bit_ceil(members) : members; slots > members; --slots) {
+					if (!lead_group)
+						class_spares.emplace_back(static_cast<uint32_t>(children_begin + grouped.size()), donor);
+					grouped.push_back({.dword_count = dword_count});
+					grouped_specializations.push_back(child_template);
+				}
+				first = last;
+			}
+			descriptors.resize(children_begin);
+			specializations.resize(children_begin);
+			descriptors.insert(descriptors.end(), grouped.begin(), grouped.end());
+			specializations.insert(specializations.end(), grouped_specializations.begin(),
+			                       grouped_specializations.end());
+			for (size_t entry = 0; entry < map_entries; ++entry) {
+				auto& ordinal = snapshot.flattened_srt[map_first + entry * entry_stride];
+				if (ordinal != 0u) ordinal = renumber[ordinal];
+			}
+		}
+		return true;
 	};
 	// A heap's two words live at a place fixed by the plan, so the mapping offsets the program
 	// bakes do not move with the length of other tables' key maps.
@@ -879,6 +972,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				// object list (Ghost of Yotei CS 0x8457901d80b91921: about 60 per scene).
 				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>)
 					pad_candidates();
+				if (!group_image_candidates(mapping_offset + 1u, entries, 1u)) return false;
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -999,7 +1093,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 		const auto unique = descriptors.size() - children_begin + 1u;
-		pad_candidates();
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			if (!group_image_candidates(mapping_offset + 2u, key_count, 2u)) return false;
+		} else {
+			pad_candidates();
+		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -1798,6 +1896,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.flattened_srt.resize(bindless_mapping[i] + 2u, 0u);
 	}
 	std::vector<uint32_t> padding;
+	std::vector<std::pair<uint32_t, uint32_t>> class_spares;
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1813,7 +1912,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers, UINT32_MAX, padding,
+					        snapshot.buffers, specialization.buffers, UINT32_MAX, padding, class_spares,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
@@ -1899,7 +1998,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool table_candidates = bounded_table || indirect.sources.empty();
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
-			        specialization.images, bindless_mapping[i], padding,
+			        specialization.images, bindless_mapping[i], padding, class_spares,
 			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations;
 				        // a selector names exactly the records the shader uses, so a malformed one
@@ -1942,7 +2041,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.samplers[i] = {.dword_count = 4u};
 				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
-				        specialization.samplers, UINT32_MAX, padding,
+				        specialization.samplers, UINT32_MAX, padding, class_spares,
 				        [](DescriptorValue&) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
@@ -1983,7 +2082,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) return false;
+	// A spare image slot is never selected; it takes the class of the group it pads, which the
+	// null descriptor alone would not give it.
+	for (const auto& [spare, donor]: class_spares)
+		specialization.images[spare] = specialization.images[donor];
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
