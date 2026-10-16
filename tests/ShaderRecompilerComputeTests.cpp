@@ -3279,6 +3279,9 @@ public:
         auto &scheduler = context.GetCommandScheduler();
         scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
       });
+      // A completed submission queues its label writes and interrupts to the
+      // GPU thread behind the command above; run them before checking.
+      gpu.SendCommandSync([] {});
     };
     const auto wait_for_interrupt =
         [&](LibKernel::EventQueue::KernelEvent &event, int &count) {
