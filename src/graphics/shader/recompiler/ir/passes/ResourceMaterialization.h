@@ -60,7 +60,8 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// Refreshes cached resources and specialization in place. A failed refresh must not be used;
+// snapshot.unavailable tells a failure caused by the draw's guest data from an unsupported shader.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
