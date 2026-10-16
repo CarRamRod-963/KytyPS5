@@ -1801,6 +1801,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			// Candidates read from guest tables (rather than enumerated by the program) may
+			// belong to other image operations.
+			const bool table_candidates = bounded_table || indirect.sources.empty();
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
@@ -1810,7 +1813,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				            (image.sample_access_only && !image.depth_compare &&
 				             DescriptorImageSwizzle(value) == 0u) ||
 				            !PlaceableImageDescriptor(value) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				            (table_candidates &&
+				             DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
