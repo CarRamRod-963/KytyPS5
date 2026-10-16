@@ -16,7 +16,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_resolve_cache(*this), m_texture_cache(graphics, m_command_scheduler, m_page_manager,
 	                                          m_buffer_cache, m_resolve_cache),
-      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap),
+      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, &m_command_scheduler),
       m_bindless_table(graphics, m_command_scheduler),
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -28,6 +28,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	// Before the bindless table destroys the set layout that background builds reference.
+	m_pipeline_cache.StopBackgroundCompiles();
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
