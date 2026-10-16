@@ -754,6 +754,8 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	// Per base buffer: the output components (bit mask) formatted untyped accesses may read.
+	std::vector<uint8_t>                  formatted_components;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
