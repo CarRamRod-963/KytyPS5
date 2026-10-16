@@ -520,6 +520,165 @@ void TestGeneralNativeSrtWalker() {
         "general native walker accepted truncated user data");
 }
 
+void TestGeneralWalkerLoopFixpoint() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // entry -> header (enter) or skip; header -> body (loop flag and an opaque
+  // loop-carried test) or loop exit; body reads and returns to the header;
+  // skip and loop exit join on a control phi that picks the use block, which
+  // reads again and holds a buffer descriptor. The phi is unknown while every
+  // block counts as visited, so reaching the right blocks takes the
+  // interpreter's fixpoint, which the compiled walker must reproduce.
+  std::array<uint32_t, 8> table{0x11u, 0x12u, 0x13u, 0x14u,
+                                0x15u, 0x16u, 0x17u, 0x18u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 5> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u,
+                                    0u, 3u};
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 5;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 8; ++i)
+    AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &header = *program.blocks[1];
+  auto &body = *program.blocks[2];
+  auto &loop_exit = *program.blocks[3];
+  auto &join = *program.blocks[4];
+  auto &use = *program.blocks[5];
+  auto &exit = *program.blocks[6];
+  auto &skip = *program.blocks[7];
+  const auto emit = [](Block &block, ValueOpcode opcode,
+                       std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto branch = [](Block &block, Block &target, Value condition = {},
+                         Block *other = nullptr) {
+    block.terminator.kind =
+        other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
+    block.terminator.true_block = &target;
+    block.terminator.false_block = other;
+    block.condition = condition;
+    block.AddBranch(&target);
+    if (other)
+      block.AddBranch(other);
+  };
+  const auto user = [&](uint32_t reg) {
+    return emit(entry, ValueOpcode::GetUserData, {Value(ScalarReg(reg))});
+  };
+  const auto low = user(0);
+  const auto high = user(1);
+  const auto enter = user(2);
+  const auto loop_flag = user(3);
+  const auto index = user(4);
+  program.memory_info.push_back(
+      {.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  const auto root = emit(entry, ValueOpcode::GetAddressResource, {low, high});
+  const auto read = [&](Value byte_offset) {
+    const auto value = emit(entry, ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  };
+  read(emit(entry, ValueOpcode::ShiftLeftLogical32, {index, Value(2u)}));
+  read(Value(28u));
+  const auto srt = emit(entry, ValueOpcode::GetSrtResource, {});
+  emit(body, ValueOpcode::ReadConst, {srt, Value(0u)});
+  const auto flat = emit(use, ValueOpcode::ReadConst, {srt, Value(1u)});
+  branch(entry, header, emit(entry, ValueOpcode::IEqual32, {enter, Value(1u)}),
+         &skip);
+
+  auto &carried = header.AppendNewInst(ValueOpcode::Phi);
+  carried.SetFlags(Type::U32);
+  const auto next =
+      emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
+  carried.AddPhiOperand(&entry, index);
+  carried.AddPhiOperand(&body, next);
+  const auto again = emit(
+      header, ValueOpcode::LogicalAnd,
+      {emit(header, ValueOpcode::IEqual32, {loop_flag, Value(1u)}),
+       emit(header, ValueOpcode::INotEqual32, {Value(&carried), Value(100u)})});
+  branch(header, body, again, &loop_exit);
+  header.terminator.loop_header = true;
+  header.terminator.continue_block = &body;
+  header.terminator.merge_block = &loop_exit;
+  branch(body, header);
+  branch(loop_exit, join);
+  branch(skip, join);
+  auto &selected = join.AppendNewInst(ValueOpcode::Phi);
+  selected.SetFlags(Type::U32);
+  selected.AddPhiOperand(&skip, Value(5u));
+  selected.AddPhiOperand(&loop_exit, Value(6u));
+  branch(join, use,
+         emit(join, ValueOpcode::IEqual32, {Value(&selected), Value(5u)}),
+         &exit);
+  branch(use, exit);
+  exit.terminator.kind = TerminatorKind::Return;
+
+  DescriptorSource source;
+  source.dwords = {flat, Value(1u << 16u), Value(16u), Value(3u << 28u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  const auto buffer = emit(
+      use, ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  emit(use, ValueOpcode::LoadBufferU32,
+       {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
+      .Instruction()
+      ->SetFlags(MemoryFlags{.index = 1});
+
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.size() == 8 && plan.srt_general_code != nullptr &&
+            plan.jit_loops,
+        "loop-shaped plan did not compile the general walker");
+  struct Case {
+    uint32_t enter;
+    uint32_t loop;
+    std::vector<uint8_t> visited;
+    std::vector<uint32_t> flat;
+  };
+  const std::array cases{
+      // The body may run: both header successors; the join phi settles on the
+      // loop exit's incoming in the second iteration and skips the use block.
+      Case{1u, 1u, {1, 1, 1, 1, 1, 0, 1, 0}, {table[3], 0u}},
+      // The loop flag skips the body.
+      Case{1u, 0u, {1, 1, 0, 1, 1, 0, 1, 0}, {0u, 0u}},
+      // The loop is not reached: the phi takes the skip incoming.
+      Case{0u, 1u, {1, 0, 0, 0, 1, 1, 1, 1}, {0u, table[7]}},
+  };
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto &expected : cases) {
+    user_data[2] = expected.enter;
+    user_data[3] = expected.loop;
+    const SrtRuntime runtime{.user_data = user_data};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "compiled loop walker failed to materialize");
+    const auto visited = plan.visited_blocks;
+    const auto active = plan.active_sources;
+    Check(visited == expected.visited,
+          "compiled loop walker reached the wrong blocks");
+    Check(snapshot.flattened_srt == expected.flat,
+          "compiled loop walker refreshed the wrong reads");
+    Check(active == std::vector<uint8_t>{expected.visited[5]} &&
+              snapshot.buffers[0].dwords[0] == expected.flat[1],
+          "compiled loop walker activated the wrong descriptors");
+    auto code = std::move(plan.srt_general_code);
+    ResourceSnapshot interpreted;
+    Check(MaterializeResources(plan, runtime, interpreted, specialization),
+          "interpreter failed on the loop-shaped plan");
+    Check(plan.visited_blocks == visited && plan.active_sources == active &&
+              interpreted.flattened_srt == snapshot.flattened_srt &&
+              interpreted.buffers == snapshot.buffers,
+          "interpreter and compiled loop walker disagree");
+    plan.srt_general_code = std::move(code);
+  }
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtProgram(0x10000);
@@ -1599,6 +1758,7 @@ int main() {
   TestGeneralNativeSrtWalker();
   TestGeneralWalkerScopedMemo();
   TestGeneralWalkerAssumesExecFactor();
+  TestGeneralWalkerLoopFixpoint();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();

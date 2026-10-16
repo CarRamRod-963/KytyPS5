@@ -382,10 +382,12 @@ private:
 // under control flow or compute offsets, so this one compiles the plan's value graph as a
 // stack machine over the evaluation memo: every instruction value is computed into its memo
 // slot (tagged with the generation) the first time a path needs it, which also lets the
-// descriptor evaluation that follows hit the memo. Blocks are walked in index order with the
-// interpreter's reachability rule: a block runs when a reachable predecessor selected it or had
-// a condition the host could not decide, and a control phi takes the incoming of the reachable
-// predecessors, which must agree. Plans whose edges go backwards stay with the interpreter.
+// descriptor evaluation that follows hit the memo. Blocks are walked in a topological order with
+// the interpreter's reachability rule: a block runs when a reachable predecessor selected it or
+// had a condition the host could not decide, and a control phi takes the incoming of the
+// reachable predecessors, which must agree. Plans with loops run the interpreter's fixpoint
+// instead (see RunGeneralWalker): the code computes the blocks reachable under a given set of
+// visited blocks, and a second phase refreshes the reads of the final set.
 // Guest reads go through the runtime readers, as in the interpreter. Anything the compiler
 // does not model (floating point, varying loads, clean reads) leaves the plan to the
 // interpreter, and a failing run falls back to it as well.
@@ -412,6 +414,12 @@ struct GeneralWalkerContext {
 	uint64_t saved_sp[16] = {};
 	// Memo arrays of the EXEC-factor assumptions: 2 * mask index + clean.
 	ResourcePlan::EvaluationContext::Entry** assume_values = nullptr;
+	// Plans with loops: the blocks reached in this pass (bit 0) and processed (bit 1), while
+	// control phis read `visited`; the phase (0 reachability, 1 reads); a block was processed
+	// in the current sweep.
+	uint8_t* reachable = nullptr;
+	uint32_t phase     = 0;
+	uint32_t changed   = 0;
 };
 static_assert(offsetof(GeneralWalkerContext, user_data) == 0);
 static_assert(offsetof(GeneralWalkerContext, user_data_count) == 8);
@@ -427,6 +435,9 @@ static_assert(offsetof(GeneralWalkerContext, scratch) == 80);
 static_assert(offsetof(GeneralWalkerContext, frame) == 88);
 static_assert(offsetof(GeneralWalkerContext, saved_sp) == 96);
 static_assert(offsetof(GeneralWalkerContext, assume_values) == 224);
+static_assert(offsetof(GeneralWalkerContext, reachable) == 232);
+static_assert(offsetof(GeneralWalkerContext, phase) == 240);
+static_assert(offsetof(GeneralWalkerContext, changed) == 244);
 
 static bool KYTY_SYSV_ABI GeneralWalkerRead(GeneralWalkerContext* context, uint64_t address,
                                             uint64_t clean) {
@@ -499,7 +510,9 @@ public:
 			}
 		}
 		// Blocks are emitted in a topological order so every predecessor of a block has run
-		// (or been skipped) before it: the reachability rule and the phis depend on it.
+		// (or been skipped) before it: the reachability rule and the phis depend on it. A plan
+		// with a cycle runs the interpreter's fixpoint instead, in reverse postorder so most
+		// sweeps settle in one pass.
 		std::vector<uint32_t> order;
 		{
 			std::vector<uint32_t> pending(blocks, 0u);
@@ -519,7 +532,10 @@ public:
 					if (--pending[successor] == 0u) ready.push_back(successor);
 				}
 			}
-			if (order.size() != blocks) return false;
+		}
+		const bool loops = order.size() != blocks;
+		if (loops) {
+			order = ReversePostorder();
 		}
 		for (const auto& [phi, predecessors]: program.control_phi_predecessors) {
 			uint32_t owner = UINT32_MAX;
@@ -557,7 +573,7 @@ public:
 			for (const auto& read: program.srt_reads) {
 				if (!EmitRead(read)) return false;
 			}
-		} else {
+		} else if (!loops) {
 			for (size_t position = 0; position < order.size(); ++position) {
 				const auto  index = order[position];
 				const auto& block = program.control_flow[index];
@@ -574,39 +590,56 @@ public:
 						return false;
 					}
 				}
-				const auto reach = [&](uint32_t successor) {
-					code.mov(code.rax, code.qword[code.rbx + 48]);
-					code.mov(code.byte[code.rax + successor], 1);
-				};
-				if (block.condition.IsEmpty()) {
-					for (const auto successor: block.successors)
-						reach(successor);
-					code.jmp(next, Xbyak::CodeGenerator::T_NEAR);
-					continue;
-				}
-				// An undecidable condition reaches both successors, like the interpreter. The
-				// condition is evaluated by the clean evaluator when there is one.
-				Xbyak::Label otherwise, unknown;
-				code.mov(code.rbp, code.rsp);
-				m_fail = &unknown;
-				EnterClean();
-				const bool condition = Emit(block.condition);
-				LeaveClean();
-				if (!condition) return false;
+				if (!EmitSuccessors(block, 48, next)) return false;
+			}
+		} else {
+			// Phase 0: sweep the blocks until no reached block is left unprocessed. Control
+			// phis read the visited set of the iteration, which the caller fixes for the whole
+			// phase, so each reached block's condition is evaluated once per iteration like in
+			// the interpreter's traversal, and the order of the sweep does not change the result.
+			Xbyak::Label reads, sweep, swept;
+			code.cmp(code.dword[code.rbx + 240], 0);
+			code.jne(reads, Xbyak::CodeGenerator::T_NEAR);
+			code.L(sweep);
+			code.mov(code.dword[code.rbx + 244], 0);
+			for (size_t position = 0; position < order.size(); ++position) {
+				const auto  index = order[position];
+				const auto& block = program.control_flow[index];
+				auto& next = position + 1 < order.size() ? labels[order[position + 1]] : swept;
+				code.L(labels[index]);
+				m_base.by_mode.clear();
+				m_scopes.clear();
+				code.mov(code.rax, code.qword[code.rbx + 232]);
+				code.cmp(code.byte[code.rax + index], 1);
+				code.jne(next, Xbyak::CodeGenerator::T_NEAR);
+				code.mov(code.byte[code.rax + index], 3);
+				code.mov(code.dword[code.rbx + 244], 1);
 				m_fail = &m_failed;
-				code.test(code.eax, code.eax);
-				code.jz(otherwise, Xbyak::CodeGenerator::T_NEAR);
-				reach(block.successors[0]);
-				code.jmp(next, Xbyak::CodeGenerator::T_NEAR);
-				code.L(otherwise);
-				reach(block.successors[1]);
-				code.jmp(next, Xbyak::CodeGenerator::T_NEAR);
-				code.L(unknown);
-				code.mov(code.rsp, code.rbp);
-				RestoreNormalMemo();
-				reach(block.successors[0]);
-				reach(block.successors[1]);
-				code.jmp(next, Xbyak::CodeGenerator::T_NEAR);
+				if (!EmitSuccessors(block, 232, next)) return false;
+			}
+			code.L(swept);
+			code.cmp(code.dword[code.rbx + 244], 0);
+			code.jne(sweep, Xbyak::CodeGenerator::T_NEAR);
+			code.jmp(m_finished, Xbyak::CodeGenerator::T_NEAR);
+			// Phase 1: the reads of the final visited set in block order, as the interpreter
+			// refreshes them after its fixpoint.
+			code.L(reads);
+			for (uint32_t index = 0; index < blocks; ++index) {
+				const auto& block = program.control_flow[index];
+				if (block.srt_reads.empty()) continue;
+				Xbyak::Label skip;
+				m_base.by_mode.clear();
+				m_scopes.clear();
+				m_fail = &m_failed;
+				code.mov(code.rax, code.qword[code.rbx + 48]);
+				code.cmp(code.byte[code.rax + index], 0);
+				code.je(skip, Xbyak::CodeGenerator::T_NEAR);
+				for (const auto slot: block.srt_reads) {
+					if (slot >= program.srt_reads.size() || !EmitRead(program.srt_reads[slot])) {
+						return false;
+					}
+				}
+				code.L(skip);
 			}
 		}
 		code.L(m_finished);
@@ -630,11 +663,76 @@ public:
 		}
 		program.srt_general_code = std::move(code_holder);
 		program.jit_assumptions  = static_cast<uint32_t>(m_masks.size());
+		program.jit_loops        = loops;
 		return true;
 	}
 
 private:
 	using Code = Xbyak::CodeGenerator;
+
+	// The blocks reachable from the entry, each after its predecessors except along back edges.
+	std::vector<uint32_t> ReversePostorder() const {
+		const auto&                                blocks = m_program.control_flow;
+		std::vector<uint8_t>                       seen(blocks.size(), 0u);
+		std::vector<uint32_t>                      postorder;
+		std::vector<std::pair<uint32_t, uint32_t>> stack {{0u, 0u}};
+		seen[0] = 1u;
+		while (!stack.empty()) {
+			const auto [index, next] = stack.back();
+			const auto& successors   = blocks[index].successors;
+			if (next == successors.size()) {
+				postorder.push_back(index);
+				stack.pop_back();
+				continue;
+			}
+			++stack.back().second;
+			const auto successor = successors[next];
+			if (!seen[successor]) {
+				seen[successor] = 1u;
+				stack.emplace_back(successor, 0u);
+			}
+		}
+		return {postorder.rbegin(), postorder.rend()};
+	}
+
+	// Marks the successors a block's condition selects in the byte array at context offset
+	// `reached` and continues at `next`. An undecidable condition reaches both successors, like
+	// the interpreter. The condition is evaluated by the clean evaluator when there is one.
+	bool EmitSuccessors(const ResourceBlock& block, uint32_t reached, Xbyak::Label& next) {
+		auto&      code  = *m_code;
+		const auto reach = [&](uint32_t successor) {
+			code.mov(code.rax, code.qword[code.rbx + reached]);
+			code.or_(code.byte[code.rax + successor], 1);
+		};
+		if (block.condition.IsEmpty()) {
+			for (const auto successor: block.successors)
+				reach(successor);
+			code.jmp(next, Code::T_NEAR);
+			return true;
+		}
+		Xbyak::Label otherwise, unknown;
+		code.mov(code.rbp, code.rsp);
+		m_fail = &unknown;
+		EnterClean();
+		const bool condition = Emit(block.condition);
+		LeaveClean();
+		if (!condition) return false;
+		m_fail = &m_failed;
+		code.test(code.eax, code.eax);
+		code.jz(otherwise, Code::T_NEAR);
+		reach(block.successors[0]);
+		code.jmp(next, Code::T_NEAR);
+		code.L(otherwise);
+		reach(block.successors[1]);
+		code.jmp(next, Code::T_NEAR);
+		code.L(unknown);
+		code.mov(code.rsp, code.rbp);
+		RestoreNormalMemo();
+		reach(block.successors[0]);
+		reach(block.successors[1]);
+		code.jmp(next, Code::T_NEAR);
+		return true;
+	}
 
 	bool EmitRead(const SrtRead& read) {
 		if (read.flat_offset >= m_program.srt_reads.size() || !Emit(read.value)) return false;
@@ -691,7 +789,10 @@ private:
 		code.mov(code.rax, code.qword[code.r12 + slot]);
 		code.jmp(done, Code::T_NEAR);
 		code.L(compute);
-		if (!EmitInst(*inst)) return false;
+		// A value that depends on itself would meet the interpreter's in-progress marker,
+		// whose outcome depends on the evaluation order; such plans stay interpreted.
+		if (!m_emitting.insert(inst).second || !EmitInst(*inst)) return false;
+		m_emitting.erase(inst);
 		code.mov(code.qword[code.r12 + slot], code.rax);
 		code.mov(code.qword[code.r12 + slot + 8], code.r14);
 		code.L(done);
@@ -1476,6 +1577,7 @@ private:
 	std::unordered_map<const Inst*, bool>     m_may_be_unknown;
 	Xbyak::Label*                             m_fail = &m_failed;
 	std::unordered_map<const Inst*, uint32_t> m_phi_blocks;
+	std::unordered_set<const Inst*>           m_emitting;
 };
 
 void CompileGeneralSrtWalker(ResourcePlan& program) {
@@ -2365,6 +2467,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 // 1: refreshed; 0: run the interpreter; -1: a read failed.
 int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	const auto blocks = m_program.control_flow.size();
+	const bool loops  = m_program.jit_loops && blocks != 0;
+	// The interpreter's traversal leaves every condition undecided without the specialization
+	// reader when it captures reads.
+	if (loops && m_program.capture_specialization_reads &&
+	    m_runtime.read_specialization_memory == nullptr) {
+		return 0;
+	}
 	m_program.jit_visited.assign(blocks, 0u);
 	if (blocks != 0) m_program.jit_visited[0] = 1u;
 	m_context.values.resize(m_program.evaluation_value_count);
@@ -2395,15 +2504,49 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	    .assume_values    = m_program.jit_assume_bases.data(),
 	};
 	using Walker = bool KYTY_SYSV_ABI (*)(GeneralWalkerContext*);
-	if (!m_program.srt_general_code->getCode<Walker>()(&context)) {
-		if (context.read_failed != 0u) {
-			return -1;
-		}
+	const auto          fallback = [&]() {
 		// A failed run leaves memo entries of this generation behind; the interpreter
 		// recomputes them under a fresh one.
 		m_context.generation += 4;
 		if (&clean_context != &m_context) clean_context.generation += 4;
 		return 0;
+	};
+	const auto run = [&]() {
+		if (m_program.srt_general_code->getCode<Walker>()(&context)) return 1;
+		return context.read_failed != 0u ? -1 : fallback();
+	};
+	auto& visited = m_program.visited_blocks;
+	if (loops) {
+		// The interpreter's fixpoint: every block starts visited, each iteration computes the
+		// blocks reachable when control phis take the incomings of the visited predecessors,
+		// and the reachable set becomes the visited set until it no longer changes. Known
+		// values stay in the memo across iterations and unknown ones are never stored, which
+		// is what the interpreter's ResetUnknowns leaves. The sets only shrink, so the
+		// interpreter settles within blocks + 1 iterations; a run that does not falls back.
+		auto& reachable = m_program.reachable_blocks;
+		visited.assign(blocks, 1u);
+		bool settled = false;
+		for (size_t iteration = 0; iteration <= blocks && !settled; ++iteration) {
+			reachable.assign(blocks, 0u);
+			reachable[0]      = 1u;
+			context.visited   = visited.data();
+			context.reachable = reachable.data();
+			if (const auto result = run(); result <= 0) return result;
+			for (auto& block: reachable)
+				block = block != 0u ? 1u : 0u;
+			settled = reachable == visited;
+			if (!settled) {
+				visited.swap(reachable);
+				settled = m_program.control_phi_predecessors.empty();
+			}
+		}
+		if (!settled) return fallback();
+		context.visited = visited.data();
+		context.phase   = 1;
+		if (const auto result = run(); result <= 0) return result;
+	} else {
+		if (const auto result = run(); result <= 0) return result;
+		if (blocks != 0) visited = m_program.jit_visited;
 	}
 	auto& active = m_program.active_sources;
 	if (blocks == 0) {
@@ -2411,17 +2554,16 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 		return 1;
 	}
 	// Descriptor phis evaluated after the walk see the same reachable blocks.
-	m_program.visited_blocks = m_program.jit_visited;
-	m_reachable_blocks       = &m_program.visited_blocks;
+	m_reachable_blocks = &visited;
 	if (m_clean_evaluator != nullptr) {
-		m_clean_evaluator->m_reachable_blocks = &m_program.visited_blocks;
+		m_clean_evaluator->m_reachable_blocks = &visited;
 	}
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow)
 		for (const auto source: block.sources)
 			active.at(source) = 0u;
 	for (uint32_t index = 0; index < blocks; ++index) {
-		if (!m_program.jit_visited[index]) continue;
+		if (!visited[index]) continue;
 		for (const auto source: m_program.control_flow[index].sources)
 			active[source] = 1u;
 	}
