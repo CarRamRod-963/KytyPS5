@@ -3656,6 +3656,22 @@ private:
 		return true;
 	}
 
+	// A planned handle built from the same descriptor words (the same reads used again in a
+	// dominated block). Planning precedes patching, so the operands are still the reads.
+	const IndirectDescriptorPlan* FindTwinPlan(const Inst& handle) const {
+		for (const auto& plan: m_indirect_descriptors) {
+			const auto* other = plan.handle;
+			if (other == &handle || other->GetOpcode() != handle.GetOpcode() ||
+			    other->NumArgs() != handle.NumArgs())
+				continue;
+			bool same = true;
+			for (size_t word = 0; same && word < handle.NumArgs(); ++word)
+				same = other->Arg(word).Resolve() == handle.Arg(word).Resolve();
+			if (same) return &plan;
+		}
+		return nullptr;
+	}
+
 	const IndirectDescriptorPlan* FindIndirectDescriptor(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
@@ -3691,6 +3707,12 @@ private:
 					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
 					uint32_t bad_dword = 0;
 					if (ValidateSource(descriptor, bad_dword)) return;
+					if (const auto* twin = FindTwinPlan(*handle)) {
+						auto copy   = *twin;
+						copy.handle = handle;
+						m_indirect_descriptors.push_back(std::move(copy));
+						return;
+					}
 					IndirectDescriptorPlan plan;
 					plan.read_dwords = width;
 					if (!sampler && width == 8u && memory.image_r128) {
