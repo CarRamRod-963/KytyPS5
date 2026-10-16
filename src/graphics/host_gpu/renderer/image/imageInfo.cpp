@@ -230,6 +230,12 @@ uint32_t ImageInfo::DataAlignment() const {
 	return tiling.block.block_size;
 }
 
+bool ImageInfo::DataPlaced() const {
+	const auto alignment = DataAlignment();
+	return data.size != 0 && alignment != 0 &&
+	       (data.address & (static_cast<uint64_t>(alignment) - 1u)) == 0;
+}
+
 int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
 	if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
 	    IsVolume() || resources.levels != 1 || resources.layers == 0 ||

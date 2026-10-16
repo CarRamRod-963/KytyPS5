@@ -1439,6 +1439,39 @@ void TestRebasedTextureMipViews() {
         "sparse view accepted a different mip-tail origin");
 }
 
+// A T# read from guest memory for a bindless key can name data no image can
+// start at; the renderer maps such keys to the placeholder instead of exiting.
+void TestTextureDataPlacement() {
+  ImageInfo tiled{};
+  tiled.data.address = 0x5032b23000;
+  tiled.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+  tiled.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+  tiled.extent = {256, 256, 1};
+  tiled.resources = {9, 1};
+  tiled.tile_mode = Prospero::TileMode::kStandard4KB;
+  tiled.UpdateSize();
+  Check(tiled.DataAlignment() == 0x1000 && tiled.DataPlaced(),
+        "aligned tiled texture data was not placed");
+  auto misaligned = tiled;
+  misaligned.data.address += 0x40;
+  Check(!misaligned.DataPlaced(),
+        "tiled texture data off its tile alignment was placed");
+
+  ImageInfo linear = tiled;
+  linear.tile_mode = Prospero::TileMode::kLinear;
+  linear.data = {0x5032b23100, 0};
+  linear.mip_layout = {};
+  linear.UpdateSize();
+  Check(linear.DataAlignment() == 0x100 && linear.DataPlaced(),
+        "256-byte aligned linear texture data was not placed");
+  linear.data.address += 0x40;
+  Check(!linear.DataPlaced(), "linear texture data off 256 bytes was placed");
+
+  auto empty = tiled;
+  empty.data.size = 0;
+  Check(!empty.DataPlaced(), "texture without data was placed");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -16804,6 +16837,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestTextureDataPlacement();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
