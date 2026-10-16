@@ -25,8 +25,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	                          std::ranges::any_of(program.info.images, uses_mapping);
+	bool       uses_flattened_srt   = std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	                                  std::ranges::any_of(program.info.images, uses_mapping) ||
+	                                  std::ranges::any_of(program.info.samplers, uses_mapping);
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -43,7 +44,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       const auto access = IR::BufferAccessOf(use.user->GetOpcode());
+			       if (access != IR::BufferAccess::Read && access != IR::BufferAccess::Write) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
