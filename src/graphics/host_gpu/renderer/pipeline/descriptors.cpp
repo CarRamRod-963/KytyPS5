@@ -36,6 +36,7 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -342,16 +343,22 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
-static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
-                                     const ShaderTextureResource& descriptor, vk::Format format,
-                                     const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+// The view a T# selects; nullopt for a T# the view cannot express when `optional`, which exits
+// otherwise.
+static std::optional<ImageViewInfo>
+TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
+                const ShaderTextureResource& descriptor, vk::Format format,
+                const SurfaceFormatInfo& surface_format, bool storage, uint32_t view_levels,
+                uint32_t image_layers, bool optional) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
 	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+		if (optional) {
+			return std::nullopt;
+		}
 		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
 		     descriptor.MinLod(), descriptor.LastLevel());
 	}
@@ -360,36 +367,23 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		view.min_lod = descriptor.MinLod() - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
+	const bool mapped = !storage && resource.conversion_format == Prospero::BufferFormat::kInvalid;
+	if (mapped && optional && !IsValidImageSwizzle(descriptor.DstSelXYZW())) {
+		return std::nullopt;
+	}
 	view.mapping =
-	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
-	        ? vk::ComponentMapping {}
-	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	    mapped ? TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage)
+	           : vk::ComponentMapping {};
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
-			view.type       = vk::ImageViewType::e1D;
-			view.base_layer = image_layers > 1u ? descriptor.BaseArray5() : 0u;
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
-				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
-				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
-				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-				     descriptor.fields[6], descriptor.fields[7]);
-			}
+			view.type        = vk::ImageViewType::e1D;
+			view.base_layer  = image_layers > 1u ? descriptor.BaseArray5() : 0u;
 			view.layer_count = 1;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
-			view.type       = vk::ImageViewType::e1DArray;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
-				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
-				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
-				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-				     descriptor.fields[6], descriptor.fields[7]);
-			}
-			view.layer_count = image_layers - view.base_layer;
+			view.type        = vk::ImageViewType::e1DArray;
+			view.base_layer  = descriptor.BaseArray5();
+			view.layer_count = image_layers - std::min(view.base_layer, image_layers);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -398,34 +392,30 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
-			view.type       = vk::ImageViewType::e2DArray;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
-				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
-				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
-				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-				     descriptor.fields[6], descriptor.fields[7]);
-			}
-			view.layer_count = image_layers - view.base_layer;
+			view.type        = vk::ImageViewType::e2DArray;
+			view.base_layer  = descriptor.BaseArray5();
+			view.layer_count = image_layers - std::min(view.base_layer, image_layers);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
-			view.type       = vk::ImageViewType::e2D;
+			view.type = vk::ImageViewType::e2D;
 			// A T# without array slices has nothing for BASE_ARRAY to select.
-			view.base_layer = image_layers > 1u ? descriptor.BaseArray5() : 0u;
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
-				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-				     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
-				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
-				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-				     descriptor.fields[6], descriptor.fields[7]);
-			}
+			view.base_layer  = image_layers > 1u ? descriptor.BaseArray5() : 0u;
 			view.layer_count = 1;
 			break;
 		default: EXIT("unsupported texture view dimension\n");
+	}
+	if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
+	    view.base_layer >= image_layers) {
+		if (optional) {
+			return std::nullopt;
+		}
+		EXIT("texture base layer is out of bounds: base=%u layers=%u dimension=%u "
+		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     view.base_layer, image_layers, static_cast<uint32_t>(resource.dimension),
+		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+		     descriptor.fields[7]);
 	}
 	return view;
 }
@@ -501,6 +491,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	// Every check below that a T# can fail returns an imageless binding for an optional source.
+	const bool optional = source == TextureSource::Optional;
+	EXIT_IF(optional && storage);
+	if (optional && static_cast<uint32_t>(descriptor.Type()) <
+	                    static_cast<uint32_t>(Prospero::ImageType::kColor1D)) {
+		return {};
+	}
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -528,7 +525,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		if (source == TextureSource::Optional) {
+		if (optional) {
 			return {};
 		}
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
@@ -548,7 +545,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto format         = ShaderRecompiler::IR::ReadsDepthBits(resource)
 	                                ? Prospero::BufferFormat::k16UNorm
 	                                : descriptor.Format();
-	const auto surface_format = TextureGetSurfaceFormatInfo(format);
+	const auto found_format   = TextureFindSurfaceFormatInfo(format);
+	if (!found_format) {
+		if (optional) {
+			return {};
+		}
+		EXIT("unknown texture format: fmt=%u dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     static_cast<uint32_t>(format), descriptor.fields[0], descriptor.fields[1],
+		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		     descriptor.fields[6], descriptor.fields[7]);
+	}
+	const auto& surface_format = *found_format;
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
@@ -556,7 +563,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
-		if (source == TextureSource::Optional) {
+		if (optional) {
 			return {};
 		}
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -599,6 +606,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
+	if (optional) {
+		// The layouts the mip view below computes, and the shape the image must have.
+		auto probe = desc.info;
+		if ((desc.info.type == Prospero::ImageType::kColor1D && height != 1u) ||
+		    probe.TryUpdateSize() != nullptr) {
+			return {};
+		}
+		probe                  = desc.info;
+		probe.resources.levels = physical_levels;
+		if (levels > physical_levels && probe.TryUpdateSize() != nullptr) {
+			return {};
+		}
+	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
@@ -616,7 +636,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.UpdateSize();
 	}
 	if (!desc.info.DataPlaced()) {
-		if (source == TextureSource::Optional) {
+		if (optional) {
 			return {};
 		}
 		EXIT("texture data cannot be placed: addr=0x%016" PRIx64 " size=0x%" PRIx64
@@ -632,6 +652,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	if (optional && !m_context.IsMapped(address, desc.info.data.size)) {
+		return {};
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -642,9 +665,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                     std::countr_zero(samples));
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
+		const auto& metadata             = desc.info.metadata.range;
+		if (optional &&
+		    !m_context.IsMapped(metadata.address, std::max<uint64_t>(metadata.size, 1))) {
+			return {};
+		}
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	const auto view_info =
+	    TextureViewInfo(resource, descriptor, view_format, surface_format, storage, view_levels,
+	                    desc.info.resources.layers, optional);
+	if (!view_info) {
+		return {};
+	}
+	desc.view_info            = *view_info;
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
@@ -660,6 +693,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
+		if (optional) {
+			// Optional sources sample color textures.
+			return {};
+		}
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
@@ -667,6 +704,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                            desc.info.data.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else if (optional && !IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+	                                                    descriptor.DstSelXYZW())) {
+		return {};
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
