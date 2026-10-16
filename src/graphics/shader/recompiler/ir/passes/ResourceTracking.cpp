@@ -3969,7 +3969,7 @@ private:
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load, "
-					     "or a raw DWORD store");
+					     "or a raw 8/16/32-bit store");
 				}
 				// A store through a GPU-selected V# writes guest memory like an address store.
 				m_program.has_address_writes |= table_store;
