@@ -174,8 +174,13 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// A bound T# that cannot be placed is fatal. A T# read from guest memory on a shader's
+	// behalf (a bindless key) may be stale or name a record the game never samples: as an
+	// Optional source, such a T# returns a binding without an image instead.
+	enum class TextureSource : uint8_t { Bound, Optional };
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            TextureSource source = TextureSource::Bound);
 	// Translates the bindless keys shaders flagged since the last call (once per frame).
 	void ResolveBindlessImages(CommandBuffer& buffer);
 

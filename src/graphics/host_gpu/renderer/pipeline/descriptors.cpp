@@ -486,7 +486,8 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              TextureSource                                source) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -527,6 +528,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
+		if (source == TextureSource::Optional) {
+			return {};
+		}
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
 		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
@@ -552,6 +556,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
+		if (source == TextureSource::Optional) {
+			return {};
+		}
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
 		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
 	}
@@ -608,9 +615,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+	if (!desc.info.DataPlaced()) {
+		if (source == TextureSource::Optional) {
+			return {};
+		}
+		EXIT("texture data cannot be placed: addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " alignment=0x%x format=%u tile=%u extent=%ux%ux%u levels=%u "
+		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, desc.info.data.size, desc.info.DataAlignment(), static_cast<uint32_t>(format),
+		     static_cast<uint32_t>(tile), width, height, desc.info.extent.depth, levels,
+		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+		     descriptor.fields[7]);
+	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
@@ -1079,8 +1096,18 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		return BindlessTranslation::PlaceholderSlot;
 	}
 	auto& cache   = m_context.GetTextureCache();
-	auto  binding = ResolveTexture(m_bindless_resources[heap], value);
-	auto& image   = cache.GetImage(binding.image_id);
+	auto  binding = ResolveTexture(m_bindless_resources[heap], value, TextureSource::Optional);
+	if (!binding.image_id) {
+		static uint32_t reported = 0;
+		if (reported++ < 8u) {
+			LOGF("bindless key names a T# that cannot be bound: %08x %08x %08x %08x %08x %08x "
+			     "%08x %08x\n",
+			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+		}
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	auto& image = cache.GetImage(binding.image_id);
 	if (image.info.IsDepth() || image.info.data.Empty()) {
 		return BindlessTranslation::PlaceholderSlot;
 	}
