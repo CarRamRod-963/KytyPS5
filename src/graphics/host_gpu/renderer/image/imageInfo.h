@@ -45,6 +45,12 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+
+	// The defaulted ordering is lexicographic: 4 levels x 1 layer sorts above 1 level x 16 layers.
+	// An image serves a request only if each dimension covers it on its own.
+	[[nodiscard]] constexpr bool Covers(const ImageSubresources& requested) const noexcept {
+		return levels >= requested.levels && layers >= requested.layers;
+	}
 };
 
 // The level and first layer of a container that a single-level image occupies, or -1.

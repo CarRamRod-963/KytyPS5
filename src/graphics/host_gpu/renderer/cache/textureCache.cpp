@@ -198,8 +198,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.extent != requested.extent) {
 		return false;
 	}
-	if (cached.resources.levels < requested.resources.levels ||
-	    cached.resources.layers < requested.resources.layers) {
+	if (!cached.resources.Covers(requested.resources)) {
 		return false;
 	}
 	if (cached.samples != requested.samples) {
@@ -712,7 +711,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
 	    !requested.IsVolume() && requested.samples == cached.info.samples &&
 	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = !cached.info.resources.Covers(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -1439,8 +1438,7 @@ ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole
 			    image.depth_id && image.info.data == desc.info.data &&
 			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
 			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
+			    image.info.resources.Covers(desc.info.resources) &&
 			    desc.info.bytes_per_block == 1 &&
 			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
 				result = id;
@@ -1506,7 +1504,7 @@ ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole
 			                             desc.info.guest_format;
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Covers(desc.info.resources)) {
 				FreeImage(result);
 				result = {};
 			}
