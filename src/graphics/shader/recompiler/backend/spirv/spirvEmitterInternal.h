@@ -158,6 +158,8 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// Private per-format layout table for formatted loads through GPU-selected V#s (lazy).
+	uint32_t indirect_format_table = 0;
 };
 
 uint32_t TypeVoid(EmitterState& state);
