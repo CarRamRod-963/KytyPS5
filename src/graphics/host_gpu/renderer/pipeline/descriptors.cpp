@@ -929,6 +929,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 	}
+	ShaderRecompiler::IR::FillBufferStrides(program.info, layout, snapshot, prepared.shader_data);
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, prepared.bindless_srt.empty()
 		                                                     ? snapshot.flattened_srt
