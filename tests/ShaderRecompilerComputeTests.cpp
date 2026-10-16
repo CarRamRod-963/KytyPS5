@@ -40828,7 +40828,14 @@ void CheckFiniteFirstLaneImageChoice(VulkanHarness &vulkan) {
         O::S_ANDN2_B64, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
         O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "finite correlated image choices", compiled.resources.images.size() <= 5u,
+    // At most five correlated choices; one class is padded to a power of two
+    // with null spares.
+    Require(test.name, "finite correlated image choices",
+            compiled.resources.images.size() <= std::bit_ceil(5u) &&
+                std::ranges::count_if(compiled.resources.images,
+                                      [](const auto &image) {
+                                        return image.dwords[0] != 0u;
+                                      }) <= 5,
             "descriptor words formed an uncorrelated product");
     std::vector<VulkanHarness::Image> images;
     for (const auto &descriptor : compiled.resources.images)
@@ -41220,9 +41227,14 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
     else test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_CMP_LT_U32,
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    // One class: the candidates are padded to a power of two with null spares.
+    const auto &candidates = compiled.resources.images;
+    const auto real = packed ? 32u : std::max(count, 1u);
     Require(test.name, "bounded image candidates",
-            packed ? compiled.resources.images.size() == 32u
-                   : compiled.resources.images.size() == std::max(count, 1u),
+            candidates.size() == std::bit_ceil(real) &&
+                std::all_of(
+                    candidates.begin() + real, candidates.end(),
+                    [](const auto &image) { return image.dwords[0] == 0u; }),
             "descriptor planning escaped its selector domain");
     std::vector<VulkanHarness::Image> images;
     for (const auto &descriptor : compiled.resources.images)
@@ -41497,11 +41509,16 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
             }), "the proven scalar count was absent from the captured alias ranges");
     }
     if (compact) {
+      // One class: the six candidates are padded to a power of two with null
+      // spares.
       std::vector<u32> candidates;
-      for (const auto &image : compiled.resources.images) candidates.push_back(image.dwords[0]);
+      for (const auto &image : compiled.resources.images)
+        if (image.dwords[0] != 0u)
+          candidates.push_back(image.dwords[0]);
       std::ranges::sort(candidates);
       Require(test.name, "paired R128 descriptor boundary",
         candidates == std::vector<u32>{10u, 11u, 12u, 13u, 14u, 15u} &&
+            compiled.resources.images.size() == std::bit_ceil(6u) &&
             std::ranges::all_of(compiled.resources.images, [](const auto &image) {
               return image.dword_count == 8u &&
                   std::ranges::all_of(std::span(image.dwords).subspan(4u),
@@ -47472,10 +47489,15 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    // The null root and the candidates are one class, padded to a power of two
+    // with null spares.
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() == std::bit_ceil(count + 1u) &&
+                std::all_of(
+                    snapshot.images.begin() + count + 1u, snapshot.images.end(),
+                    [](const auto &image) { return image.dwords[0] == 0u; }),
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
     const auto ordinal = [&](u32 byte_offset) {
