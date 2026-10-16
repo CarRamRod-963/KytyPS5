@@ -3953,13 +3953,26 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
+				// A store is admitted only through a V# loaded whole from a descriptor table; a
+				// descriptor computed by shader arithmetic or control flow stays rejected.
+				bool table_store = memory.SupportsIndirectBufferStore(op) && handle != nullptr &&
+				                   handle->NumArgs() == 4u;
+				for (uint32_t word = 0; table_store && word < 4u; ++word) {
+					const auto* read = handle->Arg(word).Resolve().TryInstruction();
+					table_store =
+					    read != nullptr && (read->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+					                        read->GetOpcode() == ValueOpcode::ReadConstBuffer);
+				}
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				    (!memory.SupportsIndirectBufferLoad(op) && !table_store)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load, "
+					     "or a raw DWORD store");
 				}
+				// A store through a GPU-selected V# writes guest memory like an address store.
+				m_program.has_address_writes |= table_store;
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
 				return;

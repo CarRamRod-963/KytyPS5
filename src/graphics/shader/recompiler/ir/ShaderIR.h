@@ -100,6 +100,11 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
+	// A raw DWORD store through a GPU-selected V# is written through its device address.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !typed && !formatted && data_bits == 32u && opcode == ValueOpcode::StoreBufferU32;
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
