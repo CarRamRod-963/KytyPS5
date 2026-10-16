@@ -1437,7 +1437,8 @@ void TestRebasedTextureMipViews() {
 }
 
 // A T# read from guest memory for a bindless key can name data no image can
-// start at; the renderer maps such keys to the placeholder instead of exiting.
+// start at or a layout no image has; the renderer maps such keys to the
+// placeholder instead of exiting.
 void TestTextureDataPlacement() {
   ImageInfo tiled{};
   tiled.data.address = 0x5032b23000;
@@ -1467,6 +1468,37 @@ void TestTextureDataPlacement() {
   auto empty = tiled;
   empty.data.size = 0;
   Check(!empty.DataPlaced(), "texture without data was placed");
+
+  // The non-exiting queries a guest-read T# is checked with before it is bound.
+  Check(TextureFindSurfaceFormatInfo(Prospero::BufferFormat::k8_8_8_8UNorm)
+                    ->vk_format == vk::Format::eR8G8B8A8Unorm &&
+            !TextureFindSurfaceFormatInfo(
+                static_cast<Prospero::BufferFormat>(220)),
+        "surface format query does not tell known from unknown formats");
+  auto layout = tiled;
+  layout.data.size = 0;
+  Check(layout.TryUpdateSize() == nullptr &&
+            layout.data.size == tiled.data.size,
+        "layout query differs from UpdateSize for a valid texture");
+  auto unknown = tiled;
+  unknown.data.size = 0;
+  unknown.bytes_per_block = 0;
+  unknown.guest_format = static_cast<Prospero::BufferFormat>(220);
+  Check(unknown.TryUpdateSize() != nullptr,
+        "layout query accepted a format without an element layout");
+  auto huge = linear;
+  huge.data.size = 0;
+  huge.extent = {16384, 16384, 1};
+  huge.resources = {1, 1};
+  huge.bytes_per_block = 0;
+  huge.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+  Check(huge.TryUpdateSize() != nullptr,
+        "layout query accepted a linear level past 32 bits");
+  auto msaa = tiled;
+  msaa.data.size = 0;
+  msaa.samples = 4;
+  Check(msaa.TryUpdateSize() != nullptr,
+        "layout query accepted a multisampled mip chain");
 }
 
 void TestShaderFeatureCollection() {

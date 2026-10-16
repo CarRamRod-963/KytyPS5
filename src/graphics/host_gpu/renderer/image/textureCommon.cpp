@@ -103,13 +103,20 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 	return {resolve(0), resolve(1), resolve(2), resolve(3)};
 }
 
-SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+std::optional<SurfaceFormatInfo> TextureFindSurfaceFormatInfo(Prospero::BufferFormat format) {
 	const auto backing_format = Prospero::RemapTextureFormat(format);
 	const auto host_format = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);
 	const auto conversion_format =
 	    backing_format != format ? format : Prospero::BufferFormat::kInvalid;
-	if (host_format.format != vk::Format::eUndefined) {
-		return {host_format.format, conversion_format, host_format.host_to_storage};
+	if (host_format.format == vk::Format::eUndefined) {
+		return std::nullopt;
+	}
+	return SurfaceFormatInfo {host_format.format, conversion_format, host_format.host_to_storage};
+}
+
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+	if (const auto info = TextureFindSurfaceFormatInfo(format)) {
+		return *info;
 	}
 	EXIT("unknown format: fmt = %u\n", static_cast<uint32_t>(format));
 }
