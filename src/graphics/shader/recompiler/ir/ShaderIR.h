@@ -17,6 +17,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -147,6 +148,9 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	// The stride field of packed_stride only says whether the V# stride is nonzero; indexed
+	// accesses read the stride from the binding's shader-data stride word.
+	bool runtime_stride = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -509,16 +513,29 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	// Shader data ends with one 16-bit stride word per buffer binding (two per dword) when a
+	// buffer takes its stride at run time.
+	bool memory_strides = false;
 
+	[[nodiscard]] uint32_t BufferBindingCount() const {
+		return descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
 	[[nodiscard]] uint32_t MemorySizeDword() const {
-		return memory_offset_dword +
-		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+		return memory_offset_dword + (BufferBindingCount() + 3u) / 4u;
+	}
+	// Then the 16-bit stride words, two per dword.
+	[[nodiscard]] uint32_t MemoryStrideDword() const {
+		return MemorySizeDword() + BufferBindingCount();
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return MemorySizeDword() +
-		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+		return MemoryStrideDword() + (memory_strides ? (BufferBindingCount() + 1u) / 2u : 0u);
+	}
+	void PackMemoryStride(std::span<uint32_t> shader_data, uint32_t binding,
+	                      uint32_t stride) const {
+		const auto shift = (binding % 2u) * 16u;
+		shader_data[MemoryStrideDword() + binding / 2u] |= (stride & 0xffffu) << shift;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

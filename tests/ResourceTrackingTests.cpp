@@ -7726,6 +7726,72 @@ void TestRecordTableSpecializationStability() {
         "store candidates were not padded to a power of two");
 }
 
+void TestStructuredBufferStrideSpecialization() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  auto fixture = std::make_unique<Fixture>();
+  auto &f = *fixture;
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    words[word] = f.UserData(word);
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  f.Emit(ValueOpcode::LoadBufferU32,
+         {f.Buffer(words), lane, Value(0u), Value(0u), Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x40u));
+  f.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(f.program);
+  const auto materialize = [&](uint32_t dword1, ResourceSnapshot &snapshot,
+                               ResourceSpecialization &specialization) {
+    const std::array<uint32_t, 4> user_data{
+        0x10000u, dword1, 64u,
+        (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) |
+            DstSel(4, 5, 6, 7)};
+    const SrtRuntime runtime{.user_data = user_data};
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  ResourceSnapshot first_snapshot, snapshot;
+  ResourceSpecialization first, specialization;
+  Check(materialize(32u << 16u, first_snapshot, first) &&
+            first.buffers.size() == 1u && first.buffers[0].packed_stride == 1u,
+        "a structured buffer specialization kept its stride value");
+  for (const uint32_t stride : {8u, 36u, 60u, 192u, 0x3fffu}) {
+    Check(materialize(stride << 16u, snapshot, specialization) &&
+              specialization == first &&
+              (snapshot.buffers[0].dwords[1] >> 16u) == stride,
+          "a changed V# stride changed the specialization or lost the snapshot "
+          "stride");
+  }
+  // Swizzle enable and a zero stride select other access forms.
+  Check(materialize((32u << 16u) | (1u << 31u), snapshot, specialization) &&
+            specialization != first,
+        "swizzle enable lost its specialization");
+  Check(materialize(0u, snapshot, specialization) && specialization != first &&
+            specialization.buffers[0].packed_stride == 0u,
+        "a zero V# stride shared the specialization of a strided buffer");
+
+  // Applied to the program, the buffer reads its stride at run time.
+  ApplyResourceSpecialization(f.program, first);
+  Check(f.program.info.buffers.size() == 1u &&
+            f.program.info.buffers[0].runtime_stride &&
+            (f.program.info.buffers[0].packed_stride & 0x3fffu) == 1u,
+        "an applied specialization did not mark the runtime stride");
+  Bindings bindings;
+  bindings
+      .descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] =
+      3u;
+  bindings.memory_offset_dword = 2u;
+  bindings.memory_strides = true;
+  auto info = f.program.info;
+  info.buffers[0].descriptor_index = 1u;
+  std::vector<uint32_t> shader_data(bindings.ShaderDataDwords(), 0u);
+  FillBufferStrides(info, bindings, first_snapshot, shader_data);
+  // Offsets in dword 2, the three bound sizes in 3..5, then the strides.
+  Check(bindings.MemoryStrideDword() == 6u && shader_data.size() == 8u &&
+            shader_data[6] == 32u << 16u && shader_data[7] == 0u,
+        "the stride word of binding 1 was not packed into its half of the "
+        "first stride dword");
+}
+
 void TestFiniteBufferSelection() {
   enum class Variant { Valid, WiderExec, Unbounded, Cycle, TooMany };
   const auto make = [](Variant variant) {
@@ -9497,6 +9563,8 @@ int main() {
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("record table specialization stability",
         TestRecordTableSpecializationStability);
+    Run("structured buffer stride specialization",
+        TestStructuredBufferStrideSpecialization);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
