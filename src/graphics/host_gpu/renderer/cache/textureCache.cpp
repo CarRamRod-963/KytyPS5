@@ -1366,6 +1366,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	return LookupImage(desc, exact_format, nullptr);
+}
+
+ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole_owner) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1404,6 +1408,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				block_alias = true;
 			}
 		}
+		const ImageId matched = block_alias || candidates.size() != 1 ? ImageId {} : result;
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1468,6 +1473,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (sole_owner != nullptr) {
+			*sole_owner = matched && result == matched;
+		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
@@ -1483,6 +1491,43 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, ImageLookup& lookup) {
+	if (lookup.valid && lookup.exact_format == exact_format && desc.type != BindingType::VideoOut &&
+	    lookup.input == desc) {
+		if (m_scheduler.Current().IsInvalid()) {
+			EXIT("TextureCache: image lookup requires a valid command buffer\n");
+		}
+		bool found = false;
+		{
+			std::scoped_lock lock {m_lock};
+			auto*            image = m_slot_images.try_get(lookup.image);
+			if (image != nullptr && image->registered && !image->binding.needs_rebind &&
+			    !image->depth_id &&
+			    !LayoutChangedSince(lookup.stamp, desc.info.data.address, desc.info.data.size)) {
+				image->tick_accessed_last = m_scheduler.CurrentTick();
+				TouchImage(*image);
+				found = true;
+			}
+		}
+		if (found) {
+			desc = lookup.output;
+			MaterializeColorClear(lookup.image, desc, desc.metadata_base_layer);
+			return lookup.image;
+		}
+	}
+	// A layout change made by this lookup itself is seen by the next one. Only a description that
+	// found the one image overlapping its memory as is gets remembered: with other images there,
+	// a lookup also depends on their contents (aliases it re-resolves, overlaps it may delete).
+	lookup.stamp        = LayoutNow();
+	lookup.input        = desc;
+	lookup.exact_format = exact_format;
+	bool sole_owner     = false;
+	lookup.image        = LookupImage(desc, exact_format, &sole_owner);
+	lookup.output       = desc;
+	lookup.valid        = sole_owner;
+	return lookup.image;
 }
 
 void TextureCache::UpdateImage(ImageId id) {

@@ -38,6 +38,8 @@ struct ImageMetadataInfo {
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
 	bool                dcc_alpha_msb        = true;
+
+	bool operator==(const ImageMetadataInfo&) const = default;
 };
 
 struct ImageSubresources {
@@ -92,6 +94,8 @@ struct ImageInfo {
 	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
 	uint64_t linear_slice_stride = 0;
 	uint32_t first_tail_level    = 16;
+
+	bool operator==(const ImageInfo&) const = default;
 
 	// Null when the layout was computed; otherwise what the description lacks, and the layout
 	// fields are unspecified. UpdateSize exits on a failure.
