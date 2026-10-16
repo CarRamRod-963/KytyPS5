@@ -10,9 +10,34 @@ uint64_t Multiply(uint64_t left, uint64_t right) {
 	return left * right;
 }
 
+uint64_t CheckedMultiply(bool& overflow, uint64_t left, uint64_t right) {
+	if (right != 0 && left > UINT64_MAX / right) {
+		overflow = true;
+		return 0;
+	}
+	return left * right;
+}
+
+uint64_t CheckedAdd(bool& overflow, uint64_t left, uint64_t right) {
+	if (right > UINT64_MAX - left) {
+		overflow = true;
+		return 0;
+	}
+	return left + right;
+}
+
 uint64_t Add(uint64_t left, uint64_t right) {
 	EXIT_IF(right > UINT64_MAX - left);
 	return left + right;
+}
+
+// Bytes of a guest-linear level 0, which the linear layout stores in 32 bits.
+uint64_t LinearLevelSize(const TileTextureElementLayout& element, const vk::Extent3D& extent) {
+	const uint64_t elements =
+	    std::max((extent.width + element.texel_width - 1u) / element.texel_width, 1u);
+	const uint64_t rows =
+	    std::max((extent.height + element.texel_height - 1u) / element.texel_height, 1u);
+	return Common::AlignUp<uint64_t>(elements, 256u / element.bytes) * rows * element.bytes;
 }
 
 bool IsDepthPlane(const ImageInfo& info) {
@@ -76,18 +101,25 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
-void ImageInfo::UpdateSize() {
-	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
-	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
-	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
-	        !std::has_single_bit(samples));
+const char* ImageInfo::TryUpdateSize() {
+	if (guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
+	    extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
+	    resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
+	    !std::has_single_bit(samples)) {
+		return "invalid format, extent, level, layer or sample count";
+	}
 	const bool auto_size = data.size == 0;
+	bool                     overflow  = false;
 	TileTextureElementLayout element {};
-	EXIT_NOT_IMPLEMENTED(!TileGetTextureElementLayout(guest_format, element));
+	if (!TileGetTextureElementLayout(guest_format, element)) {
+		return "format has no texture element layout";
+	}
 	if (bytes_per_block == 0) {
 		bytes_per_block = element.bytes;
 	}
-	EXIT_IF(bytes_per_block != element.bytes);
+	if (bytes_per_block != element.bytes) {
+		return "bytes per block differ from the format's element size";
+	}
 	mip_layout                     = {};
 	tiling                         = {};
 	tiling.texel_width             = element.texel_width;
@@ -98,72 +130,106 @@ void ImageInfo::UpdateSize() {
 	first_tail_level               = 16;
 
 	if (samples > 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume() || resources.levels != 1 ||
-		                     (tile_mode != Prospero::TileMode::kDepth &&
-		                      tile_mode != Prospero::TileMode::kRenderTarget));
+		if (IsVolume() || resources.levels != 1 ||
+		    (tile_mode != Prospero::TileMode::kDepth &&
+		     tile_mode != Prospero::TileMode::kRenderTarget)) {
+			return "unsupported multisampled shape or tile mode";
+		}
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
 			pitch = tile_mode == Prospero::TileMode::kDepth
 			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
 			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
-		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+		if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling)) {
+			return "no block layout for the format and tile mode";
+		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
-			EXIT_NOT_IMPLEMENTED(!TileGetRenderTargetSize(extent.width, extent.height, pitch,
-			                                              bytes_per_block, slice, fragments));
-			data.size = Multiply(slice.size, resources.layers);
+			if (!TileGetRenderTargetSize(extent.width, extent.height, pitch, bytes_per_block, slice,
+			                             fragments)) {
+				return "no multisampled render-target size";
+			}
+			data.size = CheckedMultiply(overflow, slice.size, resources.layers);
 		}
-		EXIT_IF(data.size % resources.layers != 0);
+		if (data.size % resources.layers != 0) {
+			return "data size is not a multiple of the layer count";
+		}
 		tiled_slice_stride = data.size / resources.layers;
 		mip_layout[0]      = {0, data.size, pitch, extent.height};
-		return;
+		return overflow ? "size overflow" : nullptr;
 	}
 
 	if (pitch == 0) {
 		pitch = TileGetTexturePitch(guest_format, extent.width, tile_mode);
 	}
-	EXIT_IF(pitch == 0);
+	if (pitch == 0) {
+		return "zero pitch";
+	}
 	if (IsDepthPlane(*this) && resources.levels == 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume());
+		if (IsVolume()) {
+			return "volume depth plane";
+		}
 		if (IsTiled()) {
-			EXIT_NOT_IMPLEMENTED(
-			    !TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+			TileSurfaceLayout            surface {};
+			const TileSurfaceDescription description {guest_format,
+			                                          tile_mode,
+			                                          TileSurfaceDimension::Dim2D,
+			                                          extent.width,
+			                                          extent.height,
+			                                          1,
+			                                          1,
+			                                          1};
+			if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling) ||
+			    !TileGetTiledTextureLayout(description, surface) ||
+			    surface.block_slice_size > UINT32_MAX) {
+				return "no tiled depth-plane layout";
+			}
+		} else if (LinearLevelSize(element, extent) > UINT32_MAX) {
+			return "linear level size exceeds 32 bits";
 		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
 			TileGetTextureSize(guest_format, extent.width, extent.height, 1, tile_mode, &slice,
 			                   nullptr, nullptr);
-			data.size = Multiply(slice.size, resources.layers);
+			data.size = CheckedMultiply(overflow, slice.size, resources.layers);
 		}
-		EXIT_IF(data.size % resources.layers != 0);
+		if (data.size % resources.layers != 0) {
+			return "data size is not a multiple of the layer count";
+		}
 		const auto slice = data.size / resources.layers;
-		EXIT_IF(Multiply(Multiply(pitch, extent.height), bytes_per_block) > slice);
+		if (CheckedMultiply(overflow, CheckedMultiply(overflow, pitch, extent.height),
+		                    bytes_per_block) > slice) {
+			return "depth plane exceeds its slice";
+		}
 		linear_slice_stride = slice;
 		tiled_slice_stride  = IsTiled() ? slice : 0;
 		mip_layout[0]       = {0, data.size, pitch, extent.height, 0, slice, pitch};
-		return;
+		return overflow ? "size overflow" : nullptr;
 	}
 	if (!IsTiled()) {
+		if (LinearLevelSize(element, extent) > UINT32_MAX) {
+			return "linear level size exceeds 32 bits";
+		}
 		TileSizeAlign  total {};
 		TileSizeOffset offsets[16] {};
 		TilePaddedSize padded[16] {};
 		TileGetTextureSize(guest_format, extent.width, extent.height, resources.levels, tile_mode,
 		                   &total, offsets, padded);
 		if (data.size == 0) {
-			data.size = Multiply(total.size, TransferLayers());
+			data.size = CheckedMultiply(overflow, total.size, TransferLayers());
 		}
 		for (uint32_t level = 0; level < resources.levels; ++level) {
 			auto& mip         = mip_layout[level];
 			mip.offset        = offsets[level].offset;
-			mip.size          = Multiply(offsets[level].size, MipExtent(level).depth);
+			mip.size = CheckedMultiply(overflow, offsets[level].size, MipExtent(level).depth);
 			mip.pitch         = padded[level].width / element.texel_width;
 			mip.height        = padded[level].height / element.texel_height;
 			mip.linear_offset = offsets[level].offset;
 			mip.linear_size   = offsets[level].size;
 			mip.linear_pitch  = mip.pitch;
-			linear_slice_stride =
-			    std::max(linear_slice_stride, Add(mip.linear_offset, mip.linear_size));
+			linear_slice_stride = std::max(
+			    linear_slice_stride, CheckedAdd(overflow, mip.linear_offset, mip.linear_size));
 		}
 		if (TransferLayers() > 1 && data.size % TransferLayers() == 0) {
 			linear_slice_stride = std::max(linear_slice_stride, data.size / TransferLayers());
@@ -179,7 +245,9 @@ void ImageInfo::UpdateSize() {
 		                                          IsVolume() ? extent.depth : 1u,
 		                                          resources.levels,
 		                                          resources.layers};
-		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
+		if (!TileGetTiledTextureLayout(description, surface)) {
+			return "no tiled layout for the format, tile mode and shape";
+		}
 		tiling             = surface.texture;
 		first_tail_level   = surface.first_tail_level;
 		tiled_slice_stride = surface.block_slice_size;
@@ -196,7 +264,7 @@ void ImageInfo::UpdateSize() {
 			auto&       mip    = mip_layout[level];
 			const auto  active = MipExtent(level);
 			mip.offset         = source.offset;
-			mip.size           = Multiply(source.size, IsVolume() ? 1u : resources.layers);
+			mip.size = CheckedMultiply(overflow, source.size, IsVolume() ? 1u : resources.layers);
 			mip.pitch          = source.padded_width;
 			mip.height         = source.padded_height;
 			mip.tail_x         = source.tail_x;
@@ -205,17 +273,32 @@ void ImageInfo::UpdateSize() {
 			    Common::AlignUp(mip_pitch, element.texel_width) / element.texel_width;
 			const auto rows =
 			    Common::AlignUp(active.height, element.texel_height) / element.texel_height;
-			mip.linear_size      = Multiply(Multiply(mip.linear_pitch, rows), element.bytes);
+			mip.linear_size = CheckedMultiply(
+			    overflow, CheckedMultiply(overflow, mip.linear_pitch, rows), element.bytes);
 			const auto alignment = std::max(element.bytes, 4u);
-			EXIT_IF(linear_offset > UINT64_MAX - (alignment - 1u));
+			if (linear_offset > UINT64_MAX - (alignment - 1u)) {
+				return "size overflow";
+			}
 			mip.linear_offset = Common::AlignUp<uint64_t>(linear_offset, alignment);
-			linear_offset     = Add(mip.linear_offset, Multiply(mip.linear_size, active.depth));
+			linear_offset = CheckedAdd(overflow, mip.linear_offset,
+			                           CheckedMultiply(overflow, mip.linear_size, active.depth));
 			mip_pitch         = std::max(mip_pitch >> 1u, 1u);
 		}
 		const auto compact_size = CompactMipSize(*this);
 		if (compact_size != 0 && (auto_size || data.size == compact_size)) {
 			data.size = mip_layout[0].size = compact_size;
 		}
+	}
+	return overflow ? "size overflow" : nullptr;
+}
+
+void ImageInfo::UpdateSize() {
+	if (const char* failure = TryUpdateSize()) {
+		EXIT("image size cannot be computed: %s (format=%u tile=%u extent=%ux%ux%u levels=%u "
+		     "layers=%u samples=%u)\n",
+		     failure, static_cast<uint32_t>(guest_format), static_cast<uint32_t>(tile_mode),
+		     extent.width, extent.height, extent.depth, resources.levels, resources.layers,
+		     samples);
 	}
 }
 
