@@ -614,6 +614,13 @@ add_executable(bindless_translation_tests EXCLUDE_FROM_ALL
 target_link_libraries(bindless_translation_tests common fmt::fmt)
 target_include_directories(bindless_translation_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.cpp"
+)
+target_link_libraries(pipeline_compile_queue_tests common fmt::fmt)
+target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -665,6 +672,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
+	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
@@ -759,6 +767,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		bindless_translation_tests
+		pipeline_compile_queue_tests
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
