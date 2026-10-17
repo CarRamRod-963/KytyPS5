@@ -49,31 +49,47 @@
 
 namespace Libs::Graphics {
 
-std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
-	                                           const ShaderVertexInputInfo& vs_input_info) {
+std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t                     index_offset,
+                                                const ShaderVertexInputInfo& vs_input_info,
+                                                int32_t  unpatched_vertex_offset,
+                                                uint32_t unpatched_instance_offset) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
 	uint32_t instance_offset = 0;
 	if (!vs_input_info.fetch_embedded) {
 		return {vertex_offset, instance_offset};
 	}
 
+	// A rewritten fetch reads Vulkan vertex inputs, so the host offsets reproduce the guest's
+	// fetch index: the hardware VertexID (index plus VGT_INDX_OFFSET) or the zero-based
+	// InstanceID, plus the user SGPR the fetch prolog adds. The translator subtracts the same
+	// SGPRs from the seeded index VGPRs, so all other uses still see the hardware values.
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = *vs_input_info.stage.resources;
-	if (index_offset == 0 &&
-	    program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
-		const auto index =
-		    static_cast<uint32_t>(program.info.vertex_offset_sgpr) - program.user_data_base;
-		if (index < resources.user_data.size()) {
-			vertex_offset = static_cast<int32_t>(resources.user_data[index]);
+	const auto  user_sgpr = [&](int32_t sgpr) -> std::optional<uint32_t> {
+		if (sgpr < static_cast<int32_t>(program.user_data_base)) {
+			return std::nullopt;
 		}
+		const auto index = static_cast<uint32_t>(sgpr) - program.user_data_base;
+		if (index >= resources.user_data.size()) {
+			return std::nullopt;
+		}
+		return resources.user_data[index];
+	};
+	// Without a recognized prolog add, a rewritten fetch keeps the indirect packet's offsets.
+	// Programs without rewritten loads (mesh shaders, unrecognized fetches) read their buffers
+	// themselves and receive hardware indices only.
+	const bool rewritten_fetch = std::ranges::any_of(
+	    program.info.vertex_fetch_components, [](uint8_t components) { return components != 0; });
+	if (const auto value = user_sgpr(program.info.vertex_offset_sgpr)) {
+		vertex_offset += static_cast<int32_t>(*value);
+	} else if (rewritten_fetch) {
+		vertex_offset += unpatched_vertex_offset;
 	}
-	if (program.info.instance_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
-		const auto index =
-		    static_cast<uint32_t>(program.info.instance_offset_sgpr) - program.user_data_base;
-		if (index < resources.user_data.size()) {
-			instance_offset = resources.user_data[index];
-		}
+	if (const auto value = user_sgpr(program.info.instance_offset_sgpr)) {
+		instance_offset = *value;
+	} else if (rewritten_fetch) {
+		instance_offset = unpatched_instance_offset;
 	}
 
 	return {vertex_offset, instance_offset};
@@ -1395,16 +1411,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 
+	// Indirect packets patch their offsets into user SGPRs and bypass VGT_INDX_OFFSET.
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
-	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+	    ResolveDrawOffsets(indirect ? 0 : ucfg.GetIndexOffset(), state.vertex_info[0],
+	                       args.base_vertex, args.first_instance);
 
 	DrawEmitInfo emit {};
-	// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
-	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
-	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
-	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.vertex_offset  = vertex_offset;
+	emit.first_instance = instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1490,13 +1505,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
-	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+	    ResolveDrawOffsets(indirect ? 0 : ucfg.GetIndexOffset(), state.vertex_info[0],
+	                       static_cast<int32_t>(args.first_vertex), args.first_instance);
 	DrawEmitInfo emit {};
-	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
-	emit.first_vertex = native_indirect ? 0 :
-	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.first_vertex   = static_cast<uint32_t>(vertex_offset);
+	emit.first_instance = instance_offset;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
