@@ -141,6 +141,13 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.
 void                   ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size);
+// GPU-thread queries behind TryReadBufferBacking, for host readers that cache guest bytes: whether
+// the range holds GPU writes not yet in the backing, the readback of exactly those bytes, and a
+// sequence that advances whenever a GPU write is recorded. Off the GPU thread, or for memory the
+// GPU cannot see, nothing is dirty and the sequence is 0.
+[[nodiscard]] bool     HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+void                   ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t GpuWriteSequence();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Stops at the first hole, or with span_holes at the end of the last committed range.
