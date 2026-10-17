@@ -739,6 +739,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		++m_gpu_write_sequence;
 		for (auto& watched: m_watched_ranges) {
 			if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
 				watched.sequence        = ++m_watched_write_sequence;
@@ -898,6 +899,15 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Contains(vaddr, size);
+}
+
+void BufferCache::ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	m_gpu_modified_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty.emplace_back(begin, end - begin); });
+	for (const auto& [begin, bytes]: dirty) {
+		ReadMemory(begin, bytes);
+	}
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
