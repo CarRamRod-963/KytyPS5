@@ -26717,6 +26717,39 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
   return test;
 }
 
+TestCase VectorFractClampsBelowOne() {
+  using O = ShaderOpcode;
+
+  // DX fract returns [0, 1): x - floor(x) of a tiny negative value rounds
+  // to 1.0 and the hardware clamps it to the largest value below one, in the
+  // destination precision.
+  TestCase test;
+  test.name = "VectorFractClampsBelowOne";
+  test.initial = {0xb08637bdu, 0xbf99999au, 0x40300000u,
+                  0x00008400u, 0x00004180u, 0x0000bc01u};
+  test.expected = {0x3f7fffffu, 0x3f4cccccu, 0x3f400000u,
+                   0x00003bffu, 0x00003a00u, 0x00003bfeu};
+  auto &code = test.code;
+  for (u32 i = 0; i < 6u; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, i, 30);
+    code.push_back(EncodeVop1(0x01, 10u + i, InlineU32(0)));
+  }
+  for (u32 i = 0; i < 3u; i++) {
+    code.push_back(EncodeVop1(0x20, 10u + i, Vgpr(i))); // v_fract_f32
+  }
+  for (u32 i = 3; i < 6u; i++) {
+    code.push_back(EncodeVop1(0x5f, 10u + i, Vgpr(i))); // v_fract_f16
+  }
+  for (u32 i = 0; i < 6u; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32,   O::BUFFER_LOAD_DWORD,  O::V_FRACT_F32,
+                  O::V_FRACT_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorCarryAndBitCountOps() {
   using O = ShaderOpcode;
 
@@ -27795,16 +27828,18 @@ TestCase VectorSpecialF16Ops() {
 TestCase VectorFractF16CapturedAndEdges() {
   using O = ShaderOpcode;
 
-  // RDNA2 section 12.8: x - floor(x), rounded to half precision.
-  // Load at runtime to exercise the emitted operation, including half subnormals.
+  // RDNA2 section 12.8: x - floor(x), rounded to half precision and kept below
+  // one: small negative inputs whose difference rounds to 1.0 return the
+  // largest half below one. Load at runtime to exercise the emitted operation,
+  // including half subnormals.
   const std::array<u32, 18> inputs{
       0x3d00u, 0xbd00u, 0x0000u, 0x8000u, 0x0001u, 0x8001u,
       0x03ffu, 0x83ffu, 0x7bffu, 0xfbffu, 0x3800u, 0xb800u,
       0x8c00u, 0x8c01u, 0x7c00u, 0xfc00u, 0x7e55u, 0x7d01u};
   const std::array<u32, 18> fractions{
-      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3c00u,
-      0x03ffu, 0x3c00u, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
-      0x3c00u, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
+      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3bffu,
+      0x03ffu, 0x3bffu, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
+      0x3bffu, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
   TestCase test;
   test.name = "VectorFractF16CapturedAndEdges";
   for (u32 bits : inputs) {
@@ -29928,6 +29963,7 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
 
 TestCase VectorFractF64CapturedAndEdges() {
   using O = ShaderOpcode;
+  // -2^-1074 rounds x - floor(x) to 1.0: V_FRACT clamps it below one.
   constexpr std::array<std::array<uint64_t, 2>, 17> cases{{
       {0x400a000000000000ull, 0x3fd0000000000000ull}, // 3.25 -> .25
       {0xbff4000000000000ull, 0x3fe8000000000000ull}, // -1.25 -> .75
@@ -29936,7 +29972,7 @@ TestCase VectorFractF64CapturedAndEdges() {
       {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
       {0, 0}, {0x8000000000000000ull, 0},
       {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
-      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      {1, 1}, {0x8000000000000001ull, 0x3fefffffffffffffull},
       {0x000fffffffffffffull, 0x000fffffffffffffull},
       {0x7fefffffffffffffull, 0},
       {0x7ff0000000000000ull, 0x7ff8000000000000ull},
@@ -30418,6 +30454,115 @@ TestCase VectorF64ModesModifiersAndExec() {
                   O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.initial.resize(test.expected.size());
   test.required_spirv = {"OpFAdd"};
+  return test;
+}
+
+TestCase VectorFractF64ClampsBelowOne() {
+  using O = ShaderOpcode;
+
+  // As VectorFractClampsBelowOne for V_FRACT_F64 (VOP1 0x3e, VOP3 0x1be): x -
+  // floor(x) of a tiny negative double rounds to 1.0 and the hardware clamps it
+  // to the largest double below one: -2^-60 and -2^-54 (a tie) round to 1.0,
+  // -2^-53 is already that value. NaN passes through. Load at runtime so the
+  // emitted operation runs.
+  struct Sample {
+    uint64_t input;
+    uint64_t fraction;
+    bool vop3;
+    u32 abs; // VOP3 source modifiers.
+    u32 neg;
+  };
+  constexpr uint64_t below_one = 0x3fefffffffffffffull;
+  const std::array<Sample, 14> samples{{
+      {0x4006000000000000ull, 0x3fe8000000000000ull, false, 0, 0}, // 2.75
+      {0xbfd0000000000000ull, 0x3fe8000000000000ull, false, 0, 0}, // -0.25
+      {0x3ff199999999999aull, 0x3fb99999999999a0ull, false, 0, 0}, // 1.1
+      {0xc008000000000000ull, 0, false, 0, 0},                     // -3.0
+      {0, 0, false, 0, 0},                                         // 0.0
+      {0x7e37e43c8800759cull, 0, false, 0, 0},                     // 1e300
+      {0xbc30000000000000ull, below_one, false, 0, 0},             // -2^-60
+      {0xbc90000000000000ull, below_one, false, 0, 0},             // -2^-54
+      {0xbca0000000000000ull, below_one, false, 0, 0},             // -2^-53
+      {0xbfd0000000000000ull, 0x3fe8000000000000ull, true, 0, 0},  // VOP3
+      {0x4006000000000000ull, 0x3fd0000000000000ull, true, 0, 1},  // -(2.75)
+      {0xc006000000000000ull, 0x3fe8000000000000ull, true, 1, 0},  // |-2.75|
+      {0x4006000000000000ull, 0x3fd0000000000000ull, true, 1, 1},  // -|2.75|
+      {0x3c30000000000000ull, below_one, true, 0, 1},              // -(2^-60)
+  }};
+  const std::array<uint64_t, 4> more_inputs{
+      0x7ff8000000000000ull,  // NaN, VOP1
+      0xfff8000000000000ull,  // -NaN, VOP3 negate
+      0xbc30000000000000ull,  // -2^-60, captured in-place v[4:5]
+      0x4006000000000000ull}; // 2.75, captured in-place v[2:3]
+  TestCase test;
+  test.name = "VectorFractF64ClampsBelowOne";
+  for (const auto &sample : samples) {
+    test.initial.insert(
+        test.initial.end(),
+        {static_cast<u32>(sample.input), static_cast<u32>(sample.input >> 32)});
+  }
+  for (const auto bits : more_inputs) {
+    test.initial.insert(test.initial.end(),
+                        {static_cast<u32>(bits), static_cast<u32>(bits >> 32)});
+  }
+  test.expected = test.initial;
+  const auto load_pair = [&](u32 reg, size_t index) {
+    AppendVMovU32(&test.code, 30, static_cast<u32>(index * 8u));
+    AppendBufferLoadDword(&test.code, reg, 30);
+    AppendVMovU32(&test.code, 30, static_cast<u32>(index * 8u + 4u));
+    AppendBufferLoadDword(&test.code, reg + 1, 30);
+  };
+  const auto store_pair = [&](u32 reg, uint64_t bits) {
+    AppendStoreVgpr(&test.code, reg, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, reg + 1,
+                    static_cast<u32>(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(), {static_cast<u32>(bits),
+                                               static_cast<u32>(bits >> 32)});
+  };
+  for (size_t i = 0; i < samples.size(); i++) {
+    load_pair(0, i);
+    AppendVMovLiteral(&test.code, 2, 0xa5a5a5a5u); // Both words are written.
+    AppendVMovLiteral(&test.code, 3, 0xa5a5a5a5u);
+    if (samples[i].vop3) {
+      AppendVop3(&test.code, 0x1be, 2, Vgpr(0), 0, 0, samples[i].abs, 0, false,
+                 0, samples[i].neg);
+    } else {
+      test.code.push_back(EncodeVop1(0x3e, 2, Vgpr(0)));
+    }
+    store_pair(2, samples[i].fraction);
+  }
+  // Check the quiet NaN class without constraining its sign or payload.
+  for (u32 negate = 0; negate < 2; negate++) {
+    load_pair(0, samples.size() + negate);
+    if (negate != 0) {
+      AppendVop3(&test.code, 0x1be, 2, Vgpr(0), 0, 0, 0, 0, false, 0, 1);
+    } else {
+      test.code.push_back(EncodeVop1(0x3e, 2, Vgpr(0)));
+    }
+    AppendVMovLiteral(&test.code, 4, 0x7ff80000u);
+    test.code.push_back(EncodeVop2(0x1b, 3, Vgpr(4), 3));
+    AppendStoreVgpr(&test.code, 3, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(0x7ff80000u);
+  }
+  // Captured v_fract_f64 v[4:5], v[4:5] and v[2:3], v[2:3] from
+  // cs_4ee720fc4678fa19 (PCs 0x208 and 0x26c): the source is the destination.
+  load_pair(4, samples.size() + 2u);
+  test.code.push_back(0x7e087d04u);
+  store_pair(4, below_one);
+  load_pair(2, samples.size() + 3u);
+  test.code.push_back(0x7e047d02u);
+  store_pair(2, 0x3fe8000000000000ull);
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  const auto fract_count = samples.size() + 4u;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD,  O::V_FRACT_F64,
+                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FRACT_F64", fract_count}};
+  test.ir_counts = {{" = FPFract64 ", fract_count},
+                    {" = FPOrdGreaterThanEqual64 ", fract_count},
+                    {" = SelectF64 ", fract_count}};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", " Fract ",
+                         "OpFOrdGreaterThanEqual"};
   return test;
 }
 
@@ -44590,6 +44735,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
+  AddCase(VectorFractClampsBelowOne);
+  AddCase(VectorFractF64ClampsBelowOne);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorMbcntUsesThreadMask);
@@ -51568,6 +51715,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
     RunCase(&vulkan, Vop2SdwaMulI24Destinations(64));
     RunCase(&vulkan, VectorIntegerOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fract-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorFractClampsBelowOne());
+    RunCase(&vulkan, VectorFractF64ClampsBelowOne());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
