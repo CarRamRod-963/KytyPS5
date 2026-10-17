@@ -54,6 +54,8 @@ public:
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
+	// Decompresses DCC single-value blocks in place (see dccConstant.h).
+	void ExpandDccConstantBlocks(Result data, uint32_t element_bytes);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -130,6 +132,7 @@ private:
 	vk::Pipeline                            m_d24_to_d16      = nullptr;
 	vk::Pipeline                            m_d32_to_d16      = nullptr;
 	vk::Pipeline                            m_color_transform = nullptr;
+	vk::Pipeline                            m_dcc_constant    = nullptr;
 };
 
 } // namespace Libs::Graphics
