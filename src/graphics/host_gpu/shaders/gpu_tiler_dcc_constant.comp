@@ -1,0 +1,41 @@
+#version 450
+
+// One workgroup per 256-byte DCC block encoded as a single value (key 0x10): copies the block's
+// first element over the whole block, in place.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 1, std430) buffer Data { uint data[]; } blocks;
+
+layout(push_constant, std430) uniform Expand {
+	uint base;
+	uint block_count;
+	uint element_bytes;
+	uint groups_x;
+} params;
+
+shared uint first_words[4];
+
+void main() {
+	uint block = gl_WorkGroupID.y * params.groups_x + gl_WorkGroupID.x;
+	if (block >= params.block_count) {
+		return;
+	}
+	uint word          = gl_LocalInvocationID.x;
+	uint start         = (params.base >> 2u) + block * 64u;
+	uint element_words = max(params.element_bytes >> 2u, 1u);
+	if (word < element_words) {
+		first_words[word] = blocks.data[start + word];
+	}
+	barrier();
+	uint value = first_words[word % element_words];
+	if (params.element_bytes == 1u) {
+		value = (first_words[0] & 0xffu) * 0x01010101u;
+	} else if (params.element_bytes == 2u) {
+		value = (first_words[0] & 0xffffu) * 0x00010001u;
+	}
+	// Smaller elements rewrite the first word with its own first element repeated; the barrier
+	// orders that after every read of it.
+	if (word >= element_words || params.element_bytes < 4u) {
+		blocks.data[start + word] = value;
+	}
+}
