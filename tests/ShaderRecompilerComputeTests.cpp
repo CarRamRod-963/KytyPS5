@@ -12580,6 +12580,167 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A count written by one compute pass bounds the work of the next pass in the
+  // same command buffer through a scalar load the resource walk evaluates on
+  // the host (Ghost of Yotei's terrain: a culling CS writes the patch count,
+  // the vertex-record CS skips every workgroup at or past it). The walk must
+  // see the GPU's count, also once the page is a hot readback page whose last
+  // published bytes stay readable while the new write is pending.
+  void CheckScalarWalkGpuWrites() {
+    constexpr const char *name = "ScalarWalkGpuWrites";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t count_address = base + 0x5c4;
+    constexpr uint64_t output = base + 0x10000;
+    constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    constexpr uint32_t groups = 8;
+
+    // s[0:3] = count V#, s4 = count.
+    std::vector<u32> writer{EncodeVop1(0x01, 1, 4),
+                            EncodeMubuf0(0x1cu, 0, false, false),
+                            EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&writer);
+    // s[0:3] = output V#, s[4:5] = count address, s6 = workgroup ID X.
+    std::vector<u32> consumer{
+        EncodeSmem0(0x00, 8, 2),
+        EncodeSmem1(0, 125),                  // s_load_dword s8, s[4:5], 0
+        EncodeSopp(0x0c, 0),                  // s_waitcnt
+        EncodeSopc(0x09, 6, 8),               // s_cmp_ge_u32 s6, s8
+        EncodeSopp(0x05, 5),                  // s_cbranch_scc1 end
+        EncodeVop1(0x01, 1, 8),               // v_mov_b32 v1, s8
+        EncodeVop1(0x01, 2, 6),               // v_mov_b32 v2, s6
+        EncodeVop2(0x1a, 2, InlineU32(2), 2), // v_lshlrev_b32 v2, 2, v2
+        EncodeMubuf0(0x1cu),
+        EncodeMubuf1(1, 0, 2)}; // buffer_store_dword v1, v2, s[0:3]
+    AppendEnd(&consumer);
+    for (const auto *code : {&writer, &consumer}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(
+                             code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "scalar walk allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "scalar walk mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = records;
+        descriptor.fields[3] =
+            DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i]);
+        }
+      };
+      const auto set_consumer = [&] {
+        shaders.SetCsShader(
+            {.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+             .num_thread_x = 1,
+             .num_thread_y = 1,
+             .num_thread_z = 1,
+             .wave_size = 64,
+             .user_sgpr = 6,
+             .tgid_x_en = true});
+        set_buffer(0, output, groups * sizeof(u32));
+        shaders.SetCsUserSgpr(4, static_cast<u32>(count_address));
+        shaders.SetCsUserSgpr(5, static_cast<u32>(count_address >> 32u));
+      };
+      u32 previous = 0;
+      for (const u32 count : {3u, 7u, 5u, 0u, 8u}) {
+        shaders.SetCsShader(
+            {.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+             .num_thread_x = 1,
+             .num_thread_y = 1,
+             .num_thread_z = 1,
+             .wave_size = 64,
+             .user_sgpr = 5});
+        set_buffer(0, count_address, sizeof(u32));
+        shaders.SetCsUserSgpr(4, count);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        u32 stale = sentinel;
+        Require(name, "pending GPU count",
+                cache.HasGpuDirtyBytes(count_address, sizeof(u32)) &&
+                    LibKernel::Memory::TryReadBacking(count_address, &stale,
+                                                      sizeof(stale)) &&
+                    stale == previous,
+                "the count was visible to the CPU before the consumer was "
+                "recorded");
+        cache.FillBuffer(output, groups * sizeof(u32), sentinel, false);
+
+        set_consumer();
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+        cache.ReadMemory(output, groups * sizeof(u32));
+        std::array<u32, groups> actual{};
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(output, actual.data(),
+                                                  sizeof(actual)),
+                "consumer output could not be read back");
+        for (u32 group = 0; group < groups; group++) {
+          Require(name, "walk sees the recorded GPU count",
+                  actual[group] == (group < count ? count : sentinel),
+                  "count " + std::to_string(count) + " (previous " +
+                      std::to_string(previous) + ") group " +
+                      std::to_string(group) + " wrote " + Hex(actual[group]));
+        }
+
+        // The count reaches the shader through the host-flattened SRT, and a
+        // clean count costs no further GPU drain.
+        ShaderComputeInputInfo input{};
+        const auto tick = scheduler.CurrentTick();
+        (void)context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        Require(
+            name, "host-flattened count",
+            input.stage.resources != nullptr &&
+                std::ranges::find(input.stage.resources->flattened_srt,
+                                  count) !=
+                    input.stage.resources->flattened_srt.end(),
+            "the count did not reach the consumer through the flattened SRT");
+        Require(name, "clean count stays cheap",
+                scheduler.CurrentTick() == tick,
+                "a walk over clean memory drained the GPU");
+        previous = count;
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "scalar walk mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "scalar walk allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorMetadataClear() {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     struct PackedCase {
@@ -52226,6 +52387,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-walk-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarWalkGpuWrites();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeIndirectDispatch();
@@ -52493,6 +52659,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
+  vulkan.CheckScalarWalkGpuWrites();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
