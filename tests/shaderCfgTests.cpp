@@ -12192,6 +12192,34 @@ void TestNewShaderRecompilerClipDisabledPosition() {
         "clip-disabled viewport transform is absent from the shader cache key");
 }
 
+void TestNewShaderRecompilerNanPositionCull() {
+  // Guests kill vertices by exporting a NaN position (Ghost of Yotei's terrain
+  // holes). The clipping-error guard must treat any NaN component like the
+  // all-zero position: test the bits with integer compares and store the zero
+  // position the clip plane collapses.
+  const uint32_t shader[] = {
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, 154u) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 155u) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 172u) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 166u) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 169u) == 2u &&
+            SpirvInstructionOpcodeCount(result.spirv, 156u) == 0u,
+        "position clipping-error guard does not cull NaN components with "
+        "integer tests");
+  Check(SpirvStoredBuiltInElements(result.spirv, 3u) ==
+            std::vector<uint32_t>({0u}),
+        "NaN position guard did not store its clipping-error plane");
+}
+
 void TestNewShaderRecompilerAuxPositionExports() {
   const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
     ShaderVertexInputInfo vertex{};
@@ -17139,8 +17167,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wqm_result = compile("wqm", wqm,
-                                  {.words = 407,
-                                   .instructions = 99,
+                                  {.words = 445,
+                                   .instructions = 107,
                                    .variables = 4,
                                    .loads = 3,
                                    .stores = 2,
@@ -17220,6 +17248,7 @@ int main() {
   TestVertexBufferGrouping();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
+  TestNewShaderRecompilerNanPositionCull();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();

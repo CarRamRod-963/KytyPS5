@@ -610,11 +610,38 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (state.invalid_position_clip_distance != UINT32_MAX) {
 				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
 				const auto equal = state.builder.AllocateId();
-				const auto invalid = state.builder.AllocateId();
+				const auto all_zero         = state.builder.AllocateId();
 				const auto distance = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
 				                          value, zero);
-				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
+				state.builder.AddFunction(spv::OpAll, TypeBool(state), all_zero, equal);
+				// A NaN component is a clipping error as well: the guest kills primitives by
+				// exporting NaN positions, which the native clipper discards but a Vulkan
+				// rasterizer may stretch across the screen. Integer compares keep the test
+				// from being folded away by a fast-math driver compiler.
+				const auto u32x4     = TypeU32Vector(state, 4);
+				const auto magnitude = Binary(
+				    state, spv::OpBitwiseAnd, u32x4, Unary(state, spv::OpBitcast, u32x4, value),
+				    state.builder.Constant(
+				        spv::OpConstantComposite, u32x4, ConstantU32(state, 0x7fffffffu),
+				        ConstantU32(state, 0x7fffffffu), ConstantU32(state, 0x7fffffffu),
+				        ConstantU32(state, 0x7fffffffu)));
+				const auto infinity = ConstantU32(state, 0x7f800000u);
+				const auto nan =
+				    Binary(state, spv::OpUGreaterThan, TypeBoolVector(state, 4), magnitude,
+				           state.builder.Constant(spv::OpConstantComposite, u32x4, infinity,
+				                                  infinity, infinity, infinity));
+				const auto invalid = Binary(state, spv::OpLogicalOr, TypeBool(state), all_zero,
+				                            Unary(state, spv::OpAny, TypeBool(state), nan));
+				// The rasterizer then sees a zero position: a NaN would reach the clipper's
+				// interpolation below even at a zero distance.
+				const auto invalid_vector = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4),
+				                          invalid_vector, invalid, invalid, invalid, invalid);
+				const auto culled = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeF32Vector(state, 4), culled,
+				                          invalid_vector, zero, value);
+				value = culled;
 				// Zero at valid vertices makes a primitive containing an invalid position
 				// collapse to its remaining edge, before the undefined 0/0 perspective divide.
 				state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
@@ -626,8 +653,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          distance);
 				static std::atomic_bool logged = false;
 				if (!logged.exchange(true, std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "Shader: emitted zero-position clip guard\n");
+					Log::WriteToConsoleAndLog("Shader: emitted zero or NaN position clip guard\n");
 				}
 			}
 			const auto pointer = state.builder.AllocateId();
