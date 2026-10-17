@@ -1374,6 +1374,10 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  // Fault-bitmap words expected after the dispatch, from the word of this
+  // address on.
+  std::optional<uint64_t> fault_words_address;
+  std::vector<u32> expected_fault_words;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -17618,17 +17622,28 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    if (test.fault_free_address) {
+    const auto fault_address = test.fault_free_address
+                                   ? test.fault_free_address
+                                   : test.fault_words_address;
+    const u32 fault_words =
+        test.fault_free_address
+            ? 1u
+            : static_cast<u32>(test.expected_fault_words.size());
+    if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
-      fault_result = CreateHostBuffer(test.name, sizeof(u32),
-                                     vk::BufferUsageFlagBits::eTransferDst, {});
+      Require(test.name, "fault check", fault_words != 0u,
+              "fault check expects no words");
+      fault_result =
+          CreateHostBuffer(test.name, fault_words * sizeof(u32),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::MemoryBarrier ready{
           .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
-      const vk::BufferCopy region{(BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32),
-                                   0, sizeof(u32)};
+      const vk::BufferCopy region{
+          (BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32), 0,
+          fault_words * sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                         .dstAccessMask = vk::AccessFlagBits::eHostRead};
@@ -17639,6 +17654,17 @@ public:
     if (test.fault_free_address) {
       Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
               "suppressed formatted access touched an unmapped page");
+    } else if (test.fault_words_address) {
+      const auto words = ReadBuffer(test.name, fault_result, fault_words);
+      for (u32 i = 0; i < fault_words; ++i) {
+        Require(test.name, "fault check",
+                words[i] == test.expected_fault_words[i],
+                "fault word " + std::to_string(i) + " = " +
+                    std::to_string(words[i]) + ", expected " +
+                    std::to_string(test.expected_fault_words[i]));
+      }
+    }
+    if (fault_address) {
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -35320,6 +35346,46 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+// Every lane of one wave loads from its own unmapped page. All pages share
+// fault-bitmap words, so the lanes' bits must be merged atomically rather than
+// stored over each other.
+TestCase GlobalLoadFaultsReportEveryLanePage(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t Unmapped = GuestBase + 0x100000u;
+  static_assert(((Unmapped >> BufferCache::CACHING_PAGEBITS) & 31u) == 0u);
+  std::vector<u32> code;
+  code.push_back(
+      EncodeVop2(0x1a, 1, InlineU32(BufferCache::CACHING_PAGEBITS), 0));
+  AppendVMovLiteral(&code, 2, static_cast<u32>(Unmapped));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(2), 1));
+  AppendVMovU32(&code, 5, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 2));
+  code.push_back(EncodeFlat1(3, 0x7d, 0, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32u ? "GlobalLoadFaultsReportEveryLanePage32"
+                               : "GlobalLoadFaultsReportEveryLanePage64";
+  test.code = std::move(code);
+  test.initial.assign(wave_size, 0xdeadbeefu);
+  test.expected.assign(wave_size, 0u);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.fault_words_address = Unmapped;
+  test.expected_fault_words = {0xffffffffu, wave_size == 64u ? 0xffffffffu : 0u,
+                               0u};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_LSHLREV_B32,   O::V_MOV_B32,          O::V_ADD_NC_U32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -44108,6 +44174,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(32));
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
@@ -50260,6 +50328,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(32));
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(64));
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
