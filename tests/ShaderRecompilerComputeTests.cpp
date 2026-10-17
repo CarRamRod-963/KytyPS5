@@ -11351,6 +11351,232 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A DCC target reset the way Ghost of Yotei resets its motion vectors: every
+  // key is the single-value code 0x10 and only the first pixel of each 256-byte
+  // block is written.
+  void CheckDccConstantBlocks() {
+    constexpr const char *name = "DccConstantBlocks";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t dcc_address = base + 0x100000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    constexpr uint64_t block_bytes = 256;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "DCC constant-block direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "DCC constant-block fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    TileSizeAlign dcc_size{};
+    (void)TileGetDccSize(width, height, 1, 4, 1,
+                         Prospero::TileMode::kRenderTarget, dcc_size, 0);
+    const uint64_t metadata_size = dcc_size.size;
+    Require(name, "metadata size",
+            metadata_size != 0 && metadata_size % 0x1000 == 0 &&
+                dcc_address + metadata_size <= base + allocation_size,
+            "unexpected DCC metadata size for a 64x64 RG16F target");
+
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k16_16,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib3(0,
+                                {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 1,
+                                 .metadata_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetColorClearWord0(0, {.word0 = 0});
+      registers.SetColorClearWord1(0, {.word1 = 0});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      // The color data precedes its metadata; its size comes from the target's
+      // layout.
+      RenderColorInfo color{};
+      const auto resolve = [&] {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        color = {};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), color, 0);
+        return texture_cache.FindRenderTarget(color.image_id, color.desc);
+      };
+      const auto write_first_dwords = [&](uint64_t size, auto value_of) {
+        Require(name, "guest color write", context.InvalidateMemory(base, size),
+                "color data is outside the mapped allocation");
+        for (uint64_t block = 0; block < size / block_bytes; block++) {
+          const uint32_t value = value_of(block);
+          LibKernel::Memory::WriteBacking(base + block * block_bytes, &value,
+                                          sizeof(value));
+        }
+      };
+      const auto read_image = [&] {
+        return ReadCachedTexel(name, context, color.image_id, {},
+                               {width, height, 1});
+      };
+      const auto read_guest = [&](uint64_t address, uint64_t size) {
+        std::vector<uint8_t> bytes(size);
+        context.GetBufferCache().ReadMemory(address, size);
+        Require(name, "guest readback",
+                LibKernel::Memory::TryReadBacking(address, bytes.data(),
+                                                  bytes.size()),
+                "guest bytes are unavailable");
+        return bytes;
+      };
+
+      // Uncompressed keys while the first resolve sizes the color data.
+      WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
+      color = {};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      const uint64_t data_size = color.desc.info.data.size;
+      Require(name, "target layout",
+              data_size != 0 && data_size % block_bytes == 0 &&
+                  data_size <= 0x100000 &&
+                  color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  color.desc.info.metadata.range.address == dcc_address &&
+                  color.desc.info.metadata.range.size == metadata_size &&
+                  color.desc.info.bytes_per_block == 4,
+              "the RG16F DCC target did not resolve to the expected layout");
+      const auto first_value = [](uint64_t block) {
+        return 0x3c000000u + static_cast<uint32_t>(block);
+      };
+      write_first_dwords(data_size, first_value);
+      WriteMetadata(context, dcc_address, metadata_size, 0x10101010u);
+      Require(name, "target acquisition", resolve() != nullptr,
+              "the reset DCC target could not be bound");
+
+      const auto expanded = read_image();
+      std::vector<uint32_t> tile_values;
+      bool uniform_tiles = true;
+      for (uint32_t ty = 0; ty < height; ty += 8) {
+        for (uint32_t tx = 0; tx < width; tx += 8) {
+          const auto value = expanded[ty * width + tx];
+          for (uint32_t y = ty; y < ty + 8; y++) {
+            for (uint32_t x = tx; x < tx + 8; x++) {
+              uniform_tiles &= expanded[y * width + x] == value;
+            }
+          }
+          tile_values.push_back(value);
+        }
+      }
+      auto sorted = tile_values;
+      std::sort(sorted.begin(), sorted.end());
+      Require(name, "single-value blocks",
+              uniform_tiles && tile_values[0] == first_value(0) &&
+                  std::adjacent_find(sorted.begin(), sorted.end()) ==
+                      sorted.end() &&
+                  std::all_of(sorted.begin(), sorted.end(),
+                              [&](uint32_t value) {
+                                return value >= first_value(0) &&
+                                       value <
+                                           first_value(data_size / block_bytes);
+                              }),
+              "each 8x8 pixel block did not take its own block's first pixel");
+
+      const auto keys = read_guest(dcc_address, metadata_size);
+      Require(name, "uncompressed keys",
+              std::all_of(keys.begin(), keys.end(),
+                          [](uint8_t key) { return key == 0xff; }),
+              "decoded single-value blocks kept their compressed keys");
+      const auto guest = read_guest(base, data_size);
+      bool guest_expanded = true;
+      for (uint64_t block = 0; block < data_size / block_bytes; block++) {
+        for (uint64_t offset = 0; offset < block_bytes; offset += 4) {
+          uint32_t value = 0;
+          std::memcpy(&value, guest.data() + block * block_bytes + offset,
+                      sizeof(value));
+          guest_expanded &= value == first_value(block);
+        }
+      }
+      Require(name, "guest decompression", guest_expanded,
+              "guest memory does not hold the decompressed blocks");
+
+      // Native rendering after the decode: stale single-value keys must not
+      // bring back what guest memory holds.
+      vk::ClearValue painted{};
+      painted.color.float32 = std::array{1.0f, -1.0f, 0.0f, 0.0f};
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      WriteMetadata(context, dcc_address, metadata_size, 0x10101010u);
+      Require(name, "native acquisition", resolve() != nullptr,
+              "the painted DCC target could not be bound");
+      const auto native = read_image();
+      Require(name, "native write preserved",
+              std::all_of(native.begin(), native.end(),
+                          [](uint32_t value) { return value == 0xbc003c00u; }),
+              "re-read single-value keys overwrote a later native write");
+
+      // The next frame's reset is decoded again.
+      write_first_dwords(data_size, [](uint64_t) { return 0x7e007e00u; });
+      WriteMetadata(context, dcc_address, metadata_size, 0x10101010u);
+      Require(name, "second reset acquisition", resolve() != nullptr,
+              "the re-reset DCC target could not be bound");
+      const auto reset = read_image();
+      Require(name, "repeated reset",
+              std::all_of(reset.begin(), reset.end(),
+                          [](uint32_t value) { return value == 0x7e007e00u; }),
+              "a second single-value reset left stale pixels");
+
+      // Keys mixing single-value and uncompressed blocks cannot be mapped to
+      // blocks: the raw bytes are uploaded as before.
+      (void)read_guest(base, data_size);
+      write_first_dwords(data_size, [](uint64_t) { return 0x11111111u; });
+      WriteMetadata(context, dcc_address, metadata_size / 2, 0x10101010u);
+      WriteMetadata(context, dcc_address + metadata_size / 2, metadata_size / 2,
+                    UINT32_MAX);
+      Require(name, "mixed acquisition", resolve() != nullptr,
+              "the mixed-key DCC target could not be bound");
+      const auto mixed = read_image();
+      Require(name, "mixed keys stay raw",
+              mixed[0] == 0x11111111u && mixed[1] == 0x7e007e00u,
+              "a mixed metadata slice was decoded");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "DCC constant-block direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "DCC constant-block direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   static void WriteMetadata(RenderContext &context, uint64_t address,
                             uint64_t size, uint32_t value) {
     Require("DccMetadata", "guest write range", size % sizeof(value) == 0 &&
@@ -53802,6 +54028,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -53834,6 +54061,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckDccConstantBlocks();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
@@ -53844,6 +54072,7 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
@@ -54151,6 +54380,7 @@ int main(int argc, char **argv) {
     vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckMsaaStorageClear();
