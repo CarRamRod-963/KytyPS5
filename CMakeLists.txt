@@ -259,6 +259,7 @@ set(gpu_tiler_shader_names
 	demote_d16
 	color_transform
 	color_clear
+	dcc_constant
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -620,6 +621,11 @@ add_executable(bindless_translation_tests EXCLUDE_FROM_ALL
 target_link_libraries(bindless_translation_tests common fmt::fmt)
 target_include_directories(bindless_translation_tests PRIVATE ${inc_headers})
 
+
+add_executable(dcc_constant_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DccConstantTests.cpp"
+target_include_directories(dcc_constant_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.cpp"
@@ -718,6 +724,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
+	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -840,6 +847,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		bindless_translation_tests
+		dcc_constant_tests
 		pipeline_compile_queue_tests
 		pipeline_cache_writer_tests
 		memory_tracker_tests
