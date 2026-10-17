@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/dccConstant.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -1259,6 +1260,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
+		if (code == DccConstant::Key && !volume_texture &&
+		    desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+			ExpandDccConstantSlice(id, desc, address, slice_size, first + slice);
+			continue;
+		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
@@ -1291,6 +1297,57 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+void TextureCache::ExpandDccConstantSlice(ImageId id, const ImageDesc& desc,
+                                          uint64_t metadata_address, uint64_t metadata_size,
+                                          uint32_t layer) {
+	const auto& info   = desc.info;
+	const auto  layers = info.TransferLayers();
+	if (desc.type == BindingType::VideoOut || info.IsDepth() || info.IsVolume() ||
+	    info.samples != 1 || !info.IsTiled() || info.IsBlock() ||
+	    !DccConstant::SupportsElementBytes(info.bytes_per_block) || layers == 0 ||
+	    info.data.size % layers != 0 || (info.data.size / layers) % DccConstant::BlockBytes != 0) {
+		return;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		// Only guest bytes the pending upload will read are decoded. Without one, the native image
+		// is newer than guest memory (or already holds this decode) and stays as it is.
+		if (image.info.data != info.data || image.info.samples != 1 ||
+		    !(image.IsBufferModified() || image.IsCpuDirty())) {
+			return;
+		}
+	}
+	std::vector<uint8_t> keys(metadata_size);
+	if (!LibKernel::Memory::TryReadBacking(metadata_address, keys.data(), keys.size())) {
+		EXIT("TextureCache: failed to read color metadata slice\n");
+	}
+	// Key bytes are swizzled relative to the blocks they describe, so only a slice made of
+	// single-value blocks is decoded; mixed slices keep their raw bytes.
+	if (!DccConstant::IsConstantSlice(keys)) {
+		return;
+	}
+	// Decompress the slice in guest memory, as a DCC decompress pass would: the value of each
+	// 256-byte block is its first pixel, and every byte of the block must hold it before upload.
+	const auto data_size    = info.data.size / layers;
+	const auto data_address = info.data.address + data_size * layer;
+	InvalidateMemoryFromGPU(data_address, data_size);
+	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(data_address, data_size, true);
+	m_tiler.ExpandDccConstantBlocks({buffer->Handle(), offset, data_size}, info.bytes_per_block);
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		if (image.IsGpuModified()) {
+			image.ClearGpuModified();
+		}
+		image.MarkBufferModified();
+	}
+	// The blocks are uncompressed now; publish that like the keys of an expanded clear.
+	std::fill(keys.begin(), keys.end(), uint8_t {0xff});
+	m_buffer_cache.InvalidateMemory(metadata_address, metadata_size);
+	LibKernel::Memory::WriteBacking(metadata_address, keys.data(), keys.size());
 }
 
 void TextureCache::RefreshImage(ImageId id) {
