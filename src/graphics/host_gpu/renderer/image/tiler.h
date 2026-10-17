@@ -61,6 +61,8 @@ public:
 	// `expand` is set.
 	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
 	                                         bool expand);
+	// Decompresses DCC single-value blocks in place (see dccConstant.h).
+	void ExpandDccConstantBlocks(Result data, uint32_t element_bytes);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -141,6 +143,7 @@ private:
 	vk::Pipeline                            m_color_transform = nullptr;
 	vk::Pipeline                            m_color_clear     = nullptr;
 	std::unique_ptr<Buffer>                 m_clear_predicates;
+	vk::Pipeline                            m_dcc_constant    = nullptr;
 };
 
 } // namespace Libs::Graphics

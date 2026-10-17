@@ -15,6 +15,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_dcc_constant_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -73,7 +74,7 @@ TileManager::~TileManager() {
 		}
 	}
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
-	                     m_color_clear}) {
+	                     m_color_clear, m_dcc_constant}) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
 		}
@@ -619,6 +620,72 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
 	                        0, nullptr);
+}
+
+void TileManager::ExpandDccConstantBlocks(Result data, uint32_t element_bytes) {
+	constexpr uint64_t BlockBytes = 256;
+	EXIT_IF(data.buffer == nullptr || data.size == 0 || data.size % BlockBytes != 0 ||
+	        element_bytes == 0 || element_bytes > 16 || !std::has_single_bit(element_bytes));
+	if (m_dcc_constant == nullptr) {
+		m_dcc_constant = CreatePipeline(GPU_TILER_DCC_CONSTANT_SPV, nullptr);
+	}
+	const auto& limits    = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto  alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	EXIT_IF(data.offset % 4 != 0);
+	// Bound each dispatch by the storage range one descriptor can reach.
+	const uint64_t max_blocks = (limits.maxStorageBufferRange - (alignment - 1)) / BlockBytes;
+	EXIT_IF(max_blocks == 0);
+
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = data.buffer;
+	barrier.offset              = data.offset;
+	barrier.size                = data.size;
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                        vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_dcc_constant);
+	for (uint64_t first = 0; first < data.size / BlockBytes;) {
+		const auto blocks = std::min(data.size / BlockBytes - first, max_blocks);
+		const auto binding =
+		    BindStorage({data.buffer, data.offset + first * BlockBytes, blocks * BlockBytes},
+		                blocks * BlockBytes);
+		vk::WriteDescriptorSet write {};
+		write.dstBinding      = 1;
+		write.descriptorCount = 1;
+		write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+		write.pBufferInfo     = &binding.info;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1,
+		                             &write);
+		const uint32_t groups_y =
+		    static_cast<uint32_t>((blocks + limits.maxComputeWorkGroupCount[0] - 1u) /
+		                          limits.maxComputeWorkGroupCount[0]);
+		const uint32_t groups_x = static_cast<uint32_t>((blocks + groups_y - 1u) / groups_y);
+		EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+		struct {
+			uint32_t base;
+			uint32_t block_count;
+			uint32_t element_bytes;
+			uint32_t groups_x;
+		} push {binding.base, static_cast<uint32_t>(blocks), element_bytes, groups_x};
+		static_assert(sizeof(push) <= sizeof(Conversion));
+		command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+		                      &push);
+		command.dispatch(groups_x, groups_y, 1);
+		first += blocks;
+	}
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &barrier, 0,
+	                        nullptr);
 }
 
 TileManager::Result TileManager::TransformColor(Result input, ColorTransform transform,
