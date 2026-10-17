@@ -19044,10 +19044,17 @@ public:
       registers.SetTargetOutputMode(0, saved_output_mode);
 
       // Captured Playroom strips contain the fullscreen triangle followed by an
-      // out-of-bounds fetch exporting (0,0,0,0). Additive color reveals any extra triangle.
-      static constexpr std::array<std::array<u32, 4>, 4> fourth_positions{{
-          {0, 0, 0, 0}, {0x80000000u, 0, 0x80000000u, 0x80000000u},
-          {0, 0, 0, 0x3f800000u}, {0xbf800000u, 0xbf800000u, 0, 0}}};
+      // out-of-bounds fetch exporting (0,0,0,0). Additive color reveals any
+      // extra triangle. Ghost of Yotei kills terrain-hole vertices with a
+      // 0xffc00000 position; a NaN in any component is a clipping error that
+      // culls the primitive as well.
+      static constexpr std::array<std::array<u32, 4>, 6> fourth_positions{
+          {{0, 0, 0, 0},
+           {0x80000000u, 0, 0x80000000u, 0x80000000u},
+           {0xffc00000u, 0xffc00000u, 0xffc00000u, 0xffc00000u},
+           {0x7fc00000u, 0, 0, 0x3f800000u},
+           {0, 0, 0, 0x3f800000u},
+           {0xbf800000u, 0xbf800000u, 0, 0}}};
       static const auto position_shaders = [&] {
         std::array<std::vector<u32>, fourth_positions.size()> result;
         for (size_t i = 0; i < result.size(); i++) {
@@ -19098,8 +19105,10 @@ public:
                   "clipping-error culling removed valid fullscreen coverage");
           second_triangle |= pixels[component] == 0x3f000000u;
         }
-        Require(name, "zero homogeneous position culling", second_triangle == (i >= 2),
-                "zero positions drew an extra triangle, or a valid position was culled");
+        Require(name, "zero or NaN position culling",
+                second_triangle == (i >= 4),
+                "zero or NaN positions drew an extra triangle, or a valid "
+                "position was culled");
       }
 
       // A NULL-export stencil pass must ignore smaller stale color targets,
