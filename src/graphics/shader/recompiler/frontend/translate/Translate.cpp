@@ -1133,6 +1133,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.Emit(IR::ValueOpcode::GetBuiltin,
 			                  {IR::Value(static_cast<uint32_t>(kind)), IR::Value(component)}));
 		};
+		// The VertexID and InstanceID VGPRs exclude the offsets a fetch prolog adds from user
+		// SGPRs. A rewritten fetch takes those offsets from the Vulkan draw instead (see
+		// ResolveDrawOffsets), so they are removed from the native indices here once.
+		const auto fetch_index = [&](IR::StageInputKind kind) {
+			const auto sgpr  = options.embedded_fetch == nullptr ? -1
+			                   : kind == IR::StageInputKind::VertexIndex
+			                       ? options.embedded_fetch->vertex_offset_sgpr
+			                       : options.embedded_fetch->instance_offset_sgpr;
+			const auto index = builtin(kind);
+			if (sgpr < 0) {
+				return index;
+			}
+			return entry_ir.ISub(index, entry_ir.GetUserData(static_cast<IR::ScalarReg>(sgpr)));
+		};
 		for (uint32_t index = 0; index < options.user_data_count; index++) {
 			const auto reg = static_cast<IR::ScalarReg>(options.user_data_base + index);
 			if (IR::RegIndex(reg) >= IR::NumScalarRegs) {
@@ -1314,10 +1328,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
-			                      builtin(IR::StageInputKind::VertexIndex));
+			                      fetch_index(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			                      fetch_index(IR::StageInputKind::InstanceIndex));
 		} else if (options.stage == ShaderType::TessellationControl) {
 			const auto& tess = options.input_info.vertex->tess;
 			entry_ir.SetScalarReg(
@@ -1414,7 +1428,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto  index   = [&](uint8_t slot, IR::StageInputKind kind,
 			                          IR::StageInputKind base_kind) {
 				if (!options.input_info.vertex->indirect_draw) {
-					return builtin(kind);
+					return fetch_index(kind);
 				}
 				const auto base = builtin(base_kind);
 				if (slot < options.user_data_count) {
