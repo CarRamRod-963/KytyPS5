@@ -433,6 +433,83 @@ void TestGeneralWalkerAssumesExecFactor() {
         "compiled walker decided an unknown conjunction");
 }
 
+void TestGeneralWalkerZeroUnsignedBound() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // No U32 is below zero: a zero upper bound decides the compare without its
+  // unknown left operand, in the compiled walker as in the interpreter.
+  constexpr uint64_t table_address = 0x10000u;
+  struct Reads {
+    std::array<uint32_t, 4> table{};
+    uint32_t count = 0;
+  } reads;
+  std::array<uint32_t, 2> user_data{
+      static_cast<uint32_t>(table_address),
+      static_cast<uint32_t>(table_address >> 32u)};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto read = [&](Value byte_offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+    return value;
+  };
+  const auto bound = read(Value(0u));
+  const auto below =
+      emit(ValueOpcode::ULessThan32, {emit(ValueOpcode::UndefU32, {}), bound});
+  read(emit(ValueOpcode::SelectU32, {below, Value(8u), Value(4u)}));
+  auto plan = ExtractResourcePlan(program);
+  Check(
+      plan.srt_general_code != nullptr,
+      "compare with a zero unsigned bound did not compile the general walker");
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory =
+          +[](void *data, uint64_t address, std::span<uint32_t> words) {
+            auto &reads = *static_cast<Reads *>(data);
+            if (address < table_address || address >= table_address + 16u ||
+                address % 4u || words.size() != 1)
+              return false;
+            ++reads.count;
+            words[0] = reads.table[(address - table_address) / 4u];
+            return true;
+          },
+      .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  reads.table = {0u, 0x11u, 0x12u, 0x13u};
+  // The compiled walker reads the bound and the selected word once each; a
+  // failed native run would read them again in the interpreter.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u, 0x11u} &&
+            reads.count == 2u,
+        "compiled walker did not decide a compare with a zero unsigned bound");
+  auto code = std::move(plan.srt_general_code);
+  ResourceSnapshot interpreted;
+  Check(MaterializeResources(plan, runtime, interpreted, specialization) &&
+            interpreted.flattened_srt == snapshot.flattened_srt,
+        "interpreter and compiled walker disagree on a zero unsigned bound");
+  plan.srt_general_code = std::move(code);
+  // A nonzero bound leaves the compare unknown: neither evaluator decides it.
+  reads.table[0] = 3u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "compiled walker decided a compare with an unknown operand");
+  plan.srt_general_code.reset();
+  Check(!MaterializeResources(plan, runtime, interpreted, specialization),
+        "interpreter decided a compare with an unknown operand");
+}
+
 void TestGeneralNativeSrtWalker() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Two tables; user data holds a pointer to each and a selector/index word.
@@ -1758,6 +1835,7 @@ int main() {
   TestGeneralNativeSrtWalker();
   TestGeneralWalkerScopedMemo();
   TestGeneralWalkerAssumesExecFactor();
+  TestGeneralWalkerZeroUnsignedBound();
   TestGeneralWalkerLoopFixpoint();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();

@@ -1302,10 +1302,26 @@ private:
 				if (!EmitPair(inst, 0, 1)) return false;
 				EmitCompare(&Code::setne);
 				return true;
-			case ValueOpcode::ULessThan32:
-				if (!EmitPair(inst, 0, 1)) return false;
+			case ValueOpcode::ULessThan32: {
+				// Like the interpreter: a zero upper bound decides without the left operand,
+				// which may be an unknown loop-carried value.
+				Xbyak::Label zero, done;
+				if (!Emit(inst.Arg(1))) return false;
+				code.test(code.eax, code.eax);
+				code.jz(zero, Code::T_NEAR);
+				code.push(code.rax);
+				PushScope();
+				const bool left = Emit(inst.Arg(0));
+				PopScope();
+				if (!left) return false;
+				code.pop(code.rcx);
 				EmitCompare(&Code::setb);
+				code.jmp(done, Code::T_NEAR);
+				code.L(zero);
+				code.xor_(code.eax, code.eax);
+				code.L(done);
 				return true;
+			}
 			case ValueOpcode::ULessThanEqual32: {
 				Xbyak::Label one, done;
 				if (!Emit(inst.Arg(0))) return false;
