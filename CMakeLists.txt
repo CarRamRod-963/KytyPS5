@@ -592,6 +592,11 @@ add_executable(guest_write_set_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(guest_write_set_tests PRIVATE ${inc_headers})
 
+add_executable(scalar_read_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ScalarReadCacheTests.cpp"
+)
+target_include_directories(scalar_read_cache_tests PRIVATE ${inc_headers})
+
 add_executable(dcc_constant_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DccConstantTests.cpp"
 )
@@ -661,6 +666,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
 	add_test(NAME guest_write_set COMMAND $<TARGET_FILE:guest_write_set_tests>)
+	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
@@ -748,6 +754,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		bindless_translation_tests
 		guest_write_set_tests
+		scalar_read_cache_tests
 		dcc_constant_tests
 		pipeline_compile_queue_tests
 		pipeline_cache_writer_tests

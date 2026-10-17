@@ -871,6 +871,25 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
+void ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		GetGpuResources().GetBufferCache().ReadGpuDirtyBytes(vaddr, size);
+	}
+}
+
+uint64_t GpuWriteSequence() {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()
+	           ? GetGpuResources().GetBufferCache().GpuWriteSequence()
+	           : 0;
+}
+
 uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges == nullptr ? 0 : g_virtual_ranges->ClampRangeSize(vaddr, size);
 }

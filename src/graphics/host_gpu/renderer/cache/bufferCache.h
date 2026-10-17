@@ -83,6 +83,12 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Reads back the GPU-dirty bytes inside the range, each dirty interval clipped to it, so the
+	// backing holds every GPU write of the range recorded so far. Bytes outside the dirty
+	// intervals are neither read back nor looked up as buffers.
+	void ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Advances whenever a GPU write of guest memory is recorded.
+	[[nodiscard]] uint64_t GpuWriteSequence() const noexcept { return m_gpu_write_sequence; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	// Reports whether the CPU wrote the range since the last upload or consumption, and arms the
 	// range so the next CPU write is reported again.
@@ -194,6 +200,7 @@ private:
 	std::vector<WatchedRange>                         m_watched_ranges;
 	uint64_t                                          m_watched_write_sequence = 0;
 	bool                                              m_watched_write_pending  = false;
+	uint64_t                                          m_gpu_write_sequence     = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
