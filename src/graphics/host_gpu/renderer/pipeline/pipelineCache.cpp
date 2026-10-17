@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/scalarReadCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -117,47 +118,30 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
-// Chunks of guest memory read while one program's resources are evaluated. The walk reads
-// the SRT and its descriptors one DWORD at a time, and every backing read takes the address
-// space lock and a mapping lookup; the chunks turn the dozens of reads of one evaluation into
-// a few. Guest memory is stable for the evaluation's duration (it runs on the GPU thread), so a
-// cache lives for one evaluation and is dropped with it.
-struct ScalarReadCache {
-	static constexpr uint64_t ChunkBytes = 128;
-	static constexpr size_t   Entries    = 32;
-	struct Entry {
-		uint64_t base = UINT64_MAX;
-		uint32_t words[ChunkBytes / sizeof(uint32_t)];
-	};
-	std::array<Entry, Entries> entries;
+// The guest memory the walk reads on the GPU thread, synchronized with recorded GPU writes like
+// the specialization reader's TryReadBufferBacking.
+struct GuestScalarMemory {
+	static bool Read(uint64_t address, void* data, uint64_t size) {
+		return Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+	}
+	static bool HasGpuDirtyBytes(uint64_t address, uint64_t size) {
+		return Libs::LibKernel::Memory::HasGpuDirtyBytes(address, size);
+	}
+	static void ReadGpuDirtyBytes(uint64_t address, uint64_t size) {
+		Libs::LibKernel::Memory::ReadGpuDirtyBytes(address, size);
+	}
+	static uint64_t GpuWriteSequence() { return Libs::LibKernel::Memory::GpuWriteSequence(); }
 };
+using GuestScalarReadCache = ScalarReadCache<GuestScalarMemory>;
 
 bool ReadShaderScalarMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
-	const auto bytes = values.size_bytes();
-	const auto base  = address & ~(ScalarReadCache::ChunkBytes - 1u);
-	if (auto* cache = static_cast<ScalarReadCache*>(userdata);
-	    cache != nullptr && bytes <= ScalarReadCache::ChunkBytes &&
-	    address - base + bytes <= ScalarReadCache::ChunkBytes) {
-		auto& entry =
-		    cache->entries[(base / ScalarReadCache::ChunkBytes) % ScalarReadCache::Entries];
-		if (entry.base != base) {
-			entry.base = Libs::LibKernel::Memory::TryReadBacking(base, entry.words,
-			                                                     ScalarReadCache::ChunkBytes)
-			                 ? base
-			                 : UINT64_MAX;
-		}
-		if (entry.base == base) {
-			std::memcpy(values.data(),
-			            reinterpret_cast<const uint8_t*>(entry.words) + (address - base), bytes);
-			return true;
-		}
-		// A chunk that crosses unmapped memory: read exactly what was asked for.
+	if (auto* cache = static_cast<GuestScalarReadCache*>(userdata); cache != nullptr) {
+		cache->Read(address, values);
+		return true;
 	}
-	// The walk evaluates loads the shader may never execute, e.g. through a null SRT pointer, so
-	// unmapped guest memory reads as zeros instead of faulting the host.
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), bytes)) {
-		std::ranges::fill(values, 0u);
-	}
+	GuestScalarMemory    memory;
+	GuestScalarReadCache uncached(memory);
+	uncached.Read(address, values);
 	return true;
 }
 
@@ -486,7 +470,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		ScalarReadCache                              read_cache;
+		GuestScalarMemory                            scalar_memory;
+		GuestScalarReadCache                         read_cache(scalar_memory);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
