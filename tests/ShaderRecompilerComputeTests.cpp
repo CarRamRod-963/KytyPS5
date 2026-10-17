@@ -18262,6 +18262,9 @@ public:
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     constexpr uint64_t index_address = rect_address + 0x1000;
+    constexpr uint64_t fetch_vertex_address = index_address + 0x1000;
+    constexpr uint64_t fetch_instance_address = fetch_vertex_address + 0x1000;
+    constexpr uint64_t fetch_table_address = fetch_instance_address + 0x1000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -18307,6 +18310,36 @@ public:
                   sizeof(rect_vertices));
       constexpr std::array<uint32_t, 3> indices{0, 1, 2};
       std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
+      for (uint32_t element = 0; element < 16; element++) {
+        const auto marker = [](bool selected) {
+          return selected ? 0x3f800000u : 0u;
+        };
+        const std::array<u32, 4> vertex_record{
+            marker(element >= 7 && element <= 9), 0, 0, 0};
+        const std::array<u32, 4> instance_record{marker(element == 6), 0, 0, 0};
+        std::memcpy(
+            reinterpret_cast<void *>(fetch_vertex_address + element * 16),
+            vertex_record.data(), sizeof(vertex_record));
+        std::memcpy(
+            reinterpret_cast<void *>(fetch_instance_address + element * 16),
+            instance_record.data(), sizeof(instance_record));
+      }
+      std::array<u32, 10> fetch_tables{};
+      for (const auto [slot, address] :
+           {std::pair<u32, uint64_t>{0, fetch_vertex_address},
+            {1, fetch_instance_address}}) {
+        ShaderBufferResource descriptor{
+            {0, 16u << 16u, 16,
+             DstSel(4, 5, 6, 7) |
+                 (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float)
+                  << 12u)}};
+        descriptor.UpdateAddress48(address);
+        std::copy_n(descriptor.fields, 4, fetch_tables.begin() + slot * 4);
+      }
+      fetch_tables[8] = 0;                // semantic 0: buffer 0, vertex rate
+      fetch_tables[9] = 1u | (1u << 26u); // semantic 1: buffer 1, instance rate
+      std::memcpy(reinterpret_cast<void *>(fetch_table_address),
+                  fetch_tables.data(), sizeof(fetch_tables));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -19393,6 +19426,143 @@ public:
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
       }
+      // A fetch rewritten into Vulkan vertex inputs takes its offsets from the
+      // draw, while VertexID and InstanceID stay hardware values: the prolog
+      // adds the user-SGPR offsets (s12 and s13) once, for the fetch and for
+      // every other use alike.
+      static const auto fetch_vertex = [] {
+        std::vector<u32> code;
+        AppendVop3(&code, 0x15du, 5, 12, InlineU32(0),
+                   Vgpr(5)); // v_sad_u32 v5, s12, 0, v5
+        AppendVop3(&code, 0x15du, 8, 13, InlineU32(0),
+                   Vgpr(8)); // v_sad_u32 v8, s13, 0, v8
+        code.push_back(EncodeSMovB32(0, InlineU32(0)));
+        code.push_back(EncodeSmem0(0x02u, 20, 4));
+        code.push_back(EncodeSmem1(0)); // s_load_dwordx4 s[20:23], s[8:9], 0
+        code.push_back(EncodeSmem0(0x02u, 24, 4));
+        code.push_back(EncodeSmem1(16)); // s_load_dwordx4 s[24:27], s[8:9], 16
+        code.push_back(EncodeVop2(0x01u, 0, Vgpr(8), 5));
+        code.push_back(EncodeMubuf0(0x03u, 0, true));
+        code.push_back(EncodeMubuf1(9, 5, 0));
+        code.push_back(EncodeMubuf0(0x03u, 0, true));
+        code.push_back(EncodeMubuf1(13, 6, 0));
+        AppendVMovLiteral(&code, 1, 0xbf800000u);
+        AppendVMovLiteral(&code, 2, 0x40400000u);
+        // The corners need VertexID 8 and 9; only instance 1 (InstanceID 6) is
+        // placed.
+        code.push_back(EncodeVopc(0xc2, InlineU32(8), 5));
+        code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+        code.push_back(EncodeVopc(0xc2, InlineU32(9), 5));
+        code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+        code.push_back(EncodeVopc(0xc2, InlineU32(6), 8));
+        code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 3));
+        code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 4));
+        AppendVMovU32(&code, 0, 0);
+        // W is one only where both fetches read their marked records.
+        code.push_back(EncodeVop2(0x08, 6, Vgpr(9), 13));
+        code.push_back(EncodeExp0(0x0c, 0xf));
+        code.push_back(EncodeExp1(3, 4, 0, 6));
+        for (u32 parameter = 0; parameter < 8; parameter++) {
+          code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+        }
+        AppendEnd(&code);
+        return code;
+      }();
+      static auto fetch_offsets = [] {
+        std::array<uint16_t,
+                   static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+            offsets{};
+        offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+        offsets[static_cast<size_t>(
+            AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+        offsets[static_cast<size_t>(
+            AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        return offsets;
+      }();
+      static ShaderUserData fetch_user_data{};
+      fetch_user_data.direct_resource_offset = fetch_offsets.data();
+      fetch_user_data.direct_resource_count =
+          static_cast<uint16_t>(fetch_offsets.size());
+      static std::array<ShaderSemantic, 2> fetch_semantics{};
+      for (u32 semantic = 0; semantic < fetch_semantics.size(); semantic++) {
+        fetch_semantics[semantic].semantic = semantic;
+        fetch_semantics[semantic].hardware_mapping = semantic;
+        fetch_semantics[semantic].size_in_elements = 4;
+      }
+      const auto fetch_vs = reinterpret_cast<uint64_t>(fetch_vertex.data());
+      ShaderMapUserData(
+          fetch_vs,
+          {.type = Prospero::ShaderBinaryType::kGs,
+           .user_data = &fetch_user_data,
+           .input_semantics = fetch_semantics.data(),
+           .num_input_semantics = static_cast<uint32_t>(fetch_semantics.size()),
+           .code_size_bytes =
+               static_cast<uint32_t>(fetch_vertex.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(fetch_vs);
+      shaders.SetGsShaderResource2({.user_sgpr = 6});
+      for (const auto [sgpr, value] :
+           {std::pair<u32, u32>{0, static_cast<u32>(fetch_table_address)},
+            {1, static_cast<u32>(fetch_table_address >> 32u)},
+            {2, static_cast<u32>(fetch_table_address + 32)},
+            {3, static_cast<u32>((fetch_table_address + 32) >> 32u)},
+            {5, 5}}) {
+        shaders.SetGsUserSgpr(sgpr, value, HW::UserSgprType::Unknown);
+      }
+      struct FetchDrawCase {
+        const char *label;
+        bool indexed;
+        DrawOffsetSource source;
+        uint32_t index_offset;
+        uint32_t vertex_sgpr;
+      };
+      for (const auto test :
+           {FetchDrawCase{"indirect indexed", true,
+                          DrawOffsetSource::IndirectArgs, 0, 7},
+            FetchDrawCase{"indirect auto", false,
+                          DrawOffsetSource::IndirectArgs, 0, 7},
+            FetchDrawCase{"direct indexed", true, DrawOffsetSource::DrawState,
+                          0, 7},
+            FetchDrawCase{"direct auto", false, DrawOffsetSource::DrawState, 0,
+                          7},
+            FetchDrawCase{"direct index offset", true,
+                          DrawOffsetSource::DrawState, 3, 4}}) {
+        const bool indirect = test.source == DrawOffsetSource::IndirectArgs;
+        shaders.SetGsUserSgpr(4, test.vertex_sgpr, HW::UserSgprType::Unknown);
+        user_config.SetIndexOffset(test.index_offset);
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        if (test.indexed) {
+          RenderExecutorTestAccess::DrawIndex(
+              executor, scheduler.Current(),
+              {.index_count = 3,
+               .index_addr = reinterpret_cast<const void *>(index_address),
+               .instance_count = 2,
+               .index_type_and_size = 1,
+               .base_vertex = indirect ? 7 : 0,
+               .first_instance = indirect ? 5u : 0u,
+               .offset_source = test.source});
+        } else {
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(),
+              {.vertex_count = 3,
+               .instance_count = 2,
+               .first_vertex = indirect ? 7u : 0u,
+               .first_instance = indirect ? 5u : 0u,
+               .offset_source = test.source});
+        }
+        const auto pixels = ReadCachedTexel(
+            name, context, sparse_color.image_id, {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          Require("EmbeddedFetchDrawOffsets", test.label,
+                  pixels[component] ==
+                      (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                  "a rewritten fetch missed its offset or VertexID/InstanceID "
+                  "counted it twice");
+        }
+      }
+      user_config.SetIndexOffset(0);
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
@@ -45656,11 +45826,10 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto valid =
       Compile("EmbeddedFetchVertexOffset", MakeFetch({{18, 0}}), 7);
-  Require(
-      "EmbeddedFetchVertexOffset", "parse",
-      valid.program.info.vertex_offset_sgpr == 18 && Resolve(valid, 0) == 7 &&
-          Resolve(valid, 5) == 5,
-      "canonical fetch offset or register index-offset precedence is wrong");
+  Require("EmbeddedFetchVertexOffset", "parse",
+          valid.program.info.vertex_offset_sgpr == 18 &&
+              Resolve(valid, 0) == 7 && Resolve(valid, 5) == 12,
+          "canonical fetch offset did not add to the register index offset");
 
   const auto ngg_code = MakeFetch({{18, 5}}, {}, 5, true);
   Require("EmbeddedFetchNggVertexOffset", "encoding",
@@ -45669,9 +45838,9 @@ void CheckEmbeddedFetchVertexOffset() {
   const auto ngg = Compile("EmbeddedFetchNggVertexOffset", ngg_code, 8);
   Require("EmbeddedFetchNggVertexOffset", "parse",
           ngg.program.info.vertex_offset_sgpr == 18 && Resolve(ngg, 0) == 8 &&
-              Resolve(ngg, 5) == 5,
-          "PS5 NGG vertex-index offset or register index-offset precedence is "
-          "wrong");
+              Resolve(ngg, 5) == 13,
+          "PS5 NGG vertex-index offset did not add to the register index "
+          "offset");
 
   const auto ngg_instance =
       Compile("EmbeddedFetchNggInstanceOffset",
@@ -45716,6 +45885,35 @@ void CheckEmbeddedFetchVertexOffset() {
             "non-prolog, conflicting, malformed, or out-of-window add was "
             "classified");
   }
+
+  // Unpatched indirect offsets reach a rewritten fetch only where no prolog
+  // SGPR was recognized; programs that load their own vertex data (mesh
+  // shaders, unrecognized fetches) never take them.
+  const auto ResolveIndirect = [](const CompiledShader &result,
+                                  bool rewritten) {
+    ShaderVertexInputInfo vertex;
+    vertex.fetch_embedded = true;
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.user_data_base = result.program.user_data_base;
+    program.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
+    program.info.instance_offset_sgpr =
+        result.program.info.instance_offset_sgpr;
+    if (rewritten) {
+      program.info.vertex_fetch_components =
+          result.program.info.vertex_fetch_components;
+    }
+    vertex.stage.program = &program;
+    vertex.stage.resources = &result.resources;
+    return ResolveDrawOffsets(0, vertex, 3, 4);
+  };
+  using Offsets = std::pair<int32_t, uint32_t>;
+  Require("EmbeddedFetchVertexOffset", "unpatched indirect offsets",
+          ResolveIndirect(conflict, true) == Offsets{3, 4} &&
+              ResolveIndirect(valid, true) == Offsets{7, 4} &&
+              ResolveIndirect(ngg_instance, true) == Offsets{3, 81} &&
+              ResolveIndirect(conflict, false) == Offsets{0, 0},
+          "indirect packet offsets replaced a recognized prolog SGPR or "
+          "reached a program that loads its own vertex data");
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
