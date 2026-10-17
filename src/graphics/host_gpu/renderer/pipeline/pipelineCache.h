@@ -4,11 +4,13 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -192,7 +194,10 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Set when pipelines were created since the last snapshot; a failed write sets it again.
+	std::atomic<bool> m_driver_cache_dirty {false};
+	// Writes the driver cache off the GPU thread; joined before the cache is destroyed.
+	PipelineCacheWriter m_driver_cache_writer;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -204,6 +209,9 @@ private:
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	// Snapshots the driver cache and writes it to m_driver_cache_path through a temporary file.
+	// Safe on any thread while the cache lives: the driver synchronizes the cache object.
+	bool WriteDriverCache();
 	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
 	void InstallOptimizedPipelines();
 };
