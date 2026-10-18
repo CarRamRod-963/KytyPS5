@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/guestWriteSet.h"
@@ -12,9 +13,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <cstddef>
+#include <cstring>
 #include <optional>
 #include <unordered_map>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -227,6 +231,43 @@ private:
 	// Render-target image lookups per color slot and for depth (TextureCache::ImageLookup).
 	std::array<TextureCache::ImageLookup, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_lookups;
 	TextureCache::ImageLookup                                           m_depth_target_lookup;
+	// The registers (a byte copy) and other inputs a render-target lookup last decoded its
+	// description from, and the lookup's generation after that FindImage. While all of them are
+	// unchanged, the lookup's input is still the description they decode to, so a draw skips the
+	// decode and the description compare.
+	struct TargetLookupSource {
+		static constexpr size_t MaxRegisterBytes = 160;
+
+		std::array<std::byte, MaxRegisterBytes> registers {};
+		uint64_t                                inputs     = 0;
+		uint64_t                                generation = 0;
+		bool                                    valid      = false;
+		// Color targets: what the decode produces besides the description.
+		uint32_t                        guest_mip_level   = 0;
+		uint32_t                        guest_array_layer = 0;
+		Prospero::ColorComponentMapping export_mapping;
+
+		template <typename Registers>
+		[[nodiscard]] bool Matches(const Registers& value, uint64_t other_inputs,
+		                           const TextureCache::ImageLookup& lookup) const {
+			static_assert(std::is_trivially_copyable_v<Registers> &&
+			              sizeof(Registers) <= MaxRegisterBytes);
+			return valid && inputs == other_inputs && generation == lookup.generation &&
+			       std::memcmp(registers.data(), &value, sizeof(Registers)) == 0;
+		}
+		template <typename Registers>
+		void Remember(const Registers& value, uint64_t other_inputs,
+		              const TextureCache::ImageLookup& lookup) {
+			static_assert(std::is_trivially_copyable_v<Registers> &&
+			              sizeof(Registers) <= MaxRegisterBytes);
+			std::memcpy(registers.data(), &value, sizeof(Registers));
+			inputs     = other_inputs;
+			generation = lookup.generation;
+			valid      = true;
+		}
+	};
+	std::array<TargetLookupSource, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_sources;
+	TargetLookupSource                                           m_depth_target_source;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
