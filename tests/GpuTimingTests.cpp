@@ -197,7 +197,14 @@ void TestSyncReasons() {
   }
   counters.AddLabel(false);
   counters.AddLabel(false);
+  counters.AddBarrier(Common::GpuTiming::BarrierKind::ComputeToCompute);
+  counters.AddBarrier(Common::GpuTiming::BarrierKind::ComputeToCompute);
+  counters.AddBarrier(Common::GpuTiming::BarrierKind::AllToAll);
+  counters.AddUnmergedBarriers(7);
   const auto delta = counters.Snapshot().Since(before);
+  Check(delta.barriers[0] == 2 && delta.barriers[1] == 0 &&
+            delta.barriers[3] == 1 && delta.barriers_unmerged == 7,
+        "dispatch barrier counts");
   Check(delta.async_pages == 12 && delta.async_deferred == 4,
         "async download page counts");
   Check(delta.labels_direct == 6 && delta.labels_gpu_thread == 2,

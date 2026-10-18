@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gpuTiming.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -44,6 +45,7 @@ vk::CommandBuffer CommandBuffer::StateHandle() const {
 
 vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes) const {
 	EXIT_IF(IsInvalid() || m_rendering);
+	Common::GpuTiming::Sync().AddUnmergedBarriers(writes ? 2 : 1);
 	RecordBarrier(m_barriers.BeforeDispatch(writes));
 	m_has_commands = true;
 	return m_buffer;
@@ -51,6 +53,7 @@ vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes) const {
 
 void CommandBuffer::GuestFlush() const {
 	EXIT_IF(IsInvalid());
+	Common::GpuTiming::Sync().AddUnmergedBarriers(1);
 	const auto barrier = m_barriers.Flush();
 	if (barrier != BarrierTracker::Barrier::None) {
 		EndRendering();
@@ -62,6 +65,11 @@ void CommandBuffer::OrderDispatches() const {
 	EXIT_IF(IsInvalid());
 	RecordBarrier(m_barriers.BeforeBarrier());
 }
+
+static_assert(static_cast<uint8_t>(BarrierTracker::Barrier::ComputeToCompute) - 1u ==
+                  static_cast<uint8_t>(Common::GpuTiming::BarrierKind::ComputeToCompute) &&
+              static_cast<uint8_t>(BarrierTracker::Barrier::AllToAll) - 1u ==
+                  static_cast<uint8_t>(Common::GpuTiming::BarrierKind::AllToAll));
 
 void CommandBuffer::RecordBarrier(BarrierTracker::Barrier barrier) const {
 	using Barrier = BarrierTracker::Barrier;
@@ -110,6 +118,8 @@ void CommandBuffer::RecordBarrier(BarrierTracker::Barrier barrier) const {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &memory;
 	m_buffer.pipelineBarrier2(dependency);
+	Common::GpuTiming::Sync().AddBarrier(
+	    static_cast<Common::GpuTiming::BarrierKind>(static_cast<uint8_t>(barrier) - 1u));
 }
 
 void CommandBuffer::Begin() {
