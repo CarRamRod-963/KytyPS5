@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -108,6 +109,16 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// How CreatePipelineInternal builds a pipeline that the driver cache does not hold.
+enum class PipelineBuildMode : uint8_t {
+	// Optimized, on the calling thread.
+	Optimized,
+	// Unoptimized on the calling thread; the returned job builds the optimized pipeline.
+	UnoptimizedFirst,
+	// Nothing on the calling thread; the returned job builds the optimized pipeline.
+	Background,
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -157,11 +168,34 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
+	// With --skip-pending-draws: like GetGraphicsPipeline, but returns null when the draw is to
+	// be skipped, which only happens when `blocker` is None. A missing pipeline is then built on
+	// the background queue, and the draws using it are skipped until it is ready, for at most
+	// PendingDrawSkipWindow; afterwards, and for any blocked draw, the lookup waits for it.
+	Pipeline* FindGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	                               const RenderDepthInfo&                 depth,
+	                               std::span<const ShaderVertexInputInfo> vertex_info,
+	                               CommandBuffer&                         command,
+	                               const ShaderPixelInputInfo*            ps_input_info,
+	                               vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                               const GraphicsPrograms& programs, PendingDrawBlocker blocker);
+	[[nodiscard]] bool SkipPendingDrawsEnabled() const { return m_skip_pending_draws; }
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
 private:
+	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
+
+	// A graphics pipeline whose first build runs on the background queue; its handle is null.
+	struct PendingBuild {
+		uint64_t                              ticket = 0;
+		std::chrono::steady_clock::time_point queued;
+		uint64_t                              vs_hash       = 0;
+		uint64_t                              ps_hash       = 0;
+		uint64_t                              skipped_draws = 0;
+		bool                                  wait_logged   = false;
+	};
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -206,6 +240,13 @@ private:
 	std::unique_ptr<PipelineCompileQueue>         m_compile_queue;
 	std::unordered_map<uint64_t, Pipeline*>       m_pending_optimized;
 	std::vector<PipelineCompileQueue::Completion> m_completed;
+	// Missing pipelines are built unoptimized first (--async-pipelines).
+	bool m_defer_optimization = false;
+	// Draws that only change the picture skip pipelines that are still building
+	// (--skip-pending-draws).
+	bool                                              m_skip_pending_draws = false;
+	std::chrono::steady_clock::duration               m_skip_window        = PendingDrawSkipWindow;
+	std::unordered_map<const Pipeline*, PendingBuild> m_pending_builds;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
@@ -214,6 +255,8 @@ private:
 	bool WriteDriverCache();
 	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
 	void InstallOptimizedPipelines();
+	// Returns the pipeline of a pending first build, or null when the draw may skip it.
+	Pipeline* ResolvePendingBuild(Pipeline& pipeline, PendingDrawBlocker blocker);
 };
 
 inline uint64_t PipelineCompileHandle(vk::Pipeline pipeline) {
@@ -225,15 +268,15 @@ inline vk::Pipeline PipelineFromCompileHandle(uint64_t handle) {
 }
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
-// Creates the pipeline layout and a pipeline that is usable right away. With
-// `defer_optimization`, the pipeline may be unoptimized; the returned job then builds the
+// Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
+// the pipeline may be unoptimized or (Background) still null; the returned job then builds the
 // optimized one (see PipelineCache::DeferOptimization).
 PipelineCompileQueue::Job CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
     const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
-    vk::PipelineCache driver_cache, bool defer_optimization);
+    vk::PipelineCache driver_cache, PipelineBuildMode mode);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
