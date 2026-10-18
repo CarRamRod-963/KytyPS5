@@ -28,6 +28,20 @@ uint64_t BufferBindingSize(const BufferResource& resource, const ShaderBufferRes
 		return std::max(size, uint64_t {resource.max_byte_extent});
 	return size;
 }
+// Vectors MaterializeResources fills and empties again within one refresh. They keep their
+// capacity in the plan, so a refresh of a known shape allocates nothing; every user clears or
+// assigns its vector before reading it.
+struct MaterializationScratch {
+	std::vector<uint32_t>                                     bindless_mapping;
+	std::vector<uint32_t>                                     padding;
+	std::vector<std::pair<uint32_t, uint32_t>>                class_spares;
+	std::vector<std::pair<std::array<uint32_t, 3>, uint32_t>> class_order;
+	std::vector<DescriptorValue>                              grouped;
+	std::vector<ResourceSpecialization::Image>                grouped_images;
+	std::vector<uint32_t>                                     renumber;
+	std::vector<uint32_t>                                     row_lengths;
+	std::vector<uint32_t>                                     row_batch;
+};
 
 namespace {
 
@@ -414,7 +428,8 @@ bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::
 // memory, a runtime count beyond the probe limit or a key range past 32 bits.
 bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
                          const DescriptorValue& material_value, const SrtRuntime& runtime,
-                         std::vector<uint32_t>& keys, bool& unavailable) {
+                         std::vector<uint32_t>& keys, bool& unavailable,
+                         MaterializationScratch& program_scratch) {
 	const auto* selector = &*indirect.selector;
 	keys.clear();
 	unavailable           = false;
@@ -480,7 +495,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		    selector->offset != 0u || rows.stride == 0u || (rows.stride & 3u) != 0u)
 			return false;
 		if (counts.GetSize() / 4u > MaxIndirectDescriptorProbes) return data_limit();
-		std::vector<uint32_t> lengths(counts.GetSize() / 4u);
+		auto& lengths = program_scratch.row_lengths;
+		lengths.assign(counts.GetSize() / 4u, 0u);
 		if (!read_scalar(counts.Base48(), counts.GetSize(), 0u, lengths)) return false;
 		uint32_t total = 0;
 		for (size_t row = 0; row < lengths.size(); ++row) {
@@ -492,7 +508,7 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 			total += length;
 		}
 		keys.reserve(total);
-		std::vector<uint32_t> batch;
+		auto& batch = program_scratch.row_batch;
 		for (size_t row = 0; row < lengths.size();) {
 			if (lengths[row] == 0u) { ++row; continue; }
 			const auto first = uint64_t {row} * rows.stride / 4u;
@@ -739,7 +755,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto  count = descriptors.size() - children_begin;
 			if (count == 0u) return true;
 			using Class = std::array<uint32_t, 3>;
-			std::vector<std::pair<Class, uint32_t>> order(count);
+			auto& scratch = *program.materialization_scratch;
+			auto& order   = scratch.class_order;
+			order.resize(count);
 			const auto&                             root = descriptors[resource_index];
 			std::optional<Class>                    lead;
 			if (!NullImageDescriptor(root)) lead = ImageCandidateClass(image, root);
@@ -762,9 +780,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			});
 			// Dynamic-mip candidates never share an access; spares would only add switch arms.
 			const bool pad = image.mip_mode != ImageMipMode::Dynamic;
-			std::vector<DescriptorValue> grouped;
-			std::vector<Specialization>  grouped_specializations;
-			std::vector<uint32_t>        renumber(count + 1u, 0u);
+			auto&      grouped                 = scratch.grouped;
+			auto&      grouped_specializations = scratch.grouped_images;
+			auto&      renumber                = scratch.renumber;
+			grouped.clear();
+			grouped_specializations.clear();
+			renumber.assign(count + 1u, 0u);
 			auto child_template          = root_resource;
 			child_template.indirect_root = resource_index;
 			for (size_t first = 0; first < count;) {
@@ -1127,8 +1148,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
 			if (!selector_keys->resolved) {
 				bool data_limit = false;
-				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys,
-				                         data_limit)) {
+				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys, data_limit,
+				                         *program.materialization_scratch)) {
 					const auto details = fmt::format(
 					    "selector_source={} stride={} offset={} workgroup_axis={} limit={}",
 					    selector->source, selector->stride, selector->offset,
@@ -2035,6 +2056,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (program.materialization_scratch == nullptr) {
+		program.materialization_scratch = std::make_shared<MaterializationScratch>();
+	}
+	auto& scratch = *program.materialization_scratch;
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	snapshot.unavailable = false;
 	if (!program.resource_tracking_complete) return false;
@@ -2107,15 +2132,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	bool validate_buffer_keys = false;
 	// Every image table may become a bindless heap; its two words are reserved ahead of the
 	// variable-length key maps.
-	std::vector<uint32_t> bindless_mapping(program.info.images.size(), UINT32_MAX);
+	auto& bindless_mapping = scratch.bindless_mapping;
+	bindless_mapping.assign(program.info.images.size(), UINT32_MAX);
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto* source = Source(program, program.info.images[i].source);
 		if (source == nullptr || !source->indirect_descriptor) continue;
 		bindless_mapping[i] = static_cast<uint32_t>(snapshot.flattened_srt.size());
 		snapshot.flattened_srt.resize(bindless_mapping[i] + 2u, 0u);
 	}
-	std::vector<uint32_t> padding;
-	std::vector<std::pair<uint32_t, uint32_t>> class_spares;
+	auto& padding      = scratch.padding;
+	auto& class_spares = scratch.class_spares;
+	padding.clear();
+	class_spares.clear();
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -2701,7 +2729,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, formatted_components,
 	       capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys,
+	       materialization_scratch] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, formatted_components,
