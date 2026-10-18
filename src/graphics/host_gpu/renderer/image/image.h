@@ -177,6 +177,20 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
+	// The last read-only transition that went through the per-subresource states. Repeating it
+	// changes nothing and emits no barrier, so it is answered without walking the subresources
+	// while the state it left behind is still the image's state.
+	struct SettledTransition {
+		vk::Image               image = nullptr;
+		vk::ImageLayout         layout {};
+		vk::AccessFlags2        access {};
+		vk::PipelineStageFlags2 stage {};
+		ImageSubresourceRange   range;
+		VulkanImageState        state;
+		size_t                  subresources = 0;
+	};
+	std::optional<SettledTransition> m_settled;
+
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash  = 0;
