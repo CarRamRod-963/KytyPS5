@@ -345,6 +345,9 @@ void GpuTimingRows(const Snapshot& shown, bool details) {
 		    Fmt("%.0f/s", static_cast<double>(sync.TotalServed()) / timing.seconds));
 		Row("Readbacks joined to another's submit",
 		    Fmt("%.0f/s", static_cast<double>(sync.TotalJoined()) / timing.seconds));
+		Row("Async download pages (over cap)",
+		    Fmt("%.0f/s  (%.0f/s)", static_cast<double>(sync.async_pages) / timing.seconds,
+		        static_cast<double>(sync.async_deferred) / timing.seconds));
 		for (const auto reason: Common::GpuTiming::BusiestReasons(sync, 6)) {
 			const auto i = static_cast<size_t>(reason);
 			Row((std::string("  ") + Common::GpuTiming::SyncReasonName(reason)).c_str(),
