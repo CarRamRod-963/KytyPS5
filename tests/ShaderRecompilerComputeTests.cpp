@@ -2429,6 +2429,43 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    // Nothing recorded (a barrier at most) and nothing waiting for the tick:
+    // a flush keeps the buffer, and an operation that depends only on
+    // recorded work completes with the previous submission.
+    const auto empty_tick = scheduler.CurrentTick();
+    const auto empty_handle = scheduler.Current().BarrierHandle();
+    {
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+      empty_handle.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                   vk::PipelineStageFlagBits::eAllCommands, {},
+                                   1, &barrier, 0, nullptr, 0, nullptr);
+    }
+    scheduler.Flush();
+    std::atomic<bool> after_recorded_ran{false};
+    scheduler.DeferPriorityOperationAfterRecorded(
+        [&after_recorded_ran] { after_recorded_ran = true; });
+    scheduler.Flush();
+    scheduler.WaitPriorityOperations(empty_tick - 1);
+    Require("SchedulerTimeline", "empty flush",
+            scheduler.CurrentTick() == empty_tick &&
+                scheduler.Current().BarrierHandle() == empty_handle &&
+                !scheduler.Current().HasCommands() && after_recorded_ran.load(),
+            "a flush submitted an empty command buffer or an operation on "
+            "recorded work waited for a later submission");
+    // Recorded work, or an operation queued for the current tick, submits.
+    (void)scheduler.Current().Handle();
+    scheduler.Flush();
+    const auto queued_tick = scheduler.CurrentTick();
+    scheduler.DeferPriorityOperation([] {});
+    scheduler.Flush();
+    scheduler.DrainPriorityOperations();
+    Require("SchedulerTimeline", "non-empty flush",
+            queued_tick == empty_tick + 1 &&
+                scheduler.CurrentTick() == empty_tick + 2,
+            "a flush kept recorded work or a waited-for tick unsubmitted");
+
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
     timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -2480,7 +2517,10 @@ public:
             "failed to signal the external timeline semaphore");
     scheduler.Wait(last_blocked_tick);
     m_runtime_context.device.destroySemaphore(external_timeline, nullptr);
+    // Flushes submit only buffers that hold work.
+    (void)scheduler.Current().Handle();
     scheduler.Flush();
+    (void)scheduler.Current().Handle();
     scheduler.Flush();
     Require(
         "SchedulerTimeline", "timeline pool reuse",
@@ -3023,6 +3063,17 @@ public:
             packet[7] = 0x123u;
             return packet;
           };
+      // Pending work for a release to submit: a command recorded through
+      // the command buffer's handle (a barrier alone is not work).
+      const auto record_work = [&context] {
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+        context.GetCommandScheduler().Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+            nullptr, 0, nullptr);
+      };
 
       vk::SemaphoreTypeCreateInfo timeline_type{};
       timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
@@ -3092,6 +3143,7 @@ public:
 
           timestamp_before = Sync::ReadReferenceClock();
           for (const auto gcr : {0u, 1u << 9u}) {
+            record_work();
             const auto timestamp_tick = gpu_scheduler.CurrentTick();
             auto timestamp =
                 make_release_mem(3, 0, &cb_db_release_label, UINT64_MAX, 0x14u, gcr);
@@ -3109,6 +3161,7 @@ public:
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
+          record_work();
           const auto interrupt_tick = gpu_scheduler.CurrentTick();
           const auto interrupt_result =
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
@@ -3157,11 +3210,15 @@ public:
       alignas(uint64_t) uint64_t release_label = 0;
       alignas(uint64_t) uint64_t clock_label = 0;
       alignas(uint64_t) uint64_t gds_label = UINT64_MAX;
+      alignas(uint32_t) uint32_t coalesced_label = 0;
+      bool coalesced_complete = true;
+      uint64_t coalesced_submits = 0;
       bool release_mem_submission_counts = false;
       const auto clock_before = Sync::ReadReferenceClock();
       gpu.SendCommandSync([&] {
         processor->BufferInit();
 
+        record_work();
         const auto clock_tick = gpu_scheduler.CurrentTick();
         processor->WriteAtEndOfPipe64(0, 0, 0x04, 0x38, 5, 4, &clock_label,
                                       UINT64_MAX, 2);
@@ -3175,6 +3232,7 @@ public:
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
           auto immediate = make_release_mem(1, interrupt, &release_label, 0x11223344u);
           Pm4Execution immediate_execution;
+          record_work();
           const auto immediate_tick = gpu_scheduler.CurrentTick();
           const auto immediate_result =
               processor->Process(immediate_execution, immediate);
@@ -3193,6 +3251,7 @@ public:
 
         auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
         Pm4Execution interrupt_execution;
+        record_work();
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
@@ -3206,6 +3265,23 @@ public:
             processor->Process(gds_interrupt_execution, gds_interrupt);
         const bool gds_interrupt_waited_once =
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
+
+        // Back-to-back releases with nothing recorded between them: the
+        // first submits the pending work, the others complete with it.
+        record_work();
+        const auto coalesced_tick = gpu_scheduler.CurrentTick();
+        for (const auto value : {0x51u, 0x52u, 0x53u}) {
+          auto release = make_release_mem(1, 0, &coalesced_label, value);
+          Pm4Execution execution;
+          coalesced_complete &= processor->Process(execution, release) ==
+                                Pm4ProcessResult::Complete;
+        }
+        auto coalesced_interrupt = make_release_mem(0, 4, nullptr, 0);
+        Pm4Execution coalesced_interrupt_execution;
+        coalesced_complete &= processor->Process(coalesced_interrupt_execution,
+                                                 coalesced_interrupt) ==
+                              Pm4ProcessResult::Complete;
+        coalesced_submits = gpu_scheduler.CurrentTick() - coalesced_tick;
 
         release_mem_submission_counts =
             gds_result == Pm4ProcessResult::Complete &&
@@ -3223,6 +3299,11 @@ public:
               clock_label >= clock_before &&
                   clock_label <= Sync::ReadReferenceClock(),
               "clock write with writeback and interrupt lost its data");
+      Require("GpuCommandLane", "coalesced releases",
+              coalesced_complete && coalesced_submits == 1 &&
+                  coalesced_label == 0x53u,
+              "releases with nothing recorded between them submitted again "
+              "or lost the last label");
       Require("GpuCommandLane", "RELEASE_MEM submission counts",
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&

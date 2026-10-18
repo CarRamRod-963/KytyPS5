@@ -170,6 +170,16 @@ void CommandScheduler::EndRendering() {
 }
 
 void CommandScheduler::Flush() {
+	if (!m_command.IsInvalid() && !m_command.HasCommands()) {
+		std::unique_lock lock(m_operation_mutex);
+		if (m_last_queued_tick < CurrentTick()) {
+			lock.unlock();
+			// Nothing to execute and nobody waits for this tick: keep recording into the
+			// buffer. Its barriers keep their meaning for the commands recorded next.
+			Common::GpuTiming::Sync().AddSkippedFlush(Common::GpuTiming::CurrentSyncReason());
+			return;
+		}
+	}
 	SubmitInfo submit;
 	Flush(submit);
 }
@@ -243,13 +253,34 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::DeferPriorityOperationAfterRecorded(
+    Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), true, true);
+}
+
+uint64_t CommandScheduler::ActivePriorityTick() {
+	std::lock_guard lock(m_operation_mutex);
+	return m_priority_active ? m_priority_active_tick : 0;
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      bool after_recorded) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		auto  tick  = CurrentTick();
+		if (after_recorded && !m_command.IsInvalid() && !m_command.HasCommands()) {
+			// Everything the operation depends on was submitted with an earlier tick. The
+			// priority queue runs in order, so it cannot complete before an earlier entry.
+			tick = std::max(tick - 1, m_last_priority_tick);
+		}
+		if (priority) {
+			m_last_priority_tick = tick;
+		}
+		m_last_queued_tick = std::max(m_last_queued_tick, tick);
+		queue.push({std::move(operation), tick});
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
