@@ -12442,6 +12442,108 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A read of GPU-written bytes whose asynchronous download already rode an
+  // earlier submission waits for that download instead of submitting a copy
+  // of its own; a newer recorded write still gets a synchronous readback.
+  void CheckSubmittedDownloadReadback() {
+    constexpr const char *name = "SubmittedDownloadReadback";
+    constexpr uintptr_t base = 0x0000000207e00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t target = base + 0x2000;
+    constexpr uint64_t bytes = 64;
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      // A GPU write (a clean range would be filled on the CPU by FillBuffer).
+      const auto gpu_fill = [&](uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(target, bytes, true);
+        buffer->Fill(offset, bytes, value);
+      };
+      const auto backing = [&] {
+        uint32_t value = 0;
+        Require(name, "backing read",
+                LibKernel::Memory::TryReadBacking(target + bytes - 4, &value,
+                                                  sizeof(value)),
+                "the target could not be read");
+        return value;
+      };
+
+      // The first readback makes the page hot.
+      gpu_fill(0x11111111u);
+      cache.ReadMemory(target, bytes);
+      Require(name, "first readback", backing() == 0x11111111u,
+              "the synchronous readback lost the GPU write");
+
+      // The next write's download rides the submission that holds it.
+      gpu_fill(0x22222222u);
+      scheduler.Flush();
+      const auto served_tick = scheduler.CurrentTick();
+      cache.ReadMemory(target, bytes);
+      Require(name, "served by the submitted download",
+              scheduler.CurrentTick() == served_tick &&
+                  backing() == 0x22222222u &&
+                  !cache.HasGpuDirtyBytes(target, bytes),
+              "the read submitted its own copy or returned stale bytes");
+
+      // A write recorded after the download makes it stale: read back again.
+      gpu_fill(0x33333333u);
+      scheduler.Flush();
+      gpu_fill(0x44444444u);
+      const auto newer_tick = scheduler.CurrentTick();
+      cache.ReadMemory(target, bytes);
+      Require(name, "newer write read back",
+              scheduler.CurrentTick() == newer_tick + 1 &&
+                  backing() == 0x44444444u &&
+                  !cache.HasGpuDirtyBytes(target, bytes),
+              "a stale download served a newer GPU write");
+
+      // The same through a guest read fault on the hot page.
+      gpu_fill(0x55555555u);
+      scheduler.Flush();
+      const auto fault_tick = scheduler.CurrentTick();
+      cache.ReadMemoryAround(target + bytes - 4, uint64_t{1} << 20u);
+      Require(name, "fault served by the submitted download",
+              scheduler.CurrentTick() == fault_tick && backing() == 0x55555555u,
+              "the fault read submitted its own copy or returned stale bytes");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorMetadataClear() {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     struct PackedCase {
@@ -51954,6 +52056,11 @@ int main(int argc, char **argv) {
     vulkan.CheckScalarWalkGpuWrites();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--submitted-download-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSubmittedDownloadReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeIndirectDispatch();
@@ -52222,6 +52329,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   vulkan.CheckScalarWalkGpuWrites();
+  vulkan.CheckSubmittedDownloadReadback();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
