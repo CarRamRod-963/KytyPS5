@@ -217,8 +217,24 @@ public:
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
 		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
-			    std::memcpy(m_backing_base + (entry.backing_offset + start - entry.vaddr),
-			                source + (start - vaddr), bytes);
+			    auto*       target = m_backing_base + (entry.backing_offset + start - entry.vaddr);
+			    const auto* from   = source + (start - vaddr);
+			    // An aligned word is one store: a guest thread polling it (a GPU label) never
+			    // sees a torn value.
+			    if (bytes == sizeof(uint32_t) && reinterpret_cast<uintptr_t>(target) % bytes == 0) {
+				    uint32_t value = 0;
+				    std::memcpy(&value, from, sizeof(value));
+				    std::atomic_ref(*reinterpret_cast<uint32_t*>(target))
+				        .store(value, std::memory_order_release);
+			    } else if (bytes == sizeof(uint64_t) &&
+			               reinterpret_cast<uintptr_t>(target) % bytes == 0) {
+				    uint64_t value = 0;
+				    std::memcpy(&value, from, sizeof(value));
+				    std::atomic_ref(*reinterpret_cast<uint64_t*>(target))
+				        .store(value, std::memory_order_release);
+			    } else {
+				    std::memcpy(target, from, bytes);
+			    }
 		    },
 		    [](uint64_t, uint64_t) {});
 		return true;
