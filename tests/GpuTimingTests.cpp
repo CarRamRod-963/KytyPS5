@@ -163,6 +163,66 @@ void TestPublish() {
   Check(Common::GpuTiming::GuestFlips() == flips + 1, "guest flip counter");
 }
 
+void TestSyncReasons() {
+  using Common::GpuTiming::CurrentSyncReason;
+  using Common::GpuTiming::SyncCounters;
+  using Common::GpuTiming::SyncReason;
+  using Common::GpuTiming::SyncScope;
+  Check(CurrentSyncReason() == SyncReason::Other, "reason outside a scope");
+  {
+    const SyncScope outer(SyncReason::WalkRead);
+    {
+      // A generic helper inside a specific purpose keeps the purpose.
+      const SyncScope inner(SyncReason::BufferRead);
+      Check(CurrentSyncReason() == SyncReason::WalkRead,
+            "inner scope replaced the outer reason");
+    }
+    Check(CurrentSyncReason() == SyncReason::WalkRead, "outer reason lost");
+  }
+  Check(CurrentSyncReason() == SyncReason::Other, "scope not restored");
+
+  SyncCounters counters;
+  const auto before = counters.Snapshot();
+  for (int i = 0; i < 30; i++) {
+    counters.AddSubmit(SyncReason::Label);
+  }
+  for (int i = 0; i < 10; i++) {
+    counters.AddSubmit(SyncReason::WalkRead);
+    counters.AddWait(SyncReason::WalkRead, 2 * MS);
+  }
+  counters.AddWait(SyncReason::Completion, 1 * MS);
+  const auto delta = counters.Snapshot().Since(before);
+  Check(delta.TotalSubmits() == 40 && delta.TotalWaits() == 11, "sync totals");
+  Check(delta.wait_ns[static_cast<size_t>(SyncReason::WalkRead)] ==
+            static_cast<uint64_t>(20 * MS),
+        "walk-read wait time");
+  const auto order = Common::GpuTiming::BusiestReasons(delta);
+  Check(order.size() == 3 && order[0] == SyncReason::Label &&
+            order[1] == SyncReason::WalkRead &&
+            order[2] == SyncReason::Completion,
+        "busiest reasons order");
+  Check(Common::GpuTiming::BusiestReasons(delta, 1).size() == 1,
+        "busiest reasons limit");
+  // Over 2 s: label 15 submits/s; walk-read 5 submits, 5 waits, 10 ms per s.
+  const auto line = Common::GpuTiming::FormatSyncCounts(delta, 2.0);
+  Check(line == "label 15/0/0.0, walk-read 5/5/10.0, completion 0/0/0.5",
+        "sync count format");
+  Check(Common::GpuTiming::FormatSyncCounts({}, 1.0) == "none",
+        "empty sync counts");
+
+  Summary summary;
+  summary.seconds = 2.0;
+  summary.sync = delta;
+  Check(Common::GpuTiming::FormatSummary(summary).find(
+            "sync submits/waits/wait-ms per s: label 15/0/0.0") !=
+            std::string::npos,
+        "summary line carries the sync counts");
+  Summary merged;
+  merged.Merge(summary);
+  merged.Merge(summary);
+  Check(merged.sync.TotalSubmits() == 80, "merged sync counts");
+}
+
 } // namespace
 
 int main() {
@@ -171,6 +231,7 @@ int main() {
   TestBusyUnion();
   TestLatencies();
   TestPublish();
+  TestSyncReasons();
   std::printf("GpuTimingTests: all passed\n");
   return 0;
 }

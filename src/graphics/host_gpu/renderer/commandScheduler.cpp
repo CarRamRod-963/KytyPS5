@@ -234,6 +234,7 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	const Common::GpuTiming::SyncScope reason(Common::GpuTiming::SyncReason::Completion);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -353,6 +354,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result    = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::GpuTiming::Sync().AddSubmit(Common::GpuTiming::CurrentSyncReason());
 
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
