@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/scalarReadCache.h"
+#include "graphics/host_gpu/renderer/pipeline/srtWalkerCompileQueue.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -282,6 +283,16 @@ struct PipelineCache::ProgramCache {
 			    : std::span<const uint32_t>{};
 		}
 
+		// Replaces the interpreted plan with the one compiled in the background once it is ready.
+		void AdoptCompiledWalker() {
+			if (walker_job == nullptr || !walker_job->Ready()) return;
+			if (auto compiled = walker_job->Take()) {
+				compiled->source_reads = std::move(resource_plan.source_reads);
+				resource_plan          = std::move(*compiled);
+			}
+			walker_job.reset();
+		}
+
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 			const auto revision = call_source->revision;
 			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
@@ -322,6 +333,8 @@ struct PipelineCache::ProgramCache {
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		// The same plan with its general walker being compiled (see SrtWalkerCompileQueue).
+		std::shared_ptr<SrtWalkerCompileQueue::Job>  walker_job;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -514,6 +527,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
+			cached.AdoptCompiledWalker();
 			Permutation* permutation = nullptr;
 			if (cached.call_source) source_changed = cached.RefreshCallSource(runtime);
 			if (!source_changed) {
@@ -597,12 +611,16 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			std::shared_ptr<SrtWalkerCompileQueue::Job> walker_job;
+			entry = programs
+			            .try_emplace(lookup_key, ExtractPlan(translated.program, walker_job),
+			                         std::move(retained))
+			            .first;
+			entry->second.walker_job = std::move(walker_job);
 			if (!entry->second.Materialize(runtime))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 		} else if (source_changed) {
-			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->second.resource_plan = ExtractPlan(translated.program, entry->second.walker_job);
 			if (!entry->second.Materialize(runtime))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 			if (const auto* permutation = entry->second.FindPermutation<true>(push_data_cursor)) {
@@ -656,6 +674,23 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// The plan the GPU thread interprets right away, and a second extraction whose general walker
+	// is compiled in the background (SourceEntry::AdoptCompiledWalker).
+	ShaderRecompiler::IR::ResourcePlan
+	ExtractPlan(const ShaderRecompiler::IR::Program&         program,
+	            std::shared_ptr<SrtWalkerCompileQueue::Job>& walker_job) {
+		using ShaderRecompiler::IR::SrtWalkerCompilation;
+		auto plan =
+		    ShaderRecompiler::IR::ExtractResourcePlan(program, SrtWalkerCompilation::SimpleOnly);
+		walker_job.reset();
+		if (plan.resource_tracking_complete && plan.srt_plan_complete && !plan.srt_reads.empty()) {
+			walker_job = walker_queue.Submit(std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+			    ShaderRecompiler::IR::ExtractResourcePlan(program,
+			                                              SrtWalkerCompilation::SimpleOnly)));
+		}
+		return plan;
+	}
+
 	explicit ProgramCache(GraphicContext& graphics)
 	    : graphics(graphics), profile {HostShaderProfile(graphics)} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
@@ -676,6 +711,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 	// Receives every compiled compute permutation; null when there is no manifest.
 	ProgramManifest* manifest = nullptr;
+	// Last, so its thread stops before the entries holding its jobs are destroyed.
+	SrtWalkerCompileQueue walker_queue;
 };
 
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,

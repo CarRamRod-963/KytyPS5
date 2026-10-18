@@ -56,8 +56,14 @@ struct ResourceSpecialization {
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
-// its values and is independent of the translated shader CFG.
-ResourcePlan ExtractResourcePlan(const Program& program);
+// its values and is independent of the translated shader CFG. Extraction is deterministic: two
+// plans extracted from one program are interchangeable.
+enum class SrtWalkerCompilation {
+	All,        // the simple and the general compiled walker
+	SimpleOnly, // the general walker is left to CompileSrtWalkers (it may take long)
+};
+ResourcePlan ExtractResourcePlan(const Program&       program,
+                                 SrtWalkerCompilation walkers = SrtWalkerCompilation::All);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used;
 // snapshot.unavailable tells a failure caused by the draw's guest data from an unsupported shader.

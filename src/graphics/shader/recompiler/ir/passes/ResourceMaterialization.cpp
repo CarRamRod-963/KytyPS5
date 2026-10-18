@@ -1728,7 +1728,7 @@ void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& ta
 	}
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
+ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerCompilation walkers) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -1959,7 +1959,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
-	CompileSrtWalkers(plan);
+	if (walkers == SrtWalkerCompilation::All) {
+		CompileSrtWalkers(plan);
+	} else {
+		CompileSrtWalker(plan);
+	}
 	return plan;
 }
 
