@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1286,6 +1287,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
+			Common::GpuTiming::RecordGuestFlip();
 		}
 	}
 

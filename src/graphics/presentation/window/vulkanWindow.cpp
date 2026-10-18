@@ -1072,6 +1072,15 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// Optional: maps GPU timestamps onto the host clock for the submission latencies.
+		if (HasExtension(available_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+			graphic_ctx.calibrated_timestamps_enabled = true;
+		} else if (HasExtension(available_extensions,
+		                        VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+			graphic_ctx.calibrated_timestamps_enabled = true;
+		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
