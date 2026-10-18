@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/logging/log.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 
 namespace Libs {
@@ -204,6 +206,24 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	}
 }
 
+// A failing call usually makes the game drop the movie without a message, so log every failure.
+static int32_t LogFailure(const char* function, int32_t result) {
+	if (result != OK) {
+		LOGF("Videodec2: %s failed: 0x%08x\n", function, static_cast<uint32_t>(result));
+	}
+	return result;
+}
+
+static void LogFirstFrame(Videodec2Decoder decoder, const Decoder::Output& decoded) {
+	Decoder::PictureInfo picture {};
+	const bool           has_pts = Decoder::GetPictureInfo(decoded.buffer, &picture) &&
+	                               picture.pts != Decoder::TIMESTAMP_INVALID;
+	LOGF(
+	    "Videodec2: decoder %p: first frame %ux%u, pitch %u, NV12, buffer %p (%zu bytes), pts %s\n",
+	    decoder, decoded.width, decoded.height, decoded.pitch, decoded.buffer, decoded.buffer_size,
+	    has_pts ? std::to_string(picture.pts) : std::string("none"));
+}
+
 static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
                                      bool                              require_compute_queue) {
 	if (config->resource_type != VIDEODEC2_RESOURCE_TYPE_COMPUTE) {
@@ -238,10 +258,7 @@ static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI
-QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
-	PRINT_NAME();
-
+static int32_t QueryComputeMemoryInfoImpl(Videodec2ComputeMemoryInfo* compute_memory_info) {
 	if (compute_memory_info == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
 	}
@@ -256,11 +273,9 @@ QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
-    const Videodec2ComputeConfigInfo* compute_config_info,
-    const Videodec2ComputeMemoryInfo* compute_memory_info, Videodec2ComputeQueue* compute_queue) {
-	PRINT_NAME();
-
+static int32_t AllocateComputeQueueImpl(const Videodec2ComputeConfigInfo* compute_config_info,
+                                        const Videodec2ComputeMemoryInfo* compute_memory_info,
+                                        Videodec2ComputeQueue*            compute_queue) {
 	if (compute_config_info == nullptr || compute_memory_info == nullptr ||
 	    compute_queue == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
@@ -301,10 +316,8 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
-                                                    Videodec2DecoderMemoryInfo*       memory_info) {
-	PRINT_NAME();
-
+static int32_t QueryDecoderMemoryInfoImpl(const Videodec2DecoderConfigInfo* config,
+                                          Videodec2DecoderMemoryInfo*       memory_info) {
 	if (config == nullptr || memory_info == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
 	}
@@ -332,11 +345,9 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* config,
-                                           const Videodec2DecoderMemoryInfo* memory_info,
-                                           Videodec2Decoder*                 decoder) {
-	PRINT_NAME();
-
+static int32_t CreateDecoderImpl(const Videodec2DecoderConfigInfo* config,
+                                 const Videodec2DecoderMemoryInfo* memory_info,
+                                 Videodec2Decoder*                 decoder) {
 	if (config == nullptr || memory_info == nullptr || decoder == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
 	}
@@ -374,6 +385,15 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 		g_decoders.insert(state);
 	}
 
+	LOGF(
+	    "Videodec2: decoder %p: codec %u, profile %u, level %u, max %dx%d, dpb %d, queue depth %u, "
+	    "memory cpu %zu, gpu %zu, cpu-gpu %zu, frame buffer %zu\n",
+	    static_cast<void*>(state), config->codec_type, config->profile, config->max_level,
+	    config->max_frame_width, config->max_frame_height, config->max_dpb_frame_count,
+	    config->decode_input_queue_depth, memory_info->cpu_memory_size,
+	    memory_info->gpu_memory_size, memory_info->cpu_gpu_memory_size,
+	    memory_info->max_frame_buffer_size);
+
 	*decoder = state;
 	return OK;
 }
@@ -386,7 +406,7 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 		std::scoped_lock lock(g_decoder_mutex);
 		auto             it = g_decoders.find(decoder);
 		if (it == g_decoders.end()) {
-			return VIDEODEC2_ERROR_DECODER_INSTANCE;
+			return LogFailure(__func__, VIDEODEC2_ERROR_DECODER_INSTANCE);
 		}
 		state = static_cast<DecoderState*>(*it);
 		g_decoders.erase(it);
@@ -397,11 +417,8 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2InputData* input_data,
-                                    Videodec2FrameBuffer* frame_buffer,
-                                    Videodec2OutputInfo*  output_info) {
-	PRINT_NAME();
-
+static int32_t DecodeImpl(Videodec2Decoder decoder, const Videodec2InputData* input_data,
+                          Videodec2FrameBuffer* frame_buffer, Videodec2OutputInfo* output_info) {
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
@@ -443,13 +460,14 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 	                     input_data->dts_data, input_data->attached_data},
 	                    {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
+	if (decoded.first_frame) {
+		LogFirstFrame(decoder, decoded);
+	}
 	return MapDecoderResult(result);
 }
 
-static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
-                                   Videodec2OutputInfo* output_info) {
-	PRINT_NAME();
-
+static int32_t FlushImpl(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
+                         Videodec2OutputInfo* output_info) {
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_DECODER_INSTANCE;
@@ -479,6 +497,9 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 	const auto      result = Decoder::Flush(
 	    state, {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
+	if (decoded.first_frame) {
+		LogFirstFrame(decoder, decoded);
+	}
 	return MapDecoderResult(result);
 }
 
@@ -487,10 +508,50 @@ static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
-		return VIDEODEC2_ERROR_DECODER_INSTANCE;
+		return LogFailure(__func__, VIDEODEC2_ERROR_DECODER_INSTANCE);
 	}
 	Decoder::Reset(state);
 	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI
+QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
+	PRINT_NAME();
+	return LogFailure(__func__, QueryComputeMemoryInfoImpl(compute_memory_info));
+}
+
+static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
+    const Videodec2ComputeConfigInfo* compute_config_info,
+    const Videodec2ComputeMemoryInfo* compute_memory_info, Videodec2ComputeQueue* compute_queue) {
+	PRINT_NAME();
+	return LogFailure(__func__, AllocateComputeQueueImpl(compute_config_info, compute_memory_info,
+	                                                     compute_queue));
+}
+
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
+                                                    Videodec2DecoderMemoryInfo*       memory_info) {
+	PRINT_NAME();
+	return LogFailure(__func__, QueryDecoderMemoryInfoImpl(config, memory_info));
+}
+
+static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* config,
+                                           const Videodec2DecoderMemoryInfo* memory_info,
+                                           Videodec2Decoder*                 decoder) {
+	PRINT_NAME();
+	return LogFailure(__func__, CreateDecoderImpl(config, memory_info, decoder));
+}
+
+static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2InputData* input_data,
+                                    Videodec2FrameBuffer* frame_buffer,
+                                    Videodec2OutputInfo*  output_info) {
+	PRINT_NAME();
+	return LogFailure(__func__, DecodeImpl(decoder, input_data, frame_buffer, output_info));
+}
+
+static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
+                                   Videodec2OutputInfo* output_info) {
+	PRINT_NAME();
+	return LogFailure(__func__, FlushImpl(decoder, frame_buffer, output_info));
 }
 
 static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_info,
