@@ -878,10 +878,22 @@ bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
-void ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
-	    Graphics::GuestGpu::IsGpuThread()) {
-		GetGpuResources().GetBufferCache().ReadGpuDirtyBytes(vaddr, size);
+void ReadGpuDirtyBytes(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		return;
+	}
+	std::array<std::pair<uint64_t, uint64_t>, 32> gpu_ranges;
+	size_t                                        count = 0;
+	for (const auto& [vaddr, size]: ranges) {
+		if (!IsGpuAddressRange(vaddr, size)) continue;
+		if (count == gpu_ranges.size()) {
+			GetGpuResources().GetBufferCache().ReadGpuDirtyBytes(std::span(gpu_ranges));
+			count = 0;
+		}
+		gpu_ranges[count++] = {vaddr, size};
+	}
+	if (count != 0) {
+		GetGpuResources().GetBufferCache().ReadGpuDirtyBytes(std::span(gpu_ranges).first(count));
 	}
 }
 
