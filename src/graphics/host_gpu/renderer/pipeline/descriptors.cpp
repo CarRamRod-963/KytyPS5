@@ -759,7 +759,12 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 			texture_cache.MaterializeColorClear(entry.image_id, entry.desc,
 			                                    entry.desc.metadata_base_layer);
 			binding.image_id = entry.image_id;
-			binding.desc     = entry.desc;
+			// A binding refilled with the same entry (the same stage's slot draw after draw)
+			// already holds its description.
+			if (binding.memo_serial != entry.serial) {
+				binding.desc        = entry.desc;
+				binding.memo_serial = entry.serial;
+			}
 			return;
 		}
 		m_texture_memo.erase(found);
@@ -777,8 +782,10 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 		              [&](const auto& item) { return !TextureMemoEntryValid(item.second); });
 		m_texture_memo_sweep_at = std::max(TextureMemoFirstSweep, m_texture_memo.size() * 2u);
 	}
-	m_texture_memo.insert_or_assign(
-	    key, TextureMemoEntry {binding.image_id, binding.desc, texture_cache.LayoutNow()});
+	binding.memo_serial = ++m_texture_memo_serial;
+	m_texture_memo.insert_or_assign(key, TextureMemoEntry {binding.image_id, binding.desc,
+	                                                       texture_cache.LayoutNow(),
+	                                                       binding.memo_serial});
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,

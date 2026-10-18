@@ -227,12 +227,15 @@ private:
 		ImageId                   image_id;
 		TextureCache::ImageDesc   desc;
 		TextureCache::LayoutStamp stamp;
+		// Unique per insertion; the description of an entry never changes after it.
+		uint64_t serial = 0;
 	};
 	// Whether a memo hit may return the entry's image (the checks a lookup would otherwise redo).
 	[[nodiscard]] bool      TextureMemoEntryValid(const TextureMemoEntry& entry);
 	static constexpr size_t TextureMemoFirstSweep = 8192;
 	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
 	size_t m_texture_memo_sweep_at = TextureMemoFirstSweep;
+	uint64_t m_texture_memo_serial   = 0;
 	// Render-target image lookups per color slot and for depth (TextureCache::ImageLookup).
 	std::array<TextureCache::ImageLookup, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_lookups;
 	TextureCache::ImageLookup                                           m_depth_target_lookup;
