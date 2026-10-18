@@ -9,15 +9,37 @@
 
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
 #include <vector>
+
+// Counts heap allocations while armed, so a test can require that a warm
+// materialization allocates nothing.
+namespace AllocationCounter {
+thread_local bool armed = false;
+thread_local uint64_t count = 0;
+} // namespace AllocationCounter
+
+void *operator new(std::size_t size) {
+  if (AllocationCounter::armed)
+    ++AllocationCounter::count;
+  if (void *pointer = std::malloc(size == 0 ? 1 : size))
+    return pointer;
+  throw std::bad_alloc();
+}
+void operator delete(void *pointer) noexcept { std::free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
 
 namespace {
 
@@ -9753,6 +9775,105 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+// MaterializeResources runs for every stage of every draw and dispatch.
+// Repeating one with the same guest data must give the same result and, once
+// warm, allocate nothing: its scratch lives in the plan and the snapshot.
+void TestWarmMaterializationAllocatesNothing() {
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using T = Libs::Graphics::Prospero::ImageType;
+  const auto texture = [](uint32_t identity, F format) {
+    return std::array<uint32_t, 8>{identity,
+                                   uint32_t(format) << 20u,
+                                   3u | (3u << 14u),
+                                   Libs::Graphics::DstSel(4, 5, 6, 7) |
+                                       (uint32_t(T::kColor2D) << 28u),
+                                   0u,
+                                   0u,
+                                   0u,
+                                   0u};
+  };
+  const auto measure = [](const char *name, const ResourcePlan &plan,
+                          const SrtRuntime &runtime) {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "warm materialization fixture failed");
+    const auto expected_snapshot = snapshot;
+    const auto expected_specialization = specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "warm materialization fixture failed twice");
+    constexpr uint32_t Calls = 2000;
+    AllocationCounter::count = 0;
+    AllocationCounter::armed = true;
+    const auto start = std::chrono::steady_clock::now();
+    bool ok = true;
+    for (uint32_t call = 0; call < Calls; ++call)
+      ok &= MaterializeResources(plan, runtime, snapshot, specialization);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    AllocationCounter::armed = false;
+    Check(ok && snapshot.images == expected_snapshot.images &&
+              snapshot.buffers == expected_snapshot.buffers &&
+              snapshot.samplers == expected_snapshot.samplers &&
+              snapshot.flattened_srt == expected_snapshot.flattened_srt &&
+              specialization == expected_specialization,
+          "a repeated materialization changed its result");
+    std::printf("  %s: %.0f ns/call, %.2f allocations/call\n", name,
+                std::chrono::duration<double, std::nano>(elapsed).count() /
+                    Calls,
+                double(AllocationCounter::count) / Calls);
+    Check(AllocationCounter::count == 0, "a warm materialization allocated");
+  };
+  // A bounded table of 440-byte records probed every 8 bytes: candidates
+  // grouped by class.
+  {
+    auto fixture = MakeIndirectImageFixture(false, 440u, 0u, 32u);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    constexpr uint32_t table = 0x4000u;
+    LinearTestMemory memory;
+    memory.words.resize((table + 16u * 440u - memory.base) / 4u);
+    memory.fail_address = 0x3000u;
+    const std::array rows{F::k32Float, F::k32UInt,  F::k32Float,
+                          F::k32UInt,  F::k32Float, F::k32Float};
+    for (uint32_t row = 0; row < rows.size(); ++row) {
+      const auto value = texture(0x100u + row * 0x10u, rows[row]);
+      std::copy(value.begin(), value.end(),
+                memory.words.begin() +
+                    (table + row * 440u + 32u - memory.base) / 4u);
+    }
+    const std::array<uint32_t, 8> data{
+        0x3000u, 16u << 16u, 1u, 0u, table, 440u << 16u, uint32_t(rows.size()),
+        0u};
+    const SrtRuntime runtime{.user_data = data,
+                             .userdata = &memory,
+                             .read_specialization_memory =
+                                 ReadLinearTestMemory};
+    measure("bounded image table", plan, runtime);
+  }
+  // A key-list table of 32 T#s.
+  {
+    auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false,
+                                            ValueOpcode::ImageSampleRaw, true);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u;
+    for (uint32_t row = 0; row < 32u; ++row) {
+      const auto value = texture(0x100u + (row % 5u) * 0x10u,
+                                 row % 2u ? F::k32Float : F::k32UInt);
+      std::copy(value.begin(), value.end(),
+                memory.words.begin() + (0x2000u - memory.base) / 4u + row * 8u);
+    }
+    const std::array<uint32_t, 8> data{0x3000u, 4u << 16u, 32u, 0u,
+                                       0x2000u, 0u,        0u,  0u};
+    const SrtRuntime runtime{.user_data = data,
+                             .userdata = &memory,
+                             .read_specialization_memory =
+                                 ReadLinearTestMemory};
+    measure("key-list image table", plan, runtime);
+  }
+}
+
 int main() {
   try {
     const auto Run = [](const char *name, auto test) {
@@ -9838,6 +9959,8 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("warm materialization allocates nothing",
+        TestWarmMaterializationAllocatesNothing);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;
