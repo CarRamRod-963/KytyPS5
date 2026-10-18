@@ -167,6 +167,9 @@ static_assert(sizeof(Vp9PictureInfo) == 88);
 
 class Instance;
 
+// Pictures are written as linear NV12: luma rows, then interleaved CbCr rows, both at this pitch.
+[[nodiscard]] uint32_t FramePitch(uint32_t width);
+
 [[nodiscard]] bool      IsCodecSupported(uint32_t codec_type);
 [[nodiscard]] Instance* Create(const Config& config);
 void                    Destroy(Instance* instance);
