@@ -30,8 +30,9 @@ public:
 	void Begin(vk::CommandBuffer buffer, uint64_t tick);
 	void End(vk::CommandBuffer buffer, uint64_t tick);
 	// After the queue submission of `tick` returned; `submit_ns` is the steady-clock time
-	// taken right before it.
-	void Submitted(uint64_t tick, int64_t submit_ns);
+	// taken right before it; `reason` why it was submitted, `commands` recorded into it.
+	void Submitted(uint64_t tick, int64_t submit_ns, Common::GpuTiming::SyncReason reason,
+	               uint32_t commands);
 	// A thread that blocked on `tick` woke up.
 	void RecordWake(uint64_t tick);
 	// The guest end-of-pipe label deferred to the completion of `tick` was written. A label
@@ -50,6 +51,8 @@ private:
 		int64_t                submit_ns = 0;
 		bool                   ended     = false;
 		bool                   submitted = false;
+		Common::GpuTiming::SyncReason reason    = Common::GpuTiming::SyncReason::Other;
+		uint32_t                      commands  = 0;
 		std::optional<int64_t> host_end_ns;
 	};
 
