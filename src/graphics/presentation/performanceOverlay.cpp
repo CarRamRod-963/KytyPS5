@@ -401,6 +401,8 @@ void CompilationRows(const Snapshot& shown) {
 	    shown.shader_compile_peak_ns);
 	row("Pipeline compile", Counter::PipelinesCreated, Counter::PipelineCreateNs,
 	    shown.pipeline_create_peak_ns);
+	const auto skipped = Rate(shown, Counter::DrawsSkippedPending);
+	Row("Draws skipped (pending pipelines)", Fmt("%.0f/s", skipped), skipped > 0.0 ? MEDIUM : GOOD);
 }
 
 void FrameTimingRows(const Snapshot& shown) {

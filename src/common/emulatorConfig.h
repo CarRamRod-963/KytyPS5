@@ -89,6 +89,7 @@ struct ConfigOptions {
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   async_pipelines_enabled     = true;
+	bool                   skip_pending_draws              = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   lod_stats_enabled           = false;
@@ -161,6 +162,7 @@ bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool AsyncPipelinesEnabled();
+bool     SkipPendingDrawsEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool LodStatsEnabled();
