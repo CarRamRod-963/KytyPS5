@@ -25,6 +25,7 @@ enum class Counter {
 	ShaderCompileNs,
 	PipelinesCreated,
 	PipelineCreateNs,
+	DrawsSkippedPending, // Left out while their pipelines were built (--skip-pending-draws).
 	// Caches.
 	TextureUploadBytes,
 	TextureDownloadBytes,
