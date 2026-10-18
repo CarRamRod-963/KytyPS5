@@ -69,10 +69,14 @@ public:
 	// whose pages no cache watches is stored at once through the guest backing; a watched one
 	// needs the caches' bookkeeping, which runs on the GPU thread, and is written there. Labels
 	// keep their order: while one waits for the GPU thread, the later ones follow it there.
+	// Command streams suspended on a memory condition are retried after the store.
 	void DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	                  Common::UniqueFunction<void>&& notify);
 
 private:
+	// Retries command streams suspended on a memory condition (see GuestGpu); any thread.
+	void NotifyGpuMemoryWritten();
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -97,6 +101,9 @@ private:
 	bool                      m_bda_logged = false;
 	// Labels handed to the GPU thread and not yet written.
 	std::atomic<uint32_t> m_gpu_thread_labels {0};
+	// m_gpu for threads outside the GPU thread's lifetime, and how many of them use it now.
+	std::atomic<GuestGpu*> m_notified_gpu {nullptr};
+	std::atomic<uint32_t>  m_gpu_notifiers {0};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

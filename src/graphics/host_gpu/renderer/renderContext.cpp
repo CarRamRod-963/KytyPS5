@@ -43,11 +43,17 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	m_notified_gpu.store(m_gpu.get());
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// The completion thread may still store labels; wait until none uses the GPU object.
+		m_notified_gpu.store(nullptr);
+		while (m_gpu_notifiers.load() != 0) {
+			std::this_thread::yield();
+		}
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
@@ -57,6 +63,14 @@ void RenderContext::ShutdownGpu() {
 		m_command_scheduler.DrainPriorityOperations();
 		m_video_out = nullptr;
 	}
+}
+
+void RenderContext::NotifyGpuMemoryWritten() {
+	m_gpu_notifiers.fetch_add(1);
+	if (auto* gpu = m_notified_gpu.load(); gpu != nullptr) {
+		gpu->NotifyMemoryWritten();
+	}
+	m_gpu_notifiers.fetch_sub(1);
 }
 
 GuestGpu& RenderContext::GetGpu() const {
@@ -97,6 +111,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
 	    m_page_manager.TryWriteUnwatched(reinterpret_cast<uint64_t>(dst), &value, size)) {
 		Common::GpuTiming::Sync().AddLabel(true);
+		NotifyGpuMemoryWritten();
 		if (notify) {
 			notify();
 		}
@@ -114,6 +129,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 		} else {
 			std::memcpy(dst, &value, sizeof(value));
 		}
+		NotifyGpuMemoryWritten();
 		if (notify) {
 			notify();
 		}
