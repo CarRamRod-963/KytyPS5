@@ -323,6 +323,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		TouchHotPages(vaddr, size);
 		DrainPublished();
+		AwaitSubmittedDownloads(vaddr, size);
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
@@ -357,6 +358,7 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 		});
 		TouchHotPages(base, size);
 		DrainPublished();
+		AwaitSubmittedDownloads(base, size);
 		auto& buffer = m_slot_buffers[FindBuffer(base, size)];
 		if (DownloadBufferMemory<false>(buffer, base, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
@@ -431,6 +433,35 @@ void BufferCache::DrainPublished() {
 	}
 }
 
+void BufferCache::AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size) {
+	uint64_t wait_tick = 0;
+	bool     covered   = true;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
+		for (auto page = begin & ~(CACHING_PAGESIZE - 1u); covered && page < end;
+		     page += CACHING_PAGESIZE) {
+			const auto hot = m_hot_pages.find(page);
+			// The epoch moves on every GPU write recorded for the page, so an unchanged one
+			// means the download was recorded after the last write and will be published.
+			if (hot == m_hot_pages.end() || hot->second.download_tick == 0 ||
+			    hot->second.epoch->load(std::memory_order_acquire) != hot->second.download_epoch) {
+				covered = false;
+			} else {
+				wait_tick = std::max(wait_tick, hot->second.download_tick);
+			}
+		}
+	});
+	if (!covered || wait_tick == 0 || wait_tick >= m_scheduler.CurrentTick()) {
+		return;
+	}
+	m_scheduler.Wait(wait_tick);
+	m_scheduler.WaitPriorityOperations(wait_tick);
+	DrainPublished();
+	// Whatever the publications did not clean is read back by the caller as before.
+	if (!m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		Common::GpuTiming::Sync().AddServedBySubmitted(Common::GpuTiming::CurrentSyncReason());
+	}
+}
+
 void BufferCache::RecordAsyncDownloads() {
 	if (!GuestGpu::IsGpuThread()) {
 		return;
@@ -474,6 +505,8 @@ void BufferCache::RecordAsyncDownloads() {
 			if (any) {
 				pages.push_back(
 				    {page, hot->second.epoch->load(std::memory_order_acquire), hot->second.epoch});
+				// Filled in once the copies are recorded.
+				hot->second.download_tick = 0;
 			}
 		}
 	});
@@ -529,6 +562,13 @@ void BufferCache::RecordAsyncDownloads() {
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 
+	// RecordAsyncDownloads runs right before the submission of the current tick.
+	const auto download_tick = m_scheduler.CurrentTick();
+	for (const auto& page: pages) {
+		auto& hot          = m_hot_pages.at(page.page);
+		hot.download_tick  = download_tick;
+		hot.download_epoch = page.epoch;
+	}
 	m_scheduler.DeferPriorityOperation(
 	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
 		    m_download_buffer.Invalidate(offset, total);
