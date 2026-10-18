@@ -1353,6 +1353,11 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool TryWriteBacking(uint64_t vaddr, const void *data, uint64_t size) {
+  std::memcpy(reinterpret_cast<void *>(vaddr), data, size);
+  return true;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {

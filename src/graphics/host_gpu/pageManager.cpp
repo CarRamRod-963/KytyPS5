@@ -329,6 +329,28 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
 }
 
+bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	const auto region_base = Common::AlignDown(vaddr, REGION_SIZE);
+	if (vaddr + size > region_base + REGION_SIZE) {
+		return false;
+	}
+	// Created when missing: a region created and watched after an unlocked check could
+	// otherwise miss this write.
+	auto&      region = *m_impl->GetOrCreateRegion(vaddr);
+	const auto first  = static_cast<size_t>((vaddr - region_base) / PAGE_SIZE);
+	const auto last   = static_cast<size_t>((vaddr + size - 1u - region_base) / PAGE_SIZE);
+	SpinGuard  lock(region.lock);
+	for (auto page = first; page <= last; page++) {
+		if (region.pages[page].write_watchers != 0 || region.pages[page].access_watchers != 0) {
+			return false;
+		}
+	}
+	return Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+}
+
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);

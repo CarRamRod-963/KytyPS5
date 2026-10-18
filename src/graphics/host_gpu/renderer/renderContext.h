@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -16,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -62,6 +64,14 @@ public:
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
+	// Writes a 4- or 8-byte end-of-pipe label whose submission completed, then runs `notify`
+	// (interrupts, flip completion). Called in queue order by the completion thread. A label
+	// whose pages no cache watches is stored at once through the guest backing; a watched one
+	// needs the caches' bookkeeping, which runs on the GPU thread, and is written there. Labels
+	// keep their order: while one waits for the GPU thread, the later ones follow it there.
+	void DeliverLabel(void* dst, uint64_t value, uint32_t size,
+	                  Common::UniqueFunction<void>&& notify);
+
 private:
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
@@ -85,6 +95,8 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	// Labels handed to the GPU thread and not yet written.
+	std::atomic<uint32_t> m_gpu_thread_labels {0};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
