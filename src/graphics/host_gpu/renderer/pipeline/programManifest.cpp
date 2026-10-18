@@ -1,0 +1,475 @@
+#include "graphics/host_gpu/renderer/pipeline/programManifest.h"
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <system_error>
+#include <utility>
+#include <xxhash.h>
+
+namespace Libs::Graphics {
+
+namespace {
+
+using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
+
+// Serialized field by field; these trip when a stored struct changes so that the format version
+// is revisited (a new field must be stored, or the version bumped).
+static_assert(sizeof(Specialization::Buffer) == 32);
+static_assert(sizeof(Specialization::Image) == 36);
+static_assert(sizeof(Specialization::Sampler) == 12);
+static_assert(sizeof(ShaderComputeInputInfo) == 104);
+
+constexpr std::array<char, 8> FileMagic          = {'K', 'y', 'P', 'r', 'o', 'g', 'M', 'f'};
+constexpr uint8_t             KindCode           = 1;
+constexpr uint8_t             KindComputeProgram = 2;
+// An entry is a u32 payload size, the payload's XXH3 and the payload.
+constexpr size_t EntryHeaderSize = sizeof(uint32_t) + sizeof(uint64_t);
+// Bounds that no real entry reaches; a larger size field is corruption.
+constexpr uint32_t MaxPayloadSize = 64u << 20u;
+constexpr uint32_t MaxUserData    = 64;
+constexpr uint32_t MaxResources   = 1u << 16u;
+
+class Writer {
+public:
+	explicit Writer(std::vector<uint8_t>& out): m_out(out) {}
+	template <typename T>
+	void Put(T value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		const auto offset = m_out.size();
+		m_out.resize(offset + sizeof(T));
+		std::memcpy(m_out.data() + offset, &value, sizeof(T));
+	}
+	void PutBool(bool value) { Put<uint8_t>(value ? 1u : 0u); }
+	void PutWords(std::span<const uint32_t> words) {
+		const auto offset = m_out.size();
+		m_out.resize(offset + words.size_bytes());
+		if (!words.empty()) {
+			std::memcpy(m_out.data() + offset, words.data(), words.size_bytes());
+		}
+	}
+
+private:
+	std::vector<uint8_t>& m_out;
+};
+
+class Reader {
+public:
+	explicit Reader(std::span<const uint8_t> data): m_data(data) {}
+	template <typename T>
+	bool Get(T& value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		if (m_data.size() - m_offset < sizeof(T)) {
+			return false;
+		}
+		std::memcpy(&value, m_data.data() + m_offset, sizeof(T));
+		m_offset += sizeof(T);
+		return true;
+	}
+	bool GetBool(bool& value) {
+		uint8_t raw = 0;
+		if (!Get(raw) || raw > 1u) {
+			return false;
+		}
+		value = raw != 0u;
+		return true;
+	}
+	bool GetWords(std::vector<uint32_t>& words, uint32_t count) {
+		if ((m_data.size() - m_offset) / sizeof(uint32_t) < count) {
+			return false;
+		}
+		words.resize(count);
+		if (count != 0u) {
+			std::memcpy(words.data(), m_data.data() + m_offset, count * sizeof(uint32_t));
+		}
+		m_offset += count * sizeof(uint32_t);
+		return true;
+	}
+	[[nodiscard]] bool AtEnd() const { return m_offset == m_data.size(); }
+
+private:
+	std::span<const uint8_t> m_data;
+	size_t                   m_offset = 0;
+};
+
+template <typename Enum>
+void PutEnum(Writer& writer, Enum value) {
+	writer.Put(static_cast<uint32_t>(value));
+}
+
+template <typename Enum>
+bool GetEnum(Reader& reader, Enum& value) {
+	uint32_t raw = 0;
+	if (!reader.Get(raw)) {
+		return false;
+	}
+	value = static_cast<Enum>(raw);
+	return true;
+}
+
+void PutInput(Writer& w, const ShaderComputeInputInfo& input) {
+	for (const auto value: input.threads_num)
+		w.Put(value);
+	w.Put(input.lds_size_dwords);
+	w.Put(input.scratch_size_dwords);
+	w.Put(input.wave_size);
+	w.PutBool(input.async_compute);
+	w.Put(input.float_mode);
+	for (const auto value: input.group_id)
+		w.PutBool(value);
+	w.PutBool(input.dispatch_thread_dimensions);
+	w.Put(static_cast<int32_t>(input.thread_ids_num));
+	w.Put(static_cast<int32_t>(input.workgroup_register));
+	w.PutBool(input.tg_size_en);
+}
+
+bool GetInput(Reader& r, ShaderComputeInputInfo& input) {
+	for (auto& value: input.threads_num) {
+		if (!r.Get(value)) return false;
+	}
+	if (!r.Get(input.lds_size_dwords) || !r.Get(input.scratch_size_dwords) ||
+	    !r.Get(input.wave_size) || !r.GetBool(input.async_compute) || !r.Get(input.float_mode)) {
+		return false;
+	}
+	for (auto& value: input.group_id) {
+		if (!r.GetBool(value)) return false;
+	}
+	int32_t thread_ids_num     = 0;
+	int32_t workgroup_register = 0;
+	if (!r.GetBool(input.dispatch_thread_dimensions) || !r.Get(thread_ids_num) ||
+	    !r.Get(workgroup_register) || !r.GetBool(input.tg_size_en)) {
+		return false;
+	}
+	input.thread_ids_num     = thread_ids_num;
+	input.workgroup_register = workgroup_register;
+	return true;
+}
+
+void PutSpecialization(Writer& w, const Specialization& specialization) {
+	w.Put(static_cast<uint32_t>(specialization.buffers.size()));
+	for (const auto& buffer: specialization.buffers) {
+		w.Put(buffer.packed_stride);
+		PutEnum(w, buffer.descriptor_format);
+		w.Put(buffer.descriptor_swizzle);
+		w.PutBool(buffer.zero_stride_oob);
+		w.PutBool(buffer.scalar_empty);
+		w.Put(buffer.indirect_root);
+		w.Put(buffer.indirect_mapping_offset);
+		w.Put(buffer.indirect_search_iterations);
+		w.PutBool(buffer.unbound);
+	}
+	w.Put(static_cast<uint32_t>(specialization.images.size()));
+	for (const auto& image: specialization.images) {
+		PutEnum(w, image.numeric_class);
+		PutEnum(w, image.dimension);
+		w.Put(image.mip_count);
+		PutEnum(w, image.conversion_format);
+		w.Put(image.shader_swizzle);
+		w.Put(image.indirect_root);
+		w.Put(image.indirect_mapping_offset);
+		w.Put(image.indirect_search_iterations);
+		w.PutBool(image.cube);
+		w.PutBool(image.fmask);
+		w.PutBool(image.bindless);
+	}
+	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
+	for (const auto& sampler: specialization.samplers) {
+		w.Put(sampler.indirect_root);
+		w.Put(sampler.indirect_mapping_offset);
+		w.Put(sampler.indirect_search_iterations);
+	}
+}
+
+bool GetSpecialization(Reader& r, Specialization& specialization) {
+	uint32_t count = 0;
+	if (!r.Get(count) || count > MaxResources) {
+		return false;
+	}
+	specialization.buffers.resize(count);
+	for (auto& buffer: specialization.buffers) {
+		if (!r.Get(buffer.packed_stride) || !GetEnum(r, buffer.descriptor_format) ||
+		    !r.Get(buffer.descriptor_swizzle) || !r.GetBool(buffer.zero_stride_oob) ||
+		    !r.GetBool(buffer.scalar_empty) || !r.Get(buffer.indirect_root) ||
+		    !r.Get(buffer.indirect_mapping_offset) || !r.Get(buffer.indirect_search_iterations) ||
+		    !r.GetBool(buffer.unbound)) {
+			return false;
+		}
+	}
+	if (!r.Get(count) || count > MaxResources) {
+		return false;
+	}
+	specialization.images.resize(count);
+	for (auto& image: specialization.images) {
+		if (!GetEnum(r, image.numeric_class) || !GetEnum(r, image.dimension) ||
+		    !r.Get(image.mip_count) || !GetEnum(r, image.conversion_format) ||
+		    !r.Get(image.shader_swizzle) || !r.Get(image.indirect_root) ||
+		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
+		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless)) {
+			return false;
+		}
+	}
+	if (!r.Get(count) || count > MaxResources) {
+		return false;
+	}
+	specialization.samplers.resize(count);
+	for (auto& sampler: specialization.samplers) {
+		if (!r.Get(sampler.indirect_root) || !r.Get(sampler.indirect_mapping_offset) ||
+		    !r.Get(sampler.indirect_search_iterations)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::vector<uint8_t> FileHeader() {
+	std::vector<uint8_t> header(FileMagic.begin(), FileMagic.end());
+	Writer               writer(header);
+	writer.Put(ProgramManifest::FormatVersion);
+	return header;
+}
+
+} // namespace
+
+ShaderComputeInputInfo ComputeProgramRecord::StaticInput(const ShaderComputeInputInfo& input) {
+	ShaderComputeInputInfo out {};
+	std::ranges::copy(input.threads_num, out.threads_num);
+	out.lds_size_dwords     = input.lds_size_dwords;
+	out.scratch_size_dwords = input.scratch_size_dwords;
+	out.wave_size           = input.wave_size;
+	out.async_compute       = input.async_compute;
+	out.float_mode          = input.float_mode;
+	std::ranges::copy(input.group_id, out.group_id);
+	out.dispatch_thread_dimensions = input.dispatch_thread_dimensions;
+	out.thread_ids_num             = input.thread_ids_num;
+	out.workgroup_register         = input.workgroup_register;
+	out.tg_size_en                 = input.tg_size_en;
+	return out;
+}
+
+uint64_t ComputeProgramRecord::Key() const {
+	const auto body = ProgramManifest::EncodeComputeBody(*this);
+	return XXH3_64bits(body.data(), body.size());
+}
+
+std::vector<uint8_t> ProgramManifest::EncodeComputeBody(const ComputeProgramRecord& record) {
+	std::vector<uint8_t> out;
+	out.reserve(128 + record.specialization.buffers.size() * 32u +
+	            record.specialization.images.size() * 40u);
+	Writer w(out);
+	w.Put(KindComputeProgram);
+	w.Put(record.shader_hash);
+	w.Put(static_cast<uint32_t>(record.code != nullptr ? record.code->size() : 0u));
+	w.Put(record.user_data_count);
+	PutInput(w, record.input);
+	w.Put(record.push_data_cursor);
+	PutSpecialization(w, record.specialization);
+	return out;
+}
+
+std::vector<uint8_t> ProgramManifest::EncodeCode(uint64_t hash, std::span<const uint32_t> code) {
+	std::vector<uint8_t> out;
+	out.reserve(16 + code.size_bytes());
+	Writer w(out);
+	w.Put(KindCode);
+	w.Put(hash);
+	w.Put(static_cast<uint32_t>(code.size()));
+	w.PutWords(code);
+	return out;
+}
+
+ProgramManifest::ProgramManifest(std::filesystem::path path): m_path(std::move(path)) {
+	if (!m_path.empty()) {
+		Load();
+	}
+}
+
+ProgramManifest::~ProgramManifest() = default;
+
+bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload) {
+	Reader  r(payload);
+	uint8_t kind = 0;
+	if (!r.Get(kind)) {
+		return false;
+	}
+	if (kind == KindCode) {
+		uint64_t hash  = 0;
+		uint32_t words = 0;
+		auto     code  = std::make_shared<std::vector<uint32_t>>();
+		if (!r.Get(hash) || !r.Get(words) || !r.GetWords(*code, words) || !r.AtEnd()) {
+			return false;
+		}
+		m_code.try_emplace({hash, words}, std::move(code));
+		return true;
+	}
+	if (kind != KindComputeProgram) {
+		return false;
+	}
+	auto     record     = std::make_shared<ComputeProgramRecord>();
+	uint32_t code_words = 0;
+	if (!r.Get(record->shader_hash) || !r.Get(code_words) || !r.Get(record->user_data_count) ||
+	    record->user_data_count > MaxUserData || !GetInput(r, record->input) ||
+	    !r.Get(record->push_data_cursor) || !GetSpecialization(r, record->specialization) ||
+	    !r.Get(record->spirv_hash) || !r.AtEnd()) {
+		return false;
+	}
+	// A program whose code entry was lost cannot be translated; skip it, the entry is intact.
+	const auto code = m_code.find({record->shader_hash, code_words});
+	if (code == m_code.end()) {
+		return true;
+	}
+	record->code = code->second;
+	if (m_keys.insert(record->Key()).second) {
+		m_records.push_back(std::move(record));
+	}
+	return true;
+}
+
+void ProgramManifest::Load() {
+	std::vector<uint8_t> data;
+	{
+		std::ifstream file(m_path, std::ios::binary | std::ios::ate);
+		if (file) {
+			const auto size = static_cast<std::streamoff>(file.tellg());
+			if (size > 0) {
+				data.resize(static_cast<size_t>(size));
+				file.seekg(0);
+				if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
+					data.clear();
+				}
+			}
+		}
+	}
+	const auto header = FileHeader();
+	size_t     offset = 0;
+	bool       valid =
+	    data.size() >= header.size() && std::equal(header.begin(), header.end(), data.begin());
+	if (valid) {
+		offset = header.size();
+		while (offset < data.size()) {
+			uint32_t size = 0;
+			uint64_t hash = 0;
+			if (data.size() - offset < EntryHeaderSize) {
+				break;
+			}
+			std::memcpy(&size, data.data() + offset, sizeof(size));
+			std::memcpy(&hash, data.data() + offset + sizeof(size), sizeof(hash));
+			if (size == 0 || size > MaxPayloadSize ||
+			    data.size() - offset - EntryHeaderSize < size) {
+				break;
+			}
+			const auto payload = std::span(data).subspan(offset + EntryHeaderSize, size);
+			if (XXH3_64bits(payload.data(), payload.size()) != hash || !ParseEntry(payload)) {
+				break;
+			}
+			offset += EntryHeaderSize + size;
+		}
+	}
+	m_loaded.records      = m_records.size();
+	m_loaded.code_entries = m_code.size();
+	if (!valid || offset != data.size()) {
+		m_loaded.dropped_bytes = valid ? data.size() - offset : data.size();
+		m_loaded.rewritten     = !data.empty();
+		// A file that cannot be rewritten is not appended to: new entries would follow the
+		// unreadable ones. The manifest then lives in memory for this session.
+		if (!Rewrite()) {
+			return;
+		}
+	}
+	m_file.open(m_path, std::ios::binary | std::ios::app);
+}
+
+bool ProgramManifest::Rewrite() {
+	// Only the entries that were read are written back: every record's code, then the records.
+	std::vector<uint8_t> out    = FileHeader();
+	auto                 append = [&out](std::span<const uint8_t> payload) {
+		Writer w(out);
+		w.Put(static_cast<uint32_t>(payload.size()));
+		w.Put(static_cast<uint64_t>(XXH3_64bits(payload.data(), payload.size())));
+		out.insert(out.end(), payload.begin(), payload.end());
+	};
+	std::unordered_set<const std::vector<uint32_t>*> written;
+	for (const auto& record: m_records) {
+		if (written.insert(record->code.get()).second) {
+			append(EncodeCode(record->shader_hash, *record->code));
+		}
+		auto body = EncodeComputeBody(*record);
+		Writer(body).Put(record->spirv_hash);
+		append(body);
+	}
+	auto temp = m_path;
+	temp += ".tmp";
+	std::error_code error;
+	if (!m_path.parent_path().empty()) {
+		std::filesystem::create_directories(m_path.parent_path(), error);
+	}
+	{
+		std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(out.data()),
+		           static_cast<std::streamsize>(out.size()));
+		if (!file.flush()) {
+			return false;
+		}
+	}
+	std::filesystem::rename(temp, m_path, error);
+	if (error) {
+		return false;
+	}
+	m_code.clear();
+	for (const auto& record: m_records) {
+		m_code.try_emplace({record->shader_hash, static_cast<uint32_t>(record->code->size())},
+		                   record->code);
+	}
+	return true;
+}
+
+void ProgramManifest::AppendEntry(std::span<const uint8_t> payload) {
+	if (!m_file.is_open()) {
+		return;
+	}
+	std::vector<uint8_t> header;
+	Writer               w(header);
+	w.Put(static_cast<uint32_t>(payload.size()));
+	w.Put(static_cast<uint64_t>(XXH3_64bits(payload.data(), payload.size())));
+	m_file.write(reinterpret_cast<const char*>(header.data()),
+	             static_cast<std::streamsize>(header.size()));
+	m_file.write(reinterpret_cast<const char*>(payload.data()),
+	             static_cast<std::streamsize>(payload.size()));
+	// Flushed per entry: a session that ends in a crash keeps what it recorded.
+	m_file.flush();
+}
+
+bool ProgramManifest::Add(const ComputeProgramRecord& record) {
+	if (record.code == nullptr || record.code->empty() || record.user_data_count > MaxUserData) {
+		return false;
+	}
+	auto            body = EncodeComputeBody(record);
+	const auto      key  = XXH3_64bits(body.data(), body.size());
+	std::lock_guard lock(m_mutex);
+	if (!m_keys.insert(key).second) {
+		return false;
+	}
+	auto       stored   = std::make_shared<ComputeProgramRecord>(record);
+	const auto code_key = CodeKey {record.shader_hash, static_cast<uint32_t>(record.code->size())};
+	if (const auto code = m_code.find(code_key); code != m_code.end()) {
+		stored->code = code->second;
+	} else {
+		m_code.emplace(code_key, record.code);
+		AppendEntry(EncodeCode(record.shader_hash, *record.code));
+	}
+	Writer(body).Put(record.spirv_hash);
+	AppendEntry(body);
+	m_records.push_back(std::move(stored));
+	return true;
+}
+
+std::vector<std::shared_ptr<const ComputeProgramRecord>> ProgramManifest::Records() const {
+	std::lock_guard lock(m_mutex);
+	return m_records;
+}
+
+size_t ProgramManifest::Size() const {
+	std::lock_guard lock(m_mutex);
+	return m_records.size();
+}
+
+} // namespace Libs::Graphics
