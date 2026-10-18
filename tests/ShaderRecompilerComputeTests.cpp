@@ -13270,6 +13270,68 @@ public:
                         .labels_direct == 1u,
             "labels stayed on the GPU thread");
 
+    // A stream suspended on WAIT_REG_MEM for a label resumes when the label
+    // lands, not when the GPU thread's next poll times out. The timeouts
+    // counted between the label landing and the stream resuming tell them
+    // apart: without a wake-up the sleeping GPU thread needs one.
+    constexpr uint32_t wait_rounds = 8;
+    uint32_t prompt = 0;
+    uint32_t resumed_rounds = 0;
+    std::string timeouts;
+    for (uint32_t round = 0; round < wait_rounds; ++round) {
+      const uint32_t value = 0x5000u + round;
+      alignas(4) uint32_t resumed = 0;
+      std::array<uint32_t, 12> stream{};
+      stream[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+      stream[1] = 0x10u | 3u; // Memory, equal.
+      stream[2] = static_cast<uint32_t>(label);
+      stream[3] = static_cast<uint32_t>(label >> 32u);
+      stream[4] = value;
+      stream[5] = UINT32_MAX;
+      stream[6] = 0;
+      const auto resumed_address = reinterpret_cast<uint64_t>(&resumed);
+      stream[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      stream[8] = 0;
+      stream[9] = static_cast<uint32_t>(resumed_address);
+      stream[10] = static_cast<uint32_t>(resumed_address >> 32u);
+      stream[11] = 1;
+      const auto before_stall = Common::GpuTiming::Sync().Snapshot();
+      gpu.Submit(stream, {});
+      const bool stalled = wait_for([&] {
+        return Common::GpuTiming::Sync()
+                   .Snapshot()
+                   .Since(before_stall)
+                   .stalls[static_cast<size_t>(
+                       Common::GpuTiming::StallKind::WaitRegMem)] != 0;
+      });
+      gpu.SendCommand([&] {
+        processor->BufferInit();
+        write_label(label, value, 0);
+      });
+      const bool landed = wait_for(
+          [&] { return static_cast<uint32_t>(backing(label)) == value; });
+      const auto at_label = Common::GpuTiming::Sync().Snapshot();
+      const bool done = wait_for(
+          [&] { return std::atomic_ref<uint32_t>(resumed).load() == 1u; });
+      const auto slept = Common::GpuTiming::Sync()
+                             .Snapshot()
+                             .Since(at_label)
+                             .gpu_thread_timeouts;
+      gpu.WaitForIdle();
+      if (stalled && landed && done) {
+        ++resumed_rounds;
+        prompt += slept == 0 ? 1u : 0u;
+      }
+      timeouts += " " + std::to_string(slept);
+    }
+    Require(name, "stream behind a label resumes",
+            resumed_rounds == wait_rounds,
+            "a stream waiting for a label did not resume");
+    Require(name, "label wakes a waiting stream", prompt * 2 >= wait_rounds,
+            "streams waiting for a label resumed only at the next poll "
+            "(timeouts after the label per round:" +
+                timeouts + ")");
+
     (void)Sync::DeleteEqEvent(context, interrupt_queue, 0);
     LibKernel::EventQueue::KernelDeleteEqueue(interrupt_queue);
     gpu.SendCommandSync([&] {

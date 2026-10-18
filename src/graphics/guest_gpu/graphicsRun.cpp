@@ -478,16 +478,29 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					// A wake that came before this wait must not be lost.
-					if (!std::exchange(gpu->m_wake_pending, false)) {
-						const auto start    = std::chrono::steady_clock::now();
-						const bool signaled = gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					// Sleep until new work, a memory write from outside the streams, or the
+					// next poll (guest CPU stores are not reported). A write after the
+					// suspended streams last ran, or a wake that came before this wait, makes the
+					// sleep pointless.
+					uint64_t writes_seen = UINT64_MAX;
+					for (const auto& queue: gpu->m_queues) {
+						if (!queue.empty() && queue.front().blocked) {
+							writes_seen = std::min(writes_seen, queue.front().blocked_writes);
+						}
+					}
+					gpu->m_waiting_blocked.store(true);
+					const bool woken = std::exchange(gpu->m_wake_pending, false);
+					if (!woken && gpu->m_memory_writes.load() == writes_seen) {
+						const auto start = std::chrono::steady_clock::now();
+						const bool signaled =
+						    gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 						Common::GpuTiming::Sync().AddGpuThreadBlocked(
 						    std::chrono::duration_cast<std::chrono::nanoseconds>(
 						        std::chrono::steady_clock::now() - start)
 						        .count(),
 						    !signaled);
 					}
+					gpu->m_waiting_blocked.store(false);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -524,11 +537,13 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		const auto writes   = gpu->m_memory_writes.load();
 		const bool complete = gpu->Process(submission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			submission.blocked        = true;
+			submission.blocked_writes = writes;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -542,6 +557,14 @@ void GuestGpu::ThreadRun(void* data) {
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 			gpu->m_idle.SignalAll();
 		}
+	}
+}
+
+void GuestGpu::NotifyMemoryWritten() {
+	m_memory_writes.fetch_add(1);
+	if (m_waiting_blocked.load()) {
+		Common::LockGuard lock(m_queue_mutex);
+		m_work_available.Signal();
 	}
 }
 
