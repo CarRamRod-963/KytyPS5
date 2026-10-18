@@ -412,6 +412,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       ray_query, cooperative_matrix, float8, uniform_control_flow,
 	       maximal_reconvergence] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+	// Optional: maps GPU timestamps onto the host clock for the submission latencies.
+	graphics.calibrated_timestamps_enabled = add(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
+	                                         add(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
