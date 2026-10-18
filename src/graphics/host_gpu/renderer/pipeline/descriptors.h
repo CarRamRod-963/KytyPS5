@@ -24,6 +24,9 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// The texture memo entry whose description `desc` holds (RenderExecutor::ResolveTextureMemo),
+	// 0 for none: a hit on that entry leaves the description as it is instead of copying it.
+	uint64_t memo_serial = 0;
 };
 
 struct PreparedBindings {
