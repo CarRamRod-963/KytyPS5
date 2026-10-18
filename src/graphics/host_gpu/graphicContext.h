@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -137,6 +138,8 @@ struct GraphicContext {
 	std::mutex                 recycled_images_mutex;
 	std::vector<RecycledImage> recycled_images;
 	uint64_t                   recycled_image_bytes = 0;
+	// Images created outside device-local memory because it was exhausted.
+	std::atomic<uint64_t> image_fallback_count = 0;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
