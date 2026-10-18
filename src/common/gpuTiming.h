@@ -89,6 +89,8 @@ struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> skipped {};
 	// Readbacks served by waiting for an already submitted asynchronous download.
 	std::array<uint64_t, SYNC_REASON_COUNT> served {};
+	// Readbacks that rode the submission of another readback served at the same time.
+	std::array<uint64_t, SYNC_REASON_COUNT> joined {};
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
@@ -96,6 +98,7 @@ struct SyncCounts {
 	[[nodiscard]] uint64_t   TotalWaits() const noexcept;
 	[[nodiscard]] uint64_t   TotalSkipped() const noexcept;
 	[[nodiscard]] uint64_t   TotalServed() const noexcept;
+	[[nodiscard]] uint64_t   TotalJoined() const noexcept;
 };
 
 // Running totals per reason, written from any thread with one relaxed increment.
@@ -115,6 +118,9 @@ public:
 	void AddServedBySubmitted(SyncReason reason) noexcept {
 		m_served[Index(reason)].fetch_add(1, std::memory_order_relaxed);
 	}
+	void AddJoinedReadback(SyncReason reason) noexcept {
+		m_joined[Index(reason)].fetch_add(1, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -128,6 +134,7 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_wait_ns {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_skipped {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_served {};
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_joined {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.
