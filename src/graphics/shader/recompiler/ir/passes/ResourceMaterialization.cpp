@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/DescriptorInterner.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -34,6 +35,7 @@ struct MaterializationScratch {
 	std::vector<uint32_t>                                     renumber;
 	std::vector<uint32_t>                                     row_lengths;
 	std::vector<uint32_t>                                     row_batch;
+	DescriptorInterner                                        candidates;
 };
 
 namespace {
@@ -645,16 +647,23 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// A table yields thousands of keys but a few hundred distinct candidates; the interner finds
+	// the first equal child as a linear search would, so ordinals follow first occurrence.
+	auto& interner = program.materialization_scratch->candidates;
+	interner.Reset();
+	const auto children = [&] {
+		return std::span<const DescriptorValue>(descriptors).subspan(children_begin);
+	};
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		const auto ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
-			descriptors.push_back(candidate);
-			auto child = root_resource;
-			child.indirect_root = resource_index;
-			specializations.push_back(child);
-		}
+		const auto found = interner.Find(children(), candidate);
+		if (found != DescriptorInterner::NotFound) return found + 1u;
+		const auto ordinal = static_cast<uint32_t>(descriptors.size() - children_begin + 1u);
+		descriptors.push_back(candidate);
+		interner.Added(children());
+		auto child          = root_resource;
+		child.indirect_root = resource_index;
+		specializations.push_back(child);
 		return ordinal;
 	};
 	// Spare candidate slots hold null descriptors: the program bakes the candidate count, so it
