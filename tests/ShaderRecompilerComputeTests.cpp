@@ -47867,6 +47867,46 @@ void CheckImageTransitionState(RenderContext &renderer) {
               barriers[0].dstStageMask == vk::PipelineStageFlagBits2::eTransfer,
           "normalized state did not return to one full barrier");
 
+  // A repeated read-only partial transition is answered without a barrier;
+  // anything that changed the states in between is seen again.
+  constexpr ImageSubresourceRange mip0_layers{0, 1, 0, 3};
+  barriers = image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               mip0_layers);
+  Require(name, "settled partial read",
+          barriers.size() == 3 &&
+              image
+                  .GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               mip0_layers)
+                  .empty() &&
+              image.backing.subresource_states.size() == 6 &&
+              image.backing.subresource_states[1].layout ==
+                  vk::ImageLayout::eShaderReadOnlyOptimal,
+          "a repeated read-only partial transition emitted barriers");
+  barriers = image.GetBarriers(vk::ImageLayout::eGeneral,
+                               vk::AccessFlagBits2::eShaderWrite,
+                               graphics_stage, mip0_layer1);
+  barriers = image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               mip0_layers);
+  Require(name, "settled partial after a write",
+          barriers.size() == 1 &&
+              barriers[0].subresourceRange.baseArrayLayer == 1 &&
+              barriers[0].oldLayout == vk::ImageLayout::eGeneral,
+          "a write between two partial reads was not synchronized");
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  barriers = image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               mip0_layers);
+  Require(name, "settled partial after a reset",
+          barriers.size() == 3 &&
+              barriers[0].oldLayout == vk::ImageLayout::eUndefined,
+          "a reset image state kept the settled partial transition");
+  image.backing.subresource_states.clear();
+  image.backing.state = {};
+
   auto depth_info = MakeInfo(vk::Format::eD32SfloatS8Uint, 1, 1);
   depth_info.guest_format = Prospero::BufferFormat::k32Float;
   depth_info.bytes_per_block = 4;
