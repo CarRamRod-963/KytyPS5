@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -161,7 +162,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       std::vector<Common::UniqueFunction<void>>* batch) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -233,6 +235,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	};
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
+	} else if (batch != nullptr) {
+		batch->emplace_back(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
@@ -315,23 +319,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		reason = is_write ? Common::GpuTiming::SyncReason::CpuWrite
 		                  : Common::GpuTiming::SyncReason::BufferRead;
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason] {
-		const Common::GpuTiming::SyncScope sync_reason(reason);
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		TouchHotPages(vaddr, size);
-		DrainPublished();
-		AwaitSubmittedDownloads(vaddr, size);
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
-	});
+	RequestGuestReadback({is_write ? GuestReadback::Kind::Write : GuestReadback::Kind::Read, vaddr,
+	                      size, reason, nullptr});
 }
 
 void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
@@ -340,28 +329,109 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 		     "addr=0x%016" PRIx64 "\n",
 		     vaddr);
 	}
-	// The dirty-range query runs on the GPU thread with the readback: the range set is only
-	// serialized there, and a guest thread faulting on a read arrives from anywhere.
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, window] {
-		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::FaultRead);
-		const auto page  = vaddr & ~(CACHING_PAGESIZE - 1u);
-		const auto query = std::min(window, UINT64_MAX - page);
-		uint64_t   base  = vaddr;
-		uint64_t   size  = 1;
-		m_gpu_modified_ranges.ForEachInRange(page, query, [&](uint64_t begin, uint64_t end) {
-			if (begin <= vaddr && vaddr < end) {
-				base = begin;
-				size = end - begin;
-			}
-		});
-		TouchHotPages(base, size);
-		DrainPublished();
-		AwaitSubmittedDownloads(base, size);
-		auto& buffer = m_slot_buffers[FindBuffer(base, size)];
-		if (DownloadBufferMemory<false>(buffer, base, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
+	RequestGuestReadback({GuestReadback::Kind::Around, vaddr, window,
+	                      Common::GpuTiming::SyncReason::FaultRead, nullptr});
+}
+
+void BufferCache::RequestGuestReadback(const GuestReadback& request) {
+	if (GuestGpu::IsGpuThread()) {
+		ServeGuestReadbacks({&request, 1});
+		return;
+	}
+	// Every request is followed by a command that serves all pending ones, so it is served by
+	// its own command at the latest; a later command finds nothing left.
+	std::binary_semaphore done {0};
+	{
+		std::lock_guard lock(m_guest_readbacks_mutex);
+		auto&           queued = m_guest_readbacks.emplace_back(request);
+		queued.done            = &done;
+	}
+	m_scheduler.Context().GetGpu().SendCommand([this] {
+		std::vector<GuestReadback> requests;
+		{
+			std::lock_guard lock(m_guest_readbacks_mutex);
+			requests.swap(m_guest_readbacks);
+		}
+		if (!requests.empty()) {
+			ServeGuestReadbacks(requests);
 		}
 	});
+	done.acquire();
+}
+
+void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
+	struct Served {
+		uint64_t base   = 0;
+		uint64_t size   = 0;
+		bool     copied = false;
+		bool     skip   = false;
+	};
+	std::vector<Served>                          served(requests.size());
+	std::vector<Common::UniqueFunction<void>>    publications;
+	std::optional<Common::GpuTiming::SyncReason> submit_reason;
+	for (size_t i = 0; i < requests.size(); i++) {
+		const auto&                        request = requests[i];
+		auto&                              result  = served[i];
+		const Common::GpuTiming::SyncScope sync_reason(request.reason);
+		result.base = request.vaddr;
+		result.size = request.size;
+		if (request.kind == GuestReadback::Kind::Write &&
+		    !IsRegionRegistered(request.vaddr, request.size)) {
+			result.skip = true;
+			continue;
+		}
+		if (request.kind == GuestReadback::Kind::Around) {
+			// The dirty-range query runs here: the range set is only serialized on the GPU
+			// thread, and a guest thread faulting on a read arrives from anywhere.
+			const auto vaddr = request.vaddr;
+			const auto page  = vaddr & ~(CACHING_PAGESIZE - 1u);
+			const auto query = std::min(request.size, UINT64_MAX - page);
+			result.size      = 1;
+			m_gpu_modified_ranges.ForEachInRange(page, query, [&](uint64_t begin, uint64_t end) {
+				if (begin <= vaddr && vaddr < end) {
+					result.base = begin;
+					result.size = end - begin;
+				}
+			});
+		}
+		TouchHotPages(result.base, result.size);
+		DrainPublished();
+		AwaitSubmittedDownloads(result.base, result.size);
+		auto& buffer = m_slot_buffers[FindBuffer(result.base, result.size)];
+		result.copied =
+		    DownloadBufferMemory<false>(buffer, result.base, result.size, &publications);
+		if (result.copied) {
+			if (submit_reason) {
+				// Rides the submission of an earlier request of the batch.
+				Common::GpuTiming::Sync().AddJoinedReadback(request.reason);
+			} else {
+				submit_reason = request.reason;
+			}
+		}
+	}
+	if (!publications.empty()) {
+		const Common::GpuTiming::SyncScope sync_reason(*submit_reason);
+		const auto                         tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		for (auto& publish: publications) {
+			publish();
+		}
+	}
+	for (size_t i = 0; i < requests.size(); i++) {
+		const auto& result = served[i];
+		if (!result.skip) {
+			if (result.copied) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(result.base, result.size);
+			}
+			if (requests[i].kind == GuestReadback::Kind::Write) {
+				m_memory_tracker.MarkRegionAsCpuModified(result.base, result.size);
+			}
+		}
+		if (requests[i].done != nullptr) {
+			requests[i].done->release();
+		}
+	}
 }
 
 // The hot set is small: a few hundred pages the game reads back every frame.
