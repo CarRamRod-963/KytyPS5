@@ -205,7 +205,8 @@ void GpuTimestamps::End(vk::CommandBuffer buffer, uint64_t tick) {
 	slot.ended = true;
 }
 
-void GpuTimestamps::Submitted(uint64_t tick, int64_t submit_ns) {
+void GpuTimestamps::Submitted(uint64_t tick, int64_t submit_ns,
+                              Common::GpuTiming::SyncReason reason, uint32_t commands) {
 	if (m_pool == nullptr) {
 		return;
 	}
@@ -214,6 +215,8 @@ void GpuTimestamps::Submitted(uint64_t tick, int64_t submit_ns) {
 	if (slot.tick == tick) {
 		slot.submit_ns = submit_ns;
 		slot.submitted = true;
+		slot.reason    = reason;
+		slot.commands  = commands;
 	}
 	Collect();
 	MaybeRotate(NowNs());
@@ -249,6 +252,8 @@ void GpuTimestamps::Collect() {
 		submission.gpu_begin_ns  = m_wrap_ns + DeviceNs(begin);
 		submission.gpu_end_ns    = submission.gpu_begin_ns + DeviceNs(span);
 		submission.host_begin_ns = HostNs(begin);
+		submission.reason        = slot.reason;
+		submission.commands      = slot.commands;
 		slot.host_end_ns         = HostNs(data[1]);
 		m_accumulator.AddSubmission(submission);
 	}

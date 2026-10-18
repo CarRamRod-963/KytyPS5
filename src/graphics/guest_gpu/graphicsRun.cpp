@@ -245,7 +245,7 @@ void CommandProcessor::BufferWait() {
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
-		SuspendPm4();
+		SuspendPm4(Common::GpuTiming::StallKind::Rewind);
 	}
 }
 
@@ -274,7 +274,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+		SuspendPm4(Common::GpuTiming::StallKind::WaitRegMem);
 	}
 }
 
@@ -413,7 +413,12 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto start = std::chrono::steady_clock::now();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::GpuTiming::Sync().AddGpuThreadStarved(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - start)
+				        .count());
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -437,7 +442,13 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						const auto start    = std::chrono::steady_clock::now();
+						const bool signaled = gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						Common::GpuTiming::Sync().AddGpuThreadBlocked(
+						    std::chrono::duration_cast<std::chrono::nanoseconds>(
+						        std::chrono::steady_clock::now() - start)
+						        .count(),
+						    !signaled);
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -591,8 +602,9 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
-void CommandProcessor::SuspendPm4() {
+void CommandProcessor::SuspendPm4(Common::GpuTiming::StallKind kind) {
 	EXIT_IF(g_current_execution == nullptr);
+	Common::GpuTiming::Sync().AddStall(kind);
 	g_current_execution->m_suspended = true;
 }
 
@@ -740,7 +752,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
-						SuspendPm4();
+						SuspendPm4(Common::GpuTiming::StallKind::Predication);
 					} else {
 						m_predicate_skip = false;
 					}
@@ -940,7 +952,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	// Stall only this command processor, not the host command lane or other queues.
 	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
 	                                                 static_cast<int>(display_buffer_index))) {
-		SuspendPm4();
+		SuspendPm4(Common::GpuTiming::StallKind::Flip);
 	}
 }
 

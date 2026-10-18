@@ -86,6 +86,19 @@ enum class BarrierKind : uint8_t { ComputeToCompute, AllToCompute, ComputeToAll,
 
 inline constexpr size_t BARRIER_KIND_COUNT = static_cast<size_t>(BarrierKind::Count);
 
+// Why the guest GPU thread suspended a command stream until a later retry.
+enum class StallKind : uint8_t {
+	WaitRegMem,  // WAIT_REG_MEM condition not met yet.
+	Rewind,      // REWIND packet not yet valid.
+	Predication, // Occlusion-query results not ready.
+	Flip,        // The display buffer to render into is still being shown.
+	Count
+};
+
+inline constexpr size_t STALL_KIND_COUNT = static_cast<size_t>(StallKind::Count);
+
+[[nodiscard]] const char* StallKindName(StallKind kind) noexcept;
+
 struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> submits {};
 	std::array<uint64_t, SYNC_REASON_COUNT> waits {}; // Blocking waits on the GPU timeline.
@@ -109,6 +122,15 @@ struct SyncCounts {
 	// flush would have been.
 	std::array<uint64_t, BARRIER_KIND_COUNT> barriers {};
 	uint64_t                                 barriers_unmerged = 0;
+	// The guest GPU thread waiting for guest work (starved), and waiting with every queue
+	// suspended on a condition (blocked: polls, how many ended by timeout, time).
+	uint64_t gpu_thread_starved    = 0;
+	uint64_t gpu_thread_starved_ns = 0;
+	uint64_t gpu_thread_blocked    = 0;
+	uint64_t gpu_thread_timeouts   = 0;
+	uint64_t gpu_thread_blocked_ns = 0;
+	// Command stream suspensions by kind (StallKind).
+	std::array<uint64_t, STALL_KIND_COUNT> stalls {};
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
@@ -153,6 +175,23 @@ public:
 	void AddUnmergedBarriers(uint64_t count) noexcept {
 		m_barriers_unmerged.fetch_add(count, std::memory_order_relaxed);
 	}
+	void AddGpuThreadStarved(int64_t ns) noexcept {
+		m_gpu_thread_starved.fetch_add(1, std::memory_order_relaxed);
+		m_gpu_thread_starved_ns.fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
+		                                  std::memory_order_relaxed);
+	}
+	void AddGpuThreadBlocked(int64_t ns, bool timeout) noexcept {
+		m_gpu_thread_blocked.fetch_add(1, std::memory_order_relaxed);
+		if (timeout) {
+			m_gpu_thread_timeouts.fetch_add(1, std::memory_order_relaxed);
+		}
+		m_gpu_thread_blocked_ns.fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
+		                                  std::memory_order_relaxed);
+	}
+	void AddStall(StallKind kind) noexcept {
+		const auto index = static_cast<size_t>(kind);
+		m_stalls[index < STALL_KIND_COUNT ? index : 0].fetch_add(1, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -173,6 +212,12 @@ private:
 	std::atomic<uint64_t>                                m_labels_gpu_thread {};
 	std::array<std::atomic<uint64_t>, BARRIER_KIND_COUNT> m_barriers {};
 	std::atomic<uint64_t>                                 m_barriers_unmerged {};
+	std::atomic<uint64_t>                                 m_gpu_thread_starved {};
+	std::atomic<uint64_t>                                 m_gpu_thread_starved_ns {};
+	std::atomic<uint64_t>                                 m_gpu_thread_blocked {};
+	std::atomic<uint64_t>                                 m_gpu_thread_timeouts {};
+	std::atomic<uint64_t>                                 m_gpu_thread_blocked_ns {};
+	std::array<std::atomic<uint64_t>, STALL_KIND_COUNT>   m_stalls {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.
@@ -194,7 +239,14 @@ struct Submission {
 	uint64_t               gpu_begin_ns = 0;
 	uint64_t               gpu_end_ns   = 0;
 	std::optional<int64_t> host_begin_ns;
+	SyncReason             reason   = SyncReason::Other; // Why the buffer was submitted.
+	uint32_t               commands = 0;                 // Commands recorded into it.
 };
+
+// Submissions grouped by the number of commands recorded into them.
+inline constexpr size_t SIZE_CLASS_COUNT = 4; // <= 1, 2-15, 16-127, >= 128 commands.
+
+[[nodiscard]] size_t SizeClassOf(uint32_t commands) noexcept;
 
 struct Summary {
 	double   seconds    = 0.0;
@@ -211,6 +263,14 @@ struct Summary {
 	LatencyHistogram label;
 	// Submissions and blocking waits per reason in the window.
 	SyncCounts sync;
+	// Sum of the individual execution spans (begin to end of each submission, overlaps
+	// counted for both) by submission reason and by size class, and the submissions per class.
+	std::array<uint64_t, SYNC_REASON_COUNT> span_ns_by_reason {};
+	std::array<uint64_t, SIZE_CLASS_COUNT>  span_ns_by_size {};
+	std::array<uint64_t, SIZE_CLASS_COUNT>  submits_by_size {};
+	// GPU idle although a submitted buffer waited to start: from the later of its submission and
+	// the previous end to its start (host clock; needs calibration).
+	uint64_t launch_gap_ns = 0;
 
 	void Merge(const Summary& other) noexcept;
 
@@ -236,7 +296,8 @@ public:
 
 private:
 	Summary  m_window;
-	uint64_t m_last_end_ns = 0;
+	uint64_t m_last_end_ns      = 0;
+	int64_t  m_last_host_end_ns = INT64_MIN;
 };
 
 // "GpuTiming: busy 412 ms/s, 980 submits/s (...), end->complete p50/p95 ..." (no newline).
