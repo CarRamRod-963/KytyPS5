@@ -1008,6 +1008,29 @@ void PipelineCache::StartPrecompile(uint32_t thread_count) {
 	QueuePrecompile(thread_count);
 }
 
+size_t PipelineCache::PrecompileAll(uint32_t thread_count) {
+	StartPrecompile(thread_count);
+	if (m_precompile_queue == nullptr) {
+		return 0;
+	}
+	auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds {30};
+	for (;;) {
+		const auto remaining = m_precompile_queue->Remaining();
+		if (remaining == 0) {
+			break;
+		}
+		if (std::chrono::steady_clock::now() >= next_report) {
+			next_report += std::chrono::seconds {30};
+			PipelineCacheLog("Precompile: {} programs left", remaining);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds {250});
+	}
+	m_precompile_queue->Stop();
+	m_precompile_queue.reset();
+	Save();
+	return m_precompile_stats.compiled.load();
+}
+
 void PipelineCache::CheckpointDriverCache() {
 	// A driver cache without a file (tests) is not persisted.
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {

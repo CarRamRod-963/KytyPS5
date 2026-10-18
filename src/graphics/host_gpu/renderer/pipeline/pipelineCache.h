@@ -142,6 +142,9 @@ public:
 	// Queues a driver-cache build of every compute program the title's manifest recorded in
 	// earlier sessions (--precompile-pipelines). Needs the renderer's bindless set layout.
 	void StartPrecompile(uint32_t thread_count);
+	// --precompile-only: builds every recorded program's pipeline on `thread_count` threads,
+	// then saves the driver cache. Returns the number of pipelines the driver compiled.
+	size_t PrecompileAll(uint32_t thread_count);
 	// Joins the background compiles. Their pipeline layouts reference the renderer's bindless
 	// set layout, so the owner calls this before destroying it.
 	void StopBackgroundCompiles();
