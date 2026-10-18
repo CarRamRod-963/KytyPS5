@@ -1,12 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -18,6 +20,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_bindless_table(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// After the bindless table: precompiled layouts reference its set layout.
+	if (Config::PrecompilePipelinesEnabled()) {
+		// Like the background pipeline builds: driver compilers are multithreaded themselves,
+		// and the guest needs the CPU.
+		m_pipeline_cache.StartPrecompile(
+		    std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 2u));
+	}
 }
 
 RenderContext::~RenderContext() {

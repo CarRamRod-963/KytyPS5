@@ -79,6 +79,11 @@ void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& ta
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// Whether ApplyResourceSpecialization accepts `specialization` for a translated program: its
+// resource counts and indirect roots fit the program's resources. A specialization recorded for
+// another recompiler version may not.
+bool SpecializationApplies(const Program& program, const ResourceSpecialization& specialization);
+
 // Writes the V# stride of every buffer binding with a runtime stride into the shader data.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);

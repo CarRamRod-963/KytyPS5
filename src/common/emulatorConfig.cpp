@@ -201,6 +201,10 @@ bool SkipPendingDrawsEnabled() {
 	return g_config->skip_pending_draws;
 }
 
+bool PrecompilePipelinesEnabled() {
+	return g_config->precompile_pipelines;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

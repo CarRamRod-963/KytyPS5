@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/programManifest.h"
+#include "graphics/host_gpu/renderer/pipeline/programPrecompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -104,6 +106,8 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// ComputeProgramRecord::Key of a recorded compute program, else 0.
+	uint64_t record_key = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -116,6 +120,9 @@ enum class PipelineBuildMode : uint8_t {
 	UnoptimizedFirst,
 	// Nothing on the calling thread; the returned job builds the optimized pipeline.
 	Background,
+	// Optimized on the calling thread unless the driver cache holds the pipeline; fills the
+	// driver cache ahead of the pipeline's use (see PrecompileComputeProgram).
+	Precompile,
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
@@ -127,6 +134,9 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Queues a driver-cache build of every compute program the title's manifest recorded in
+	// earlier sessions (--precompile-pipelines). Needs the renderer's bindless set layout.
+	void StartPrecompile(uint32_t thread_count);
 	// Joins the background compiles. Their pipeline layouts reference the renderer's bindless
 	// set layout, so the owner calls this before destroying it.
 	void StopBackgroundCompiles();
@@ -183,6 +193,14 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
+
+	struct PrecompileStats {
+		std::atomic<uint64_t> cached {0};
+		std::atomic<uint64_t> compiled {0};
+		std::atomic<uint64_t> skipped {0};
+		std::atomic<uint64_t> compile_ms {0};
+		std::atomic<uint64_t> finished {0};
+	};
 
 	// A graphics pipeline whose first build runs on the background queue; its handle is null.
 	struct PendingBuild {
@@ -244,6 +262,16 @@ private:
 	bool                                              m_skip_pending_draws = false;
 	std::chrono::steady_clock::duration               m_skip_window        = PendingDrawSkipWindow;
 	std::unordered_map<const Pipeline*, PendingBuild> m_pending_builds;
+	// Compute programs of this title (_PipelineCache/<title>.programs); null without a driver
+	// cache file.
+	std::unique_ptr<ProgramManifest>        m_manifest;
+	std::unique_ptr<ProgramPrecompileQueue> m_precompile_queue;
+	PrecompileStats                         m_precompile_stats;
+	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
+	std::atomic<bool> m_precompile_dirty {false};
+	// Live compute pipelines the driver cache provided or compiled.
+	uint64_t m_compute_from_cache = 0;
+	uint64_t m_compute_compiled   = 0;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
@@ -252,6 +280,10 @@ private:
 	bool WriteDriverCache();
 	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
 	void InstallOptimizedPipelines();
+	void SetManifest(std::unique_ptr<ProgramManifest> manifest);
+	// Queues the manifest's programs, on a new queue unless one exists.
+	void QueuePrecompile(uint32_t thread_count);
+	void LogPrecompileStats(const char* when);
 	// Returns the pipeline of a pending first build, or null when the draw may skip it.
 	Pipeline* ResolvePendingBuild(Pipeline& pipeline, PendingDrawBlocker blocker);
 };
@@ -277,7 +309,24 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
-                       vk::PipelineCache driver_cache, bool defer_optimization);
+                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
+                       bool* from_driver_cache = nullptr);
+
+enum class PrecompileOutcome : uint8_t {
+	// The driver cache already held the pipeline.
+	Cached,
+	// The driver compiled the pipeline into the driver cache.
+	Compiled,
+	// The program cannot be rebuilt from its record (a shader with calls, or a specialization
+	// this recompiler no longer derives for the shader).
+	Skipped,
+};
+// Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
+// its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
+// Thread-safe; touches no guest state. `spirv_hash` receives the hash of the module.
+PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
+                                           const ComputeProgramRecord& record,
+                                           uint64_t*                   spirv_hash = nullptr);
 
 } // namespace Libs::Graphics
 

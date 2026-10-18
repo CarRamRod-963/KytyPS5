@@ -89,6 +89,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
+	bool                   precompile_pipelines            = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -157,6 +158,7 @@ bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool AsyncPipelinesEnabled();
 bool     SkipPendingDrawsEnabled();
+bool     PrecompilePipelinesEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
