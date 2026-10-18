@@ -29,7 +29,8 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
-	void Wait(uint64_t tick);
+	// Returns true when the caller had to block until the GPU reached `tick`.
+	bool Wait(uint64_t tick);
 
 private:
 	GraphicContext&       m_graphics;
