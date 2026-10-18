@@ -2295,6 +2295,33 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	return resource;
 }
 
+bool SpecializationApplies(const Program& program, const ResourceSpecialization& specialization) {
+	if (!program.resource_tracking_complete || program.shader_info_complete) {
+		return false;
+	}
+	// Mirrors the checks of ApplyResourceSpecialization: entries past the program's resources
+	// copy a root among them, and every root names an entry.
+	const auto roots_fit = [](const auto& entries, size_t original, uint32_t none) {
+		if (original > entries.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < entries.size(); index++) {
+			const auto root = entries[index].indirect_root;
+			if ((index >= original && root >= original) ||
+			    (root != none && root >= entries.size())) {
+				return false;
+			}
+		}
+		return true;
+	};
+	const auto& info = program.info;
+	return roots_fit(specialization.buffers, info.buffers.size(),
+	                 BufferResource::NoIndirectBuffer) &&
+	       roots_fit(specialization.images, info.images.size(), ImageResource::NoIndirectImage) &&
+	       roots_fit(specialization.samplers, info.samplers.size(),
+	                 SamplerResource::NoIndirectSampler);
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||

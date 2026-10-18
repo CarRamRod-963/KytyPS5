@@ -631,6 +631,14 @@ add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_compile_queue_tests common fmt::fmt)
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+add_executable(program_manifest_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramManifestTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programManifest.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.cpp"
+)
+target_link_libraries(program_manifest_tests common fmt::fmt xxhash)
+target_include_directories(program_manifest_tests PRIVATE ${inc_headers})
+
 add_executable(pending_draw_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PendingDrawPolicyTests.cpp"
 )
@@ -696,6 +704,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -744,6 +753,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	add_test(NAME compute_program_precompile
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-precompile-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
