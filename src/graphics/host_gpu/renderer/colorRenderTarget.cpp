@@ -71,6 +71,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	auto& texture_cache = m_context.GetTextureCache();
+	EXIT_IF(rt_slot >= m_color_target_lookups.size());
+	auto&          lookup = m_color_target_lookups[rt_slot];
+	auto&          source = m_color_target_sources[rt_slot];
+	const uint64_t inputs = render_target_slice_offset | uint64_t {exact_format} << 32u;
+	// The description is a function of the slot's registers and these inputs alone, and the
+	// lookup still holds the one they decoded to last time.
+	if (source.Matches(rt, inputs, lookup) && !graphics_debug_dump_enabled()) {
+		r.guest_mip_level   = source.guest_mip_level;
+		r.guest_array_layer = source.guest_array_layer;
+		r.export_mapping    = source.export_mapping;
+		if (!texture_cache.FindRememberedImage(lookup, exact_format, r.desc, r.image_id)) {
+			r.desc     = lookup.input;
+			r.image_id = texture_cache.FindImage(r.desc, exact_format, lookup);
+			source.Remember(rt, inputs, lookup);
+		}
+		BindRenderTarget(r.image_id);
+		return;
+	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
 	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
@@ -262,12 +281,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	EXIT_IF(rt_slot >= m_color_target_lookups.size());
-	r.image_id = texture_cache.FindImage(r.desc, exact_format, m_color_target_lookups[rt_slot]);
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format, lookup);
 	r.export_mapping           = target_format.export_mapping;
+	source.Remember(rt, inputs, lookup);
+	source.guest_mip_level   = r.guest_mip_level;
+	source.guest_array_layer = r.guest_array_layer;
+	source.export_mapping    = r.export_mapping;
 	BindRenderTarget(r.image_id);
 }
 
