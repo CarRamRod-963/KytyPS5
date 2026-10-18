@@ -105,9 +105,8 @@ void TestDirtyChunkIsReadBackFirst() {
   Check(ReadWord(cache, count) == 3669,
         "a GPU-written count read stale backing bytes");
   Check(memory.readbacks.size() == 1 &&
-            memory.readbacks[0] ==
-                std::pair<uint64_t, uint64_t>{count & ~uint64_t{127}, 128},
-        "the dirty chunk was not read back exactly once before it was filled");
+            memory.readbacks[0] == std::pair<uint64_t, uint64_t>{count, 4},
+        "the dirty word was not read back exactly once before it was served");
   Check(ReadWord(cache, count) == 3669 && memory.readbacks.size() == 1,
         "a synchronized chunk was read back again");
 
@@ -117,6 +116,33 @@ void TestDirtyChunkIsReadBackFirst() {
   (void)ReadWord(second, FakeGuestMemory::Base + 0x100);
   Check(memory.readbacks.size() == 1,
         "a clean chunk was read back for a dirty neighbour");
+}
+
+// Ghost of Yotei writes counters on the GPU next to SRT data the walks read; a
+// chunk that holds a GPU-dirty word costs a readback only for that word.
+void TestOnlyReadDirtyBytesAreReadBack() {
+  FakeGuestMemory memory;
+  const auto chunk = FakeGuestMemory::Base + 0x300;
+  memory.CpuWrite(chunk + 0x10, 11);
+  memory.CpuWrite(chunk + 0x14, 12);
+  memory.CpuWrite(chunk + 0x40, 5);
+  memory.GpuWrite(chunk + 0x40, 6);
+  Cache cache(memory);
+  Check(ReadWord(cache, chunk + 0x10) == 11 &&
+            ReadWord(cache, chunk + 0x14) == 12,
+        "clean words of a dirty chunk");
+  Check(memory.readbacks.empty(),
+        "clean words of a chunk were read back for a dirty neighbour");
+  Check(ReadWord(cache, chunk + 0x40) == 6,
+        "a GPU-written word of a cached chunk read stale bytes");
+  Check(memory.readbacks.size() == 1 &&
+            memory.readbacks[0] ==
+                std::pair<uint64_t, uint64_t>{chunk + 0x40, 4},
+        "the dirty word was not read back alone");
+  std::array<uint32_t, 2> pair{};
+  cache.Read(chunk + 0x3c, pair);
+  Check(pair == std::array<uint32_t, 2>{0u, 6u} && memory.readbacks.size() == 1,
+        "a synchronized word was read back again or lost");
 }
 
 void TestCachedChunkDroppedAfterGpuWrite() {
@@ -160,6 +186,7 @@ void TestUncachedAndUnmappedReads() {
 int main() {
   TestCleanReadsDoNotSynchronize();
   TestDirtyChunkIsReadBackFirst();
+  TestOnlyReadDirtyBytesAreReadBack();
   TestCachedChunkDroppedAfterGpuWrite();
   TestUncachedAndUnmappedReads();
   std::printf("ScalarReadCacheTests: ok\n");
