@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -78,7 +79,7 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
+      m_command_pool(graphics, m_master), m_timestamps(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
@@ -167,10 +168,16 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		WaitTick(tick);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		WaitTick(tick);
+	}
+}
+
+void CommandScheduler::WaitTick(uint64_t tick) {
+	if (m_master.Wait(tick)) {
+		m_timestamps.RecordWake(tick);
 	}
 }
 
@@ -241,7 +248,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_operations.pop();
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		WaitTick(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -300,6 +307,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_timestamps.Begin(m_command.m_buffer, CurrentTick());
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -308,6 +316,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
 	m_context.GetBufferCache().RecordAsyncDownloads();
+	m_command.EndRendering();
+	m_timestamps.End(m_command.m_buffer, CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -315,6 +325,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	int64_t    submit_ns = 0;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -336,7 +347,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                std::chrono::steady_clock::now().time_since_epoch())
+		                .count();
+		result    = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
@@ -345,6 +359,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	m_command.m_buffer = nullptr;
+	m_timestamps.Submitted(tick, submit_ns);
 	return tick;
 }
 
