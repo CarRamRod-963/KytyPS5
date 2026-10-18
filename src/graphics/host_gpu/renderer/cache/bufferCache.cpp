@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -297,6 +298,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::CpuWrite);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -307,7 +309,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	// The readback runs on the GPU thread; it counts under the requester's reason.
+	auto reason = Common::GpuTiming::CurrentSyncReason();
+	if (reason == Common::GpuTiming::SyncReason::Other) {
+		reason = is_write ? Common::GpuTiming::SyncReason::CpuWrite
+		                  : Common::GpuTiming::SyncReason::BufferRead;
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, reason] {
+		const Common::GpuTiming::SyncScope sync_reason(reason);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -333,6 +342,7 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 	// The dirty-range query runs on the GPU thread with the readback: the range set is only
 	// serialized there, and a guest thread faulting on a read arrives from anywhere.
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, window] {
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::FaultRead);
 		const auto page  = vaddr & ~(CACHING_PAGESIZE - 1u);
 		const auto query = std::min(window, UINT64_MAX - page);
 		uint64_t   base  = vaddr;
@@ -912,6 +922,7 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	const Common::GpuTiming::SyncScope         sync_reason(Common::GpuTiming::SyncReason::WalkRead);
 	std::vector<std::pair<uint64_t, uint64_t>> dirty;
 	m_gpu_modified_ranges.ForEachInRange(
 	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty.emplace_back(begin, end - begin); });
@@ -971,6 +982,7 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::GarbageCollect);
 	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);

@@ -2,7 +2,10 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuTiming.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -50,10 +53,17 @@ bool MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
-	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	const auto start = std::chrono::steady_clock::now();
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+		                                         Common::DebugCounters::Counter::GpuWaitNs);
+		const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
+	const auto waited = std::chrono::steady_clock::now() - start;
+	Common::GpuTiming::Sync().AddWait(
+	    Common::GpuTiming::CurrentSyncReason(),
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
 	Refresh();
 	return true;
 }

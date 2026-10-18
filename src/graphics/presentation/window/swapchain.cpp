@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -120,6 +121,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Present);
 		m_scheduler.Wait(frame->present_tick);
 		return frame;
 	}
@@ -605,6 +607,7 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Present);
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
@@ -877,6 +880,7 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Present);
 	const auto tick                       = scheduler.Submit(submit);
 	m_image_acquired_ticks[m_frame_index] = tick;
 	return tick;
@@ -966,6 +970,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Present);
 		frame->present_tick = m_impl->present_scheduler.Submit();
 	}
 	return *frame;

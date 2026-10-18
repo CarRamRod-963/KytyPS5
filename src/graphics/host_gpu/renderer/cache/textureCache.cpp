@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1236,6 +1237,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		Common::DebugCounters::ScopedTimer timer(
 		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
+		const Common::GpuTiming::SyncScope sync_reason(
+		    Common::GpuTiming::SyncReason::MetadataCheck);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 		metadata_written = true;
 	}
