@@ -1106,14 +1106,43 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
-void BufferCache::ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	const Common::GpuTiming::SyncScope         sync_reason(Common::GpuTiming::SyncReason::WalkRead);
+void BufferCache::ReadGpuDirtyBytes(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::WalkRead);
+	// The dirty intervals of all ranges, each clipped to its range; overlapping ones (ranges that
+	// overlap each other) are merged so no byte is read back twice.
 	std::vector<std::pair<uint64_t, uint64_t>> dirty;
-	m_gpu_modified_ranges.ForEachInRange(
-	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty.emplace_back(begin, end - begin); });
-	for (const auto& [begin, bytes]: dirty) {
-		ReadMemory(begin, bytes);
+	for (const auto& [vaddr, size]: ranges) {
+		if (size == 0) continue;
+		m_gpu_modified_ranges.ForEachInRange(
+		    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty.emplace_back(begin, end); });
 	}
+	if (dirty.empty()) {
+		return;
+	}
+	std::ranges::sort(dirty);
+	size_t merged = 0;
+	for (const auto& interval: dirty) {
+		if (merged != 0 && interval.first <= dirty[merged - 1].second) {
+			dirty[merged - 1].second = std::max(dirty[merged - 1].second, interval.second);
+		} else {
+			dirty[merged++] = interval;
+		}
+	}
+	dirty.resize(merged);
+	if (!GuestGpu::IsGpuThread()) {
+		for (const auto& [begin, end]: dirty) {
+			ReadMemory(begin, end - begin);
+		}
+		return;
+	}
+	// One batch: every interval's copy is recorded, then a single wait covers them all.
+	std::vector<GuestReadback> requests;
+	requests.reserve(dirty.size());
+	for (const auto& [begin, end]: dirty) {
+		requests.push_back({GuestReadback::Kind::Read, begin, end - begin,
+		                    Common::GpuTiming::SyncReason::WalkRead, nullptr});
+	}
+	ServeGuestReadbacks(requests);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
