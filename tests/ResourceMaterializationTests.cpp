@@ -1,12 +1,15 @@
+#include "graphics/host_gpu/renderer/pipeline/srtWalkerCompileQueue.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include <xbyak/xbyak.h>
 
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -571,6 +574,92 @@ void TestGeneralNativeSrtWalker() {
                               {.user_data = std::span(user_data).first(4)},
                               snapshot, specialization),
         "general native walker accepted truncated user data");
+}
+
+// The pipeline cache interprets a new shader's plan right away and compiles its
+// general walker on a second extraction in the background; the compiled plan
+// then replaces the interpreted one and must refresh identically.
+void TestBackgroundGeneralWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  std::array<uint32_t, 8> first{0x11u, 0x12u, 0x13u, 0x14u,
+                                0x15u, 0x16u, 0x17u, 0x18u};
+  std::array<uint32_t, 8> second{0x21u, 0x22u, 0x23u, 0x24u,
+                                 0x25u, 0x26u, 0x27u, 0x28u};
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address),
+                                   static_cast<uint32_t>(address >> 32u)};
+  };
+  const auto first_words = pointer_words(first.data());
+  const auto second_words = pointer_words(second.data());
+  std::array<uint32_t, 5> user_data{first_words[0], first_words[1],
+                                    second_words[0], second_words[1], 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 5;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto control = emit(ValueOpcode::GetUserData, {Value(ScalarReg(8))});
+  const auto chosen = emit(ValueOpcode::IEqual32, {control, Value(1u)});
+  const auto low =
+      emit(ValueOpcode::SelectU32,
+           {chosen, emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))})});
+  const auto high =
+      emit(ValueOpcode::SelectU32,
+           {chosen, emit(ValueOpcode::GetUserData, {Value(ScalarReg(7))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto root = emit(ValueOpcode::GetAddressResource, {low, high});
+  const auto offset =
+      emit(ValueOpcode::ShiftLeftLogical32,
+           {emit(ValueOpcode::BitwiseAnd32, {control, Value(6u)}), Value(2u)});
+  for (const auto byte_offset : {offset, Value(4u)}) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  }
+
+  auto interpreted =
+      ExtractResourcePlan(program, SrtWalkerCompilation::SimpleOnly);
+  Check(interpreted.srt_general_code == nullptr,
+        "a plan extracted for the background compile already had a general "
+        "walker");
+  std::unique_ptr<ResourcePlan> compiled;
+  {
+    Libs::Graphics::SrtWalkerCompileQueue queue;
+    // A job its owner dropped is skipped without harm.
+    (void)queue.Submit(std::make_unique<ResourcePlan>(
+        ExtractResourcePlan(program, SrtWalkerCompilation::SimpleOnly)));
+    auto job = queue.Submit(std::make_unique<ResourcePlan>(
+        ExtractResourcePlan(program, SrtWalkerCompilation::SimpleOnly)));
+    for (uint32_t wait = 0; wait < 10000u && !job->Ready(); ++wait)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(job->Ready(), "the background walker compile did not finish");
+    compiled = job->Take();
+  }
+  Check(compiled != nullptr && compiled->srt_general_code != nullptr,
+        "the background compile did not produce a general walker");
+  for (const uint32_t selector : {0u, 1u, 3u, 7u}) {
+    user_data[4] = selector;
+    const SrtRuntime runtime{.user_data = user_data};
+    const auto &table = selector == 1u ? second : first;
+    ResourceSnapshot from_interpreter, from_compiled;
+    ResourceSpecialization interpreter_specialization, compiled_specialization;
+    Check(MaterializeResources(interpreted, runtime, from_interpreter,
+                               interpreter_specialization) &&
+              MaterializeResources(*compiled, runtime, from_compiled,
+                                   compiled_specialization) &&
+              from_interpreter.flattened_srt ==
+                  std::vector<uint32_t>{table[selector & 6u], table[1]} &&
+              from_compiled.flattened_srt == from_interpreter.flattened_srt &&
+              compiled_specialization == interpreter_specialization,
+          "the plan compiled in the background refreshed differently");
+  }
 }
 
 void TestGeneralWalkerLoopFixpoint() {
@@ -1809,6 +1898,7 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestGeneralNativeSrtWalker();
+  TestBackgroundGeneralWalker();
   TestGeneralWalkerScopedMemo();
   TestGeneralWalkerAssumesExecFactor();
   TestGeneralWalkerZeroUnsignedBound();
