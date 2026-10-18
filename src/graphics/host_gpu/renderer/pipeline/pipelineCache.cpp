@@ -659,7 +659,11 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	ShaderRecompiler::Spirv::SetMaximalReconvergence(graphics.maximal_reconvergence_enabled);
 	InitializeDriverCache();
-	if (m_scheduler != nullptr && Config::AsyncPipelinesEnabled()) {
+	// Both modes replace or install pipeline handles while a command buffer is recording, which
+	// needs the scheduler.
+	m_defer_optimization = m_scheduler != nullptr && Config::AsyncPipelinesEnabled();
+	m_skip_pending_draws = m_scheduler != nullptr && Config::SkipPendingDrawsEnabled();
+	if (m_defer_optimization || m_skip_pending_draws) {
 		// Driver compilers are multithreaded themselves; two builds at a time keep the CPU
 		// available for the guest.
 		const auto threads = std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 2u);
@@ -693,13 +697,14 @@ void PipelineCache::StopBackgroundCompiles() {
 		return;
 	}
 	if (!m_pending_optimized.empty()) {
-		LOGF("PipelineCache: dropping %zu pending optimized pipeline builds\n",
-		     m_pending_optimized.size());
+		LOGF("PipelineCache: dropping %zu pending pipeline builds\n", m_pending_optimized.size());
 	}
 	// Results that were not installed are destroyed here; their pipelines keep the unoptimized
-	// handles.
+	// handles, or none if they were never built.
 	m_compile_queue->Stop();
 	m_pending_optimized.clear();
+	m_pending_builds.clear();
+	m_skip_pending_draws = false;
 }
 
 void PipelineCache::DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job) {
@@ -724,6 +729,26 @@ void PipelineCache::InstallOptimizedPipelines() {
 		EXIT_IF(entry == m_pending_optimized.end());
 		auto& pipeline = *entry->second;
 		m_pending_optimized.erase(entry);
+		if (pipeline.pipeline == nullptr) {
+			// A first build: its draws were skipped until now, nothing has bound a handle.
+			const auto pending = m_pending_builds.find(&pipeline);
+			EXIT_IF(pending == m_pending_builds.end());
+			if (completion.handle == 0) {
+				EXIT("PipelineCache: background pipeline build failed (VS %016" PRIx64
+				     " PS %016" PRIx64 ")\n",
+				     pending->second.vs_hash, pending->second.ps_hash);
+			}
+			pipeline.pipeline = PipelineFromCompileHandle(completion.handle);
+			const auto ms     = std::chrono::duration<double, std::milli>(
+			                        std::chrono::steady_clock::now() - pending->second.queued)
+			                        .count();
+			LOGF("PipelineCache: pipeline of VS %016" PRIx64 " PS %016" PRIx64
+			     " is ready after %.0f ms; %" PRIu64 " draws were skipped\n",
+			     pending->second.vs_hash, pending->second.ps_hash, ms,
+			     pending->second.skipped_draws);
+			m_pending_builds.erase(pending);
+			continue;
+		}
 		if (completion.handle == 0) {
 			LOGF("PipelineCache: optimized build failed; keeping unoptimized pipeline %p\n",
 			     static_cast<void*>(pipeline.pipeline));
@@ -1073,11 +1098,44 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+PipelineCache::Pipeline* PipelineCache::ResolvePendingBuild(Pipeline&          pipeline,
+                                                            PendingDrawBlocker blocker) {
+	const auto entry = m_pending_builds.find(&pipeline);
+	EXIT_IF(entry == m_pending_builds.end());
+	auto&      pending = entry->second;
+	const auto waited  = std::chrono::steady_clock::now() - pending.queued;
+	if (m_skip_pending_draws && PendingDrawMaySkip(blocker, waited, m_skip_window)) {
+		pending.skipped_draws++;
+		return nullptr;
+	}
+	if (!pending.wait_logged) {
+		pending.wait_logged = true;
+		LOGF("PipelineCache: waiting for the pipeline of VS %016" PRIx64 " PS %016" PRIx64
+		     " (%s)\n",
+		     pending.vs_hash, pending.ps_hash,
+		     blocker == PendingDrawBlocker::None ? "skipped for too long"
+		                                         : PendingDrawBlockerName(blocker));
+	}
+	m_compile_queue->Expedite(pending.ticket);
+	InstallOptimizedPipelines();
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	return &pipeline;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	return *FindGraphicsPipeline(colors, depth, vertex_info, command, ps_input_info, topology,
+	                             primitive_restart_enable, programs, PendingDrawBlocker::Disabled);
+}
+
+PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const GraphicsPrograms& programs, PendingDrawBlocker blocker) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1245,7 +1303,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	InstallOptimizedPipelines();
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		auto& found = *iter->second;
+		return found.pipeline != nullptr ? &found : ResolvePendingBuild(found, blocker);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1258,7 +1317,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
-	auto cached = std::make_unique<Pipeline>();
+	// A draw that may be skipped leaves the whole build to the background queue.
+	const auto build_mode = m_skip_pending_draws && PendingDrawMaySkip(blocker, {}, m_skip_window)
+	                            ? PipelineBuildMode::Background
+	                        : m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
+	                                               : PipelineBuildMode::Optimized;
+	auto       cached     = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto job = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
@@ -1266,19 +1330,38 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                              ps_input_info, programs, static_params, m_driver_cache,
-		                              m_compile_queue != nullptr);
+		                              build_mode);
 	}();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr && !job);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
-	DeferOptimization(*iter->second, std::move(job));
+	auto& created = *iter->second;
+	if (created.pipeline == nullptr) {
+		const PendingBuild pending {
+		    .ticket        = m_compile_queue->Enqueue(std::move(job)),
+		    .queued        = std::chrono::steady_clock::now(),
+		    .vs_hash       = vs_input_info.stage.program->shader_hash,
+		    .ps_hash       = ps_active ? ps_input_info->stage.program->shader_hash : 0,
+		    .skipped_draws = 1,
+		};
+		m_pending_optimized.emplace(pending.ticket, &created);
+		m_pending_builds.emplace(&created, pending);
+		LOGF("PipelineCache: skipping draws of VS %016" PRIx64 " PS %016" PRIx64
+		     " until its pipeline is ready (built in the background; the draws only change the "
+		     "picture; they wait after %" PRId64 " ms)\n",
+		     pending.vs_hash, pending.ps_hash,
+		     static_cast<int64_t>(
+		         std::chrono::duration_cast<std::chrono::milliseconds>(m_skip_window).count()));
+		return nullptr;
+	}
+	DeferOptimization(created, std::move(job));
 	CheckpointDriverCache();
 
-	return *iter->second;
+	return &created;
 }
 
 PipelineCache::Pipeline&
@@ -1304,7 +1387,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                              m_driver_cache, m_compile_queue != nullptr);
+		                              m_driver_cache, m_defer_optimization);
 	}();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
