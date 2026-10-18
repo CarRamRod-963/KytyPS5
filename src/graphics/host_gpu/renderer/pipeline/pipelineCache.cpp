@@ -128,8 +128,8 @@ struct GuestScalarMemory {
 	static bool HasGpuDirtyBytes(uint64_t address, uint64_t size) {
 		return Libs::LibKernel::Memory::HasGpuDirtyBytes(address, size);
 	}
-	static void ReadGpuDirtyBytes(uint64_t address, uint64_t size) {
-		Libs::LibKernel::Memory::ReadGpuDirtyBytes(address, size);
+	static void ReadGpuDirtyBytes(std::span<const ScalarReadRange> ranges) {
+		Libs::LibKernel::Memory::ReadGpuDirtyBytes(ranges);
 	}
 	static uint64_t GpuWriteSequence() { return Libs::LibKernel::Memory::GpuWriteSequence(); }
 };
@@ -335,6 +335,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		// The same plan with its general walker being compiled (see SrtWalkerCompileQueue).
 		std::shared_ptr<SrtWalkerCompileQueue::Job>  walker_job;
+		// The ranges the last walk read back (ScalarReadCache::Prefetch).
+		std::vector<ScalarReadRange>                 walk_read_backs;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -531,8 +533,13 @@ struct PipelineCache::ProgramCache {
 			Permutation* permutation = nullptr;
 			if (cached.call_source) source_changed = cached.RefreshCallSource(runtime);
 			if (!source_changed) {
-				if (!cached.Materialize(runtime))
-					return SkipUnavailableDraw(stage, params.hash, input_info);
+				read_cache.Prefetch(cached.walk_read_backs);
+				const bool materialized = cached.Materialize(runtime);
+				read_cache.Prefetch({});
+				if (const auto read_backs = read_cache.ReadBacks(); !read_backs.empty()) {
+					cached.walk_read_backs.assign(read_backs.begin(), read_backs.end());
+				}
+				if (!materialized) return SkipUnavailableDraw(stage, params.hash, input_info);
 				permutation = cached.call_source ? cached.FindPermutation<true>(push_data_cursor)
 				                                 : cached.FindPermutation<false>(push_data_cursor);
 			}
