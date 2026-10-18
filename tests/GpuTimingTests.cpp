@@ -191,7 +191,10 @@ void TestSyncReasons() {
     counters.AddWait(SyncReason::WalkRead, 2 * MS);
   }
   counters.AddWait(SyncReason::Completion, 1 * MS);
+  counters.AddAsyncDownloads(12, 4);
   const auto delta = counters.Snapshot().Since(before);
+  Check(delta.async_pages == 12 && delta.async_deferred == 4,
+        "async download page counts");
   Check(delta.TotalSubmits() == 40 && delta.TotalWaits() == 11, "sync totals");
   Check(delta.wait_ns[static_cast<size_t>(SyncReason::WalkRead)] ==
             static_cast<uint64_t>(20 * MS),
@@ -217,10 +220,15 @@ void TestSyncReasons() {
             "sync submits/waits/wait-ms per s: label 15/0/0.0") !=
             std::string::npos,
         "summary line carries the sync counts");
+  Check(Common::GpuTiming::FormatSummary(summary).find(
+            "async download pages 6/s, skipped over cap 2/s") !=
+            std::string::npos,
+        "summary line carries the async download pages");
   Summary merged;
   merged.Merge(summary);
   merged.Merge(summary);
-  Check(merged.sync.TotalSubmits() == 80, "merged sync counts");
+  Check(merged.sync.TotalSubmits() == 80 && merged.sync.async_deferred == 8,
+        "merged sync counts");
 }
 
 } // namespace
