@@ -345,6 +345,8 @@ void GpuTimingRows(const Snapshot& shown, bool details) {
 		    Fmt("%.0f/s", static_cast<double>(sync.TotalWaits()) / timing.seconds));
 		Row("Empty flushes skipped",
 		    Fmt("%.0f/s", static_cast<double>(sync.TotalSkipped()) / timing.seconds));
+		Row("Readbacks from submitted downloads",
+		    Fmt("%.0f/s", static_cast<double>(sync.TotalServed()) / timing.seconds));
 		for (const auto reason: Common::GpuTiming::BusiestReasons(sync, 6)) {
 			const auto i = static_cast<size_t>(reason);
 			Row((std::string("  ") + Common::GpuTiming::SyncReasonName(reason)).c_str(),

@@ -84,6 +84,7 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 		waits[i] += other.waits[i];
 		wait_ns[i] += other.wait_ns[i];
 		skipped[i] += other.skipped[i];
+		served[i] += other.served[i];
 	}
 }
 
@@ -94,6 +95,7 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 		delta.waits[i]   = waits[i] - earlier.waits[i];
 		delta.wait_ns[i] = wait_ns[i] - earlier.wait_ns[i];
 		delta.skipped[i] = skipped[i] - earlier.skipped[i];
+		delta.served[i]  = served[i] - earlier.served[i];
 	}
 	return delta;
 }
@@ -110,6 +112,10 @@ uint64_t SyncCounts::TotalSkipped() const noexcept {
 	return std::accumulate(skipped.begin(), skipped.end(), uint64_t {0});
 }
 
+uint64_t SyncCounts::TotalServed() const noexcept {
+	return std::accumulate(served.begin(), served.end(), uint64_t {0});
+}
+
 SyncCounters& Sync() noexcept {
 	static SyncCounters counters;
 	return counters;
@@ -122,6 +128,7 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 		counts.waits[i]   = m_waits[i].load(std::memory_order_relaxed);
 		counts.wait_ns[i] = m_wait_ns[i].load(std::memory_order_relaxed);
 		counts.skipped[i] = m_skipped[i].load(std::memory_order_relaxed);
+		counts.served[i]  = m_served[i].load(std::memory_order_relaxed);
 	}
 	return counts;
 }
@@ -263,9 +270,11 @@ namespace {
 
 std::string SyncSuffix(const Summary& summary) {
 	const double scale = summary.seconds > 0.0 ? 1.0 / summary.seconds : 0.0;
-	char         tail[64];
-	std::snprintf(tail, sizeof(tail), ", empty flushes skipped %.0f/s",
-	              static_cast<double>(summary.sync.TotalSkipped()) * scale);
+	char         tail[128];
+	std::snprintf(tail, sizeof(tail),
+	              ", empty flushes skipped %.0f/s, readbacks served by submitted downloads %.0f/s",
+	              static_cast<double>(summary.sync.TotalSkipped()) * scale,
+	              static_cast<double>(summary.sync.TotalServed()) * scale);
 	return ", sync submits/waits/wait-ms per s: " +
 	       FormatSyncCounts(summary.sync, summary.seconds) + tail;
 }
