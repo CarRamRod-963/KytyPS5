@@ -182,6 +182,15 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	file.Write(code.data(), code.size_bytes());
 }
 
+// The SPIR-V features of the host device every module of this run is emitted for.
+ShaderRecompiler::Spirv::Profile HostShaderProfile(const GraphicContext& graphics) {
+	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	return {.maintenance8           = graphics.maintenance8_enabled,
+	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .device_clock_period_ps = graphics.device_clock_period_ps};
+}
+
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
@@ -258,6 +267,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		uint64_t                                     spirv_hash = 0;
 	};
 
 	struct SourceEntry {
@@ -447,7 +457,25 @@ struct PipelineCache::ProgramCache {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)),
 		};
+	}
+
+	// Adds a compiled compute permutation to the title's manifest and returns its key. Shaders
+	// with calls read guest code at run time and are not recorded.
+	uint64_t RecordComputeProgram(const ShaderParams& params, const ShaderComputeInputInfo& input,
+	                              uint32_t push_data_cursor, const Permutation& permutation) {
+		ComputeProgramRecord record;
+		record.shader_hash = params.hash;
+		record.code =
+		    std::make_shared<const std::vector<uint32_t>>(params.code.begin(), params.code.end());
+		record.user_data_count  = params.user_data_count;
+		record.input            = ComputeProgramRecord::StaticInput(input);
+		record.push_data_cursor = push_data_cursor;
+		record.specialization   = permutation.specialization;
+		record.spirv_hash       = permutation.spirv_hash;
+		manifest->Add(record);
+		return record.Key();
 	}
 
 	template <typename InputInfo>
@@ -603,6 +631,13 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
 		    entry->second.FunctionCode()));
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (manifest != nullptr && !entry->second.call_source) {
+				auto& added = entry->second.permutations.back();
+				added.handle.record_key =
+				    RecordComputeProgram(params, input_info, push_data_cursor, added);
+			}
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -624,13 +659,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
-	    : graphics(graphics), image_heap(image_heap),
-	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
-	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
-	      profile {.maintenance8 = graphics.maintenance8_enabled,
-		           .native_float_min_max =
-		               graphics.physical_device_properties.vendorID == 0x1002u,
-		           .device_clock_period_ps = graphics.device_clock_period_ps} {
+	    : graphics(graphics), image_heap(image_heap), profile {HostShaderProfile(graphics)} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -648,7 +677,71 @@ struct PipelineCache::ProgramCache {
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;
 	uint64_t                                                    next_shader_id = 0;
+	// Receives every compiled compute permutation; null when there is no manifest.
+	ProgramManifest* manifest = nullptr;
 };
+
+PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
+                                           const ComputeProgramRecord& record,
+                                           uint64_t*                   spirv_hash) {
+	EXIT_IF(record.code == nullptr || record.code->empty());
+	// The inputs GetComputeProgram derives from the device.
+	auto input               = record.input;
+	input.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+	input.lds_storage = input.lds_size_dwords * 4u >
+	                    graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	// Translation reads the user-data count; the values only feed the resource walk.
+	const std::vector<uint32_t> user_data(record.user_data_count, 0u);
+
+	const auto                       profile = HostShaderProfile(graphics);
+	ShaderRecompiler::CompileOptions options;
+	options.stage              = ShaderType::Compute;
+	options.profile            = &profile;
+	options.shader_hash        = record.shader_hash;
+	options.user_data          = user_data;
+	options.dump_ir            = false;
+	options.early_dump         = false;
+	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+	options.dump_label         = "Precompile CS";
+	options.input_info.compute = &input;
+	options.wave_size          = input.wave_size;
+
+	auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
+	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+		return PrecompileOutcome::Skipped;
+	}
+	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	// A recompiler change may give the shader other resources than the record was made for.
+	if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, record.specialization)) {
+		return PrecompileOutcome::Skipped;
+	}
+	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+	                                               record.specialization, record.push_data_cursor);
+	if (!ValidateShaderSpirv(options.dump_label, record.shader_hash, result.spirv,
+	                         profile.maintenance8)) {
+		return PrecompileOutcome::Skipped;
+	}
+	if (spirv_hash != nullptr) {
+		*spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+	}
+	const auto module = CompileSPV(result.spirv, graphics.device);
+	if (module == nullptr) {
+		return PrecompileOutcome::Skipped;
+	}
+	const auto                             program = std::move(result.program).TakeCompiledInfo();
+	ShaderRecompiler::IR::ResourceSnapshot resources;
+	input.stage = {.program = &program, .resources = &resources};
+
+	PipelineCache::Pipeline pipeline;
+	bool                    from_driver_cache = false;
+	(void)CreatePipelineInternal(graphics, pipeline, input, module, driver_cache,
+	                             PipelineBuildMode::Precompile, &from_driver_cache);
+	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	graphics.device.destroyShaderModule(module, nullptr);
+	return from_driver_cache ? PrecompileOutcome::Cached : PrecompileOutcome::Compiled;
+}
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
@@ -693,6 +786,14 @@ PipelineCache::~PipelineCache() {
 }
 
 void PipelineCache::StopBackgroundCompiles() {
+	if (m_precompile_queue != nullptr) {
+		const auto remaining = m_precompile_queue->Remaining();
+		m_precompile_queue->Stop();
+		if (remaining != 0) {
+			LogPrecompileStats("stopped");
+		}
+		m_precompile_queue.reset();
+	}
 	if (m_compile_queue == nullptr) {
 		return;
 	}
@@ -719,6 +820,10 @@ void PipelineCache::DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::
 // a command buffer is being recorded: command buffers recorded so far may have bound the old
 // handle, so it is destroyed once the current command buffer has completed.
 void PipelineCache::InstallOptimizedPipelines() {
+	if (m_precompile_dirty.load(std::memory_order_relaxed) &&
+	    m_precompile_dirty.exchange(false, std::memory_order_relaxed)) {
+		CheckpointDriverCache();
+	}
 	if (m_pending_optimized.empty() || !m_scheduler->Active()) {
 		return;
 	}
@@ -838,10 +943,75 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+
+	SetManifest(std::make_unique<ProgramManifest>(m_driver_cache_path.parent_path() /
+	                                              (title_id + ".programs")));
+	const auto loaded = m_manifest->Loaded();
+	PipelineCacheLog("Program manifest: {} compute programs in {}{}", loaded.records,
+	                 Common::PathToString(m_manifest->Path()),
+	                 loaded.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
+	                                                loaded.dropped_bytes)
+	                                  : std::string {});
+}
+
+void PipelineCache::SetManifest(std::unique_ptr<ProgramManifest> manifest) {
+	m_manifest                = std::move(manifest);
+	m_program_cache->manifest = m_manifest.get();
+}
+
+void PipelineCache::QueuePrecompile(uint32_t thread_count) {
+	EXIT_IF(thread_count == 0);
+	if (m_precompile_queue == nullptr) {
+		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(thread_count);
+	}
+	const auto records = m_manifest->Records();
+	for (const auto& record: records) {
+		(void)m_precompile_queue->Enqueue(record->Key(), [this, record, total = records.size()] {
+			const auto start   = std::chrono::steady_clock::now();
+			const auto outcome = PrecompileComputeProgram(m_graphics, m_driver_cache, *record);
+			const auto ms      = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                         std::chrono::steady_clock::now() - start)
+			                         .count();
+			auto&      stats   = m_precompile_stats;
+			switch (outcome) {
+				case PrecompileOutcome::Cached: stats.cached++; break;
+				case PrecompileOutcome::Compiled:
+					stats.compiled++;
+					stats.compile_ms += static_cast<uint64_t>(ms);
+					m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+					m_precompile_dirty.store(true, std::memory_order_relaxed);
+					break;
+				case PrecompileOutcome::Skipped: stats.skipped++; break;
+			}
+			if (++stats.finished == total) {
+				LogPrecompileStats("done");
+			}
+		});
+	}
+	PipelineCacheLog("Precompile: {} recorded compute programs queued on {} threads",
+	                 m_precompile_queue->Queued(), thread_count);
+}
+
+void PipelineCache::LogPrecompileStats(const char* when) {
+	const auto& stats = m_precompile_stats;
+	PipelineCacheLog(
+	    "Precompile {}: {} pipelines already in the driver cache, {} compiled ({} s of "
+	    "driver time), {} skipped",
+	    when, stats.cached.load(), stats.compiled.load(), stats.compile_ms.load() / 1000u,
+	    stats.skipped.load());
+}
+
+void PipelineCache::StartPrecompile(uint32_t thread_count) {
+	if (m_manifest == nullptr || m_driver_cache == nullptr) {
+		PipelineCacheLog("Precompile: no driver pipeline cache for this title; nothing to build");
+		return;
+	}
+	QueuePrecompile(thread_count);
 }
 
 void PipelineCache::CheckpointDriverCache() {
-	if (m_driver_cache == nullptr) {
+	// A driver cache without a file (tests) is not persisted.
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {
 		return;
 	}
 	m_driver_cache_dirty.store(true, std::memory_order_relaxed);
@@ -861,8 +1031,13 @@ void PipelineCache::CheckpointDriverCache() {
 }
 
 void PipelineCache::Save() {
+	if (m_compute_from_cache + m_compute_compiled != 0) {
+		PipelineCacheLog("Compute pipelines this session: {} from the driver cache, {} compiled",
+		                 m_compute_from_cache, m_compute_compiled);
+	}
 	m_driver_cache_writer.Wait();
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty.exchange(false)) {
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||
+	    !m_driver_cache_dirty.exchange(false)) {
 		return;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
@@ -1377,14 +1552,25 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<Pipeline>();
-	auto job = [&] {
+	// A recorded program whose precompile has not finished: build it here, or wait for the
+	// worker building it, rather than compiling it twice; the build below then hits the driver
+	// cache.
+	if (m_precompile_queue != nullptr && compute_program.record_key != 0) {
+		m_precompile_queue->Expedite(compute_program.record_key);
+	}
+	auto cached            = std::make_unique<Pipeline>();
+	bool from_driver_cache = false;
+	auto job               = [&] {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                              m_driver_cache, m_defer_optimization);
+		                              m_driver_cache,
+		                              m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
+		                                                   : PipelineBuildMode::Optimized,
+		                              &from_driver_cache);
 	}();
+	(from_driver_cache ? m_compute_from_cache : m_compute_compiled)++;
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

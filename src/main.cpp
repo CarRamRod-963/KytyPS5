@@ -100,6 +100,10 @@ static void PrintUsage() {
 	    "  --skip-pending-draws                 Skip draws that only change the picture while\n"
 	    "                                       their pipelines build in the background (at most\n"
 	    "                                       2 s per pipeline).\n");
+	::printf(
+	    "  --precompile-pipelines               Build the compute pipelines recorded in earlier\n"
+	    "                                       sessions into the driver cache on background\n"
+	    "                                       threads while the game runs.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -221,6 +225,7 @@ static constexpr Flag FLAGS[] = {
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
+    {"--precompile-pipelines", &ConfigOptions::precompile_pipelines},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
