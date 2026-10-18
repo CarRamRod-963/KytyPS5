@@ -43,6 +43,10 @@ target_link_libraries(common
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
 )
+if(WIN32)
+	# hostStats.cpp reads per-process GPU engine utilization from the performance counters.
+	target_link_libraries(common PRIVATE pdh)
+endif()
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
 	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")
