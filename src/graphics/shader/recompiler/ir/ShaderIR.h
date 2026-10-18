@@ -28,6 +28,8 @@ class CodeGenerator;
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+struct MaterializationScratch;
+
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
@@ -746,6 +748,9 @@ struct ResourcePlan {
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// GPU-thread scratch of MaterializeResources (ResourceMaterialization.cpp), kept across
+	// refreshes so a warm refresh allocates nothing.
+	mutable std::shared_ptr<MaterializationScratch> materialization_scratch;
 };
 
 struct Program: ResourcePlan {
