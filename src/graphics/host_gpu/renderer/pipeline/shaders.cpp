@@ -342,33 +342,44 @@ static vk::Result BuildPipeline(vk::Device device, vk::PipelineCache cache, Inpu
 }
 
 // Creates pipeline.pipeline from `inputs` (see PipelineBuildMode). Unless the build is
-// Optimized, a pipeline the driver cache cannot provide is not optimized on the calling thread:
-// UnoptimizedFirst creates it without optimization, which some drivers do orders of magnitude
-// faster, Background leaves pipeline.pipeline null, and the returned job builds the optimized
-// pipeline through the driver cache. Unoptimized pipelines stay out of the driver cache: it is
-// persisted, and the optimized build supersedes them.
+// Optimized or Precompile, a pipeline the driver cache cannot provide is not optimized on the
+// calling thread: UnoptimizedFirst creates it without optimization, which some drivers do orders
+// of magnitude faster, Background leaves pipeline.pipeline null, and the returned job builds the
+// optimized pipeline through the driver cache. Unoptimized pipelines stay out of the driver
+// cache: it is persisted, and the optimized build supersedes them. `from_driver_cache` tells
+// whether the driver cache provided the pipeline.
 template <typename Inputs>
 static PipelineCompileQueue::Job
 CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                      std::unique_ptr<Inputs> inputs, vk::PipelineCache driver_cache,
-                     PipelineBuildMode mode) {
+                     PipelineBuildMode mode, bool* from_driver_cache = nullptr) {
 	EXIT_IF(pipeline.pipeline != nullptr);
 	const auto device = graphics.device;
 	vk::Result result = vk::Result::eSuccess;
-	if (mode != PipelineBuildMode::Optimized && driver_cache != nullptr &&
-	    graphics.pipeline_creation_cache_control_enabled) {
+	if (from_driver_cache != nullptr) {
+		*from_driver_cache = false;
+	}
+	// Probed in every mode: a hit is the whole build, and the outcome is reported.
+	if (driver_cache != nullptr && graphics.pipeline_creation_cache_control_enabled) {
 		result = BuildPipeline(device, driver_cache, *inputs,
 		                       vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
-		                       "optimized-cached", pipeline.pipeline);
+		                       mode == PipelineBuildMode::Precompile ? "precompile-cached"
+		                                                             : "optimized-cached",
+		                       pipeline.pipeline);
 		if (result == vk::Result::eSuccess) {
 			EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+			if (from_driver_cache != nullptr) {
+				*from_driver_cache = true;
+			}
 			return {};
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::ePipelineCompileRequired);
 		pipeline.pipeline = nullptr;
 	}
-	if (mode == PipelineBuildMode::Optimized) {
-		result = BuildPipeline(device, driver_cache, *inputs, {}, "optimized", pipeline.pipeline);
+	if (mode == PipelineBuildMode::Optimized || mode == PipelineBuildMode::Precompile) {
+		result = BuildPipeline(device, driver_cache, *inputs, {},
+		                       mode == PipelineBuildMode::Precompile ? "precompile" : "optimized",
+		                       pipeline.pipeline);
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
 		return {};
 	}
@@ -726,10 +737,12 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-PipelineCompileQueue::Job
-CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                       const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
-                       vk::PipelineCache driver_cache, bool defer_optimization) {
+PipelineCompileQueue::Job CreatePipelineInternal(GraphicContext&               graphics,
+                                                 PipelineCache::Pipeline&      pipeline,
+                                                 const ShaderComputeInputInfo& input_info,
+                                                 vk::ShaderModule              compute_module,
+                                                 vk::PipelineCache             driver_cache,
+                                                 PipelineBuildMode mode, bool* from_driver_cache) {
 	EXIT_IF(compute_module == nullptr);
 
 	auto  inputs                  = std::make_unique<ComputePipelineInputs>();
@@ -764,12 +777,18 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=%u push_constants=%u\n",
-	     pipeline_layout_info.setLayoutCount, 1u);
+	// Precompile builds run on worker threads; only their outcome is traced.
+	const bool trace = mode != PipelineBuildMode::Precompile;
+	if (trace) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=%u push_constants=%u\n",
+		     pipeline_layout_info.setLayoutCount, 1u);
+	}
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	if (trace) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
@@ -780,11 +799,12 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	inputs->info.layout            = pipeline.pipeline_layout;
 	inputs->info.basePipelineIndex = -1;
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
-	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache,
-	                            defer_optimization ? PipelineBuildMode::UnoptimizedFirst
-	                                               : PipelineBuildMode::Optimized);
+	if (trace) {
+		LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
+		     static_cast<void*>(pipeline.pipeline_layout));
+	}
+	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
+	                            from_driver_cache);
 }
 
 } // namespace Libs::Graphics

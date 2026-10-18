@@ -91,6 +91,11 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);
 // The sampled resource that root resolves entries of kind as; kind 0 gives the identity of
 // root's view of a heap.
 ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
+// Whether ApplyResourceSpecialization accepts `specialization` for a translated program: its
+// resource counts and indirect roots fit the program's resources. A specialization recorded for
+// another recompiler version may not.
+bool SpecializationApplies(const Program& program, const ResourceSpecialization& specialization);
+
 // Writes the V# stride of every buffer binding with a runtime stride into the shader data.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
                        const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);

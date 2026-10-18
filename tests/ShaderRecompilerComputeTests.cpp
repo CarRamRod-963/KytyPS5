@@ -82,6 +82,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -621,6 +622,32 @@ struct PipelineCacheTestAccess {
 
   static size_t PendingBuilds(const PipelineCache &cache) {
     return cache.m_pending_builds.size();
+  }
+
+  // Gives a cache without a title the manifest and driver cache a title would
+  // have; the cache owns the driver cache afterwards.
+  static void AttachPersistence(PipelineCache &cache,
+                                std::unique_ptr<ProgramManifest> manifest,
+                                vk::PipelineCache driver_cache) {
+    cache.SetManifest(std::move(manifest));
+    cache.m_driver_cache = driver_cache;
+  }
+
+  static uint64_t ComputeFromDriverCache(const PipelineCache &cache) {
+    return cache.m_compute_from_cache;
+  }
+
+  // Queues the manifest's programs behind `blocker` on a single precompile
+  // thread.
+  static void QueuePrecompileBehind(PipelineCache &cache,
+                                    ProgramPrecompileQueue::Job blocker) {
+    cache.m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(1);
+    (void)cache.m_precompile_queue->Enqueue(0, std::move(blocker));
+    cache.QueuePrecompile(1);
+  }
+
+  static uint64_t PrecompilesFinished(const PipelineCache &cache) {
+    return cache.m_precompile_stats.finished.load();
   }
 };
 
@@ -22536,6 +22563,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_pipeline_cache_control = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -22572,6 +22600,8 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.conditional_rendering_enabled = true;
+    m_runtime_context.pipeline_creation_cache_control_enabled =
+        m_pipeline_cache_control;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -22827,6 +22857,11 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    // Driver-cache probes
+    // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
+    m_pipeline_cache_control =
+        available_features13.pipelineCreationCacheControl == true;
+    device_features13.pipelineCreationCacheControl = m_pipeline_cache_control;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -47784,6 +47819,175 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// A compute program the pipeline cache records is rebuilt from the record alone
+// (same SPIR-V), fills a driver cache that the pipeline cache then hits on
+// first use, and a precompile that has not finished is expedited by the
+// pipeline lookup instead of compiling twice.
+void CheckComputePrecompile(VulkanHarness &vulkan) {
+  constexpr const char *name = "ComputePrecompile";
+  // A typed buffer store through the V# in s[0:3] (the Ps5GameExampleImageClear
+  // shape).
+  std::vector<u32> code;
+  AppendVop3(&code, 0x346u, 4, 8, InlineU32(6), Vgpr(0));
+  for (u32 i = 0; i < 4; i++) {
+    code.push_back(EncodeVop1(0x01u, i, i + 4u));
+  }
+  code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+  code.push_back(EncodeMubuf1(0, 0, 4));
+  AppendEnd(&code);
+  ShaderMapUserData(
+      reinterpret_cast<uint64_t>(code.data()),
+      {.type = Prospero::ShaderBinaryType::kCs,
+       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = 64;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 64;
+  regs.cs_regs.tgid_x_en = 1;
+  regs.cs_regs.user_sgpr = 8;
+  regs.cs_user_sgpr.value[0] = 0x00010000u;
+  regs.cs_user_sgpr.value[1] = 16u << 16u;
+  regs.cs_user_sgpr.value[2] = 64;
+  regs.cs_user_sgpr.value[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt) << 12u) |
+      4u | (5u << 3u) | (6u << 6u) | (7u << 9u);
+
+  auto &graphics = vulkan.RuntimeContext();
+  const bool probes = graphics.pipeline_creation_cache_control_enabled;
+  const auto new_driver_cache = [&] {
+    vk::PipelineCacheCreateInfo create{};
+    vk::PipelineCache cache = nullptr;
+    RequireVk(name, "driver cache",
+              graphics.device.createPipelineCache(&create, nullptr, &cache),
+              "vkCreatePipelineCache");
+    return cache;
+  };
+
+  // Record the program through the pipeline cache.
+  std::shared_ptr<const ComputeProgramRecord> record;
+  ShaderProgram recorded;
+  {
+    PipelineCache cache(graphics, nullptr);
+    auto manifest = std::make_unique<ProgramManifest>();
+    auto *manifest_view = manifest.get();
+    PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
+                                               nullptr);
+    ShaderComputeInputInfo input{};
+    input.workgroup_counts[0] = 3;
+    recorded = cache.GetComputeProgram(regs, {}, input);
+    Require(name, "program", static_cast<bool>(recorded),
+            "the program was not compiled");
+    Require(name, "recorded", manifest_view->Size() == 1,
+            "a compiled compute permutation was not recorded");
+    record = manifest_view->Records().front();
+    Require(name, "record key",
+            recorded.record_key == record->Key() && record->Key() != 0,
+            "the program does not carry its record key");
+    Require(name, "record contents",
+            record->shader_hash != 0 && *record->code == code &&
+                record->user_data_count == 8 &&
+                record->input.workgroup_counts[0] == 0 &&
+                !record->specialization.buffers.empty() &&
+                record->spirv_hash != 0,
+            "the record lost the code, the static input or the specialization");
+    ShaderComputeInputInfo again{};
+    again.workgroup_counts[0] = 7;
+    (void)cache.GetComputeProgram(regs, {}, again);
+    Require(name, "dedupe", manifest_view->Size() == 1,
+            "a program found in the cache was recorded again");
+  }
+
+  // Rebuilding from the record gives the same module and fills the driver
+  // cache.
+  auto driver_cache = new_driver_cache();
+  uint64_t spirv_hash = 0;
+  const auto first =
+      PrecompileComputeProgram(graphics, driver_cache, *record, &spirv_hash);
+  Require(name, "replayed module", spirv_hash == record->spirv_hash,
+          "the record translated to a module other than the recorded one");
+  // The driver may also keep pipelines in its own cache across processes
+  // (NVIDIA does), so a fresh VkPipelineCache can already report the pipeline
+  // as cached.
+  Require(name, "first precompile", first != PrecompileOutcome::Skipped,
+          "a record of a compiled program was skipped");
+  if (probes) {
+    Require(name, "second precompile",
+            PrecompileComputeProgram(graphics, driver_cache, *record) ==
+                PrecompileOutcome::Cached,
+            "the driver cache does not hold the precompiled pipeline");
+  }
+
+  // A specialization the shader no longer has is skipped, not applied.
+  auto stale = *record;
+  stale.specialization.buffers.clear();
+  Require(name, "stale record",
+          PrecompileComputeProgram(graphics, driver_cache, stale) ==
+              PrecompileOutcome::Skipped,
+          "a record whose specialization does not fit the shader was built");
+
+  // The pipeline cache finds the precompiled pipeline on first use.
+  {
+    PipelineCache cache(graphics, nullptr);
+    PipelineCacheTestAccess::AttachPersistence(
+        cache, std::make_unique<ProgramManifest>(), driver_cache);
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(regs, {}, input);
+    Require(name, "live pipeline",
+            cache.GetComputePipeline(input, program).pipeline != nullptr,
+            "no pipeline for the precompiled program");
+    if (probes) {
+      Require(
+          name, "driver cache hit",
+          PipelineCacheTestAccess::ComputeFromDriverCache(cache) == 1,
+          "the first use of a precompiled program compiled its pipeline again");
+    }
+  }
+
+  // A queued precompile is expedited by the first use of its program.
+  {
+    PipelineCache cache(graphics, nullptr);
+    auto manifest = std::make_unique<ProgramManifest>();
+    (void)manifest->Add(*record);
+    PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
+                                               new_driver_cache());
+    // The only precompile thread is held, so the program's job is still queued
+    // at its first use.
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool gate_open = false;
+    PipelineCacheTestAccess::QueuePrecompileBehind(cache, [&] {
+      std::unique_lock lock(gate_mutex);
+      gate_cv.wait(lock, [&] { return gate_open; });
+    });
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(regs, {}, input);
+    Require(name, "expedited key", program.record_key == record->Key(),
+            "the live program and the record disagree on the key");
+    Require(name, "expedited pipeline",
+            cache.GetComputePipeline(input, program).pipeline != nullptr,
+            "no pipeline after expediting its precompile");
+    Require(
+        name, "expedited precompile",
+        PipelineCacheTestAccess::PrecompilesFinished(cache) == 1,
+        "the pipeline lookup did not run the queued precompile of its program");
+    if (probes) {
+      Require(
+          name, "expedited hit",
+          PipelineCacheTestAccess::ComputeFromDriverCache(cache) == 1,
+          "the pipeline lookup compiled a pipeline its precompile had built");
+    }
+    {
+      std::lock_guard lock(gate_mutex);
+      gate_open = true;
+    }
+    gate_cv.notify_all();
+  }
+  std::printf("[gpu]     %-32s ok%s\n", name,
+              probes ? "" : " (no driver-cache probes)");
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -53439,6 +53643,11 @@ int main(int argc, char **argv) {
     CheckComputeThreadDimensions(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--program-precompile-only") == 0) {
+    VulkanHarness vulkan;
+    CheckComputePrecompile(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -54663,6 +54872,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
+  CheckComputePrecompile(vulkan);
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
