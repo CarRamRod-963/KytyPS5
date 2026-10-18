@@ -1,12 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -21,6 +23,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	if (graphics.ray_query_enabled) {
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
+	}
+	// After the bindless table: precompiled layouts reference its set layout.
+	if (Config::PrecompilePipelinesEnabled()) {
+		// Like the background pipeline builds: driver compilers are multithreaded themselves,
+		// and the guest needs the CPU.
+		m_pipeline_cache.StartPrecompile(
+		    std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 2u));
 	}
 }
 
