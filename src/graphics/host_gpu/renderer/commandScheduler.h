@@ -25,6 +25,8 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
+	// Submits the current command buffer and begins the next one. A buffer that holds no
+	// commands (barriers at most) and no operation waits for is kept open instead.
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
@@ -41,6 +43,12 @@ public:
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// For an operation that depends only on GPU work recorded before this call, such as an
+	// end-of-pipe label: while the current command buffer holds no commands it completes with
+	// the previous submission, so it needs no submission of its own.
+	void DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation);
+	// The tick the running priority operation waited for; 0 outside one.
+	[[nodiscard]] uint64_t    ActivePriorityTick();
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
@@ -86,7 +94,8 @@ private:
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                    bool after_recorded = false);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
 
@@ -104,6 +113,8 @@ private:
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	uint64_t                     m_last_priority_tick   = 0; // Priority ticks never decrease.
+	uint64_t                     m_last_queued_tick     = 0; // Highest tick an operation waits for.
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

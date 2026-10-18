@@ -25,6 +25,12 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	m_has_commands = true;
+	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::BarrierHandle() const {
+	EXIT_IF(IsInvalid());
 	return m_buffer;
 }
 
@@ -38,6 +44,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_has_commands = false;
 }
 
 void CommandBuffer::End() const {
