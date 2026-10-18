@@ -9938,7 +9938,9 @@ public:
               "GC discarded the current depth plane of a depth/stencil "
               "image");
 
-      constexpr size_t gc_depth_pair_count = 6;
+      // Stencil associations go with their depth image and do not count
+      // against the ten-deletion budget, so ten of twelve pairs are freed.
+      constexpr size_t gc_depth_pair_count = 12;
       constexpr uint64_t gc_depth_pair_offset = 0x350000;
       constexpr uint64_t gc_depth_pair_stride = 0x1000;
       std::array<ImageId, gc_depth_pair_count> gc_depth_images{};
@@ -9978,7 +9980,7 @@ public:
       texture_cache.RunGarbageCollector();
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
-        const bool expected_live = index == gc_depth_pair_count - 1;
+        const bool expected_live = index >= 10;
         gc_depth_budget &=
             TextureCacheTestAccess::Contains(
                 texture_cache, gc_depth_images[index]) == expected_live &&
@@ -9987,7 +9989,7 @@ public:
       }
       Require(name, "depth/stencil GC traversal budget", gc_depth_budget,
               "recursive association deletion stopped LRU traversal or "
-              "exceeded the ten-entry deletion budget");
+              "the ten-deletion budget was not spent on depth images");
 
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;
