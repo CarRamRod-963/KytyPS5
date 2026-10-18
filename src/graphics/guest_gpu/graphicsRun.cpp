@@ -1026,29 +1026,31 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	// An end-of-pipe label means every command before it finished. Writing it when the
 	// submission completes makes the guest's wait cover the GPU, so the results it reads next
 	// are already published instead of faulting into a synchronous readback of unsubmitted
-	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
-	// With nothing recorded since the last submission the label rides on that submission, and
-	// the flush below has nothing to submit.
-	auto&      gpu       = m_renderer.GetGpu();
+	// work. With nothing recorded since the last submission the label rides on that submission,
+	// and the flush has nothing to submit.
 	auto&      scheduler = GetScheduler();
 	const auto issued_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                           std::chrono::steady_clock::now().time_since_epoch())
 	                           .count();
+	{
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
+		scheduler.Flush();
+	}
+	// Queued after the flush: the submission queued the publication of its asynchronous
+	// downloads, which then runs before the label on the completion thread.
 	scheduler.DeferPriorityOperationAfterRecorded(
-	    [&renderer = m_renderer, &gpu, &scheduler, dst, value, with_interrupt, issued_ns,
+	    [&renderer = m_renderer, &scheduler, dst, value, with_interrupt, issued_ns,
 	     event_id  = m_interrupt_event_id, interrupt_context_id] {
 		    const auto tick = scheduler.ActivePriorityTick();
-		    gpu.SendCommand([&renderer, &scheduler, tick, issued_ns, dst, value, with_interrupt,
-		                     event_id, interrupt_context_id] {
-			    std::memcpy(dst, &value, sizeof(T));
-			    scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
-			    if (with_interrupt) {
-				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-			    }
-		    });
+		    renderer.DeliverLabel(dst, static_cast<uint64_t>(value), sizeof(T),
+		                          [&renderer, &scheduler, tick, issued_ns, with_interrupt, event_id,
+		                           interrupt_context_id] {
+			                          scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
+			                          if (with_interrupt) {
+				                          renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			                          }
+		                          });
 	    });
-	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
-	GetScheduler().Flush();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
