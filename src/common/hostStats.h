@@ -54,7 +54,8 @@ struct HostStats {
 	std::optional<double> disk_read_per_s;
 	std::optional<double> disk_write_per_s;
 
-	// GPU, whole device (macOS IOAccelerator).
+	// GPU: whole device on macOS (IOAccelerator); on Windows gpu_percent is this process's
+	// busiest GPU engine (the "GPU Engine" performance counters, as in Task Manager).
 	std::string             gpu_model;
 	std::optional<uint32_t> gpu_cores;
 	std::optional<double>   gpu_percent;
