@@ -250,6 +250,86 @@ void TestSyncReasons() {
         "merged sync counts");
 }
 
+void TestSpansAndStalls() {
+  using Common::GpuTiming::StallKind;
+  using Common::GpuTiming::SyncCounters;
+  using Common::GpuTiming::SyncReason;
+  Check(Common::GpuTiming::SizeClassOf(0) == 0 &&
+            Common::GpuTiming::SizeClassOf(1) == 0 &&
+            Common::GpuTiming::SizeClassOf(2) == 1 &&
+            Common::GpuTiming::SizeClassOf(15) == 1 &&
+            Common::GpuTiming::SizeClassOf(16) == 2 &&
+            Common::GpuTiming::SizeClassOf(128) == 3,
+        "size classes");
+
+  Accumulator accumulator;
+  accumulator.SetCalibrated(true);
+  // Submitted at 0, starts at 1 ms: 1 ms launch gap (the GPU was idle).
+  auto first = Make(0, 1 * MS, 3 * MS);
+  first.reason = SyncReason::Label;
+  first.commands = 20;
+  accumulator.AddSubmission(first);
+  // Submitted while the first ran, starts 0.5 ms after it ended.
+  auto second = Make(2 * MS, 3 * MS + 500 * US, 4 * MS);
+  second.reason = SyncReason::WalkRead;
+  second.commands = 1;
+  accumulator.AddSubmission(second);
+  // Overlaps the second: starts before it ended, no gap.
+  auto third = Make(3 * MS, 3 * MS + 800 * US, 5 * MS);
+  third.reason = SyncReason::Label;
+  third.commands = 200;
+  accumulator.AddSubmission(third);
+  const auto window = accumulator.Take(1.0);
+  Check(window.launch_gap_ns == static_cast<uint64_t>(1500 * US),
+        "launch gaps");
+  Check(window.span_ns_by_reason[static_cast<size_t>(SyncReason::Label)] ==
+            static_cast<uint64_t>(3200 * US),
+        "label spans");
+  Check(window.span_ns_by_reason[static_cast<size_t>(SyncReason::WalkRead)] ==
+            static_cast<uint64_t>(500 * US),
+        "walk-read spans");
+  Check(window.submits_by_size[0] == 1 && window.submits_by_size[2] == 1 &&
+            window.submits_by_size[3] == 1 &&
+            window.span_ns_by_size[3] == static_cast<uint64_t>(1200 * US),
+        "spans by size class");
+  const auto line = Common::GpuTiming::FormatSummary(window);
+  Check(line.find("GPU span ms/s by submit reason:") != std::string::npos &&
+            line.find("launch gaps 1.5 ms/s") != std::string::npos,
+        "summary line carries spans and gaps");
+
+  SyncCounters counters;
+  const auto before = counters.Snapshot();
+  counters.AddGpuThreadStarved(3 * MS);
+  counters.AddGpuThreadBlocked(1 * MS, true);
+  counters.AddGpuThreadBlocked(2 * MS, false);
+  counters.AddStall(StallKind::WaitRegMem);
+  counters.AddStall(StallKind::WaitRegMem);
+  counters.AddStall(StallKind::Predication);
+  const auto delta = counters.Snapshot().Since(before);
+  Check(delta.gpu_thread_starved == 1 &&
+            delta.gpu_thread_starved_ns == static_cast<uint64_t>(3 * MS) &&
+            delta.gpu_thread_blocked == 2 && delta.gpu_thread_timeouts == 1 &&
+            delta.gpu_thread_blocked_ns == static_cast<uint64_t>(3 * MS),
+        "GPU thread idle counts");
+  Check(delta.stalls[static_cast<size_t>(StallKind::WaitRegMem)] == 2 &&
+            delta.stalls[static_cast<size_t>(StallKind::Predication)] == 1,
+        "stall counts");
+  Summary summary;
+  summary.seconds = 1.0;
+  summary.sync = delta;
+  Check(Common::GpuTiming::FormatSummary(summary).find(
+            "GPU thread starved 3 ms/s (1/s), blocked 3 ms/s (2/s, 1 "
+            "timeouts/s), stalls per s: wait-reg-mem 2, ce 0, de-diff 0, "
+            "rewind 0, predication 1") != std::string::npos,
+        "summary line carries the GPU thread idle time");
+  Summary merged;
+  merged.Merge(summary);
+  merged.Merge(window);
+  Check(merged.sync.gpu_thread_blocked == 2 &&
+            merged.launch_gap_ns == static_cast<uint64_t>(1500 * US),
+        "merged idle counts and gaps");
+}
+
 } // namespace
 
 int main() {
@@ -259,6 +339,7 @@ int main() {
   TestLatencies();
   TestPublish();
   TestSyncReasons();
+  TestSpansAndStalls();
   std::printf("GpuTimingTests: all passed\n");
   return 0;
 }
