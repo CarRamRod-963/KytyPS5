@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -41,12 +42,38 @@ void PipelineCompileQueue::TakeCompleted(std::vector<Completion>& out) {
 
 size_t PipelineCompileQueue::Outstanding() {
 	std::lock_guard lock(m_mutex);
-	return m_jobs.size() + m_running + m_completed.size();
+	return m_jobs.size() + m_running_tickets.size() + m_completed.size();
 }
 
 void PipelineCompileQueue::WaitIdle() {
 	std::unique_lock lock(m_mutex);
-	m_job_finished.wait(lock, [this] { return m_jobs.empty() && m_running == 0; });
+	m_job_finished.wait(lock, [this] { return m_jobs.empty() && m_running_tickets.empty(); });
+}
+
+void PipelineCompileQueue::Expedite(uint64_t ticket) {
+	std::unique_lock lock(m_mutex);
+	const auto       queued = std::ranges::find(m_jobs, ticket, &Entry::ticket);
+	if (queued == m_jobs.end()) {
+		m_job_finished.wait(lock, [&] {
+			return std::ranges::find(m_running_tickets, ticket) == m_running_tickets.end();
+		});
+		return;
+	}
+	auto job = std::move(queued->job);
+	m_jobs.erase(queued);
+	m_running_tickets.push_back(ticket);
+	lock.unlock();
+	const auto handle = job();
+	job               = Job {};
+	lock.lock();
+	Finish(ticket, handle);
+	lock.unlock();
+	m_job_finished.notify_all();
+}
+
+void PipelineCompileQueue::Finish(uint64_t ticket, uint64_t handle) {
+	m_completed.push_back({ticket, handle});
+	std::erase(m_running_tickets, ticket);
 }
 
 void PipelineCompileQueue::Stop() {
@@ -88,14 +115,13 @@ void PipelineCompileQueue::Worker() {
 			}
 			entry = std::move(m_jobs.front());
 			m_jobs.pop_front();
-			m_running++;
+			m_running_tickets.push_back(entry.ticket);
 		}
 		const auto handle = entry.job();
 		entry.job         = Job {};
 		{
 			std::lock_guard lock(m_mutex);
-			m_completed.push_back({entry.ticket, handle});
-			m_running--;
+			Finish(entry.ticket, handle);
 		}
 		m_job_finished.notify_all();
 	}
