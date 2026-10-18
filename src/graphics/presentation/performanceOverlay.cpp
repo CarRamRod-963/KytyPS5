@@ -343,6 +343,8 @@ void GpuTimingRows(const Snapshot& shown, bool details) {
 		const auto& sync = timing.sync;
 		Row("Blocking GPU waits",
 		    Fmt("%.0f/s", static_cast<double>(sync.TotalWaits()) / timing.seconds));
+		Row("Empty flushes skipped",
+		    Fmt("%.0f/s", static_cast<double>(sync.TotalSkipped()) / timing.seconds));
 		for (const auto reason: Common::GpuTiming::BusiestReasons(sync, 6)) {
 			const auto i = static_cast<size_t>(reason);
 			Row((std::string("  ") + Common::GpuTiming::SyncReasonName(reason)).c_str(),
