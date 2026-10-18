@@ -22,7 +22,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// After the bindless table: precompiled layouts reference its set layout.
-	if (Config::PrecompilePipelinesEnabled()) {
+	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
 		// Like the background pipeline builds: driver compilers are multithreaded themselves,
 		// and the guest needs the CPU.
 		m_pipeline_cache.StartPrecompile(

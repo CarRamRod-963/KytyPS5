@@ -91,6 +91,7 @@ struct ConfigOptions {
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
 	bool                   precompile_pipelines            = false;
+	bool                   precompile_only                 = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
@@ -162,6 +163,7 @@ bool SyncRawImageBuffersEnabled();
 bool AsyncPipelinesEnabled();
 bool     SkipPendingDrawsEnabled();
 bool     PrecompilePipelinesEnabled();
+bool     PrecompileOnlyEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool TrophyEnabled();
