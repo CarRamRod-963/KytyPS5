@@ -29,7 +29,8 @@ public:
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
 	void Refresh();
-	// Returns true when the caller had to block until the GPU reached `tick`.
+	// Returns true when the caller had to block until the GPU reached `tick`. A blocking wait is
+	// counted under the calling thread's Common::GpuTiming::SyncReason.
 	bool Wait(uint64_t tick);
 
 private:
