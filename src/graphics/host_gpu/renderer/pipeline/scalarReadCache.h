@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -22,18 +23,36 @@ namespace Libs::Graphics {
 // recorded after a chunk was filled drops every chunk, and a readback drops every marked chunk.
 // Clean memory costs one dirty-range query per chunk.
 //
+// Every readback waits for the GPU work recorded before it. The ranges a walk read back are
+// handed to the next walk of the same program (Prefetch), whose first readback reads back their
+// GPU-dirty bytes in the same round trip: a walk that reads several GPU-written tables waits
+// once, not once per table, as long as it reads the tables the previous walk read.
+//
 // The backend provides, on the thread that evaluates:
 //   bool     Read(uint64_t address, void* data, uint64_t size);  // backing; false if unmapped
 //   bool     HasGpuDirtyBytes(uint64_t address, uint64_t size);
-//   void     ReadGpuDirtyBytes(uint64_t address, uint64_t size); // readback into the backing
+//   void     ReadGpuDirtyBytes(std::span<const ScalarReadRange> ranges); // one readback of all
 //   uint64_t GpuWriteSequence();                                  // advances per recorded write
+using ScalarReadRange = std::pair<uint64_t, uint64_t>; // address, size
+
 template <typename Backend>
 class ScalarReadCache {
 public:
-	static constexpr uint64_t ChunkBytes = 128;
-	static constexpr size_t   Entries    = 32;
+	static constexpr uint64_t ChunkBytes   = 128;
+	static constexpr size_t   Entries      = 32;
+	static constexpr size_t   MaxReadBacks = 16;
 
 	explicit ScalarReadCache(Backend& backend): m_backend(backend) {}
+
+	// Ranges whose GPU-dirty bytes the first readback of this walk also reads back. The span
+	// must stay valid until that readback or the end of the walk; at most MaxReadBacks are used.
+	void Prefetch(std::span<const ScalarReadRange> ranges) {
+		m_prefetch = ranges.first(std::min(ranges.size(), MaxReadBacks));
+	}
+	// The ranges this walk read back (the first MaxReadBacks), for the next walk's Prefetch.
+	[[nodiscard]] std::span<const ScalarReadRange> ReadBacks() const {
+		return std::span(m_read_backs).first(m_read_back_count);
+	}
 
 	// Unmapped guest memory reads as zeros: the walk evaluates loads the shader may never
 	// execute, e.g. through a null SRT pointer.
@@ -87,7 +106,16 @@ private:
 	// clean without a readback of their own: a chunk filled while it held GPU-dirty bytes may
 	// hold their old values under a clean mark now, so every such chunk is dropped.
 	void ReadBack(uint64_t address, uint64_t size) {
-		m_backend.ReadGpuDirtyBytes(address, size);
+		std::array<ScalarReadRange, MaxReadBacks + 1> batch {{{address, size}}};
+		size_t                                        count = 1;
+		for (const auto& range: m_prefetch) {
+			batch[count++] = range;
+		}
+		m_prefetch = {};
+		m_backend.ReadGpuDirtyBytes(std::span<const ScalarReadRange>(batch.data(), count));
+		if (m_read_back_count < MaxReadBacks) {
+			m_read_backs[m_read_back_count++] = {address, size};
+		}
 		for (auto& entry: m_entries) {
 			if (entry.dirty) {
 				entry.base  = UINT64_MAX;
@@ -96,9 +124,12 @@ private:
 		}
 	}
 
-	Backend&                   m_backend;
-	uint64_t                   m_sequence = 0;
-	std::array<Entry, Entries> m_entries;
+	Backend&                                  m_backend;
+	uint64_t                                  m_sequence = 0;
+	std::array<Entry, Entries>                m_entries;
+	std::span<const ScalarReadRange>          m_prefetch;
+	std::array<ScalarReadRange, MaxReadBacks> m_read_backs {};
+	size_t                                    m_read_back_count = 0;
 };
 
 } // namespace Libs::Graphics
