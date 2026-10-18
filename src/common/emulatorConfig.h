@@ -95,6 +95,7 @@ struct ConfigOptions {
 	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
+	bool                   precompile_pipelines            = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -173,6 +174,7 @@ bool SyncRawImageBuffersEnabled();
 uint32_t GetFlushDraws();
 bool AsyncPipelinesEnabled();
 bool     SkipPendingDrawsEnabled();
+bool     PrecompilePipelinesEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
