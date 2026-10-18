@@ -344,12 +344,14 @@ private:
 		output->valid           = true;
 		output->error_frame     = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
 		output->buffer_accepted = true;
+		output->first_frame     = !m_wrote_frame;
 		output->codec_type      = m_config.codec_type;
 		output->width           = width;
 		output->pitch           = pitch;
 		output->height          = height;
 		output->buffer          = frame_buffer.data;
 		output->buffer_size     = frame_buffer.size;
+		m_wrote_frame           = true;
 
 		{
 			std::scoped_lock lock(g_picture_mutex);
@@ -373,6 +375,7 @@ private:
 	std::deque<PendingFrame>   m_frames;
 	bool                      m_finalized = false;
 	bool                      m_eof       = false;
+	bool                       m_wrote_frame = false;
 	Config                    m_config;
 	AVCodecContext*           m_codec    = nullptr;
 	SwsContext*               m_sws      = nullptr;
