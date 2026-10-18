@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -21,6 +22,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_image_heap(*this, m_page_manager), m_bindless_table(graphics, m_command_scheduler),
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_command_scheduler.GetTimestamps().SetPrimary(true);
 	// After the bindless table: precompiled layouts reference its set layout.
 	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
 		// Like the background pipeline builds: driver compilers are multithreaded themselves,
@@ -119,6 +121,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Unmap);
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
