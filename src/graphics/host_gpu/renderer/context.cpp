@@ -29,6 +29,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_has_commands = false;
 }
 
 void CommandBuffer::End() const {
