@@ -398,6 +398,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_timestamps.End(m_command.m_buffer, CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
+	const auto commands = m_command.CommandCount();
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
@@ -431,7 +432,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result    = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-	Common::GpuTiming::Sync().AddSubmit(Common::GpuTiming::CurrentSyncReason());
+	const auto reason = Common::GpuTiming::CurrentSyncReason();
+	Common::GpuTiming::Sync().AddSubmit(reason);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
@@ -442,7 +444,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
-	m_timestamps.Submitted(tick, submit_ns);
+	m_timestamps.Submitted(tick, submit_ns, reason, commands);
 	return tick;
 }
 

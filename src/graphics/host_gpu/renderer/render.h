@@ -148,6 +148,8 @@ public:
 	void OrderDispatches() const;
 	// Whether anything but barriers was recorded since the buffer began.
 	[[nodiscard]] bool              HasCommands() const noexcept { return m_has_commands; }
+	// Commands recorded through Handle() and DispatchHandle() since the buffer began.
+	[[nodiscard]] uint32_t          CommandCount() const noexcept { return m_command_count; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -179,6 +181,7 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_has_commands = false;
+	mutable uint32_t    m_command_count = 0;
 	// Kept across submissions: barriers order commands in submission order on the queue.
 	mutable BarrierTracker m_barriers;
 	HW::Context*        m_registers   = nullptr;

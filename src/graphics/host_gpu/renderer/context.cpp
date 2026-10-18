@@ -28,6 +28,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	RecordBarrier(m_barriers.BeforeCommand());
 	m_has_commands = true;
+	m_command_count++;
 	return m_buffer;
 }
 
@@ -48,6 +49,7 @@ vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes) const {
 	Common::GpuTiming::Sync().AddUnmergedBarriers(writes ? 2 : 1);
 	RecordBarrier(m_barriers.BeforeDispatch(writes));
 	m_has_commands = true;
+	m_command_count++;
 	return m_buffer;
 }
 
@@ -131,7 +133,8 @@ void CommandBuffer::Begin() {
 	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	m_has_commands = false;
+	m_has_commands  = false;
+	m_command_count = 0;
 }
 
 void CommandBuffer::End() const {
