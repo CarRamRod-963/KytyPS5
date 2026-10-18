@@ -144,6 +144,11 @@ static_assert(sizeof(AvcPictureInfo) == 120);
 
 class Instance;
 
+// Pictures are written as linear NV12: luma rows, then interleaved CbCr rows, both at this pitch.
+[[nodiscard]] uint32_t FramePitch(uint32_t width);
+// The frame buffer size a picture of at most width x height needs.
+[[nodiscard]] size_t FrameBufferSize(uint32_t width, uint32_t height);
+
 [[nodiscard]] bool      IsCodecSupported(uint32_t codec_type);
 [[nodiscard]] Instance* Create(const Config& config);
 void                    Destroy(Instance* instance);

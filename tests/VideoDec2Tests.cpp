@@ -434,6 +434,50 @@ uint32_t DecodeAndCheck(Session* session, const std::vector<std::vector<uint8_t>
 	return pictures;
 }
 
+// The memory the API asks for must fit the budgets Ghost of Yotei carves it from (its movie memory
+// slots: CPU pool, GPU pool for the compute queue, the CPU-GPU block and the frame buffers, and a
+// second GPU pool for the GPU block), with at least four frame buffers, as the game requires.
+void TestGameMemoryBudget() {
+	struct Budget {
+		int32_t max_width, max_height;
+		size_t  cpu_pool, frame_pool, gpu_pool;
+	};
+	constexpr size_t MiB = 1024u * 1024u;
+	for (const Budget b: {Budget {1920, 1088, 0x1d99999, 72 * MiB, 34 * MiB},
+	                      Budget {1280, 720, 0x1d99999, 72 * MiB, 34 * MiB},
+	                      Budget {544, 304, 19 * MiB, 13 * MiB, 9 * MiB}}) {
+		Videodec2ComputeMemoryInfo compute {sizeof(compute)};
+		CHECK(QueryComputeMemoryInfo(&compute) == OK);
+		auto                       config = GameConfig(b.max_width, b.max_height);
+		Videodec2DecoderMemoryInfo memory {sizeof(memory)};
+		CHECK(QueryDecoderMemoryInfo(&config, &memory) == OK);
+		const size_t pitch = AlignUp(static_cast<uint32_t>(b.max_width), 256);
+		CHECK(memory.max_frame_buffer_size == pitch * b.max_height * 3 / 2);
+		CHECK(memory.cpu_memory_size <= b.cpu_pool && memory.gpu_memory_size <= b.gpu_pool);
+		size_t used = 0;
+		for (const size_t block: {compute.cpu_gpu_memory_size, memory.cpu_gpu_memory_size})
+			used = (used + 0xff) / 0x100 * 0x100 + block;
+		used = (used + 0xff) / 0x100 * 0x100;
+		const size_t frame = (memory.max_frame_buffer_size + 0xff) / 0x100 * 0x100;
+		CHECK(used < b.frame_pool && (b.frame_pool - used) / frame >= 4);
+	}
+	// Without a size bound the frame buffer still holds a 4K picture.
+	auto                       config = GameConfig(-1, -1);
+	Videodec2DecoderMemoryInfo memory {sizeof(memory)};
+	CHECK(QueryDecoderMemoryInfo(&config, &memory) == OK);
+	CHECK(memory.max_frame_buffer_size >= size_t {4096} * 2160 * 3 / 2);
+	// CreateDecoder still insists on the sizes it reported.
+	Session session(1920, 1088);
+	Videodec2Decoder second = nullptr;
+	auto             small  = session.memory;
+	small.max_frame_buffer_size--;
+	CHECK(CreateDecoder(&session.config, &small, &second) == VIDEODEC2_ERROR_MEMORY_SIZE);
+	small = session.memory;
+	small.cpu_memory_size--;
+	CHECK(CreateDecoder(&session.config, &small, &second) == VIDEODEC2_ERROR_MEMORY_SIZE);
+	CHECK(second == nullptr);
+}
+
 void TestRegistration() {
 	Loader::SymbolDatabase symbols;
 	InitVideoDec2_1(&symbols);
@@ -523,6 +567,7 @@ void TestRealStreams() {
 
 int main() {
 	TestRegistration();
+	TestGameMemoryBudget();
 	TestGeneratedStreams();
 	TestRealStreams();
 	std::puts("Videodec2 tests passed");
