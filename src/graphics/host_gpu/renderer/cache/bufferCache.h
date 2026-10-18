@@ -197,7 +197,10 @@ private:
 	// after, so their next GPU writes are downloaded ahead of the guest. The epoch advances on
 	// every GPU write of the page; a publish is valid only at the epoch it was recorded at.
 	struct HotPage {
-		uint64_t                               touched;
+		// The latest guest readback or GPU write of the page; eviction drops the oldest.
+		uint64_t touched = 0;
+		// The latest guest readback of the page; downloads over the cap go to the newest.
+		uint64_t                               faulted = 0;
 		std::shared_ptr<std::atomic<uint64_t>> epoch;
 		// The submission that carries the page's latest asynchronous download, and the epoch
 		// it was recorded at; 0 when none was recorded.
@@ -205,6 +208,9 @@ private:
 		uint64_t download_epoch = 0;
 	};
 	void                        TouchHotPages(uint64_t vaddr, uint64_t size);
+	// Drops the coldest eighth of the hot set; pages touched at `keep` stay.
+	void                        EvictColdHotPages(uint64_t keep);
+	std::vector<uint64_t>       m_hot_eviction_scratch;
 	// A synchronous readback of a range whose GPU-dirty bytes all sit on hot pages with a
 	// submitted, still valid asynchronous download waits for those downloads to publish
 	// instead of submitting a copy of its own and waiting for the whole GPU tail.
@@ -216,6 +222,10 @@ private:
 	std::map<uint64_t, HotPage> m_hot_pages;
 	uint64_t                    m_hot_touch_sequence = 0;
 	RangeSet                    m_pending_async;
+	// The downloads one submission records are capped so that a few submissions in flight fit
+	// in the download ring, which synchronous readbacks share (at most a quarter of it).
+	static constexpr uint64_t MaxAsyncDownload     = uint64_t {16} << 20u;
+	uint64_t                  m_async_download_cap = MaxAsyncDownload;
 	// Ranges a publish cleaned, with the epoch it was valid at: the GPU thread drops their exact
 	// dirty intervals unless the page was written again since (the new intervals overlap).
 	struct Published {
