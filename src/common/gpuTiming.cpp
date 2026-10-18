@@ -87,6 +87,8 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 		served[i] += other.served[i];
 		joined[i] += other.joined[i];
 	}
+	async_pages += other.async_pages;
+	async_deferred += other.async_deferred;
 }
 
 SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
@@ -99,6 +101,8 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 		delta.served[i]  = served[i] - earlier.served[i];
 		delta.joined[i]  = joined[i] - earlier.joined[i];
 	}
+	delta.async_pages    = async_pages - earlier.async_pages;
+	delta.async_deferred = async_deferred - earlier.async_deferred;
 	return delta;
 }
 
@@ -137,6 +141,8 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 		counts.served[i]  = m_served[i].load(std::memory_order_relaxed);
 		counts.joined[i]  = m_joined[i].load(std::memory_order_relaxed);
 	}
+	counts.async_pages    = m_async_pages.load(std::memory_order_relaxed);
+	counts.async_deferred = m_async_deferred.load(std::memory_order_relaxed);
 	return counts;
 }
 
@@ -277,13 +283,16 @@ namespace {
 
 std::string SyncSuffix(const Summary& summary) {
 	const double scale = summary.seconds > 0.0 ? 1.0 / summary.seconds : 0.0;
-	char         tail[192];
+	char         tail[320];
 	std::snprintf(tail, sizeof(tail),
 	              ", empty flushes skipped %.0f/s, readbacks served by submitted downloads %.0f/s, "
-	              "readbacks joined to another's submission %.0f/s",
+	              "readbacks joined to another's submission %.0f/s, async download pages %.0f/s, "
+	              "skipped over cap %.0f/s",
 	              static_cast<double>(summary.sync.TotalSkipped()) * scale,
 	              static_cast<double>(summary.sync.TotalServed()) * scale,
-	              static_cast<double>(summary.sync.TotalJoined()) * scale);
+	              static_cast<double>(summary.sync.TotalJoined()) * scale,
+	              static_cast<double>(summary.sync.async_pages) * scale,
+	              static_cast<double>(summary.sync.async_deferred) * scale);
 	return ", sync submits/waits/wait-ms per s: " +
 	       FormatSyncCounts(summary.sync, summary.seconds) + tail;
 }
