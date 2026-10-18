@@ -218,6 +218,19 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static void SetAsyncDownloadCap(BufferCache &cache, uint64_t bytes) {
+    cache.m_async_download_cap = bytes;
+  }
+
+  static uint64_t DefaultAsyncDownloadCap() {
+    return BufferCache::MaxAsyncDownload;
+  }
+
+  static bool IsGpuModifiedReadable(BufferCache &cache, uint64_t address,
+                                    uint64_t size) {
+    return cache.m_memory_tracker.IsGpuModifiedReadable(address, size);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -12961,6 +12974,82 @@ public:
               scheduler.CurrentTick() == fault_tick && backing() == 0x55555555u,
               "the fault read submitted its own copy or returned stale bytes");
 
+      // Over the per-submission cap, the pages read back most recently get
+      // their downloads; the rest wait for a later submission and fault into
+      // a readback meanwhile. Each page's write is 64 bytes, the cap two of
+      // them; `pages` are listed oldest readback first.
+      const std::array<uint64_t, 3> pages{target + 0x40000, target + 0x48000,
+                                          target + 0x50000};
+      const auto fill_at = [&](uint64_t address, uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, bytes, true);
+        buffer->Fill(offset, bytes, value);
+      };
+      const auto value_at = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "capped backing read",
+                LibKernel::Memory::TryReadBacking(address + bytes - 4, &value,
+                                                  sizeof(value)),
+                "a capped page could not be read");
+        return value;
+      };
+      for (uint32_t i = 0; i < pages.size(); ++i) {
+        fill_at(pages[i], 0x70707070u + i);
+        cache.ReadMemory(pages[i], bytes);
+      }
+      BufferCacheTestAccess::SetAsyncDownloadCap(cache, 2u * bytes);
+      const auto before_cap = Common::GpuTiming::Sync().Snapshot();
+      for (uint32_t i = 0; i < pages.size(); ++i)
+        fill_at(pages[i], 0x80808080u + i);
+      scheduler.Flush();
+      const auto capped =
+          Common::GpuTiming::Sync().Snapshot().Since(before_cap);
+      Require(name, "downloads over the cap",
+              capped.async_pages == 2u && capped.async_deferred == 1u &&
+                  !BufferCacheTestAccess::IsGpuModifiedReadable(cache, pages[0],
+                                                                bytes),
+              "the cap did not keep the newest pages or left a deferred page "
+              "readable with stale bytes (" +
+                  std::to_string(capped.async_pages) + " recorded, " +
+                  std::to_string(capped.async_deferred) + " deferred)");
+      const auto capped_tick = scheduler.CurrentTick();
+      cache.ReadMemory(pages[2], bytes);
+      cache.ReadMemory(pages[1], bytes);
+      Require(name, "served after cap pressure",
+              scheduler.CurrentTick() == capped_tick &&
+                  value_at(pages[2]) == 0x80808082u &&
+                  value_at(pages[1]) == 0x80808081u,
+              "a page within the cap was not served by its download");
+      // The deferred page: read back synchronously, never stale.
+      cache.ReadMemory(pages[0], bytes);
+      Require(name, "deferred page read back",
+              scheduler.CurrentTick() == capped_tick + 1 &&
+                  value_at(pages[0]) == 0x80808080u &&
+                  !cache.HasGpuDirtyBytes(pages[0], bytes),
+              "a page left over the cap was not read back correctly");
+      // Deferred pages ride the next submission that records work. The
+      // readbacks above made pages[0] the newest: with room for one page it
+      // alone is downloaded now.
+      BufferCacheTestAccess::SetAsyncDownloadCap(cache, bytes);
+      for (uint32_t i = 0; i < pages.size(); ++i)
+        fill_at(pages[i], 0x90909090u + i);
+      scheduler.Flush();
+      BufferCacheTestAccess::SetAsyncDownloadCap(
+          cache, BufferCacheTestAccess::DefaultAsyncDownloadCap());
+      const auto before_carry = Common::GpuTiming::Sync().Snapshot();
+      fill_at(target + 0x60000, 0x12345678u);
+      scheduler.Flush();
+      const auto carried =
+          Common::GpuTiming::Sync().Snapshot().Since(before_carry);
+      const auto carried_tick = scheduler.CurrentTick();
+      for (const auto page : pages)
+        cache.ReadMemory(page, bytes);
+      Require(name, "deferred pages served later",
+              carried.async_pages == 2u && carried.async_deferred == 0u &&
+                  scheduler.CurrentTick() == carried_tick &&
+                  value_at(pages[0]) == 0x90909090u &&
+                  value_at(pages[1]) == 0x90909091u &&
+                  value_at(pages[2]) == 0x90909092u,
+              "deferred pages' downloads did not ride the next submission");
     });
     // Readbacks that guest threads request while the GPU thread is busy share
     // one submission: a read of one page and a CPU write into another.
