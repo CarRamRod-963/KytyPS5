@@ -1,0 +1,373 @@
+#include "graphics/host_gpu/renderer/pipeline/programManifest.h"
+#include "graphics/host_gpu/renderer/pipeline/programPrecompileQueue.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using Libs::Graphics::ComputeProgramRecord;
+using Libs::Graphics::ProgramManifest;
+using Libs::Graphics::ProgramPrecompileQueue;
+using Specialization =
+    Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization;
+
+void Check(bool value, const char *text) {
+  if (!value) {
+    std::fprintf(stderr, "ProgramManifestTests: failed: %s\n", text);
+    std::abort();
+  }
+}
+
+std::filesystem::path TempPath(const char *name) {
+  auto dir =
+      std::filesystem::temp_directory_path() / "kyty_program_manifest_tests";
+  std::filesystem::create_directories(dir);
+  auto path = dir / name;
+  std::filesystem::remove(path);
+  return path;
+}
+
+std::shared_ptr<const std::vector<uint32_t>> Code(uint32_t seed,
+                                                  uint32_t words) {
+  auto code = std::make_shared<std::vector<uint32_t>>(words);
+  for (uint32_t i = 0; i < words; i++) {
+    (*code)[i] = seed * 0x9e3779b9u + i;
+  }
+  return code;
+}
+
+ComputeProgramRecord
+MakeRecord(uint32_t seed, std::shared_ptr<const std::vector<uint32_t>> code) {
+  ComputeProgramRecord record;
+  record.shader_hash = 0x1000u + seed;
+  record.code = std::move(code);
+  record.user_data_count = 12;
+  record.input.threads_num[0] = 64;
+  record.input.threads_num[1] = 2;
+  record.input.threads_num[2] = 1;
+  record.input.lds_size_dwords = 128u * seed;
+  record.input.scratch_size_dwords = 16;
+  record.input.wave_size = 32;
+  record.input.async_compute = true;
+  record.input.float_mode = 0xc0;
+  record.input.group_id[1] = true;
+  record.input.thread_ids_num = 3;
+  record.input.workgroup_register = 12;
+  record.input.tg_size_en = true;
+  record.push_data_cursor = seed;
+  Specialization::Buffer buffer;
+  buffer.packed_stride = 1;
+  buffer.descriptor_swizzle = 516;
+  buffer.unbound = true;
+  record.specialization.buffers = {buffer, buffer};
+  record.specialization.buffers[1].indirect_root = 0;
+  Specialization::Image image;
+  image.mip_count = seed;
+  image.cube = true;
+  image.bindless = (seed & 1u) != 0;
+  record.specialization.images = {image};
+  record.specialization.samplers.resize(3);
+  record.specialization.samplers[2].indirect_search_iterations = 7;
+  record.spirv_hash = 0xabcdef00u + seed;
+  return record;
+}
+
+bool SameRecord(const ComputeProgramRecord &a, const ComputeProgramRecord &b) {
+  return a.shader_hash == b.shader_hash && a.code != nullptr &&
+         b.code != nullptr && *a.code == *b.code &&
+         a.spirv_hash == b.spirv_hash && a.specialization == b.specialization &&
+         ProgramManifest::EncodeComputeBody(a) ==
+             ProgramManifest::EncodeComputeBody(b);
+}
+
+std::vector<uint8_t> ReadFile(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(file),
+          std::istreambuf_iterator<char>()};
+}
+
+void WriteFile(const std::filesystem::path &path,
+               const std::vector<uint8_t> &data) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(reinterpret_cast<const char *>(data.data()),
+             static_cast<std::streamsize>(data.size()));
+}
+
+void TestRoundTrip() {
+  const auto path = TempPath("round_trip.programs");
+  const auto code = Code(1, 300);
+  const auto a = MakeRecord(1, code);
+  const auto b = MakeRecord(2, Code(2, 40));
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 0 && !manifest.Loaded().rewritten,
+          "a new manifest is empty");
+    Check(manifest.Add(a) && manifest.Add(b), "records are added");
+  }
+  ProgramManifest manifest(path);
+  const auto records = manifest.Records();
+  Check(records.size() == 2, "records survive a reload");
+  Check(SameRecord(*records[0], a) && SameRecord(*records[1], b),
+        "a reloaded record equals the recorded one, in order");
+  Check(records[0]->Key() == a.Key(), "the key is stable across a reload");
+  Check(!manifest.Loaded().rewritten && manifest.Loaded().dropped_bytes == 0,
+        "an intact file is not rewritten");
+}
+
+void TestKey() {
+  auto a = MakeRecord(3, Code(3, 64));
+  const auto key = a.Key();
+  a.spirv_hash++;
+  Check(a.Key() == key, "the module hash is not part of the key");
+  a.input.workgroup_counts[0] = 99;
+  a.input.indirect_args_address = 0x1234;
+  a.input.host_subgroup_size = 32;
+  a.input.lds_storage = true;
+  Check(a.Key() == key, "runtime and host fields are not part of the key");
+  a.specialization.images[0].mip_count++;
+  Check(a.Key() != key, "the specialization is part of the key");
+  auto b = MakeRecord(3, Code(3, 64));
+  b.input.wave_size = 64;
+  Check(b.Key() != key, "static dispatch state is part of the key");
+  const auto static_input = ComputeProgramRecord::StaticInput(a.input);
+  Check(static_input.workgroup_counts[0] == 0 &&
+            static_input.indirect_args_address == 0 &&
+            static_input.threads_num[0] == 64 && static_input.tg_size_en,
+        "StaticInput keeps exactly the stored fields");
+}
+
+void TestDedupe() {
+  const auto path = TempPath("dedupe.programs");
+  const auto code = Code(4, 2000);
+  {
+    ProgramManifest manifest(path);
+    auto a = MakeRecord(4, code);
+    Check(manifest.Add(a), "first add");
+    a.spirv_hash++;
+    Check(!manifest.Add(a),
+          "a program recorded by another recompiler build is not added again");
+    auto b = MakeRecord(5, code);
+    b.shader_hash = a.shader_hash;
+    Check(manifest.Add(b), "another program of the same shader is added");
+    Check(manifest.Size() == 2, "two programs");
+  }
+  // The shared code is stored once: two code copies would exceed this size.
+  Check(std::filesystem::file_size(path) < 2000u * sizeof(uint32_t) * 2u,
+        "the code of a shader is stored once");
+  ProgramManifest manifest(path);
+  Check(manifest.Size() == 2, "deduplicated programs reload");
+  Check(manifest.Records()[0]->code == manifest.Records()[1]->code,
+        "programs of one shader share their code after a reload");
+  Check(!manifest.Add(MakeRecord(4, Code(4, 2000))),
+        "a reloaded program is known");
+}
+
+void TestVersion() {
+  const auto path = TempPath("version.programs");
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Add(MakeRecord(6, Code(6, 50))), "add");
+  }
+  auto data = ReadFile(path);
+  Check(data.size() > 12, "file has a header");
+  // The format version follows the 8-byte magic.
+  data[8] ^= 0xffu;
+  WriteFile(path, data);
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 0 && manifest.Loaded().rewritten,
+          "a manifest of another format version is dropped");
+    Check(manifest.Add(MakeRecord(7, Code(7, 50))),
+          "a dropped manifest accepts records");
+  }
+  ProgramManifest manifest(path);
+  Check(manifest.Size() == 1 && !manifest.Loaded().rewritten,
+        "the rewritten manifest has the current version");
+}
+
+void TestCorruption() {
+  const auto path = TempPath("corrupt.programs");
+  {
+    ProgramManifest manifest(path);
+    for (uint32_t seed = 10; seed < 13; seed++) {
+      Check(manifest.Add(MakeRecord(seed, Code(seed, 100))), "add");
+    }
+  }
+  const auto intact = ReadFile(path);
+
+  // A torn last entry (the session ended while writing it).
+  auto torn = intact;
+  torn.resize(torn.size() - 5);
+  WriteFile(path, torn);
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 2 && manifest.Loaded().rewritten &&
+              manifest.Loaded().dropped_bytes > 0,
+          "a torn entry is dropped, the entries before it are kept");
+    Check(manifest.Add(MakeRecord(20, Code(20, 100))),
+          "records are appended after a torn tail");
+  }
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 3 && !manifest.Loaded().rewritten,
+          "records appended after a repaired tail are readable");
+  }
+
+  // A flipped byte inside the second program's code entry.
+  auto flipped = intact;
+  flipped[flipped.size() / 2] ^= 0x40u;
+  WriteFile(path, flipped);
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() < 3 && manifest.Loaded().rewritten,
+          "a corrupt entry and everything after it are dropped");
+    const auto records = manifest.Records();
+    for (const auto &record : records) {
+      Check(record->code != nullptr && record->code->size() == 100,
+            "kept records are whole");
+    }
+  }
+
+  // Garbage and empty files.
+  WriteFile(path, std::vector<uint8_t>(37, 0x5au));
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 0 && manifest.Loaded().rewritten,
+          "a garbage file is replaced");
+  }
+  WriteFile(path, {});
+  {
+    ProgramManifest manifest(path);
+    Check(manifest.Size() == 0, "an empty file is a new manifest");
+    Check(manifest.Add(MakeRecord(30, Code(30, 8))), "add to a replaced file");
+  }
+  ProgramManifest manifest(path);
+  Check(manifest.Size() == 1, "a replaced file accepts records");
+}
+
+void TestMemoryOnly() {
+  ProgramManifest manifest;
+  Check(manifest.Add(MakeRecord(40, Code(40, 8))) &&
+            !manifest.Add(MakeRecord(40, Code(40, 8))),
+        "an in-memory manifest deduplicates");
+  ComputeProgramRecord empty;
+  Check(!manifest.Add(empty), "a record without code is rejected");
+}
+
+class Gate {
+public:
+  void Release() {
+    {
+      std::lock_guard lock(m_mutex);
+      m_open = true;
+    }
+    m_cv.notify_all();
+  }
+  void Wait() {
+    std::unique_lock lock(m_mutex);
+    m_cv.wait(lock, [this] { return m_open; });
+  }
+
+private:
+  std::mutex m_mutex;
+  std::condition_variable m_cv;
+  bool m_open = false;
+};
+
+void TestPrecompileQueue() {
+  ProgramPrecompileQueue queue(1);
+  Gate gate;
+  std::atomic<bool> blocker_started{false};
+  std::atomic<int> ran_a{0};
+  std::atomic<int> ran_b{0};
+  std::thread::id a_thread;
+  // The single worker is held by the first job, so the others stay queued.
+  Check(queue.Enqueue(1,
+                      [&] {
+                        blocker_started = true;
+                        gate.Wait();
+                      }),
+        "queue the blocker");
+  Check(queue.Enqueue(2,
+                      [&] {
+                        a_thread = std::this_thread::get_id();
+                        ran_a++;
+                      }),
+        "queue a");
+  Check(queue.Enqueue(3, [&] { ran_b++; }), "queue b");
+  Check(!queue.Enqueue(2, [&] { ran_a++; }), "a key is queued once");
+  Check(queue.Queued() == 3, "three jobs queued");
+  while (!blocker_started) {
+    std::this_thread::yield();
+  }
+
+  // Expediting a queued program runs it on the caller.
+  queue.Expedite(2);
+  Check(ran_a == 1 && a_thread == std::this_thread::get_id(),
+        "an expedited job runs on the calling thread");
+  queue.Expedite(2);
+  Check(ran_a == 1, "expediting a finished job does nothing");
+  queue.Expedite(99);
+  Check(queue.Remaining() == 2, "the blocker and b remain");
+
+  // Expediting the running job waits for it.
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    gate.Release();
+  });
+  queue.Expedite(1);
+  releaser.join();
+  queue.WaitIdle();
+  Check(ran_b == 1 && queue.Remaining() == 0, "every job ran once");
+  Check(!queue.Enqueue(3, [&] { ran_b++; }),
+        "a finished key is not queued again");
+
+  // Stop drops jobs that have not started.
+  ProgramPrecompileQueue stopped(1);
+  Gate hold;
+  std::atomic<bool> hold_started{false};
+  std::atomic<int> dropped_ran{0};
+  (void)stopped.Enqueue(1, [&] {
+    hold_started = true;
+    hold.Wait();
+  });
+  (void)stopped.Enqueue(2, [&] { dropped_ran++; });
+  while (!hold_started) {
+    std::this_thread::yield();
+  }
+  std::thread release_hold([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    hold.Release();
+  });
+  stopped.Stop();
+  release_hold.join();
+  Check(dropped_ran == 0, "a job that had not started is dropped on stop");
+  stopped.Expedite(2);
+  Check(dropped_ran == 0, "a stopped queue runs nothing");
+  Check(!stopped.Enqueue(5, [] {}), "a stopped queue takes no jobs");
+}
+
+} // namespace
+
+int main() {
+  TestRoundTrip();
+  TestKey();
+  TestDedupe();
+  TestVersion();
+  TestCorruption();
+  TestMemoryOnly();
+  TestPrecompileQueue();
+  std::printf("ProgramManifestTests: all tests passed\n");
+  return 0;
+}
