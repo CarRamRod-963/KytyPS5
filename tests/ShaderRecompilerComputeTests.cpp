@@ -453,6 +453,14 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  static void
+  ResolveTextureMemo(RenderExecutor &executor,
+                     const ShaderRecompiler::IR::ImageResource &resource,
+                     const ShaderRecompiler::IR::DescriptorValue &value,
+                     TextureBinding &binding) {
+    executor.ResolveTextureMemo(resource, value, binding);
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -10203,6 +10211,28 @@ public:
                     sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
                     texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
                 "sampling the target changed its padded layout or created a second image");
+        // A memo hit into a binding that already holds the entry's description
+        // keeps it; one into a binding holding anything else copies it.
+        TextureBinding memo_binding{};
+        for (uint32_t repeat = 0; repeat < 3u; ++repeat) {
+          RenderExecutorTestAccess::ResolveTextureMemo(executor, resource,
+                                                       value, memo_binding);
+          Require(
+              name, "texture memo binding",
+              memo_binding.image_id == sampled.image_id &&
+                  memo_binding.desc == sampled.desc &&
+                  memo_binding.memo_serial != 0,
+              "a texture memo lookup returned another image or description");
+        }
+        TextureBinding other_binding{};
+        other_binding.desc.info.data = {base, 1};
+        RenderExecutorTestAccess::ResolveTextureMemo(executor, resource, value,
+                                                     other_binding);
+        Require(name, "texture memo hit into another binding",
+                other_binding.image_id == sampled.image_id &&
+                    other_binding.desc == sampled.desc &&
+                    other_binding.memo_serial == memo_binding.memo_serial,
+                "a memo hit kept the description of a binding it did not fill");
         const auto expected = target.float16
                                   ? std::vector<u32>{0x00003c00u, 0x3c003c00u}
                                   : std::vector<u32>{0xffff00ffu};
