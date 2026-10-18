@@ -133,11 +133,54 @@ void TestStop() {
 	      "the destructor discards uncollected results and skips failed builds");
 }
 
+void TestExpedite() {
+	std::vector<uint64_t> discarded;
+	PipelineCompileQueue  queue(1, [&](uint64_t handle) { discarded.push_back(handle); });
+	Gate                  started;
+	Gate                  release;
+	const auto            caller = std::this_thread::get_id();
+
+	// The single worker blocks in the first job, so the second one stays queued.
+	const auto running = queue.Enqueue([&] {
+		started.Release();
+		release.Wait();
+		return uint64_t {0x44};
+	});
+	std::thread::id ran_on;
+	const auto      queued = queue.Enqueue([&] {
+        ran_on = std::this_thread::get_id();
+        return uint64_t {0x55};
+    });
+	started.Wait();
+	queue.Expedite(queued);
+	Check(ran_on == caller, "a job that has not started runs on the expediting thread");
+	std::vector<PipelineCompileQueue::Completion> completed;
+	queue.TakeCompleted(completed);
+	Check(completed.size() == 1 && completed[0].ticket == queued && completed[0].handle == 0x55,
+	      "an expedited job's result is available when Expedite returns");
+	Check(queue.Outstanding() == 1, "the running job is still outstanding");
+
+	std::thread releaser([&] { release.Release(); });
+	queue.Expedite(running);
+	releaser.join();
+	completed.clear();
+	queue.TakeCompleted(completed);
+	Check(completed.size() == 1 && completed[0].ticket == running && completed[0].handle == 0x44,
+	      "expediting a running job waits for its result");
+
+	queue.Expedite(running);
+	queue.Expedite(0x1234);
+	Check(queue.Outstanding() == 0, "expediting a collected or unknown ticket does nothing");
+	queue.Stop();
+	Check(discarded.empty(), "collected results are not discarded");
+}
+
 } // namespace
 
 int main() {
 	TestCompletion();
 	TestStop();
+	TestExpedite();
 	std::printf("PipelineCompileQueueTests: all tests passed\n");
 	return 0;
 }
