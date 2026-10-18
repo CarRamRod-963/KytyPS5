@@ -28,6 +28,9 @@ struct FakeGuestMemory {
   std::array<uint8_t, Size> gpu{};
   std::vector<std::pair<uint64_t, uint64_t>> dirty;
   std::vector<std::pair<uint64_t, uint64_t>> readbacks;
+  // GPU writes whose asynchronous download completes: the next readback
+  // publishes them (writes their bytes and clears their dirty mark) as well.
+  std::vector<std::pair<uint64_t, uint64_t>> downloaded;
   uint64_t reads = 0;
   uint64_t sequence = 0;
 
@@ -64,8 +67,15 @@ struct FakeGuestMemory {
   void ReadGpuDirtyBytes(uint64_t address, uint64_t size) {
     readbacks.emplace_back(address, size);
     std::vector<std::pair<uint64_t, uint64_t>> remaining;
+    const auto published = [&](uint64_t start, uint64_t bytes) {
+      for (const auto &[download, download_bytes] : downloaded) {
+        if (Overlaps(start, bytes, download, download_bytes))
+          return true;
+      }
+      return false;
+    };
     for (const auto &[start, bytes] : dirty) {
-      if (!Overlaps(start, bytes, address, size)) {
+      if (!Overlaps(start, bytes, address, size) && !published(start, bytes)) {
         remaining.emplace_back(start, bytes);
         continue;
       }
@@ -73,6 +83,7 @@ struct FakeGuestMemory {
                   bytes);
     }
     dirty = std::move(remaining);
+    downloaded.clear();
   }
   uint64_t GpuWriteSequence() const { return sequence; }
 };
@@ -160,6 +171,29 @@ void TestCachedChunkDroppedAfterGpuWrite() {
         "an unchanged sequence dropped the refilled chunk");
 }
 
+// A readback also publishes completed asynchronous downloads. A chunk filled
+// while one of their words was still GPU-dirty holds the old value; once the
+// word is published it is clean, and the chunk must not serve it.
+void TestPublishedWordOfCachedChunk() {
+  FakeGuestMemory memory;
+  const auto chunk = FakeGuestMemory::Base + 0x400;
+  const auto other = FakeGuestMemory::Base + 0x700;
+  memory.CpuWrite(chunk + 0x20, 1);
+  memory.CpuWrite(chunk + 0x30, 9);
+  memory.GpuWrite(chunk + 0x20, 2);
+  Cache cache(memory);
+  Check(ReadWord(cache, chunk + 0x30) == 9, "clean word of a dirty chunk");
+  memory.GpuWrite(other, 5);
+  // The other word's write recorded later dropped the chunks; refill them.
+  Check(ReadWord(cache, chunk + 0x30) == 9, "refilled clean word");
+  memory.downloaded.emplace_back(chunk + 0x20, 4);
+  Check(ReadWord(cache, other) == 5, "a GPU-written word of another chunk");
+  Check(!memory.HasGpuDirtyBytes(chunk + 0x20, 4),
+        "the download was not published by the readback");
+  Check(ReadWord(cache, chunk + 0x20) == 2,
+        "a chunk served a published word from before its publication");
+}
+
 void TestUncachedAndUnmappedReads() {
   FakeGuestMemory memory;
   // A read that ends past the mapping falls back to an exact read and returns
@@ -188,6 +222,7 @@ int main() {
   TestDirtyChunkIsReadBackFirst();
   TestOnlyReadDirtyBytesAreReadBack();
   TestCachedChunkDroppedAfterGpuWrite();
+  TestPublishedWordOfCachedChunk();
   TestUncachedAndUnmappedReads();
   std::printf("ScalarReadCacheTests: ok\n");
   return 0;
