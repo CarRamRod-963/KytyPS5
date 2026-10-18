@@ -2,10 +2,12 @@
 #define KYTY_COMMON_GPU_TIMING_H_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 // Host GPU timing per queue submission: how long the GPU executed, how long work waited before
 // it started, and how long the CPU took to notice a finished submission. The renderer feeds the
@@ -34,6 +36,98 @@ private:
 	int64_t                            m_total_ns = 0;
 };
 
+// Why a queue submission or a blocking wait on the GPU timeline happened. The renderer sets the
+// reason with a SyncScope around code that may submit or wait; Submit and the semaphore wait
+// count under the reason of the calling thread.
+enum class SyncReason : uint8_t {
+	Other,
+	QueueSlice,     // End of a processed slice of a guest command buffer.
+	Label,          // End-of-pipe label written by the guest command stream.
+	Interrupt,      // End-of-pipe interrupt without a label.
+	Flip,           // Guest flip.
+	FrameBoundary,  // Guest suspend point (frame end).
+	GuestWait,      // The command stream waits for the GPU (GDS read, explicit idle).
+	FaultRead,      // Guest CPU read fault on GPU-written memory.
+	CpuWrite,       // Guest CPU write into GPU-written memory (read back first).
+	BufferRead,     // Other host read of GPU-written buffer memory.
+	WalkRead,       // Resource walk reading GPU-written bytes.
+	MetadataCheck,  // Color-clear metadata written by compute and read by the texture cache.
+	StreamWrap,     // Stream or upload buffer full: wait for its oldest user.
+	FaultBuffer,    // Device fault buffer processing.
+	Unmap,          // Guest unmap of memory the caches own.
+	GarbageCollect, // Cache eviction of GPU-written buffers.
+	Present,        // Presentation queue work.
+	Completion,     // Completion thread waiting to run labels and published readbacks.
+	Count
+};
+
+inline constexpr size_t SYNC_REASON_COUNT = static_cast<size_t>(SyncReason::Count);
+
+[[nodiscard]] const char* SyncReasonName(SyncReason reason) noexcept;
+
+// The calling thread's current reason; Other outside any scope.
+[[nodiscard]] SyncReason CurrentSyncReason() noexcept;
+
+// Sets the calling thread's reason for its lifetime. The outermost scope wins, so a generic
+// helper (a buffer read) called for a specific purpose (a resource walk) keeps the purpose.
+class SyncScope {
+public:
+	explicit SyncScope(SyncReason reason) noexcept;
+	~SyncScope();
+	SyncScope(const SyncScope&)            = delete;
+	SyncScope& operator=(const SyncScope&) = delete;
+
+private:
+	SyncReason m_previous;
+};
+
+struct SyncCounts {
+	std::array<uint64_t, SYNC_REASON_COUNT> submits {};
+	std::array<uint64_t, SYNC_REASON_COUNT> waits {}; // Blocking waits on the GPU timeline.
+	std::array<uint64_t, SYNC_REASON_COUNT> wait_ns {};
+
+	void                     Merge(const SyncCounts& other) noexcept;
+	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
+	[[nodiscard]] uint64_t   TotalSubmits() const noexcept;
+	[[nodiscard]] uint64_t   TotalWaits() const noexcept;
+};
+
+// Running totals per reason, written from any thread with one relaxed increment.
+class SyncCounters {
+public:
+	void AddSubmit(SyncReason reason) noexcept {
+		m_submits[Index(reason)].fetch_add(1, std::memory_order_relaxed);
+	}
+	void AddWait(SyncReason reason, int64_t ns) noexcept {
+		m_waits[Index(reason)].fetch_add(1, std::memory_order_relaxed);
+		m_wait_ns[Index(reason)].fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
+		                                   std::memory_order_relaxed);
+	}
+	[[nodiscard]] SyncCounts Snapshot() const noexcept;
+
+private:
+	static size_t Index(SyncReason reason) noexcept {
+		const auto index = static_cast<size_t>(reason);
+		return index < SYNC_REASON_COUNT ? index : 0;
+	}
+
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_submits {};
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_waits {};
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_wait_ns {};
+};
+
+// Process-wide counters: every scheduler's submits and semaphore waits.
+[[nodiscard]] SyncCounters& Sync() noexcept;
+
+// Reasons with any submit or wait, most submits + waits first; at most `limit`.
+[[nodiscard]] std::vector<SyncReason> BusiestReasons(const SyncCounts& counts,
+                                                     size_t            limit = SYNC_REASON_COUNT);
+
+// "slice 600/0/0.0, label 330/0/0.0, ..." per second (submits/waits/wait ms), busiest first, at
+// most `limit` reasons; "none" when nothing happened.
+[[nodiscard]] std::string FormatSyncCounts(const SyncCounts& counts, double seconds,
+                                           size_t limit = SYNC_REASON_COUNT);
+
 // One finished submission. Device times are in nanoseconds of the device clock; host times use
 // std::chrono::steady_clock and are present only when the device clock is calibrated.
 struct Submission {
@@ -56,6 +150,8 @@ struct Summary {
 	LatencyHistogram wake;
 	// GPU finished -> the guest end-of-pipe label of the submission was written.
 	LatencyHistogram label;
+	// Submissions and blocking waits per reason in the window.
+	SyncCounts sync;
 
 	void Merge(const Summary& other) noexcept;
 
@@ -74,6 +170,7 @@ public:
 	void AddLabel(int64_t end_to_label_ns) noexcept { m_window.label.Add(end_to_label_ns); }
 	void AddFlips(uint64_t flips) noexcept { m_window.flips += flips; }
 	void SetCalibrated(bool calibrated) noexcept { m_window.calibrated = calibrated; }
+	void SetSync(const SyncCounts& sync) noexcept { m_window.sync = sync; }
 
 	// Ends the current window and starts the next one; execution overlap is tracked across.
 	[[nodiscard]] Summary Take(double seconds) noexcept;
