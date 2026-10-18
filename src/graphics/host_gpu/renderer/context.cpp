@@ -104,13 +104,13 @@ void CommandBuffer::RecordBarrier(BarrierTracker::Barrier barrier) const {
 			memory.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 			memory.srcAccessMask = ShaderAccess;
 			memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-			memory.dstAccessMask = MemoryAccess;
+			memory.dstAccessMask = LaterAccess2;
 			break;
 		case Barrier::AllToAll:
 			memory.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 			memory.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
 			memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-			memory.dstAccessMask = MemoryAccess;
+			memory.dstAccessMask = LaterAccess2;
 			break;
 		case Barrier::None: return;
 	}
