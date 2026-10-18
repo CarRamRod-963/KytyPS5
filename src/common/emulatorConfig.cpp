@@ -197,6 +197,10 @@ bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }
 
+bool SkipPendingDrawsEnabled() {
+	return g_config->skip_pending_draws;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

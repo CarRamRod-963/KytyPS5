@@ -99,6 +99,10 @@ static void PrintUsage() {
 	    "  --no-async-pipelines                 Build missing pipelines optimized at once,\n"
 	    "                                       not unoptimized first with an optimized build\n"
 	    "                                       in the background.\n");
+	::printf(
+	    "  --skip-pending-draws                 Skip draws that only change the picture while\n"
+	    "                                       their pipelines build in the background (at most\n"
+	    "                                       2 s per pipeline).\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -219,6 +223,7 @@ static constexpr Flag FLAGS[] = {
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
+    {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
