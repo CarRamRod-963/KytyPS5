@@ -177,8 +177,16 @@ private:
 	struct HotPage {
 		uint64_t                               touched;
 		std::shared_ptr<std::atomic<uint64_t>> epoch;
+		// The submission that carries the page's latest asynchronous download, and the epoch
+		// it was recorded at; 0 when none was recorded.
+		uint64_t download_tick  = 0;
+		uint64_t download_epoch = 0;
 	};
 	void                        TouchHotPages(uint64_t vaddr, uint64_t size);
+	// A synchronous readback of a range whose GPU-dirty bytes all sit on hot pages with a
+	// submitted, still valid asynchronous download waits for those downloads to publish
+	// instead of submitting a copy of its own and waiting for the whole GPU tail.
+	void                        AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size);
 	std::vector<uint64_t>       m_keep_readable;
 	std::vector<uint64_t>       m_make_unreadable;
 	void                        NoteGpuWrite(uint64_t vaddr, uint64_t size);
