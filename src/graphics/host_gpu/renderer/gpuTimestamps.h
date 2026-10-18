@@ -36,6 +36,9 @@ public:
 	void RecordWake(uint64_t tick);
 	// The guest end-of-pipe label deferred to the completion of `tick` was written.
 	void RecordLabel(uint64_t tick);
+	// The renderer's scheduler: its windows carry the per-reason submission and wait counts and
+	// are the ones the performance overlay shows. Other schedulers (presentation) only log.
+	void SetPrimary(bool primary) noexcept { m_primary = primary; }
 
 private:
 	static constexpr uint32_t RING_SIZE = 256;
@@ -77,6 +80,8 @@ private:
 	Common::GpuTiming::Summary     m_log_window;
 	int64_t                        m_window_start_ns = 0;
 	uint64_t                       m_window_flips    = 0;
+	Common::GpuTiming::SyncCounts  m_last_sync;
+	bool                           m_primary = false;
 };
 
 } // namespace Libs::Graphics

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -572,6 +573,8 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
+				const Common::GpuTiming::SyncScope sync_reason(
+				    Common::GpuTiming::SyncReason::QueueSlice);
 				cp.BufferFlush();
 			}
 			break;
@@ -593,6 +596,8 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
+				const Common::GpuTiming::SyncScope sync_reason(
+				    Common::GpuTiming::SyncReason::QueueSlice);
 				cp.BufferFlush();
 			}
 			break;
@@ -600,14 +605,17 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		case SubmissionType::SuspendPoint: {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
+			const Common::GpuTiming::SyncScope sync_reason(
+			    Common::GpuTiming::SyncReason::FrameBoundary);
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
@@ -1228,6 +1236,7 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 			}
 		});
 	});
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
 	GetScheduler().Flush();
 }
 
@@ -1324,6 +1333,7 @@ void CommandProcessor::Flip() {
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1350,6 +1360,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 			renderer.GetVideoOut().CompleteFlip(request);
 		});
 	});
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1382,6 +1393,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 			renderer.TriggerInterrupt(event_id, 0);
 		});
 	});
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1399,10 +1411,12 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::GuestWait);
 	GetScheduler().Finish();
 }
 
