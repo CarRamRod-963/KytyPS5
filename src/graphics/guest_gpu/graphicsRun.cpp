@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -526,20 +527,25 @@ bool GuestGpu::Process(Submission& submission) {
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
+				const Common::GpuTiming::SyncScope sync_reason(
+				    Common::GpuTiming::SyncReason::QueueSlice);
 				cp.BufferFlush();
 			}
 			break;
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		case SubmissionType::SuspendPoint: {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
+			const Common::GpuTiming::SyncScope sync_reason(
+			    Common::GpuTiming::SyncReason::FrameBoundary);
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
@@ -1034,6 +1040,7 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 			}
 		});
 	});
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
 	GetScheduler().Flush();
 }
 
@@ -1134,6 +1141,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	(void)command.Handle();
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1151,10 +1159,12 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::GuestWait);
 	GetScheduler().Finish();
 }
 

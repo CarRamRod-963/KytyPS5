@@ -338,6 +338,20 @@ void GpuTimingRows(const Snapshot& shown, bool details) {
 	const auto  per_flip = timing.SubmitsPerFlip();
 	Row("GPU busy", Fmt("%.0f ms/s  (%.0f submits/s, %s/flip)", busy, timing.SubmitsPerSecond(),
 	                    per_flip ? Fmt("%.1f", *per_flip).c_str() : "n/a"));
+	if (details && timing.seconds > 0.0) {
+		// Why the GPU timeline was submitted to or blocked on, busiest reasons first.
+		const auto& sync = timing.sync;
+		Row("Blocking GPU waits",
+		    Fmt("%.0f/s", static_cast<double>(sync.TotalWaits()) / timing.seconds));
+		for (const auto reason: Common::GpuTiming::BusiestReasons(sync, 6)) {
+			const auto i = static_cast<size_t>(reason);
+			Row((std::string("  ") + Common::GpuTiming::SyncReasonName(reason)).c_str(),
+			    Fmt("%.0f submits  %.0f waits  %.1f ms  /s",
+			        static_cast<double>(sync.submits[i]) / timing.seconds,
+			        static_cast<double>(sync.waits[i]) / timing.seconds,
+			        static_cast<double>(sync.wait_ns[i]) / 1e6 / timing.seconds));
+		}
+	}
 	if (!timing.calibrated) {
 		return;
 	}
