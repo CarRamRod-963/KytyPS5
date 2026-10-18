@@ -192,9 +192,16 @@ void TestSyncReasons() {
   }
   counters.AddWait(SyncReason::Completion, 1 * MS);
   counters.AddAsyncDownloads(12, 4);
+  for (int i = 0; i < 6; i++) {
+    counters.AddLabel(true);
+  }
+  counters.AddLabel(false);
+  counters.AddLabel(false);
   const auto delta = counters.Snapshot().Since(before);
   Check(delta.async_pages == 12 && delta.async_deferred == 4,
         "async download page counts");
+  Check(delta.labels_direct == 6 && delta.labels_gpu_thread == 2,
+        "label delivery counts");
   Check(delta.TotalSubmits() == 40 && delta.TotalWaits() == 11, "sync totals");
   Check(delta.wait_ns[static_cast<size_t>(SyncReason::WalkRead)] ==
             static_cast<uint64_t>(20 * MS),
@@ -224,10 +231,15 @@ void TestSyncReasons() {
             "async download pages 6/s, skipped over cap 2/s") !=
             std::string::npos,
         "summary line carries the async download pages");
+  Check(Common::GpuTiming::FormatSummary(summary).find(
+            "labels on completion 3/s, via the GPU thread 1/s") !=
+            std::string::npos,
+        "summary line carries the label delivery");
   Summary merged;
   merged.Merge(summary);
   merged.Merge(summary);
-  Check(merged.sync.TotalSubmits() == 80 && merged.sync.async_deferred == 8,
+  Check(merged.sync.TotalSubmits() == 80 && merged.sync.async_deferred == 8 &&
+            merged.sync.labels_direct == 12,
         "merged sync counts");
 }
 

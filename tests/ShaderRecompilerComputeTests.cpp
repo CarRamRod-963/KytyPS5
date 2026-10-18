@@ -3197,8 +3197,8 @@ public:
         gpu_scheduler.Finish();
         gpu_scheduler.WaitPriorityOperations(gpu_scheduler.CurrentTick() - 1);
       });
-      // The completed labels are written by GPU-thread commands queued behind
-      // the previous one.
+      // Labels outside guest memory are written by GPU-thread commands queued
+      // behind the previous one.
       gpu.SendCommandSync([] {});
       Require("GpuCommandLane", "deferred timestamp write",
               cb_db_release_label >= timestamp_before &&
@@ -3435,8 +3435,9 @@ public:
         auto &scheduler = context.GetCommandScheduler();
         scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
       });
-      // A completed submission queues its label writes and interrupts to the
-      // GPU thread behind the command above; run them before checking.
+      // A completed submission queues the label writes and interrupts of
+      // labels outside guest memory to the GPU thread behind the command
+      // above; run them before checking.
       gpu.SendCommandSync([] {});
     };
     const auto wait_for_interrupt =
@@ -13154,6 +13155,224 @@ public:
         scheduler.Finish();
       });
     }
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // An end-of-pipe label lands when its submission completes even while the
+  // GPU thread is busy, never before the data its submission published, and
+  // in order behind a label on a page a cache watches; that label keeps the
+  // caches' bookkeeping.
+  void CheckLabelDelivery() {
+    constexpr const char *name = "LabelDelivery";
+    constexpr uintptr_t base = 0x0000000208400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t data = base + 0x2000;
+    constexpr uint64_t label = base + 0x40000;
+    constexpr uint64_t watched = base + 0x80000;
+    constexpr uint64_t bytes = 64;
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    auto &cache = context.GetBufferCache();
+    auto processor = std::make_unique<CommandProcessor>(context, 0);
+    const auto backing = [&](uint64_t address) {
+      uint64_t value = 0;
+      Require(name, "backing read",
+              LibKernel::Memory::TryReadBacking(address, &value, sizeof(value)),
+              "guest memory could not be read");
+      return value;
+    };
+    const auto gpu_fill = [&](uint32_t value) {
+      auto [buffer, offset] = cache.ObtainBuffer(data, bytes, true);
+      buffer->Fill(offset, bytes, value);
+    };
+    // A 64-bit RELEASE_MEM data write (data_sel 2).
+    const auto write_label = [&](uint64_t address, uint64_t value,
+                                 uint32_t interrupt) {
+      processor->ReleaseMem(2, interrupt, reinterpret_cast<void *>(address),
+                            value, 0);
+    };
+    const auto wait_for = [](const auto &done) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+          return false;
+        }
+        std::this_thread::yield();
+      }
+      return true;
+    };
+
+    LibKernel::EventQueue::KernelEqueue interrupt_queue =
+        LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+    uint32_t interrupt_udata = 0;
+    Require(name, "interrupt queue",
+            LibKernel::EventQueue::KernelCreateEqueue(&interrupt_queue,
+                                                      "label-delivery") == 0 &&
+                Sync::AddEqEvent(context, interrupt_queue, 0,
+                                 &interrupt_udata) == 0,
+            "failed to register the graphics interrupt");
+
+    // The data page becomes hot: its next GPU writes ride their submission
+    // as asynchronous downloads, published on completion.
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      context.MapMemory(base, allocation_size);
+      gpu_fill(0x11111111u);
+      cache.ReadMemory(data, bytes);
+    });
+
+    // Each round: a GPU write of the data, the label behind it, and then the
+    // GPU thread blocks. The label must land meanwhile, and the guest that
+    // sees it must see the published data. The publication and the label run
+    // back to back on the completion thread, so a wrong order shows up as a
+    // stale read in some round.
+    constexpr uint32_t rounds = 32;
+    uint32_t delivered = 0;
+    uint32_t published = 0;
+    uint64_t downloads = 0;
+    bool interrupted = false;
+    const auto before_rounds = Common::GpuTiming::Sync().Snapshot();
+    for (uint32_t round = 0; round < rounds; ++round) {
+      const uint32_t value = 0x20000000u + round;
+      const bool last = round + 1 == rounds;
+      const auto before = Common::GpuTiming::Sync().Snapshot();
+      std::binary_semaphore gate{0};
+      gpu.SendCommand([&] {
+        processor->BufferInit();
+        gpu_fill(value);
+        write_label(label, round + 1u, last ? 2u : 0u);
+        gate.acquire();
+      });
+      const bool landed =
+          wait_for([&] { return backing(label) == round + 1u; });
+      // Read right after the label: the publication must already be done.
+      const auto seen = static_cast<uint32_t>(backing(data + bytes - 8) >> 32u);
+      if (landed) {
+        ++delivered;
+      }
+      if (seen == value) {
+        ++published;
+      }
+      if (last) {
+        LibKernel::EventQueue::KernelEvent event{};
+        int count = 0;
+        LibKernel::KernelUseconds timeout = 2000000;
+        interrupted = LibKernel::EventQueue::KernelWaitEqueue(
+                          interrupt_queue, &event, 1, &count, &timeout) == 0 &&
+                      count == 1 && event.udata == &interrupt_udata;
+      }
+      gate.release();
+      gpu.SendCommandSync([] {});
+      downloads +=
+          Common::GpuTiming::Sync().Snapshot().Since(before).async_pages;
+    }
+    const auto direct =
+        Common::GpuTiming::Sync().Snapshot().Since(before_rounds).labels_direct;
+    Require(name, "downloads ride the label's submission", downloads == rounds,
+            "the data writes were not downloaded with their submission (" +
+                std::to_string(downloads) + " of " + std::to_string(rounds) +
+                ")");
+    Require(name, "delivered while the GPU thread is busy",
+            delivered == rounds && direct == rounds && interrupted,
+            "a label or its interrupt waited for the GPU thread (" +
+                std::to_string(delivered) + " landed, " +
+                std::to_string(direct) + " direct of " +
+                std::to_string(rounds) + ")");
+    Require(name, "label after its data", published == rounds,
+            "a label became visible before its submission's data (" +
+                std::to_string(rounds - published) + " stale rounds)");
+
+    // A label on a page a clean cached buffer watches goes through the GPU
+    // thread, which marks the page CPU-modified; the label behind it follows
+    // it there instead of overtaking it.
+    bool watched_clean = false;
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      // Larger than a caching page: a cached buffer, not a stream copy.
+      (void)cache.ObtainBuffer(watched, 0x8000, false);
+      context.GetCommandScheduler().Finish();
+      watched_clean = !cache.IsRegionCpuModified(watched, 8);
+    });
+    Require(name, "watched label page", watched_clean,
+            "the cached buffer did not make its page clean");
+    const auto before_watched = Common::GpuTiming::Sync().Snapshot();
+    std::binary_semaphore gate{0};
+    gpu.SendCommand([&] {
+      processor->BufferInit();
+      write_label(watched, 0x5157u, 0);
+      write_label(label, 0x4c4cu, 0);
+      gate.acquire();
+    });
+    const bool handed_over = wait_for([&] {
+      return Common::GpuTiming::Sync()
+                 .Snapshot()
+                 .Since(before_watched)
+                 .labels_gpu_thread == 2u;
+    });
+    const bool held_back = backing(watched) == 0 && backing(label) == rounds;
+    gate.release();
+    gpu.SendCommandSync([] {});
+    bool cpu_modified = false;
+    gpu.SendCommandSync(
+        [&] { cpu_modified = cache.IsRegionCpuModified(watched, 8); });
+    Require(name, "label order behind a watched page",
+            handed_over && held_back && backing(watched) == 0x5157u &&
+                backing(label) == 0x4c4cu,
+            "a label overtook an earlier one or was lost");
+    Require(name, "watched page bookkeeping", cpu_modified,
+            "a label written into a watched page left it clean");
+
+    // Labels are direct again once the GPU thread wrote the held ones.
+    const auto before_direct = Common::GpuTiming::Sync().Snapshot();
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      write_label(label, 0x4d4du, 0);
+    });
+    Require(name, "direct after the GPU thread",
+            wait_for([&] { return backing(label) == 0x4d4du; }) &&
+                Common::GpuTiming::Sync()
+                        .Snapshot()
+                        .Since(before_direct)
+                        .labels_direct == 1u,
+            "labels stayed on the GPU thread");
+
+    (void)Sync::DeleteEqEvent(context, interrupt_queue, 0);
+    LibKernel::EventQueue::KernelDeleteEqueue(interrupt_queue);
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    processor.reset();
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
@@ -53164,6 +53383,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSubmittedDownloadReadback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--label-delivery-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLabelDelivery();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeIndirectDispatch();
@@ -53433,6 +53657,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   vulkan.CheckScalarWalkGpuWrites();
   vulkan.CheckSubmittedDownloadReadback();
+  vulkan.CheckLabelDelivery();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
