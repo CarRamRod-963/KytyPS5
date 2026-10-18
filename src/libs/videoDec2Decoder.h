@@ -43,6 +43,7 @@ struct Output {
 	bool     last_frame      = false;
 	bool     error_frame     = false;
 	bool     buffer_accepted = false;
+	bool     first_frame     = false; // The first picture this instance has written.
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
 	uint32_t pitch           = 0;
