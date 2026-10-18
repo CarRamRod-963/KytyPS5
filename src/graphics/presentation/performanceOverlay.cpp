@@ -2,6 +2,7 @@
 
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
@@ -78,6 +79,7 @@ struct Snapshot {
 	size_t                                                     history_count = 0;
 	Clock::time_point                                          sample_time {};
 	LibKernel::Memory::DebugStats                              guest_memory;
+	std::optional<Common::GpuTiming::Summary>                  gpu_timing;
 };
 
 std::mutex            g_frame_mutex;
@@ -316,6 +318,39 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("DCC/CMASK GPU checks", Fmt("%.0f/s", Rate(shown, Counter::ColorMetadataChecks)));
 }
 
+std::string Latency(const Common::GpuTiming::LatencyHistogram& histogram, double seconds) {
+	if (histogram.Count() == 0) {
+		return "n/a";
+	}
+	return Fmt("p50 %.2f  p95 %.2f ms  (%.0f/s)",
+	           static_cast<double>(histogram.Quantile(0.5)) / 1e6,
+	           static_cast<double>(histogram.Quantile(0.95)) / 1e6,
+	           seconds > 0.0 ? static_cast<double>(histogram.Count()) / seconds : 0.0);
+}
+
+// Host GPU execution against the time around it, from per-submission timestamps.
+void GpuTimingRows(const Snapshot& shown, bool details) {
+	if (!shown.gpu_timing) {
+		return;
+	}
+	const auto& timing   = *shown.gpu_timing;
+	const auto  busy     = timing.BusyMsPerSecond();
+	const auto  per_flip = timing.SubmitsPerFlip();
+	Row("GPU busy", Fmt("%.0f ms/s  (%.0f submits/s, %s/flip)", busy, timing.SubmitsPerSecond(),
+	                    per_flip ? Fmt("%.1f", *per_flip).c_str() : "n/a"));
+	if (!timing.calibrated) {
+		return;
+	}
+	const auto label_ms = timing.seconds > 0.0
+	                          ? static_cast<double>(timing.label.TotalNs()) / 1e6 / timing.seconds
+	                          : 0.0;
+	Row("GPU end -> label", Latency(timing.label, timing.seconds) + Fmt("  %.0f ms/s", label_ms));
+	if (details) {
+		Row("Submit -> GPU start", Latency(timing.queue, timing.seconds));
+		Row("GPU end -> CPU wake", Latency(timing.wake, timing.seconds));
+	}
+}
+
 void CompilationRows(const Snapshot& shown) {
 	const auto row = [&](const char* label, Counter count_counter, Counter duration_counter,
 	                     uint64_t peak_ns) {
@@ -372,6 +407,7 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	if (g_details.load(std::memory_order_acquire)) {
 		shown.guest_memory = LibKernel::Memory::GetDebugStats();
 	}
+	shown.gpu_timing = Common::GpuTiming::Latest();
 }
 
 void DrawCompact(const Snapshot& shown) {
@@ -387,6 +423,7 @@ void DrawCompact(const Snapshot& shown) {
 	               : std::string("n/a"));
 	Row("GPU", Percent(host.gpu_percent));
 	GpuActivityRows(shown);
+	GpuTimingRows(shown, false);
 	CompilationRows(shown);
 	if (shown.device_memory) {
 		Row("GPU memory", Bytes(*shown.device_memory) + " / " + Bytes(shown.device_budget));
@@ -490,6 +527,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                      Rate(shown, Counter::Dispatches)));
 		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
+		GpuTimingRows(shown, true);
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
 		CompilationRows(shown);
