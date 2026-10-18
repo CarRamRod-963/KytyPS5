@@ -46,6 +46,10 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// Guest memory changed outside the command streams (an end-of-pipe label was stored): a
+	// stream suspended on a memory condition is retried now instead of at the next poll.
+	void NotifyMemoryWritten();
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -62,6 +66,7 @@ private:
 		Pm4Execution              execution;
 		bool                      started         = false;
 		bool                      blocked         = false;
+		uint64_t                  blocked_writes  = 0; // m_memory_writes before it ran.
 		uint64_t                  flip_request_id = 0;
 	};
 
@@ -86,6 +91,10 @@ private:
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;
+	// NotifyMemoryWritten() calls so far, and whether the GPU thread sleeps with every queue
+	// suspended.
+	std::atomic_uint64_t m_memory_writes {0};
+	std::atomic_bool     m_waiting_blocked {false};
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
