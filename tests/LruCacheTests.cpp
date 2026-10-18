@@ -144,6 +144,46 @@ void TestFreeAndIdReuse() {
   Check(Collect(cache, 70).size() == 1, "touching a rebuilt item failed");
 }
 
+void TestSelectBelowPassesOverRejectedItems() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  // Old items that the predicate never accepts sit in front of the evictable
+  // ones, as images that cannot be evicted do in the texture cache's LRU order.
+  for (uint64_t i = 0; i < 50; i++) {
+    (void)cache.Insert("pinned" + std::to_string(i), i);
+  }
+  (void)cache.Insert("a", 60);
+  (void)cache.Insert("b", 61);
+  (void)cache.Insert("c", 62);
+  (void)cache.Insert("young", 100);
+  const auto evictable = [](const std::string &object) {
+    return object.rfind("pinned", 0) != 0;
+  };
+
+  auto selected = cache.SelectBelow(90, 2, 1000, evictable);
+  Check(selected.size() == 2 && selected[0] == "a" && selected[1] == "b",
+        "rejected items counted against the selection limit");
+
+  selected = cache.SelectBelow(90, 10, 1000, evictable);
+  Check(selected.size() == 3 && selected[2] == "c",
+        "SelectBelow selected an item above the tick");
+
+  selected = cache.SelectBelow(UINT64_MAX, 10, 1000, evictable);
+  Check(selected.size() == 4 && selected[3] == "young",
+        "SelectBelow missed the newest item");
+
+  selected = cache.SelectBelow(90, 10, 51, evictable);
+  Check(selected.size() == 1 && selected[0] == "a",
+        "SelectBelow visited past its visit bound");
+
+  selected = cache.SelectBelow(90, 10, 50, evictable);
+  Check(selected.empty(), "SelectBelow selected a rejected item");
+
+  Check(cache.SelectBelow(90, 0, 1000, evictable).empty(),
+        "a zero limit selected items");
+  Check(Collect(cache, UINT64_MAX).size() == 54,
+        "SelectBelow changed the cache");
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +191,7 @@ int main() {
   TestEarlyExitCallback();
   TestTouchReordersAndSkips();
   TestFreeAndIdReuse();
+  TestSelectBelowPassesOverRejectedItems();
   std::puts("LruCacheTests: all cases passed");
   return 0;
 }
