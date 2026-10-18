@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -2233,10 +2234,13 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x03: break;
 			case 0x01:
 			case 0x02:
-			case 0x04:
+			case 0x04: {
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				const Common::GpuTiming::SyncScope sync_reason(
+				    Common::GpuTiming::SyncReason::Interrupt);
 				cp.BufferFlush();
 				break;
+			}
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
 	};
@@ -2263,6 +2267,8 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		// A written label submits on its own; the interrupt-only release of the graphics
 		// queue still needs its boundary.
 		if (interrupt_selector == 0x01 && !cp.IsAsyncComputeQueue()) {
+			const Common::GpuTiming::SyncScope sync_reason(
+			    Common::GpuTiming::SyncReason::Interrupt);
 			cp.BufferFlush();
 		}
 
@@ -2282,6 +2288,8 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
+			const Common::GpuTiming::SyncScope sync_reason(
+			    Common::GpuTiming::SyncReason::Interrupt);
 			cp.BufferFlush();
 		}
 

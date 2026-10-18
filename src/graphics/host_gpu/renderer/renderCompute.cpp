@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -476,6 +477,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// back on the next bind of the target. Submitting now keeps that readback a short copy
 	// instead of a flush of everything recorded since.
 	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
+		const Common::GpuTiming::SyncScope sync_reason(
+		    Common::GpuTiming::SyncReason::MetadataCheck);
 		m_context.GetCommandScheduler().Flush();
 	}
 	ResetBindings();
@@ -551,6 +554,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// back on the next bind of the target. Submitting now keeps that readback a short copy
 	// instead of a flush of everything recorded since.
 	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
+		const Common::GpuTiming::SyncScope sync_reason(
+		    Common::GpuTiming::SyncReason::MetadataCheck);
 		m_context.GetCommandScheduler().Flush();
 	}
 	ResetBindings();

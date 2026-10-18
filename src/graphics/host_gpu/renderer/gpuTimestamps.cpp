@@ -289,9 +289,16 @@ void GpuTimestamps::MaybeRotate(int64_t now_ns) {
 	const auto flips = Common::GpuTiming::GuestFlips();
 	m_accumulator.AddFlips(flips - m_window_flips);
 	m_window_flips    = flips;
+	if (m_primary) {
+		const auto sync = Common::GpuTiming::Sync().Snapshot();
+		m_accumulator.SetSync(sync.Since(m_last_sync));
+		m_last_sync = sync;
+	}
 	const auto window = m_accumulator.Take(static_cast<double>(now_ns - m_window_start_ns) / 1e9);
 	m_window_start_ns = now_ns;
-	Common::GpuTiming::Publish(window);
+	if (m_primary) {
+		Common::GpuTiming::Publish(window);
+	}
 	m_log_window.Merge(window);
 	if (m_log_window.seconds >= LOG_INTERVAL_S) {
 		LOGF("%s\n", Common::GpuTiming::FormatSummary(m_log_window).c_str());
