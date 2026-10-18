@@ -30,6 +30,7 @@ class CodeGenerator;
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class SrtWalker;
+struct MaterializationScratch;
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
@@ -776,6 +777,9 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// GPU-thread scratch of MaterializeResources (ResourceMaterialization.cpp), kept across
+	// refreshes so a warm refresh allocates nothing.
+	mutable std::shared_ptr<MaterializationScratch> materialization_scratch;
 };
 
 struct Program: ResourcePlan {
