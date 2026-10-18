@@ -64,6 +64,22 @@ const char* SyncReasonName(SyncReason reason) noexcept {
 	return "?";
 }
 
+const char* StallKindName(StallKind kind) noexcept {
+	switch (kind) {
+		case StallKind::WaitRegMem: return "wait-reg-mem";
+		case StallKind::WaitCe: return "ce";
+		case StallKind::WaitDeDiff: return "de-diff";
+		case StallKind::Rewind: return "rewind";
+		case StallKind::Predication: return "predication";
+		case StallKind::Count: break;
+	}
+	return "?";
+}
+
+size_t SizeClassOf(uint32_t commands) noexcept {
+	return commands <= 1 ? 0 : commands < 16 ? 1 : commands < 128 ? 2 : 3;
+}
+
 SyncReason CurrentSyncReason() noexcept {
 	return g_sync_reason;
 }
@@ -95,6 +111,14 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 		barriers[i] += other.barriers[i];
 	}
 	barriers_unmerged += other.barriers_unmerged;
+	gpu_thread_starved += other.gpu_thread_starved;
+	gpu_thread_starved_ns += other.gpu_thread_starved_ns;
+	gpu_thread_blocked += other.gpu_thread_blocked;
+	gpu_thread_timeouts += other.gpu_thread_timeouts;
+	gpu_thread_blocked_ns += other.gpu_thread_blocked_ns;
+	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
+		stalls[i] += other.stalls[i];
+	}
 }
 
 SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
@@ -114,7 +138,15 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 	for (size_t i = 0; i < BARRIER_KIND_COUNT; i++) {
 		delta.barriers[i] = barriers[i] - earlier.barriers[i];
 	}
-	delta.barriers_unmerged = barriers_unmerged - earlier.barriers_unmerged;
+	delta.barriers_unmerged     = barriers_unmerged - earlier.barriers_unmerged;
+	delta.gpu_thread_starved    = gpu_thread_starved - earlier.gpu_thread_starved;
+	delta.gpu_thread_starved_ns = gpu_thread_starved_ns - earlier.gpu_thread_starved_ns;
+	delta.gpu_thread_blocked    = gpu_thread_blocked - earlier.gpu_thread_blocked;
+	delta.gpu_thread_timeouts   = gpu_thread_timeouts - earlier.gpu_thread_timeouts;
+	delta.gpu_thread_blocked_ns = gpu_thread_blocked_ns - earlier.gpu_thread_blocked_ns;
+	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
+		delta.stalls[i] = stalls[i] - earlier.stalls[i];
+	}
 	return delta;
 }
 
@@ -160,7 +192,15 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 	for (size_t i = 0; i < BARRIER_KIND_COUNT; i++) {
 		counts.barriers[i] = m_barriers[i].load(std::memory_order_relaxed);
 	}
-	counts.barriers_unmerged = m_barriers_unmerged.load(std::memory_order_relaxed);
+	counts.barriers_unmerged     = m_barriers_unmerged.load(std::memory_order_relaxed);
+	counts.gpu_thread_starved    = m_gpu_thread_starved.load(std::memory_order_relaxed);
+	counts.gpu_thread_starved_ns = m_gpu_thread_starved_ns.load(std::memory_order_relaxed);
+	counts.gpu_thread_blocked    = m_gpu_thread_blocked.load(std::memory_order_relaxed);
+	counts.gpu_thread_timeouts   = m_gpu_thread_timeouts.load(std::memory_order_relaxed);
+	counts.gpu_thread_blocked_ns = m_gpu_thread_blocked_ns.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
+		counts.stalls[i] = m_stalls[i].load(std::memory_order_relaxed);
+	}
 	return counts;
 }
 
@@ -255,6 +295,14 @@ void Summary::Merge(const Summary& other) noexcept {
 	wake.Merge(other.wake);
 	label.Merge(other.label);
 	sync.Merge(other.sync);
+	for (size_t i = 0; i < SYNC_REASON_COUNT; i++) {
+		span_ns_by_reason[i] += other.span_ns_by_reason[i];
+	}
+	for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
+		span_ns_by_size[i] += other.span_ns_by_size[i];
+		submits_by_size[i] += other.submits_by_size[i];
+	}
+	launch_gap_ns += other.launch_gap_ns;
 }
 
 double Summary::BusyMsPerSecond() const noexcept {
@@ -284,8 +332,22 @@ void Accumulator::AddSubmission(const Submission& submission) noexcept {
 		}
 		m_last_end_ns = std::max(m_last_end_ns, submission.gpu_end_ns);
 	}
+	const auto span   = submission.gpu_end_ns > submission.gpu_begin_ns
+	                        ? submission.gpu_end_ns - submission.gpu_begin_ns
+	                        : uint64_t {0};
+	const auto reason = static_cast<size_t>(submission.reason);
+	m_window.span_ns_by_reason[reason < SYNC_REASON_COUNT ? reason : 0] += span;
+	const auto size_class = SizeClassOf(submission.commands);
+	m_window.span_ns_by_size[size_class] += span;
+	m_window.submits_by_size[size_class]++;
 	if (submission.host_begin_ns) {
-		m_window.queue.Add(*submission.host_begin_ns - submission.submit_ns);
+		const auto host_begin = *submission.host_begin_ns;
+		m_window.queue.Add(host_begin - submission.submit_ns);
+		const auto ready = std::max(submission.submit_ns, m_last_host_end_ns);
+		if (host_begin > ready) {
+			m_window.launch_gap_ns += static_cast<uint64_t>(host_begin - ready);
+		}
+		m_last_host_end_ns = std::max(m_last_host_end_ns, host_begin + static_cast<int64_t>(span));
 	}
 }
 
@@ -321,8 +383,53 @@ std::string SyncSuffix(const Summary& summary) {
 	              static_cast<double>(kinds[0]) * scale, static_cast<double>(kinds[1]) * scale,
 	              static_cast<double>(kinds[2]) * scale, static_cast<double>(kinds[3]) * scale,
 	              static_cast<double>(summary.sync.barriers_unmerged) * scale);
-	return ", sync submits/waits/wait-ms per s: " +
-	       FormatSyncCounts(summary.sync, summary.seconds) + tail + barriers;
+	const auto& sync = summary.sync;
+	char        thread[256];
+	std::snprintf(thread, sizeof(thread),
+	              ", GPU thread starved %.0f ms/s (%.0f/s), blocked %.0f ms/s (%.0f/s, %.0f "
+	              "timeouts/s), stalls per s:",
+	              static_cast<double>(sync.gpu_thread_starved_ns) / 1e6 * scale,
+	              static_cast<double>(sync.gpu_thread_starved) * scale,
+	              static_cast<double>(sync.gpu_thread_blocked_ns) / 1e6 * scale,
+	              static_cast<double>(sync.gpu_thread_blocked) * scale,
+	              static_cast<double>(sync.gpu_thread_timeouts) * scale);
+	std::string line =
+	    ", sync submits/waits/wait-ms per s: " + FormatSyncCounts(sync, summary.seconds) + tail +
+	    barriers + thread;
+	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
+		char item[48];
+		std::snprintf(item, sizeof(item), "%s %s %.0f", i == 0 ? "" : ",",
+		              StallKindName(static_cast<StallKind>(i)),
+		              static_cast<double>(sync.stalls[i]) * scale);
+		line += item;
+	}
+	line += ", GPU span ms/s by submit reason:";
+	bool any = false;
+	for (const auto reason: BusiestReasons(sync)) {
+		const auto i = static_cast<size_t>(reason);
+		if (summary.span_ns_by_reason[i] == 0) {
+			continue;
+		}
+		char item[48];
+		std::snprintf(item, sizeof(item), "%s %s %.1f", any ? "," : "", SyncReasonName(reason),
+		              static_cast<double>(summary.span_ns_by_reason[i]) / 1e6 * scale);
+		line += item;
+		any = true;
+	}
+	static constexpr std::array<const char*, SIZE_CLASS_COUNT> SizeNames = {"<=1", "2-15", "16-127",
+	                                                                        ">=128"};
+	line += ", by commands (submits/s, ms/s):";
+	for (size_t i = 0; i < SIZE_CLASS_COUNT; i++) {
+		char item[64];
+		std::snprintf(item, sizeof(item), "%s %s %.0f/%.1f", i == 0 ? "" : ",", SizeNames[i],
+		              static_cast<double>(summary.submits_by_size[i]) * scale,
+		              static_cast<double>(summary.span_ns_by_size[i]) / 1e6 * scale);
+		line += item;
+	}
+	char gap[64];
+	std::snprintf(gap, sizeof(gap), ", launch gaps %.1f ms/s",
+	              static_cast<double>(summary.launch_gap_ns) / 1e6 * scale);
+	return line + gap;
 }
 
 } // namespace
