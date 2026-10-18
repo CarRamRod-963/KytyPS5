@@ -121,7 +121,14 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Recording through the handle marks the buffer as holding work worth submitting.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// For a pipeline barrier only. A barrier orders earlier submissions against the commands
+	// recorded after it, so it keeps its meaning when the buffer is submitted later, and a buffer
+	// holding nothing else is not worth a submission.
+	[[nodiscard]] vk::CommandBuffer BarrierHandle() const;
+	// Whether anything but barriers was recorded since the buffer began.
+	[[nodiscard]] bool              HasCommands() const noexcept { return m_has_commands; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -151,6 +158,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_has_commands = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

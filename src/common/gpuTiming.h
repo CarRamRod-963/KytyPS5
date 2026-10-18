@@ -85,11 +85,14 @@ struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> submits {};
 	std::array<uint64_t, SYNC_REASON_COUNT> waits {}; // Blocking waits on the GPU timeline.
 	std::array<uint64_t, SYNC_REASON_COUNT> wait_ns {};
+	// Flushes that found nothing to submit and kept the command buffer open.
+	std::array<uint64_t, SYNC_REASON_COUNT> skipped {};
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
 	[[nodiscard]] uint64_t   TotalSubmits() const noexcept;
 	[[nodiscard]] uint64_t   TotalWaits() const noexcept;
+	[[nodiscard]] uint64_t   TotalSkipped() const noexcept;
 };
 
 // Running totals per reason, written from any thread with one relaxed increment.
@@ -103,6 +106,9 @@ public:
 		m_wait_ns[Index(reason)].fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
 		                                   std::memory_order_relaxed);
 	}
+	void AddSkippedFlush(SyncReason reason) noexcept {
+		m_skipped[Index(reason)].fetch_add(1, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -114,6 +120,7 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_submits {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_waits {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_wait_ns {};
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_skipped {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.

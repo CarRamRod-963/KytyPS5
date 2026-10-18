@@ -991,6 +991,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS. A label lands
 	// when its submission completes, then the interrupt follows it.
+	EXIT_IF(data_sel >= 1 && data_sel <= 3 && CurrentBuffer().IsInvalid());
 	switch (data_sel) {
 		case 0: break;
 		case 1:
@@ -1025,12 +1026,15 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	// submission completes makes the guest's wait cover the GPU, so the results it reads next
 	// are already published instead of faulting into a synchronous readback of unsubmitted
 	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
-	auto&      gpu       = m_renderer.GetGpu();
-	auto&      scheduler = GetScheduler();
-	const auto tick      = scheduler.CurrentTick();
-	scheduler.DeferPriorityOperation([&renderer = m_renderer, &gpu, &scheduler, tick, dst, value,
-	                                  with_interrupt, event_id = m_interrupt_event_id,
-	                                  interrupt_context_id] {
+	// With nothing recorded since the last submission the label rides on that submission, and
+	// the flush below has nothing to submit.
+	auto& gpu       = m_renderer.GetGpu();
+	auto& scheduler = GetScheduler();
+	scheduler.DeferPriorityOperationAfterRecorded([&renderer = m_renderer, &gpu, &scheduler, dst,
+	                                               value, with_interrupt,
+	                                               event_id = m_interrupt_event_id,
+	                                               interrupt_context_id] {
+		const auto tick = scheduler.ActivePriorityTick();
 		gpu.SendCommand([&renderer, &scheduler, tick, dst, value, with_interrupt, event_id,
 		                 interrupt_context_id] {
 			std::memcpy(dst, &value, sizeof(T));
@@ -1045,8 +1049,8 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
-	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
+	EXIT_IF(CurrentBuffer().IsInvalid());
+	GetScheduler().DeferPriorityOperationAfterRecorded(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 	    });
