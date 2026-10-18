@@ -13344,9 +13344,64 @@ public:
               scheduler.CurrentTick() == fault_tick && backing() == 0x55555555u,
               "the fault read submitted its own copy or returned stale bytes");
 
-      context.UnmapMemory(base, allocation_size);
-      scheduler.Finish();
     });
+    // Readbacks that guest threads request while the GPU thread is busy share
+    // one submission: a read of one page and a CPU write into another.
+    {
+      constexpr uint64_t first = target + 0x8000;
+      constexpr uint64_t second = target + 0x10000;
+      auto &gpu = context.GetGpu();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      uint64_t tick_before = 0;
+      gpu.SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        for (const auto [address, value] :
+             {std::pair{first, 0x61616161u}, std::pair{second, 0x62626262u}}) {
+          auto [buffer, offset] = cache.ObtainBuffer(address, bytes, true);
+          buffer->Fill(offset, bytes, value);
+        }
+        tick_before = scheduler.CurrentTick();
+      });
+      std::binary_semaphore gate{0};
+      gpu.SendCommand([&gate] { gate.acquire(); });
+      std::thread reader([&] { cache.ReadMemory(first, bytes); });
+      std::thread writer([&] { cache.ReadMemory(second, 4, true); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      gate.release();
+      reader.join();
+      writer.join();
+      uint64_t tick_after = 0;
+      bool clean = false;
+      gpu.SendCommandSync([&] {
+        tick_after = scheduler.CurrentTick();
+        clean = !cache.HasGpuDirtyBytes(first, bytes) &&
+                !cache.HasGpuDirtyBytes(second, bytes) &&
+                cache.IsRegionCpuModified(second, 4);
+      });
+      uint32_t first_value = 0;
+      uint32_t second_value = 0;
+      Require(name, "batched readback data",
+              LibKernel::Memory::TryReadBacking(first + bytes - 4, &first_value,
+                                                sizeof(first_value)) &&
+                  LibKernel::Memory::TryReadBacking(second + bytes - 4,
+                                                    &second_value,
+                                                    sizeof(second_value)) &&
+                  first_value == 0x61616161u && second_value == 0x62626262u &&
+                  clean,
+              "a batched readback lost GPU bytes or ownership");
+      Require(name, "batched readback submission",
+              tick_after == tick_before + 1,
+              "concurrent readbacks did not share one submission (" +
+                  std::to_string(tick_after - tick_before) + ")");
+      gpu.SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+    }
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
