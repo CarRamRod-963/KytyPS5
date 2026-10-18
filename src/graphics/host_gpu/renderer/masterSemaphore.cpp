@@ -36,13 +36,13 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+bool MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
-		return;
+		return false;
 	}
 	Refresh();
 	if (IsFree(tick)) {
-		return;
+		return false;
 	}
 
 	vk::SemaphoreWaitInfo wait_info {};
@@ -55,6 +55,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
+	return true;
 }
 
 } // namespace Libs::Graphics
