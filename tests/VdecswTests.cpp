@@ -1,6 +1,7 @@
 #include "libs/libVdecsw.cpp"
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,17 +55,20 @@ InputData Input(uint32_t packet) {
 	        0x12340000u + PresentationOrder[packet]};
 }
 
+// 256-byte aligned memory with 256 guard bytes on each side. The MSVC runtime has no
+// std::aligned_alloc, so the block is aligned inside an over-allocated vector.
 struct GuardedMemory {
+	std::vector<uint8_t> storage;
 	uint8_t* allocation;
 	uint8_t* data;
 	size_t size;
-	explicit GuardedMemory(size_t bytes): size(bytes) {
-		allocation = static_cast<uint8_t*>(std::aligned_alloc(256, (bytes + 767u) & ~size_t{255}));
-		CHECK(allocation != nullptr);
+	explicit GuardedMemory(size_t bytes): storage(bytes + 767u), size(bytes) {
+		const auto misalignment = reinterpret_cast<uintptr_t>(storage.data()) & 255u;
+		allocation = storage.data() + ((256u - misalignment) & 255u);
 		data = allocation + 256;
 		std::memset(allocation, 0xa7, bytes + 512);
 	}
-	~GuardedMemory() { Check(); std::free(allocation); }
+	~GuardedMemory() { Check(); }
 	void Check() const {
 		for (size_t i = 0; i < 256; ++i)
 			CHECK(allocation[i] == 0xa7 && data[size + i] == 0xa7);
