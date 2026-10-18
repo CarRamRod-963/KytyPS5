@@ -19,8 +19,8 @@ namespace Libs::Graphics {
 // A chunk that holds any is marked when it is filled, and a read from a marked chunk reads back
 // the GPU-dirty bytes among exactly the bytes it returns: a GPU-written word next to the
 // descriptors a walk reads costs no readback unless the walk reads that word. A GPU write
-// recorded after a chunk was filled drops every chunk. Clean memory costs one dirty-range query
-// per chunk.
+// recorded after a chunk was filled drops every chunk, and a readback drops every marked chunk.
+// Clean memory costs one dirty-range query per chunk.
 //
 // The backend provides, on the thread that evaluates:
 //   bool     Read(uint64_t address, void* data, uint64_t size);  // backing; false if unmapped
@@ -49,21 +49,23 @@ public:
 		if (bytes <= ChunkBytes && address - base + bytes <= ChunkBytes) {
 			auto& entry = m_entries[(base / ChunkBytes) % Entries];
 			if (entry.base != base) {
-				entry.base  = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
-				entry.dirty = entry.base == base && m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+				Fill(entry, base);
 			}
-			auto* cached = reinterpret_cast<uint8_t*>(entry.words) + (address - base);
 			if (entry.base == base && entry.dirty && m_backend.HasGpuDirtyBytes(address, bytes)) {
-				m_backend.ReadGpuDirtyBytes(address, bytes);
-				if (!m_backend.Read(address, cached, bytes)) entry.base = UINT64_MAX;
+				ReadBack(address, bytes);
+				Fill(entry, base);
 			}
 			if (entry.base == base) {
-				std::memcpy(values.data(), cached, bytes);
+				std::memcpy(values.data(),
+				            reinterpret_cast<const uint8_t*>(entry.words) + (address - base),
+				            bytes);
 				return;
 			}
 			// A chunk that crosses unmapped memory: read exactly what was asked for.
 		}
-		Synchronize(address, bytes);
+		if (bytes != 0 && m_backend.HasGpuDirtyBytes(address, bytes)) {
+			ReadBack(address, bytes);
+		}
 		if (!m_backend.Read(address, values.data(), bytes)) {
 			std::ranges::fill(values, 0u);
 		}
@@ -76,9 +78,21 @@ private:
 		uint32_t words[ChunkBytes / sizeof(uint32_t)];
 	};
 
-	void Synchronize(uint64_t address, uint64_t size) {
-		if (size != 0 && m_backend.HasGpuDirtyBytes(address, size)) {
-			m_backend.ReadGpuDirtyBytes(address, size);
+	void Fill(Entry& entry, uint64_t base) {
+		entry.base  = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
+		entry.dirty = entry.base == base && m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+	}
+
+	// A readback also publishes completed asynchronous downloads, which turns GPU-dirty bytes
+	// clean without a readback of their own: a chunk filled while it held GPU-dirty bytes may
+	// hold their old values under a clean mark now, so every such chunk is dropped.
+	void ReadBack(uint64_t address, uint64_t size) {
+		m_backend.ReadGpuDirtyBytes(address, size);
+		for (auto& entry: m_entries) {
+			if (entry.dirty) {
+				entry.base  = UINT64_MAX;
+				entry.dirty = false;
+			}
 		}
 	}
 
