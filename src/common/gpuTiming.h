@@ -81,6 +81,11 @@ private:
 	SyncReason m_previous;
 };
 
+// Pipeline barriers recorded around guest dispatches and flushes.
+enum class BarrierKind : uint8_t { ComputeToCompute, AllToCompute, ComputeToAll, AllToAll, Count };
+
+inline constexpr size_t BARRIER_KIND_COUNT = static_cast<size_t>(BarrierKind::Count);
+
 struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> submits {};
 	std::array<uint64_t, SYNC_REASON_COUNT> waits {}; // Blocking waits on the GPU timeline.
@@ -99,6 +104,11 @@ struct SyncCounts {
 	// thread (watched pages, or behind such a label).
 	uint64_t labels_direct     = 0;
 	uint64_t labels_gpu_thread = 0;
+	// Pipeline barriers that order guest dispatches and flushes, by kind (BarrierKind), and the
+	// number a barrier before every writing dispatch, one after every dispatch and one per guest
+	// flush would have been.
+	std::array<uint64_t, BARRIER_KIND_COUNT> barriers {};
+	uint64_t                                 barriers_unmerged = 0;
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
@@ -136,6 +146,13 @@ public:
 	void AddLabel(bool direct) noexcept {
 		(direct ? m_labels_direct : m_labels_gpu_thread).fetch_add(1, std::memory_order_relaxed);
 	}
+	void AddBarrier(BarrierKind kind) noexcept {
+		const auto index = static_cast<size_t>(kind);
+		m_barriers[index < BARRIER_KIND_COUNT ? index : 0].fetch_add(1, std::memory_order_relaxed);
+	}
+	void AddUnmergedBarriers(uint64_t count) noexcept {
+		m_barriers_unmerged.fetch_add(count, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -154,6 +171,8 @@ private:
 	std::atomic<uint64_t>                                m_async_deferred {};
 	std::atomic<uint64_t>                                m_labels_direct {};
 	std::atomic<uint64_t>                                m_labels_gpu_thread {};
+	std::array<std::atomic<uint64_t>, BARRIER_KIND_COUNT> m_barriers {};
+	std::atomic<uint64_t>                                 m_barriers_unmerged {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.
