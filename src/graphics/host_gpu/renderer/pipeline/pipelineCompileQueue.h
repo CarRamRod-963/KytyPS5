@@ -40,6 +40,9 @@ public:
 	[[nodiscard]] size_t Outstanding();
 	// Blocks until no job is queued or running.
 	void WaitIdle();
+	// Returns once the ticket's result is available to TakeCompleted (or was taken): a job that
+	// has not started runs on the calling thread, a running one is waited for.
+	void Expedite(uint64_t ticket);
 	// Drops the queued jobs, waits for the running ones, joins the threads and discards every
 	// uncollected handle. Idempotent.
 	void Stop();
@@ -51,6 +54,8 @@ private:
 	};
 
 	void Worker();
+	// Records a finished job; called with the mutex held.
+	void Finish(uint64_t ticket, uint64_t handle);
 
 	Discard                  m_discard;
 	std::mutex               m_mutex;
@@ -59,8 +64,8 @@ private:
 	std::deque<Entry>        m_jobs;
 	std::vector<Completion>  m_completed;
 	std::vector<std::thread> m_threads;
+	std::vector<uint64_t>    m_running_tickets;
 	uint64_t                 m_next_ticket = 1;
-	uint32_t                 m_running     = 0;
 	bool                     m_stopped     = false;
 };
 
