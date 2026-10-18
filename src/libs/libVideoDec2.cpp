@@ -44,7 +44,13 @@ constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
-constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
+// The FFmpeg backend keeps its state in host memory, so the guest memory blocks only have to
+// exist. Games carve them and their frame buffers out of fixed budgets: Ghost of Yotei fits the
+// compute queue memory, the CPU-GPU block and at least four frame buffers into 72 MiB for 1080p
+// movies and 13 MiB for 544x304 ones, and drops the movie otherwise. Keep the blocks small.
+constexpr size_t VIDEODEC2_MEMORY_BLOCK_SIZE = 64ull * 1024ull;
+// Frame buffer size when the game does not bound the picture size or the codec is not AVC.
+constexpr size_t   VIDEODEC2_UNBOUNDED_FRAME_BUFFER_SIZE = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
 using Videodec2Decoder      = void*;
@@ -270,7 +276,7 @@ static int32_t QueryComputeMemoryInfoImpl(Videodec2ComputeMemoryInfo* compute_me
 		return VIDEODEC2_ERROR_STRUCT_SIZE;
 	}
 
-	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_MIN_MEMORY_SIZE;
+	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	compute_memory_info->cpu_gpu_memory      = nullptr;
 
 	return OK;
@@ -301,7 +307,7 @@ static int32_t AllocateComputeQueueImpl(const Videodec2ComputeConfigInfo* comput
 		return VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 	}
 
-	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -322,7 +328,7 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
 	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
 	    config.max_frame_height <= 0) {
-		return VIDEODEC2_MIN_MEMORY_SIZE;
+		return VIDEODEC2_UNBOUNDED_FRAME_BUFFER_SIZE;
 	}
 	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
 	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
@@ -346,11 +352,11 @@ static int32_t QueryDecoderMemoryInfoImpl(const Videodec2DecoderConfigInfo* conf
 		return validation_result;
 	}
 
-	memory_info->cpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->cpu_memory_size        = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->cpu_memory             = nullptr;
-	memory_info->gpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->gpu_memory_size        = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->gpu_memory             = nullptr;
-	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
 	memory_info->max_frame_buffer_size  = FrameBufferSize(*config);
 	memory_info->frame_buffer_alignment = 0x100;
@@ -376,9 +382,9 @@ static int32_t CreateDecoderImpl(const Videodec2DecoderConfigInfo* config,
 		return validation_result;
 	}
 
-	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
+	if (memory_info->cpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
+	    memory_info->gpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
+	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
 	    memory_info->max_frame_buffer_size < FrameBufferSize(*config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
