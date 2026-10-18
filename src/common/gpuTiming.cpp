@@ -91,6 +91,10 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 	async_deferred += other.async_deferred;
 	labels_direct += other.labels_direct;
 	labels_gpu_thread += other.labels_gpu_thread;
+	for (size_t i = 0; i < BARRIER_KIND_COUNT; i++) {
+		barriers[i] += other.barriers[i];
+	}
+	barriers_unmerged += other.barriers_unmerged;
 }
 
 SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
@@ -107,6 +111,10 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 	delta.async_deferred    = async_deferred - earlier.async_deferred;
 	delta.labels_direct     = labels_direct - earlier.labels_direct;
 	delta.labels_gpu_thread = labels_gpu_thread - earlier.labels_gpu_thread;
+	for (size_t i = 0; i < BARRIER_KIND_COUNT; i++) {
+		delta.barriers[i] = barriers[i] - earlier.barriers[i];
+	}
+	delta.barriers_unmerged = barriers_unmerged - earlier.barriers_unmerged;
 	return delta;
 }
 
@@ -149,6 +157,10 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 	counts.async_deferred    = m_async_deferred.load(std::memory_order_relaxed);
 	counts.labels_direct     = m_labels_direct.load(std::memory_order_relaxed);
 	counts.labels_gpu_thread = m_labels_gpu_thread.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < BARRIER_KIND_COUNT; i++) {
+		counts.barriers[i] = m_barriers[i].load(std::memory_order_relaxed);
+	}
+	counts.barriers_unmerged = m_barriers_unmerged.load(std::memory_order_relaxed);
 	return counts;
 }
 
@@ -301,8 +313,16 @@ std::string SyncSuffix(const Summary& summary) {
 	              static_cast<double>(summary.sync.async_deferred) * scale,
 	              static_cast<double>(summary.sync.labels_direct) * scale,
 	              static_cast<double>(summary.sync.labels_gpu_thread) * scale);
+	char        barriers[200];
+	const auto& kinds = summary.sync.barriers;
+	std::snprintf(barriers, sizeof(barriers),
+	              ", dispatch barriers per s: compute->compute %.0f, all->compute %.0f, "
+	              "compute->all %.0f, all->all %.0f (unmerged %.0f)",
+	              static_cast<double>(kinds[0]) * scale, static_cast<double>(kinds[1]) * scale,
+	              static_cast<double>(kinds[2]) * scale, static_cast<double>(kinds[3]) * scale,
+	              static_cast<double>(summary.sync.barriers_unmerged) * scale);
 	return ", sync submits/waits/wait-ms per s: " +
-	       FormatSyncCounts(summary.sync, summary.seconds) + tail;
+	       FormatSyncCounts(summary.sync, summary.seconds) + tail + barriers;
 }
 
 } // namespace
