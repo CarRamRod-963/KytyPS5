@@ -50,6 +50,11 @@ constexpr uint32_t VIDEODEC2_HEVC_PROFILE_MAIN10   = 2;
 constexpr uint32_t VIDEODEC2_VP9_PROFILE_2         = 2;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr size_t   VIDEODEC2_COMPUTE_MEMORY_SIZE   = 0x495300;
+// The FFmpeg backend keeps its state in host memory, so the decoder's guest memory blocks only
+// have to exist. Games carve them and their frame buffers out of fixed budgets: Ghost of Yotei fits
+// the compute queue memory, the CPU-GPU block and at least four frame buffers into 72 MiB for 1080p
+// movies and 13 MiB for 544x304 ones, and drops the movie otherwise. Keep the decoder blocks small.
+constexpr size_t VIDEODEC2_MEMORY_BLOCK_SIZE = 64ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
 using Videodec2Decoder      = void*;
@@ -398,11 +403,11 @@ static int32_t QueryDecoderMemoryInfoImpl(const Videodec2DecoderConfigInfo* conf
 		return validation_result;
 	}
 
-	memory_info->cpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->cpu_memory_size        = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->cpu_memory             = nullptr;
-	memory_info->gpu_memory_size        = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->gpu_memory_size        = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->gpu_memory             = nullptr;
-	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MEMORY_BLOCK_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
 	memory_info->max_frame_buffer_size  = FrameBufferSize(*config);
 	memory_info->frame_buffer_alignment = 0x100;
@@ -428,9 +433,9 @@ static int32_t CreateDecoderImpl(const Videodec2DecoderConfigInfo* config,
 		return validation_result;
 	}
 
-	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
+	if (memory_info->cpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
+	    memory_info->gpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
+	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MEMORY_BLOCK_SIZE ||
 	    memory_info->max_frame_buffer_size < FrameBufferSize(*config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
