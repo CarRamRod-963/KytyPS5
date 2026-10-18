@@ -304,7 +304,7 @@ private:
 
 		const auto width       = static_cast<uint32_t>(frame->width);
 		const auto height      = static_cast<uint32_t>(frame->height);
-		const auto pitch       = AlignUp(width, 256);
+		const auto pitch       = FramePitch(width);
 		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
 		const auto required =
 		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
@@ -382,6 +382,10 @@ private:
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
+
+uint32_t FramePitch(uint32_t width) {
+	return AlignUp(width, 256);
+}
 
 bool IsCodecSupported(uint32_t codec_type) {
 	return GetAvCodecId(codec_type) != AV_CODEC_ID_NONE;
