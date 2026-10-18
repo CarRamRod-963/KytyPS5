@@ -136,9 +136,25 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
+	constexpr auto write_access           = vk::AccessFlagBits2::eTransferWrite |
+	                                        vk::AccessFlagBits2::eShaderWrite |
+	                                        vk::AccessFlagBits2::eMemoryWrite;
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
+		const ImageSubresourceRange requested =
+		    partial ? *range
+		            : ImageSubresourceRange {0, info.resources.levels, 0, info.resources.layers};
+		if (m_settled && m_settled->image == backing.image &&
+		    m_settled->layout == destination_layout && m_settled->access == destination_access &&
+		    m_settled->stage == destination_stage && m_settled->range == requested &&
+		    m_settled->subresources == subresource_states.size() &&
+		    m_settled->state.layout == state.layout &&
+		    m_settled->state.access_mask == state.access_mask &&
+		    m_settled->state.pl_stage == state.pl_stage) {
+			return {};
+		}
+		m_settled.reset();
 		if (!has_subresource_states) {
 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
 		}
@@ -153,10 +169,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
+				const bool repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
@@ -184,11 +197,20 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (!partial) {
 			subresource_states.clear();
 		}
+		state = {destination_stage, destination_access, destination_layout};
+		if (partial && !(destination_access & write_access)) {
+			m_settled = SettledTransition {backing.image,
+			                               destination_layout,
+			                               destination_access,
+			                               destination_stage,
+			                               requested,
+			                               state,
+			                               subresource_states.size()};
+		}
+		return barriers;
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
+		m_settled.reset();
+		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
 			return {};
