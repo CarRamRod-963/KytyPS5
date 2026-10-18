@@ -62,10 +62,8 @@ public:
 	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	              vk::AccessFlags source_after       = LaterAccess,
+	              vk::AccessFlags destination_after  = LaterAccess);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
