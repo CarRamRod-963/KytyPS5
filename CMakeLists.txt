@@ -618,6 +618,11 @@ add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL
 target_link_libraries(pipeline_compile_queue_tests common fmt::fmt)
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+add_executable(pending_draw_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PendingDrawPolicyTests.cpp"
+)
+target_include_directories(pending_draw_policy_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_cache_writer_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineCacheWriterTests.cpp"
 )
@@ -679,6 +684,7 @@ if(BUILD_TESTING)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
+	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -774,6 +780,7 @@ if(BUILD_TESTING)
 		dcc_constant_tests
 		pipeline_compile_queue_tests
 		pipeline_cache_writer_tests
+		pending_draw_policy_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
