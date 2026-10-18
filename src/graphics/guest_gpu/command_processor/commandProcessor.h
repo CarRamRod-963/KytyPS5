@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuTiming.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -123,7 +124,7 @@ public:
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
+	void SuspendPm4(Common::GpuTiming::StallKind kind);
 	void                CountDraw();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
