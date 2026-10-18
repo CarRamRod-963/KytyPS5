@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -27,7 +28,9 @@ struct FakeGuestMemory {
   std::array<uint8_t, Size> backing{};
   std::array<uint8_t, Size> gpu{};
   std::vector<std::pair<uint64_t, uint64_t>> dirty;
+  // Every range asked for, and the number of calls (one wait each).
   std::vector<std::pair<uint64_t, uint64_t>> readbacks;
+  uint64_t readback_calls = 0;
   // GPU writes whose asynchronous download completes: the next readback
   // publishes them (writes their bytes and clears their dirty mark) as well.
   std::vector<std::pair<uint64_t, uint64_t>> downloaded;
@@ -64,8 +67,17 @@ struct FakeGuestMemory {
     }
     return false;
   }
-  void ReadGpuDirtyBytes(uint64_t address, uint64_t size) {
-    readbacks.emplace_back(address, size);
+  void
+  ReadGpuDirtyBytes(std::span<const Libs::Graphics::ScalarReadRange> ranges) {
+    ++readback_calls;
+    readbacks.insert(readbacks.end(), ranges.begin(), ranges.end());
+    const auto requested = [&](uint64_t start, uint64_t bytes) {
+      for (const auto &[address, size] : ranges) {
+        if (Overlaps(start, bytes, address, size))
+          return true;
+      }
+      return false;
+    };
     std::vector<std::pair<uint64_t, uint64_t>> remaining;
     const auto published = [&](uint64_t start, uint64_t bytes) {
       for (const auto &[download, download_bytes] : downloaded) {
@@ -75,7 +87,7 @@ struct FakeGuestMemory {
       return false;
     };
     for (const auto &[start, bytes] : dirty) {
-      if (!Overlaps(start, bytes, address, size) && !published(start, bytes)) {
+      if (!requested(start, bytes) && !published(start, bytes)) {
         remaining.emplace_back(start, bytes);
         continue;
       }
@@ -194,6 +206,59 @@ void TestPublishedWordOfCachedChunk() {
         "a chunk served a published word from before its publication");
 }
 
+// A walk that reads two GPU-written tables waits twice; the next walk of the
+// same program, given the ranges the first read back, waits once.
+void TestWalkReadBacksShareOneWait() {
+  FakeGuestMemory memory;
+  const auto first = FakeGuestMemory::Base + 0x100;
+  const auto second = FakeGuestMemory::Base + 0x600;
+  memory.GpuWrite(first, 1);
+  memory.GpuWrite(second, 2);
+  std::vector<Libs::Graphics::ScalarReadRange> history;
+  {
+    Cache walk(memory);
+    walk.Prefetch(history);
+    Check(ReadWord(walk, first) == 1 && ReadWord(walk, second) == 2,
+          "first walk values");
+    Check(memory.readback_calls == 2, "the first walk did not wait per table");
+    const auto read_backs = walk.ReadBacks();
+    history.assign(read_backs.begin(), read_backs.end());
+  }
+  Check(history == std::vector<Libs::Graphics::ScalarReadRange>{{first, 4},
+                                                                {second, 4}},
+        "the walk did not report the ranges it read back");
+  memory.GpuWrite(first, 3);
+  memory.GpuWrite(second, 4);
+  {
+    Cache walk(memory);
+    walk.Prefetch(history);
+    Check(ReadWord(walk, first) == 3 && ReadWord(walk, second) == 4,
+          "a prefetched walk read stale values");
+    Check(memory.readback_calls == 3,
+          "the prefetched walk waited more than once");
+  }
+  // Nothing dirty: the hint costs nothing.
+  {
+    Cache walk(memory);
+    walk.Prefetch(history);
+    Check(ReadWord(walk, first) == 3 && ReadWord(walk, second) == 4 &&
+              memory.readback_calls == 3 && walk.ReadBacks().empty(),
+          "a clean walk read back its hint");
+  }
+  // A walk that reads only one of the tables still waits once and serves
+  // exact values.
+  memory.GpuWrite(second, 5);
+  memory.GpuWrite(first, 6);
+  {
+    Cache walk(memory);
+    walk.Prefetch(history);
+    Check(ReadWord(walk, first) == 6 && memory.readback_calls == 4,
+          "a walk reading one hinted table");
+  }
+  Check(!memory.HasGpuDirtyBytes(second, 4),
+        "the hinted table was not read back in the same round trip");
+}
+
 void TestUncachedAndUnmappedReads() {
   FakeGuestMemory memory;
   // A read that ends past the mapping falls back to an exact read and returns
@@ -223,6 +288,7 @@ int main() {
   TestOnlyReadDirtyBytesAreReadBack();
   TestCachedChunkDroppedAfterGpuWrite();
   TestPublishedWordOfCachedChunk();
+  TestWalkReadBacksShareOneWait();
   TestUncachedAndUnmappedReads();
   std::printf("ScalarReadCacheTests: ok\n");
   return 0;
