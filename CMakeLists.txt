@@ -633,6 +633,12 @@ add_executable(scalar_read_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(scalar_read_cache_tests PRIVATE ${inc_headers})
 
+add_executable(gpu_timing_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuTimingTests.cpp"
+)
+target_include_directories(gpu_timing_tests PRIVATE ${inc_headers})
+target_link_libraries(gpu_timing_tests common)
+
 add_executable(dcc_constant_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DccConstantTests.cpp"
 )
@@ -717,6 +723,7 @@ if(BUILD_TESTING)
 	add_test(NAME guest_write_set COMMAND $<TARGET_FILE:guest_write_set_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
+	add_test(NAME gpu_timing COMMAND $<TARGET_FILE:gpu_timing_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
@@ -821,6 +828,7 @@ if(BUILD_TESTING)
 		guest_write_set_tests
 		scalar_read_cache_tests
 		dcc_constant_tests
+		gpu_timing_tests
 		pipeline_compile_queue_tests
 		pipeline_cache_writer_tests
 		pending_draw_policy_tests

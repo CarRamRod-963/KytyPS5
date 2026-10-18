@@ -1019,11 +1019,16 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	// submission completes makes the guest's wait cover the GPU, so the results it reads next
 	// are already published instead of faulting into a synchronous readback of unsubmitted
 	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
-	auto& gpu = m_renderer.GetGpu();
-	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, &gpu, dst, value, with_interrupt,
-	                                       event_id  = m_interrupt_event_id, interrupt_context_id] {
-		gpu.SendCommand([&renderer, dst, value, with_interrupt, event_id, interrupt_context_id] {
+	auto&      gpu       = m_renderer.GetGpu();
+	auto&      scheduler = GetScheduler();
+	const auto tick      = scheduler.CurrentTick();
+	scheduler.DeferPriorityOperation([&renderer = m_renderer, &gpu, &scheduler, tick, dst, value,
+	                                  with_interrupt, event_id = m_interrupt_event_id,
+	                                  interrupt_context_id] {
+		gpu.SendCommand([&renderer, &scheduler, tick, dst, value, with_interrupt, event_id,
+		                 interrupt_context_id] {
 			std::memcpy(dst, &value, sizeof(T));
+			scheduler.GetTimestamps().RecordLabel(tick);
 			if (with_interrupt) {
 				renderer.TriggerInterrupt(event_id, interrupt_context_id);
 			}

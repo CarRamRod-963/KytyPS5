@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -50,6 +51,7 @@ public:
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
+	[[nodiscard]] GpuTimestamps&   GetTimestamps() noexcept { return m_timestamps; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -86,11 +88,13 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void WaitTick(uint64_t tick);
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
+	GpuTimestamps                m_timestamps;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
