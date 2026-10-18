@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <numeric>
+#include <vector>
 
 namespace Common::GpuTiming {
 
@@ -16,6 +18,7 @@ constexpr double BUCKET_BASE_NS     = 1000.0;
 std::mutex             g_latest_mutex;
 std::optional<Summary> g_latest;
 std::atomic<uint64_t>  g_guest_flips {0};
+thread_local SyncReason g_sync_reason = SyncReason::Other;
 
 double Ms(int64_t ns) {
 	return static_cast<double>(ns) / 1e6;
@@ -35,6 +38,119 @@ std::string FormatLatency(const char* name, const LatencyHistogram& histogram, d
 }
 
 } // namespace
+
+const char* SyncReasonName(SyncReason reason) noexcept {
+	switch (reason) {
+		case SyncReason::Other: return "other";
+		case SyncReason::QueueSlice: return "slice";
+		case SyncReason::Label: return "label";
+		case SyncReason::Interrupt: return "interrupt";
+		case SyncReason::Flip: return "flip";
+		case SyncReason::FrameBoundary: return "frame";
+		case SyncReason::GuestWait: return "guest-wait";
+		case SyncReason::FaultRead: return "fault-read";
+		case SyncReason::CpuWrite: return "cpu-write";
+		case SyncReason::BufferRead: return "buffer-read";
+		case SyncReason::WalkRead: return "walk-read";
+		case SyncReason::MetadataCheck: return "metadata";
+		case SyncReason::StreamWrap: return "stream-wrap";
+		case SyncReason::FaultBuffer: return "fault-buffer";
+		case SyncReason::Unmap: return "unmap";
+		case SyncReason::GarbageCollect: return "gc";
+		case SyncReason::Present: return "present";
+		case SyncReason::Completion: return "completion";
+		case SyncReason::Count: break;
+	}
+	return "?";
+}
+
+SyncReason CurrentSyncReason() noexcept {
+	return g_sync_reason;
+}
+
+SyncScope::SyncScope(SyncReason reason) noexcept: m_previous(g_sync_reason) {
+	if (g_sync_reason == SyncReason::Other) {
+		g_sync_reason = reason;
+	}
+}
+
+SyncScope::~SyncScope() {
+	g_sync_reason = m_previous;
+}
+
+void SyncCounts::Merge(const SyncCounts& other) noexcept {
+	for (size_t i = 0; i < SYNC_REASON_COUNT; i++) {
+		submits[i] += other.submits[i];
+		waits[i] += other.waits[i];
+		wait_ns[i] += other.wait_ns[i];
+	}
+}
+
+SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
+	SyncCounts delta;
+	for (size_t i = 0; i < SYNC_REASON_COUNT; i++) {
+		delta.submits[i] = submits[i] - earlier.submits[i];
+		delta.waits[i]   = waits[i] - earlier.waits[i];
+		delta.wait_ns[i] = wait_ns[i] - earlier.wait_ns[i];
+	}
+	return delta;
+}
+
+uint64_t SyncCounts::TotalSubmits() const noexcept {
+	return std::accumulate(submits.begin(), submits.end(), uint64_t {0});
+}
+
+uint64_t SyncCounts::TotalWaits() const noexcept {
+	return std::accumulate(waits.begin(), waits.end(), uint64_t {0});
+}
+
+SyncCounters& Sync() noexcept {
+	static SyncCounters counters;
+	return counters;
+}
+
+SyncCounts SyncCounters::Snapshot() const noexcept {
+	SyncCounts counts;
+	for (size_t i = 0; i < SYNC_REASON_COUNT; i++) {
+		counts.submits[i] = m_submits[i].load(std::memory_order_relaxed);
+		counts.waits[i]   = m_waits[i].load(std::memory_order_relaxed);
+		counts.wait_ns[i] = m_wait_ns[i].load(std::memory_order_relaxed);
+	}
+	return counts;
+}
+
+std::vector<SyncReason> BusiestReasons(const SyncCounts& counts, size_t limit) {
+	std::vector<SyncReason> order;
+	for (size_t i = 0; i < SYNC_REASON_COUNT; i++) {
+		if (counts.submits[i] != 0 || counts.waits[i] != 0) {
+			order.push_back(static_cast<SyncReason>(i));
+		}
+	}
+	std::stable_sort(order.begin(), order.end(), [&](SyncReason a, SyncReason b) {
+		const auto i = static_cast<size_t>(a);
+		const auto j = static_cast<size_t>(b);
+		return counts.submits[i] + counts.waits[i] > counts.submits[j] + counts.waits[j];
+	});
+	if (order.size() > limit) {
+		order.resize(limit);
+	}
+	return order;
+}
+
+std::string FormatSyncCounts(const SyncCounts& counts, double seconds, size_t limit) {
+	const double scale = seconds > 0.0 ? 1.0 / seconds : 0.0;
+	std::string  line;
+	for (const auto reason: BusiestReasons(counts, limit)) {
+		const auto i = static_cast<size_t>(reason);
+		char       item[96];
+		std::snprintf(item, sizeof(item), "%s%s %.0f/%.0f/%.1f", line.empty() ? "" : ", ",
+		              SyncReasonName(reason), static_cast<double>(counts.submits[i]) * scale,
+		              static_cast<double>(counts.waits[i]) * scale,
+		              static_cast<double>(counts.wait_ns[i]) / 1e6 * scale);
+		line += item;
+	}
+	return line.empty() ? "none" : line;
+}
 
 size_t LatencyHistogram::BucketOf(int64_t ns) noexcept {
 	if (static_cast<double>(ns) < BUCKET_BASE_NS) {
@@ -93,6 +209,7 @@ void Summary::Merge(const Summary& other) noexcept {
 	queue.Merge(other.queue);
 	wake.Merge(other.wake);
 	label.Merge(other.label);
+	sync.Merge(other.sync);
 }
 
 double Summary::BusyMsPerSecond() const noexcept {
@@ -135,6 +252,14 @@ Summary Accumulator::Take(double seconds) noexcept {
 	return window;
 }
 
+namespace {
+
+std::string SyncSuffix(const Summary& summary) {
+	return ", sync submits/waits/wait-ms per s: " + FormatSyncCounts(summary.sync, summary.seconds);
+}
+
+} // namespace
+
 std::string FormatSummary(const Summary& summary) {
 	char       head[160];
 	const auto per_flip = summary.SubmitsPerFlip();
@@ -150,12 +275,12 @@ std::string FormatSummary(const Summary& summary) {
 	              static_cast<unsigned long long>(summary.timed), flips);
 	std::string line = head;
 	if (!summary.calibrated) {
-		return line + ", latencies n/a (no calibrated timestamps)";
+		return line + ", latencies n/a (no calibrated timestamps)" + SyncSuffix(summary);
 	}
 	line += ", " + FormatLatency("submit->start", summary.queue, summary.seconds);
 	line += ", " + FormatLatency("end->complete", summary.wake, summary.seconds);
 	line += ", " + FormatLatency("end->label", summary.label, summary.seconds);
-	return line;
+	return line + SyncSuffix(summary);
 }
 
 void Publish(const Summary& summary) {
