@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -434,10 +436,11 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 	}
 }
 
-// The hot set is small: a few hundred pages the game reads back every frame.
-static constexpr size_t   MaxHotPages      = 512;
+// The hot set: the pages the game reads back every frame (a town of Ghost of Yotei faults about
+// 500 distinct pages per frame). When full, the coldest eighth is evicted at once, so an insert
+// costs O(1) amortized instead of a scan of the whole set.
+static constexpr size_t   MaxHotPages      = 2048;
 static constexpr uint64_t MaxHotTouchPages = 16;
-static constexpr uint64_t MaxAsyncDownload = uint64_t {4} << 20u;
 
 void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
@@ -447,19 +450,31 @@ void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
 	for (auto page = first; page < last; page += CACHING_PAGESIZE) {
 		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
 			it->second.touched = touch;
+			it->second.faulted = touch;
 			continue;
 		}
 		if (m_hot_pages.size() >= MaxHotPages) {
-			auto oldest = m_hot_pages.begin();
-			for (auto it = m_hot_pages.begin(); it != m_hot_pages.end(); ++it) {
-				if (it->second.touched < oldest->second.touched) {
-					oldest = it;
-				}
-			}
-			m_hot_pages.erase(oldest);
+			EvictColdHotPages(touch);
 		}
-		m_hot_pages.emplace(page, HotPage {touch, std::make_shared<std::atomic<uint64_t>>(0)});
+		m_hot_pages.emplace(page, HotPage {.touched = touch,
+		                                   .faulted = touch,
+		                                   .epoch   = std::make_shared<std::atomic<uint64_t>>(0)});
 	}
+}
+
+void BufferCache::EvictColdHotPages(uint64_t keep) {
+	auto& touched = m_hot_eviction_scratch;
+	touched.clear();
+	for (const auto& [page, hot]: m_hot_pages) {
+		(void)page;
+		touched.push_back(hot.touched);
+	}
+	const auto coldest = touched.begin() + static_cast<ptrdiff_t>(touched.size() / 8u);
+	std::nth_element(touched.begin(), coldest, touched.end());
+	// Pages touched by the current request stay.
+	const auto threshold = std::min(*coldest, keep - 1u);
+	std::erase_if(m_hot_pages,
+	              [&](const auto& entry) { return entry.second.touched <= threshold; });
 }
 
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
@@ -548,45 +563,101 @@ void BufferCache::RecordAsyncDownloads() {
 		uint64_t                               page;
 		uint64_t                               epoch;
 		std::shared_ptr<std::atomic<uint64_t>> epoch_ptr;
+		uint64_t                               faulted;
+		size_t                                 first_interval;
+		size_t                                 interval_count;
+		uint64_t                               bytes;
 	};
-	std::vector<Interval>   intervals;
+	std::vector<Interval>   page_intervals;
 	std::vector<PageRecord> pages;
 	uint64_t                total = 0;
 	m_pending_async.ForEach([&](uint64_t start, uint64_t end) {
 		for (auto page = start; page < end; page += CACHING_PAGESIZE) {
-			const auto hot = m_hot_pages.find(page);
-			if (hot == m_hot_pages.end() ||
-			    !m_memory_tracker.IsRegionGpuModified(page, CACHING_PAGESIZE)) {
+			if (!m_memory_tracker.IsRegionGpuModified(page, CACHING_PAGESIZE)) {
 				continue;
 			}
+			const auto  hot   = m_hot_pages.find(page);
 			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
-			if (owner == nullptr || !*owner) {
+			if (hot == m_hot_pages.end() || owner == nullptr || !*owner) {
+				// Evicted since its write was recorded: no download will refresh its bytes.
+				if (m_memory_tracker.IsGpuModifiedReadable(page, CACHING_PAGESIZE)) {
+					m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, false);
+				}
 				continue;
 			}
-			bool any = false;
+			PageRecord record {.page           = page,
+			                   .epoch          = hot->second.epoch->load(std::memory_order_acquire),
+			                   .epoch_ptr      = hot->second.epoch,
+			                   .faulted        = hot->second.faulted,
+			                   .first_interval = page_intervals.size(),
+			                   .interval_count = 0,
+			                   .bytes          = 0};
 			m_gpu_modified_ranges.ForEachInRange(
 			    page, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t last) {
-				    intervals.push_back({begin, last - begin, total, *owner});
-				    total += Common::AlignUp(last - begin, 64);
-				    any = true;
+				    page_intervals.push_back({begin, last - begin, 0, *owner});
+				    record.bytes += Common::AlignUp(last - begin, 64);
 			    });
-			if (any) {
-				pages.push_back(
-				    {page, hot->second.epoch->load(std::memory_order_acquire), hot->second.epoch});
-				// Filled in once the copies are recorded.
-				hot->second.download_tick = 0;
+			record.interval_count = page_intervals.size() - record.first_interval;
+			if (record.interval_count != 0) {
+				total += record.bytes;
+				pages.push_back(std::move(record));
 			}
 		}
 	});
 	m_pending_async.Clear();
-	if (intervals.empty() || total > MaxAsyncDownload) {
+	if (pages.empty()) {
 		return;
 	}
-	auto [mapped, offset] = m_download_buffer.Map(total, 64, false);
+	// A page left out keeps its GPU write pending for the next submission's downloads. Until
+	// then a guest read must fault into a readback: a page kept readable while its write was
+	// pending would otherwise show stale bytes after the write ran.
+	const auto defer = [&](const PageRecord& record) {
+		m_pending_async.Add(record.page, CACHING_PAGESIZE);
+		if (m_memory_tracker.IsGpuModifiedReadable(record.page, CACHING_PAGESIZE)) {
+			m_memory_tracker.SetGpuModifiedReadable(record.page, CACHING_PAGESIZE, false);
+		}
+	};
+	const auto cap      = std::min(m_async_download_cap, m_download_buffer.Size() / 4u);
+	uint64_t   deferred = 0;
+	if (total > cap) {
+		// Pages the guest read back most recently first: the likeliest to be read again soon.
+		std::ranges::stable_sort(pages, std::greater {}, &PageRecord::faulted);
+		total = 0;
+		std::erase_if(pages, [&](const PageRecord& record) {
+			if (total + record.bytes <= cap) {
+				total += record.bytes;
+				return false;
+			}
+			defer(record);
+			++deferred;
+			return true;
+		});
+	}
+	uint8_t* mapped = nullptr;
+	uint64_t offset = 0;
+	if (!pages.empty()) {
+		std::tie(mapped, offset) = m_download_buffer.Map(total, 64, false);
+	}
 	if (mapped == nullptr) {
+		// The ring is still held by submissions in flight.
+		for (const auto& record: pages) {
+			defer(record);
+		}
+		Common::GpuTiming::Sync().AddAsyncDownloads(0, deferred + pages.size());
 		return;
 	}
 	m_download_buffer.Commit();
+	Common::GpuTiming::Sync().AddAsyncDownloads(pages.size(), deferred);
+	std::vector<Interval> intervals;
+	uint64_t              packed = 0;
+	for (const auto& record: pages) {
+		for (size_t i = 0; i < record.interval_count; ++i) {
+			auto interval   = page_intervals[record.first_interval + i];
+			interval.offset = packed;
+			packed += Common::AlignUp(interval.size, 64);
+			intervals.push_back(interval);
+		}
+	}
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -630,7 +701,9 @@ void BufferCache::RecordAsyncDownloads() {
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 
-	// RecordAsyncDownloads runs right before the submission of the current tick.
+	// RecordAsyncDownloads runs right before the submission of the current tick. Only pages whose
+	// copies were recorded take the new download; a deferred page keeps its earlier one, which its
+	// epoch already rejects once the GPU wrote the page again.
 	const auto download_tick = m_scheduler.CurrentTick();
 	for (const auto& page: pages) {
 		auto& hot          = m_hot_pages.at(page.page);
