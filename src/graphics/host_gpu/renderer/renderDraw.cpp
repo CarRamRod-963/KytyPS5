@@ -1138,6 +1138,38 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+static bool StageWritesMemory(const ShaderStageRuntime& stage) {
+	const auto& program = *stage.program;
+	const auto& info    = program.info;
+	return program.has_address_writes || info.uses_gds ||
+	       std::ranges::any_of(
+	           info.buffers, [](const auto& buffer) { return buffer.written || buffer.atomic; }) ||
+	       std::ranges::any_of(info.images,
+	                           [](const auto& image) { return image.written || image.atomic; });
+}
+
+// What decides whether the draw may be skipped while its pipeline is built (PendingDrawBlocker).
+static PendingDrawDescription DescribePendingDraw(const DrawRenderState&                 state,
+                                                  std::span<const ShaderVertexInputInfo> stages) {
+	PendingDrawDescription draw {.skip_enabled = true};
+	draw.writes_memory =
+	    std::ranges::any_of(stages,
+	                        [](const auto& stage) { return StageWritesMemory(stage.stage); }) ||
+	    (state.ps_active && StageWritesMemory(state.ps_input_info.stage));
+	// Guest occlusion queries do not count host samples yet: ZPASS_DONE publishes synthetic
+	// always-visible results, which a skipped draw cannot change.
+	draw.query_active = false;
+	draw.linear_color_target =
+	    std::ranges::any_of(std::span {state.color_info, state.color_count},
+	                        [](const auto& color) { return !color.desc.info.IsTiled(); });
+	const auto& depth = state.depth_info;
+	if (depth.image_id) {
+		draw.linear_depth_write  = !depth.desc.info.IsTiled() && depth.AttachmentWriteAspects();
+		draw.depth_stencil_clear = depth.depth_clear_enable || depth.stencil_clear_enable;
+	}
+	return draw;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1179,6 +1211,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	// With --skip-pending-draws the pipeline is looked up before the draw's bindings are
+	// prepared or anything is recorded, so a skipped draw leaves nothing behind but the target
+	// discovery above: no uploads, bindings, barriers, render pass, consumed metadata clears or
+	// GPU write marks.
+	auto&                    pipeline_cache = m_context.GetPipelineCache();
+	PipelineCache::Pipeline* found_pipeline = nullptr;
+	if (pipeline_cache.SkipPendingDrawsEnabled()) {
+		const auto blocker = PendingDrawSkipBlocker(DescribePendingDraw(state, vertex_stages));
+		found_pipeline     = pipeline_cache.FindGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs, blocker);
+		if (found_pipeline == nullptr) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawsSkippedPending);
+			return;
+		}
+	}
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1211,10 +1261,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	auto& pipeline =
+	    found_pipeline != nullptr
+	        ? *found_pipeline
+	        : pipeline_cache.GetGraphicsPipeline(
+	              std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+	              buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+	              primitive_restart_enable, state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

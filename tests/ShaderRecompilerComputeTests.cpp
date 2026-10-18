@@ -604,6 +604,27 @@ struct RenderExecutorTestAccess {
   }
 };
 
+struct PipelineCacheTestAccess {
+  // Turns --skip-pending-draws on or off for an existing cache.
+  static bool SetSkipPendingDraws(PipelineCache &cache, bool enabled,
+                                  std::chrono::steady_clock::duration window) {
+    if (cache.m_compile_queue == nullptr) {
+      return false;
+    }
+    cache.m_skip_pending_draws = enabled;
+    cache.m_skip_window = window;
+    return true;
+  }
+
+  static void WaitForBackgroundBuilds(PipelineCache &cache) {
+    cache.m_compile_queue->WaitIdle();
+  }
+
+  static size_t PendingBuilds(const PipelineCache &cache) {
+    return cache.m_pending_builds.size();
+  }
+};
+
 namespace {
 
 using u32 = uint32_t;
@@ -19122,6 +19143,114 @@ public:
                 "SNORM16 export lost its sign, normalization or negative endpoint clamp");
       }
       registers.SetTargetOutputMode(0, 4);
+
+      // --skip-pending-draws: a draw that only changes a tiled target is left
+      // out while the background queue builds its pipeline and drawn once the
+      // pipeline is installed. Without the option, and once the skip window has
+      // passed, the draw waits for its pipeline.
+      {
+        static const auto skip_pixels = [] {
+          std::array<std::vector<u32>, 3> result;
+          constexpr std::array<u32, 3> colors{0x3e800000u, 0x3f000000u,
+                                              0x3f400000u};
+          for (uint32_t index = 0; index < result.size(); index++) {
+            auto &code = result[index];
+            AppendVMovLiteral(&code, 0, colors[index]);
+            AppendVMovLiteral(&code, 1, 0x3f800000u);
+            code.push_back(EncodeExp0(0, 0xf));
+            code.push_back(EncodeExp1(0, 0, 0, 1));
+            AppendEnd(&code);
+          }
+          return result;
+        }();
+        auto &pipelines = context.GetPipelineCache();
+        registers.SetRenderTargetMask(0x000f);
+        registers.SetShaderMask(0x000f);
+        registers.SetTargetOutputMode(1, 0);
+        registers.SetColorBase(0, {.addr = depth_address + 0x3c000});
+        registers.SetColorAttrib2(0,
+                                  {.height = extent - 1, .width = extent - 1});
+        registers.SetColorAttrib3(
+            0, {.tile_mode = Prospero::TileMode::kStandard4KB, .dimension = 1});
+        RenderColorInfo tiled_color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), tiled_color, 0);
+        Require(
+            name, "tiled skip target",
+            tiled_color.image_id && tiled_color.desc.info.IsTiled(),
+            "the pending-draw fixture did not resolve a tiled color target");
+        const auto draw_pixel = [&](uint32_t index) {
+          const auto &code = skip_pixels[index];
+          const auto address = reinterpret_cast<uint64_t>(code.data());
+          ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                      .code_size_bytes = static_cast<uint32_t>(
+                                          code.size() * sizeof(u32))});
+          shaders.SetPsShaderBase(address);
+          TextureCacheTestAccess::ClearImage(
+              cache, scheduler.Current(), tiled_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(),
+              {.vertex_count = 3, .instance_count = 1});
+          return ReadCachedTexel(name, context, tiled_color.image_id, {},
+                                 {extent, extent, 1});
+        };
+        // Covered texels hold the shader's color, all others the cleared zero.
+        const auto drawn = [](const std::vector<u32> &pixels, u32 color) {
+          bool covered = false;
+          for (size_t texel = 0; texel + 3 < pixels.size(); texel += 4) {
+            if (pixels[texel] == color) {
+              covered = true;
+              if (pixels[texel + 1] != color || pixels[texel + 2] != color ||
+                  pixels[texel + 3] != 0x3f800000u) {
+                return false;
+              }
+            } else if (pixels[texel] != 0 || pixels[texel + 3] != 0) {
+              return false;
+            }
+          }
+          return covered;
+        };
+        const auto untouched = [](const std::vector<u32> &pixels) {
+          return std::ranges::all_of(pixels,
+                                     [](u32 value) { return value == 0; });
+        };
+
+        Require(name, "pending draw without the option",
+                drawn(draw_pixel(0), 0x3e800000u) &&
+                    PipelineCacheTestAccess::PendingBuilds(pipelines) == 0,
+                "a draw was skipped although --skip-pending-draws is off");
+
+        Require(name, "enable pending-draw skipping",
+                PipelineCacheTestAccess::SetSkipPendingDraws(
+                    pipelines, true, std::chrono::hours(1)),
+                "the pipeline cache has no background compile queue");
+        Require(name, "pending draw skipped",
+                untouched(draw_pixel(1)) &&
+                    PipelineCacheTestAccess::PendingBuilds(pipelines) == 1,
+                "a draw whose pipeline was still building changed its target");
+        PipelineCacheTestAccess::WaitForBackgroundBuilds(pipelines);
+        Require(name, "pending draw after the build",
+                drawn(draw_pixel(1), 0x3f000000u) &&
+                    PipelineCacheTestAccess::PendingBuilds(pipelines) == 0,
+                "the background pipeline was not installed for the next draw");
+
+        (void)PipelineCacheTestAccess::SetSkipPendingDraws(pipelines, true, {});
+        Require(name, "pending draw past the skip window",
+                drawn(draw_pixel(2), 0x3f400000u) &&
+                    PipelineCacheTestAccess::PendingBuilds(pipelines) == 0,
+                "a draw past the skip window did not wait for its pipeline");
+        (void)PipelineCacheTestAccess::SetSkipPendingDraws(
+            pipelines, false, PendingDrawSkipWindow);
+
+        registers.SetColorBase(0, {.addr = depth_address + 0x38000});
+        registers.SetColorAttrib2(
+            0, {.height = extent / 4 - 1, .width = extent / 4 - 1});
+        registers.SetColorAttrib3(
+            0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetRenderTargetMask(0xf000);
+        registers.SetShaderMask(0xf000);
+      }
 
       // Indirect arguments also reach s8/s9. Native VS prologs must add them
       // exactly once, for both indexed and automatically generated indices.
