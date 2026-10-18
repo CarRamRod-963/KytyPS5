@@ -10565,6 +10565,22 @@ public:
                   rendering.num_color_attachments == 1,
               "color attachment lost its dimensions or padded guest layout");
 
+      // Unchanged registers resolve through the remembered decode, other
+      // register bytes through a full one; both give the first answer.
+      for (const uint32_t clear_word : {0u, 0x12345678u, 0u}) {
+        registers.SetColorClearWord0(0, {.word0 = clear_word});
+        RenderColorInfo repeated{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), repeated, 0);
+        Require(name, "repeated color target",
+                repeated.image_id == color.image_id &&
+                    repeated.desc == color.desc &&
+                    repeated.guest_mip_level == color.guest_mip_level &&
+                    repeated.guest_array_layer == color.guest_array_layer &&
+                    repeated.target_slot == color.target_slot,
+                "a repeated render-target lookup returned another target");
+      }
+
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",
                 color.desc.info.mip_layout[0].offset == 0 &&
@@ -16621,6 +16637,18 @@ public:
       RenderDepthInfo phased_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), phased_depth);
+      // Unchanged depth registers resolve through the remembered decode.
+      RenderDepthInfo repeated_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), repeated_depth);
+      Require(name, "repeated depth target",
+              repeated_depth.image_id == phased_depth.image_id &&
+                  repeated_depth.desc == phased_depth.desc &&
+                  repeated_depth.depth_test_enable ==
+                      phased_depth.depth_test_enable &&
+                  repeated_depth.depth_write_enable ==
+                      phased_depth.depth_write_enable,
+              "a repeated depth-target lookup returned another target");
       // PRT permits missing backing; a fully resident target keeps the same layout and image.
       phased_depth_target.z_info.partially_resident = true;
       phased_depth_target.stencil_info.partially_resident = true;
