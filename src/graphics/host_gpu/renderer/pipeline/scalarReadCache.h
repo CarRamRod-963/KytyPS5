@@ -14,10 +14,13 @@ namespace Libs::Graphics {
 // lock and a mapping lookup; the chunks turn the dozens of reads of one evaluation into a few.
 //
 // The walk evaluates scalar loads on the host at record time, so a value it reads must include
-// every GPU write recorded before the command, exactly as the shader's own load would. A chunk
-// whose range holds GPU-dirty bytes (written by recorded or completed GPU work, not yet published
-// to the backing) is read back before it is filled, and a GPU write recorded after a chunk was
-// filled drops every chunk. Clean memory costs one dirty-range query per chunk.
+// every GPU write recorded before the command, exactly as the shader's own load would. Bytes
+// written by recorded or completed GPU work and not yet published to the backing are GPU-dirty.
+// A chunk that holds any is marked when it is filled, and a read from a marked chunk reads back
+// the GPU-dirty bytes among exactly the bytes it returns: a GPU-written word next to the
+// descriptors a walk reads costs no readback unless the walk reads that word. A GPU write
+// recorded after a chunk was filled drops every chunk. Clean memory costs one dirty-range query
+// per chunk.
 //
 // The backend provides, on the thread that evaluates:
 //   bool     Read(uint64_t address, void* data, uint64_t size);  // backing; false if unmapped
@@ -46,13 +49,16 @@ public:
 		if (bytes <= ChunkBytes && address - base + bytes <= ChunkBytes) {
 			auto& entry = m_entries[(base / ChunkBytes) % Entries];
 			if (entry.base != base) {
-				Synchronize(base, ChunkBytes);
-				entry.base = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
+				entry.base  = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
+				entry.dirty = entry.base == base && m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+			}
+			auto* cached = reinterpret_cast<uint8_t*>(entry.words) + (address - base);
+			if (entry.base == base && entry.dirty && m_backend.HasGpuDirtyBytes(address, bytes)) {
+				m_backend.ReadGpuDirtyBytes(address, bytes);
+				if (!m_backend.Read(address, cached, bytes)) entry.base = UINT64_MAX;
 			}
 			if (entry.base == base) {
-				std::memcpy(values.data(),
-				            reinterpret_cast<const uint8_t*>(entry.words) + (address - base),
-				            bytes);
+				std::memcpy(values.data(), cached, bytes);
 				return;
 			}
 			// A chunk that crosses unmapped memory: read exactly what was asked for.
@@ -65,7 +71,8 @@ public:
 
 private:
 	struct Entry {
-		uint64_t base = UINT64_MAX;
+		uint64_t base  = UINT64_MAX;
+		bool     dirty = false;
 		uint32_t words[ChunkBytes / sizeof(uint32_t)];
 	};
 
