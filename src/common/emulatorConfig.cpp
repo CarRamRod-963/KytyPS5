@@ -249,6 +249,10 @@ bool PrecompilePipelinesEnabled() {
 	return g_config->precompile_pipelines;
 }
 
+bool PrecompileOnlyEnabled() {
+	return g_config->precompile_only;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

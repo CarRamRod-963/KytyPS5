@@ -26,7 +26,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
 	}
 	// After the bindless table: precompiled layouts reference its set layout.
-	if (Config::PrecompilePipelinesEnabled()) {
+	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
 		// Like the background pipeline builds: driver compilers are multithreaded themselves,
 		// and the guest needs the CPU.
 		m_pipeline_cache.StartPrecompile(

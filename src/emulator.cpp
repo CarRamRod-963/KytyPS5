@@ -132,6 +132,11 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 }
 
 static void Execute(const std::filesystem::path& game_patch) {
+	if (Config::PrecompileOnlyEnabled()) {
+		// The renderer is up; the guest never starts.
+		Libs::Graphics::WindowPrecompilePipelines();
+		std::quick_exit(0);
+	}
 	std::thread([game_patch] {
 		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
 	}).detach();
