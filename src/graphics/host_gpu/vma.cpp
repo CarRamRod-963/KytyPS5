@@ -173,15 +173,35 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 	if (image.image == nullptr) {
-		VmaAllocationCreateInfo alloc_info {};
-		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		const auto create = [&](VkMemoryPropertyFlags required) {
+			VmaAllocationCreateInfo alloc_info {};
+			alloc_info.requiredFlags  = required;
+			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-		vk::Image::CType native_image = VK_NULL_HANDLE;
-		const auto       result       = static_cast<vk::Result>(vmaCreateImage(
-            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-            &alloc_info, &native_image, &image.allocation, nullptr));
-		image.image                   = native_image;
-		if (result != vk::Result::eSuccess) {
+			vk::Image::CType native_image = VK_NULL_HANDLE;
+			const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+			    &alloc_info, &native_image, &image.allocation, nullptr));
+			image.image                   = native_image;
+			return result == vk::Result::eSuccess;
+		};
+		bool created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (!created) {
+			// Device memory is exhausted. The recycled backings are the only memory freed
+			// right away; next, any memory type the image supports (system memory over the bus)
+			// keeps the title running while the caches release what they no longer use.
+			DestroyRecycledImages();
+			created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+			if (!created) {
+				created          = create(0);
+				const auto count = created ? ++image_fallback_count : uint64_t {0};
+				if (count % 256 == 1) {
+					LOGF("Image placed outside device-local memory (%" PRIu64 " so far)\n", count);
+					LogMemoryBudget();
+				}
+			}
+		}
+		if (!created) {
 			LogMemoryBudget();
 			return false;
 		}
