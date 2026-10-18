@@ -171,6 +171,8 @@ struct ProtectionCall {
 };
 std::vector<ProtectionCall> g_protection_ranges;
 std::mutex g_protection_log_mutex;
+uint64_t g_backing_writes = 0;
+bool g_backing_available = true;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -673,6 +675,68 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+void TestTryWriteUnwatched() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory =
+      Allocate(region_size * 2, PAGE_READWRITE, 0x0000000200800000ull);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto address = region_base + page_size * 3 + 8;
+  const uint64_t value = 0x1122334455667788ull;
+  uint64_t observed = 0;
+
+  g_backing_writes = 0;
+  Check(manager.TryWriteUnwatched(address, &value, sizeof(value)) &&
+            g_backing_writes == 1,
+        "unwatched write was refused");
+  std::memcpy(&observed, reinterpret_cast<void *>(address), sizeof(observed));
+  Check(observed == value, "unwatched write lost its bytes");
+
+  const uint64_t other = 0x99u;
+  manager.UpdatePageWatchers<true>(address, sizeof(other));
+  Check(!manager.TryWriteUnwatched(address, &other, sizeof(other)) &&
+            g_backing_writes == 1 &&
+            Protection(reinterpret_cast<void *>(address)) == PAGE_READONLY,
+        "write-watched page was written");
+  manager.UpdatePageWatchers<false>(address, sizeof(other));
+
+  RegionBits read_mask;
+  read_mask.Set(3);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  Check(!manager.TryWriteUnwatched(address, &other, sizeof(other)) &&
+            g_backing_writes == 1,
+        "read-watched page was written");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+
+  // A watcher on the second page of the range refuses the whole write.
+  manager.UpdatePageWatchers<true>(region_base + page_size * 4, 4);
+  Check(!manager.TryWriteUnwatched(region_base + page_size * 4 - 4, &other,
+                                   sizeof(other)) &&
+            g_backing_writes == 1,
+        "range with a watched second page was written");
+  manager.UpdatePageWatchers<false>(region_base + page_size * 4, 4);
+
+  Check(!manager.TryWriteUnwatched(region_base + region_size - 4, &other,
+                                   sizeof(other)) &&
+            g_backing_writes == 1,
+        "write across a tracking region was accepted");
+
+  g_backing_available = false;
+  Check(!manager.TryWriteUnwatched(address, &other, sizeof(other)),
+        "write without backing reported success");
+  g_backing_available = true;
+
+  Check(manager.TryWriteUnwatched(address, &other, sizeof(other)) &&
+            g_backing_writes == 3,
+        "unwatched write was refused after the watchers left");
+  std::memcpy(&observed, reinterpret_cast<void *>(address), sizeof(observed));
+  Check(observed == other, "write after unwatch lost its bytes");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -690,6 +754,15 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
   return ProtectAddressSpace(vaddr, size, mode);
 }
 
+bool TryWriteBacking(uint64_t vaddr, const void *data, uint64_t size) {
+  g_backing_writes++;
+  if (!g_backing_available) {
+    return false;
+  }
+  std::memcpy(reinterpret_cast<void *>(vaddr), data, size);
+  return true;
+}
+
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
@@ -705,6 +778,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
+  TestTryWriteUnwatched();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;
