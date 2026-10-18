@@ -103,6 +103,9 @@ static void PrintUsage() {
 	    "  --precompile-pipelines               Build the compute pipelines recorded in earlier\n"
 	    "                                       sessions into the driver cache on background\n"
 	    "                                       threads while the game runs.\n");
+	::printf(
+	    "  --precompile-only                    Build the recorded compute pipelines into the\n"
+	    "                                       driver cache, save it and exit.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -224,6 +227,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
     {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
     {"--precompile-pipelines", &ConfigOptions::precompile_pipelines},
+    {"--precompile-only", &ConfigOptions::precompile_only},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
