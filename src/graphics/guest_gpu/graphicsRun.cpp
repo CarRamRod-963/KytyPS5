@@ -1084,8 +1084,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&] {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		EXIT_IF(dst == nullptr);
-		(void)command.Handle();
+		EXIT_IF(dst == nullptr || command.IsInvalid());
 		WriteLabelAtEndOfPipe(dst, data, with_interrupt, interrupt_context_id);
 	};
 
@@ -1123,8 +1122,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&] {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					EXIT_IF(dst == nullptr);
-					(void)command.Handle();
+					EXIT_IF(dst == nullptr || command.IsInvalid());
 					WriteLabelAtEndOfPipe(dst, static_cast<uint64_t>(value), with_interrupt,
 					                      interrupt_context_id);
 				};
@@ -1231,12 +1229,15 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	// submission completes makes the guest's wait cover the GPU, so the results it reads next
 	// are already published instead of faulting into a synchronous readback of unsubmitted
 	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
-	auto&      gpu       = m_renderer.GetGpu();
-	auto&      scheduler = GetScheduler();
-	const auto tick      = scheduler.CurrentTick();
-	scheduler.DeferPriorityOperation([&renderer = m_renderer, &gpu, &scheduler, tick, dst, value,
-	                                  with_interrupt, event_id = m_interrupt_event_id,
-	                                  interrupt_context_id] {
+	// With nothing recorded since the last submission the label rides on that submission, and
+	// the flush below has nothing to submit.
+	auto& gpu       = m_renderer.GetGpu();
+	auto& scheduler = GetScheduler();
+	scheduler.DeferPriorityOperationAfterRecorded([&renderer = m_renderer, &gpu, &scheduler, dst,
+	                                               value, with_interrupt,
+	                                               event_id = m_interrupt_event_id,
+	                                               interrupt_context_id] {
+		const auto tick = scheduler.ActivePriorityTick();
 		gpu.SendCommand([&renderer, &scheduler, tick, dst, value, with_interrupt, event_id,
 		                 interrupt_context_id] {
 			std::memcpy(dst, &value, sizeof(T));
@@ -1251,8 +1252,8 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
-	(void)CurrentBuffer().Handle();
-	GetScheduler().DeferPriorityOperation(
+	EXIT_IF(CurrentBuffer().IsInvalid());
+	GetScheduler().DeferPriorityOperationAfterRecorded(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 	    });
