@@ -255,7 +255,7 @@ void GpuTimestamps::Collect() {
 	m_collected = std::max(m_collected, known);
 }
 
-void GpuTimestamps::RecordEndLatency(uint64_t tick, bool label) {
+void GpuTimestamps::RecordEndLatency(uint64_t tick, bool label, int64_t floor_ns) {
 	if (m_pool == nullptr || !m_calibrated) {
 		return;
 	}
@@ -266,7 +266,7 @@ void GpuTimestamps::RecordEndLatency(uint64_t tick, bool label) {
 	if (slot.tick != tick || tick > m_collected || !slot.host_end_ns) {
 		return;
 	}
-	const auto latency = now - *slot.host_end_ns;
+	const auto latency = now - std::max(*slot.host_end_ns, floor_ns);
 	if (label) {
 		m_accumulator.AddLabel(latency);
 	} else {
@@ -278,8 +278,8 @@ void GpuTimestamps::RecordWake(uint64_t tick) {
 	RecordEndLatency(tick, false);
 }
 
-void GpuTimestamps::RecordLabel(uint64_t tick) {
-	RecordEndLatency(tick, true);
+void GpuTimestamps::RecordLabel(uint64_t tick, int64_t issued_ns) {
+	RecordEndLatency(tick, true, issued_ns);
 }
 
 void GpuTimestamps::MaybeRotate(int64_t now_ns) {

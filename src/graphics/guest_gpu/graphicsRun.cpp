@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -1221,22 +1222,24 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	// work. The write runs on the GPU thread, where a fault on a tracked guest page is served.
 	// With nothing recorded since the last submission the label rides on that submission, and
 	// the flush below has nothing to submit.
-	auto& gpu       = m_renderer.GetGpu();
-	auto& scheduler = GetScheduler();
-	scheduler.DeferPriorityOperationAfterRecorded([&renderer = m_renderer, &gpu, &scheduler, dst,
-	                                               value, with_interrupt,
-	                                               event_id = m_interrupt_event_id,
-	                                               interrupt_context_id] {
-		const auto tick = scheduler.ActivePriorityTick();
-		gpu.SendCommand([&renderer, &scheduler, tick, dst, value, with_interrupt, event_id,
-		                 interrupt_context_id] {
-			std::memcpy(dst, &value, sizeof(T));
-			scheduler.GetTimestamps().RecordLabel(tick);
-			if (with_interrupt) {
-				renderer.TriggerInterrupt(event_id, interrupt_context_id);
-			}
-		});
-	});
+	auto&      gpu       = m_renderer.GetGpu();
+	auto&      scheduler = GetScheduler();
+	const auto issued_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count();
+	scheduler.DeferPriorityOperationAfterRecorded(
+	    [&renderer = m_renderer, &gpu, &scheduler, dst, value, with_interrupt, issued_ns,
+	     event_id  = m_interrupt_event_id, interrupt_context_id] {
+		    const auto tick = scheduler.ActivePriorityTick();
+		    gpu.SendCommand([&renderer, &scheduler, tick, issued_ns, dst, value, with_interrupt,
+		                     event_id, interrupt_context_id] {
+			    std::memcpy(dst, &value, sizeof(T));
+			    scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
+			    if (with_interrupt) {
+				    renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    });
+	    });
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
 	GetScheduler().Flush();
 }
