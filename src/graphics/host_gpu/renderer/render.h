@@ -205,9 +205,9 @@ private:
 	// ResolveTexture through a memo of (T#, resource traits) -> image, valid while the texture
 	// cache's layout generation holds; the per-bind maintenance (touch, clear materialization)
 	// still runs for a hit.
-	[[nodiscard]] TextureBinding
-	ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
-	                   const ShaderRecompiler::IR::DescriptorValue& value);
+	void ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value,
+	                        TextureBinding&                              binding);
 	struct TextureMemoKey {
 		std::array<uint32_t, 8> words;
 		uint64_t                traits;
@@ -227,7 +227,11 @@ private:
 		TextureCache::ImageDesc   desc;
 		TextureCache::LayoutStamp stamp;
 	};
+	// Whether a memo hit may return the entry's image (the checks a lookup would otherwise redo).
+	[[nodiscard]] bool      TextureMemoEntryValid(const TextureMemoEntry& entry);
+	static constexpr size_t TextureMemoFirstSweep = 8192;
 	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
+	size_t m_texture_memo_sweep_at = TextureMemoFirstSweep;
 	// Render-target image lookups per color slot and for depth (TextureCache::ImageLookup).
 	std::array<TextureCache::ImageLookup, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_lookups;
 	TextureCache::ImageLookup                                           m_depth_target_lookup;
