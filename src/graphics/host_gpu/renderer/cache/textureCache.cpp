@@ -281,6 +281,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_image_bytes += image.AccountedSize();
+	m_image_count++;
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -307,6 +309,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	m_image_bytes -= accounted;
+	m_image_count--;
 	image.registered = false;
 }
 
@@ -2047,6 +2051,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// The reusable download buffer holds the whole image or nothing.
+	if (range.size > download.Size()) {
+		return false;
+	}
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
@@ -2196,24 +2204,35 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// Images that this pass could free right away. GPU-written tiled images are kept, and a
+	// GPU-written linear image is downloaded first, which is only done under pressure.
+	const auto evictable = [&](ImageId id, bool pressured) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			return false;
+		}
+		if (!owner->IsGpuModified() || !owner->SafeToDownload()) {
+			return true;
+		}
+		return pressured && !owner->info.IsTiled();
+	};
+	// Bounds the walk past old images that cannot be evicted.
+	constexpr size_t MaxVisits = 4096;
+	size_t           evicted   = 0;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
-		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		size_t         deletions  = aggressive ? 40 : pressured ? 20 : 10;
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
-		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
-		});
+		// first. Images that cannot be evicted are passed over: they stay oldest, and counting
+		// them would stop collection for good once enough of them pile up at the front.
+		const auto candidates = m_lru_cache.SelectBelow(
+		    tick - age, deletions, MaxVisits, [&](ImageId id) { return evictable(id, pressured); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
@@ -2235,7 +2254,9 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			--deletions;
 			FreeImage(id);
+			evicted++;
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2250,6 +2271,20 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	m_gc_evicted += evicted;
+	if (m_total_used_memory >= m_pressure_gc_memory) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_gc_last_report >= std::chrono::seconds(30)) {
+			m_gc_last_report       = now;
+			constexpr uint64_t MiB = 1024ull * 1024;
+			LOGF("TextureCache: device memory %" PRIu64 " MiB (pressure %" PRIu64
+			     " MiB, critical %" PRIu64 " MiB), %" PRIu64 " images of %" PRIu64 " MiB, %" PRIu64
+			     " evicted since the last report\n",
+			     m_total_used_memory / MiB, m_pressure_gc_memory / MiB, m_critical_gc_memory / MiB,
+			     m_image_count, m_image_bytes / MiB, m_gc_evicted);
+			m_gc_evicted = 0;
+		}
 	}
 }
 
