@@ -91,6 +91,10 @@ struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> served {};
 	// Readbacks that rode the submission of another readback served at the same time.
 	std::array<uint64_t, SYNC_REASON_COUNT> joined {};
+	// Hot pages whose asynchronous download rode a submission, and hot pages whose GPU writes
+	// were left for a later submission because the downloads of one submission are capped.
+	uint64_t async_pages    = 0;
+	uint64_t async_deferred = 0;
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
@@ -121,6 +125,10 @@ public:
 	void AddJoinedReadback(SyncReason reason) noexcept {
 		m_joined[Index(reason)].fetch_add(1, std::memory_order_relaxed);
 	}
+	void AddAsyncDownloads(uint64_t recorded, uint64_t deferred) noexcept {
+		m_async_pages.fetch_add(recorded, std::memory_order_relaxed);
+		m_async_deferred.fetch_add(deferred, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -135,6 +143,8 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_skipped {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_served {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_joined {};
+	std::atomic<uint64_t>                                m_async_pages {};
+	std::atomic<uint64_t>                                m_async_deferred {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.
