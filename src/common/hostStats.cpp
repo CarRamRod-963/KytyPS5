@@ -13,8 +13,13 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <psapi.h>
 // clang-format on
+#include <string>
+#include <string_view>
+#include <vector>
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -67,9 +72,95 @@ uint64_t FileTimeTo100Ns(const FILETIME& time) {
 	return (static_cast<uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime;
 }
 
-struct PlatformState {};
+// Per-process GPU engine utilization from the "GPU Engine" performance counters, as Task
+// Manager shows it: the busiest engine of this process. Optional; any failure leaves it n/a.
+struct PlatformState {
+	PlatformState() = default;
+	~PlatformState() { Close(); }
+	PlatformState(const PlatformState&)            = delete;
+	PlatformState& operator=(const PlatformState&) = delete;
 
-void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
+	void Close() {
+		if (query != nullptr) {
+			PdhCloseQuery(query);
+		}
+		query   = nullptr;
+		counter = nullptr;
+	}
+
+	PDH_HQUERY   query       = nullptr;
+	PDH_HCOUNTER counter     = nullptr;
+	bool         unavailable = false;
+	uint32_t     misses      = 0; // Samples without an instance of this process.
+};
+
+constexpr uint32_t GPU_ENGINE_REOPEN_MISSES = 10;
+
+void SampleGpuEngines(PlatformState& state, HostStats& stats) {
+	if (state.unavailable) {
+		return;
+	}
+	if (state.query == nullptr) {
+		if (PdhOpenQueryW(nullptr, 0, &state.query) != ERROR_SUCCESS) {
+			state.query       = nullptr;
+			state.unavailable = true;
+			return;
+		}
+		if (PdhAddEnglishCounterW(state.query, L"\\GPU Engine(*)\\Utilization Percentage", 0,
+		                          &state.counter) != ERROR_SUCCESS) {
+			state.Close();
+			state.unavailable = true;
+			return;
+		}
+		// Utilization is a rate: the first collection only sets the baseline.
+		PdhCollectQueryData(state.query);
+		return;
+	}
+	if (PdhCollectQueryData(state.query) != ERROR_SUCCESS) {
+		return;
+	}
+	constexpr DWORD FORMAT = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
+	DWORD           size   = 0;
+	DWORD           count  = 0;
+	if (PdhGetFormattedCounterArrayW(state.counter, FORMAT, &size, &count, nullptr) !=
+	        static_cast<PDH_STATUS>(PDH_MORE_DATA) ||
+	    size == 0) {
+		return;
+	}
+	std::vector<uint8_t> buffer(size);
+	auto*                items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+	if (PdhGetFormattedCounterArrayW(state.counter, FORMAT, &size, &count, items) !=
+	    ERROR_SUCCESS) {
+		return;
+	}
+	// Instances look like "pid_1234_luid_0x00000000_0x0000C6F1_phys_0_eng_0_engtype_3D"; one
+	// engine can have several instances (one per context), which add up.
+	const std::wstring prefix = L"pid_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+	std::unordered_map<std::wstring, double> engines;
+	for (DWORD i = 0; i < count; i++) {
+		const std::wstring_view name = items[i].szName != nullptr ? items[i].szName : L"";
+		if (!name.starts_with(prefix) || items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) {
+			continue;
+		}
+		engines[std::wstring(name.substr(prefix.size()))] += items[i].FmtValue.doubleValue;
+	}
+	if (engines.empty()) {
+		// Wildcard instances can go stale; reopen the query now and then.
+		if (++state.misses >= GPU_ENGINE_REOPEN_MISSES) {
+			state.Close();
+			state.misses = 0;
+		}
+		return;
+	}
+	state.misses   = 0;
+	double busiest = 0.0;
+	for (const auto& [engine, percent]: engines) {
+		busiest = std::max(busiest, percent);
+	}
+	stats.gpu_percent = std::clamp(busiest, 0.0, 100.0);
+}
+
+void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	const auto process = GetCurrentProcess();
 	FILETIME   creation {};
 	FILETIME   exit {};
@@ -107,6 +198,8 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 		                            : system.dwMemoryLoad >= 80 ? MemoryPressure::Warning
 		                                                        : MemoryPressure::Normal;
 	}
+
+	SampleGpuEngines(state, stats);
 }
 
 #else
