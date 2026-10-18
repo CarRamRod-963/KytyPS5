@@ -3,8 +3,10 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/gpuTiming.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -16,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <utility>
 #include <vector>
@@ -153,10 +156,29 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	// Synchronous downloads publish before returning; asynchronous callers wait before reuse. A
+	// synchronous download given a batch only records its copies and appends its publication:
+	// the caller submits once for the whole batch, waits, and runs the publications in order.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool
+	DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                     std::vector<Common::UniqueFunction<void>>* batch = nullptr);
+	void ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
+	// A synchronous readback a guest thread waits for. Requests that arrive together (guest
+	// threads faulting at once) share one submission and one wait on the GPU thread.
+	struct GuestReadback {
+		enum class Kind : uint8_t { Read, Write, Around };
+		Kind                          kind;
+		uint64_t                      vaddr;
+		uint64_t                      size; // The window for Around.
+		Common::GpuTiming::SyncReason reason;
+		std::binary_semaphore*        done;
+	};
+	void                       RequestGuestReadback(const GuestReadback& request);
+	void                       ServeGuestReadbacks(std::span<const GuestReadback> requests);
+	std::mutex                 m_guest_readbacks_mutex;
+	std::vector<GuestReadback> m_guest_readbacks;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
