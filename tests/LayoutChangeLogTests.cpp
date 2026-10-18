@@ -1,9 +1,12 @@
 #include "graphics/host_gpu/renderer/cache/layoutChangeLog.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 using Libs::Graphics::LayoutChangeLog;
@@ -97,12 +100,118 @@ void TestAgainstExactModel() {
   }
 }
 
+// The log before the granule index: every query walked all recent changes after
+// its stamp. The indexed log must answer exactly as it did.
+class WalkingLog {
+public:
+  void Note(uint64_t address, uint64_t size) {
+    if (size == 0)
+      return;
+    if (m_recent.size() >= LayoutChangeLog::MaxRecent) {
+      const auto count = LayoutChangeLog::MaxRecent / 2u;
+      for (size_t index = 0; index < count; ++index) {
+        const auto &change = m_recent[index];
+        for (auto granule = change.address >> LayoutChangeLog::GranuleBits;
+             granule <= (change.address + change.size - 1u) >>
+             LayoutChangeLog::GranuleBits;
+             ++granule) {
+          auto &sequence = m_granules[granule];
+          sequence = std::max(sequence, change.sequence);
+        }
+        m_folded_through = change.sequence;
+      }
+      m_recent.erase(m_recent.begin(),
+                     m_recent.begin() + static_cast<std::ptrdiff_t>(count));
+    }
+    m_recent.push_back({++m_sequence, address, size});
+  }
+
+  bool ChangedSince(uint64_t stamp, uint64_t address, uint64_t size) const {
+    if (stamp >= m_sequence || size == 0)
+      return false;
+    for (auto it = m_recent.rbegin(); it != m_recent.rend(); ++it) {
+      if (it->sequence <= stamp)
+        return false;
+      if (address < it->address + it->size && it->address < address + size)
+        return true;
+    }
+    if (stamp >= m_folded_through)
+      return false;
+    for (auto granule = address >> LayoutChangeLog::GranuleBits;
+         granule <= (address + size - 1u) >> LayoutChangeLog::GranuleBits;
+         ++granule) {
+      const auto found = m_granules.find(granule);
+      if (found != m_granules.end() && found->second > stamp)
+        return true;
+    }
+    return false;
+  }
+
+private:
+  struct Change {
+    uint64_t sequence, address, size;
+  };
+  std::vector<Change> m_recent;
+  std::unordered_map<uint64_t, uint64_t> m_granules;
+  uint64_t m_sequence = 0;
+  uint64_t m_folded_through = 0;
+};
+
+// Identical answers to the walking log: small and wide changes (some spanning
+// more than WideGranules granules), queries from one byte to a few hundred
+// MiB, stamps old and new, across many folds.
+void TestSameAnswersAsWalkingLog() {
+  std::mt19937_64 random(11);
+  LayoutChangeLog log;
+  WalkingLog walking;
+  uint32_t changed = 0;
+  uint32_t unchanged = 0;
+  const auto pick_size = [&](uint32_t kind) -> uint64_t {
+    switch (kind % 8u) {
+    case 0:
+      return 1u + random() % 256u;
+    case 1:
+      return 0x1000u + random() % (64u * MiB);
+    case 2:
+      return 0x1000u + random() % (400u * MiB);
+    default:
+      return 0x1000u + random() % (4u * MiB);
+    }
+  };
+  for (uint32_t step = 0; step < 12u * LayoutChangeLog::MaxRecent; ++step) {
+    // Mostly a hot window (transient targets), sometimes anywhere in 16 GiB.
+    const auto address = random() % 4u == 0u
+                             ? 0x1'0000'0000ull + random() % (16ull << 30u)
+                             : 0x2'0000'0000ull + random() % (32u * MiB);
+    const auto size = pick_size(static_cast<uint32_t>(random()));
+    log.Note(address, size);
+    walking.Note(address, size);
+    for (uint32_t query = 0; query < 3u; ++query) {
+      const auto now = log.Now().sequence;
+      const auto age =
+          random() % 3u == 0u ? random() % (now + 1u) : random() % 64u;
+      const LayoutChangeLog::Stamp stamp{now > age ? now - age : 0u};
+      const auto where = random() % 2u == 0u
+                             ? 0x1'0000'0000ull + random() % (16ull << 30u)
+                             : 0x2'0000'0000ull + random() % (40u * MiB);
+      const auto bytes = pick_size(static_cast<uint32_t>(random()));
+      const bool reported = log.ChangedSince(stamp, where, bytes);
+      Check(reported == walking.ChangedSince(stamp.sequence, where, bytes),
+            "the indexed log answered unlike the walking log");
+      (reported ? changed : unchanged)++;
+    }
+  }
+  Check(changed > 1000u && unchanged > 1000u,
+        "the comparison did not exercise both answers");
+}
+
 } // namespace
 
 int main() {
   TestRecentChanges();
   TestUnrelatedChangesKeepStamps();
   TestAgainstExactModel();
+  TestSameAnswersAsWalkingLog();
   std::printf("LayoutChangeLogTests: all cases passed\n");
   return 0;
 }
