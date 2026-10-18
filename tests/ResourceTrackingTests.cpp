@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/ir/DescriptorInterner.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -16,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -9554,6 +9556,102 @@ void TestMalformedMemoryKindsRejected() {
 // MaterializeResources runs for every stage of every draw and dispatch.
 // Repeating one with the same guest data must give the same result and, once
 // warm, allocate nothing: its scratch lives in the plan and the snapshot.
+// The interner returns what a linear search of the list returns, so candidate
+// ordinals keep first-occurrence order: random lists of values that differ in
+// one dword or only in their dword count, with lists of every length reusing
+// one interner, including a value of the previous list that this one lacks.
+void TestDescriptorInterningMatchesLinearSearch() {
+  std::mt19937 random(0x5eed1234u);
+  DescriptorInterner interner;
+  std::vector<DescriptorValue> list;
+  std::vector<DescriptorValue> reference;
+  std::vector<DescriptorValue> previous;
+  for (uint32_t trial = 0; trial < 3000u; ++trial) {
+    const uint32_t pool_size = 1u + random() % (trial % 7u == 0u ? 400u : 24u);
+    std::vector<DescriptorValue> pool(pool_size);
+    for (auto &value : pool) {
+      value.dword_count = random() % 3u == 0u ? 4u : 8u;
+      for (uint32_t dword = 0; dword < value.dword_count; ++dword)
+        value.dwords[dword] = random() % 4u == 0u ? random() : random() % 3u;
+    }
+    if (!previous.empty())
+      pool.push_back(previous[random() % previous.size()]);
+    interner.Reset();
+    list.clear();
+    reference.clear();
+    const uint32_t keys = random() % 3000u;
+    for (uint32_t key = 0; key < keys; ++key) {
+      const auto &value = random() % 16u == 0u && !previous.empty()
+                              ? previous[random() % previous.size()]
+                              : pool[random() % pool.size()];
+      const auto expected =
+          std::find(reference.begin(), reference.end(), value);
+      const auto expected_index =
+          expected == reference.end()
+              ? DescriptorInterner::NotFound
+              : static_cast<uint32_t>(expected - reference.begin());
+      if (expected == reference.end())
+        reference.push_back(value);
+      const auto found = interner.Find(list, value);
+      Check(found == expected_index,
+            "the interner found another index than a linear search");
+      if (found == DescriptorInterner::NotFound) {
+        list.push_back(value);
+        interner.Added(list);
+      }
+    }
+    Check(list == reference, "the interned list differs from a linear one");
+    previous = list;
+  }
+  // Interning cost per materialization: 170 distinct T#s among 10000 keys, as
+  // a linear search and through the interner.
+  std::vector<DescriptorValue> pool(170u);
+  for (uint32_t index = 0; index < pool.size(); ++index) {
+    pool[index].dword_count = 8u;
+    pool[index].dwords = {0x100u + index * 0x10u,
+                          0x0d000000u,
+                          0xc00fu,
+                          0x90fac000u,
+                          0u,
+                          0u,
+                          0u,
+                          0u};
+  }
+  std::vector<uint32_t> keys(10000u);
+  for (auto &key : keys)
+    key = random() % pool.size();
+  const auto time = [&](auto &&intern) {
+    constexpr uint32_t Calls = 200u;
+    size_t unique = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t call = 0; call < Calls; ++call)
+      unique += intern();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    Check(unique == Calls * pool.size(), "an interning benchmark lost values");
+    return std::chrono::duration<double, std::micro>(elapsed).count() / Calls;
+  };
+  const auto linear = time([&] {
+    list.clear();
+    for (const auto key : keys)
+      if (std::find(list.begin(), list.end(), pool[key]) == list.end())
+        list.push_back(pool[key]);
+    return list.size();
+  });
+  const auto hashed = time([&] {
+    interner.Reset();
+    list.clear();
+    for (const auto key : keys)
+      if (interner.Find(list, pool[key]) == DescriptorInterner::NotFound) {
+        list.push_back(pool[key]);
+        interner.Added(list);
+      }
+    return list.size();
+  });
+  std::printf("  interning 10000 keys, 170 distinct: linear %.1f us, hashed "
+              "%.1f us per call\n",
+              linear, hashed);
+}
+
 void TestWarmMaterializationAllocatesNothing() {
   using F = Libs::Graphics::Prospero::BufferFormat;
   using T = Libs::Graphics::Prospero::ImageType;
@@ -9593,10 +9691,10 @@ void TestWarmMaterializationAllocatesNothing() {
               snapshot.flattened_srt == expected_snapshot.flattened_srt &&
               specialization == expected_specialization,
           "a repeated materialization changed its result");
-    std::printf("  %s: %.0f ns/call, %.2f allocations/call\n", name,
-                std::chrono::duration<double, std::nano>(elapsed).count() /
-                    Calls,
-                double(AllocationCounter::count) / Calls);
+    std::printf(
+        "  %s: %.0f ns/call, %.2f allocations/call, %zu images\n", name,
+        std::chrono::duration<double, std::nano>(elapsed).count() / Calls,
+        double(AllocationCounter::count) / Calls, snapshot.images.size());
     Check(AllocationCounter::count == 0, "a warm materialization allocated");
   };
   // A bounded table of 440-byte records probed every 8 bytes: candidates
@@ -9625,6 +9723,35 @@ void TestWarmMaterializationAllocatesNothing() {
                              .read_specialization_memory =
                                  ReadLinearTestMemory};
     measure("bounded image table", plan, runtime);
+  }
+  // Town-sized object tables: records with a T# each, sharing a few hundred
+  // distinct textures, probed every 8 bytes (55 keys per record).
+  for (const auto [rows, distinct] :
+       {std::pair{160u, 160u}, std::pair{1024u, 160u}}) {
+    auto fixture = MakeIndirectImageFixture(false, 440u, 0u, 32u);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    constexpr uint32_t table = 0x4000u;
+    LinearTestMemory memory;
+    memory.words.resize((table + rows * 440u - memory.base) / 4u);
+    memory.fail_address = 0x3000u;
+    for (uint32_t row = 0; row < rows; ++row) {
+      const auto texture_index = row % distinct;
+      const auto value = texture(0x100u + texture_index * 0x10u,
+                                 texture_index % 3u ? F::k32Float : F::k32UInt);
+      std::copy(value.begin(), value.end(),
+                memory.words.begin() +
+                    (table + row * 440u + 32u - memory.base) / 4u);
+    }
+    const std::array<uint32_t, 8> data{0x3000u, 16u << 16u,  1u,   0u,
+                                       table,   440u << 16u, rows, 0u};
+    const SrtRuntime runtime{.user_data = data,
+                             .userdata = &memory,
+                             .read_specialization_memory =
+                                 ReadLinearTestMemory};
+    const auto name = "bounded image table, " + std::to_string(rows) +
+                      " objects, " + std::to_string(distinct) + " textures";
+    measure(name.c_str(), plan, runtime);
   }
   // A key-list table of 32 T#s.
   {
@@ -9733,6 +9860,8 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("descriptor interning matches a linear search",
+        TestDescriptorInterningMatchesLinearSearch);
     Run("warm materialization allocates nothing",
         TestWarmMaterializationAllocatesNothing);
   } catch (const std::exception &exception) {
