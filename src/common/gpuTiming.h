@@ -87,12 +87,15 @@ struct SyncCounts {
 	std::array<uint64_t, SYNC_REASON_COUNT> wait_ns {};
 	// Flushes that found nothing to submit and kept the command buffer open.
 	std::array<uint64_t, SYNC_REASON_COUNT> skipped {};
+	// Readbacks served by waiting for an already submitted asynchronous download.
+	std::array<uint64_t, SYNC_REASON_COUNT> served {};
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
 	[[nodiscard]] uint64_t   TotalSubmits() const noexcept;
 	[[nodiscard]] uint64_t   TotalWaits() const noexcept;
 	[[nodiscard]] uint64_t   TotalSkipped() const noexcept;
+	[[nodiscard]] uint64_t   TotalServed() const noexcept;
 };
 
 // Running totals per reason, written from any thread with one relaxed increment.
@@ -109,6 +112,9 @@ public:
 	void AddSkippedFlush(SyncReason reason) noexcept {
 		m_skipped[Index(reason)].fetch_add(1, std::memory_order_relaxed);
 	}
+	void AddServedBySubmitted(SyncReason reason) noexcept {
+		m_served[Index(reason)].fetch_add(1, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -121,6 +127,7 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_waits {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_wait_ns {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_skipped {};
+	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_served {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.
