@@ -71,6 +71,26 @@ public:
 		}
 	}
 
+	// The oldest objects at or below `tick` that `eligible` accepts, at most `limit` of them,
+	// examining at most `max_visits` objects. Rejected objects do not count against `limit`, so
+	// old objects that can never be selected do not hide the evictable ones behind them.
+	template <typename Predicate>
+	[[nodiscard]] std::vector<Object> SelectBelow(Tick tick, size_t limit, size_t max_visits,
+	                                              Predicate&& eligible) const {
+		std::vector<Object> selected;
+		const auto*         item = m_first;
+		for (size_t visits = 0; visits < max_visits && selected.size() < limit; visits++) {
+			if (item == nullptr || item->tick > tick) {
+				break;
+			}
+			if (eligible(item->object)) {
+				selected.push_back(item->object);
+			}
+			item = item->next;
+		}
+		return selected;
+	}
+
 private:
 	void Attach(Item& item) {
 		item.prev = m_last;
