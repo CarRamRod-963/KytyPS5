@@ -341,20 +341,21 @@ static vk::Result BuildPipeline(vk::Device device, vk::PipelineCache cache, Inpu
 	return result;
 }
 
-// Creates pipeline.pipeline from `inputs`. With deferred optimization, a pipeline the driver
-// cache cannot provide is created without optimization, which some drivers do orders of
-// magnitude faster, and the returned job builds the optimized pipeline through the driver cache.
-// Unoptimized pipelines stay out of the driver cache: it is persisted, and the optimized build
-// supersedes them.
+// Creates pipeline.pipeline from `inputs` (see PipelineBuildMode). Unless the build is
+// Optimized, a pipeline the driver cache cannot provide is not optimized on the calling thread:
+// UnoptimizedFirst creates it without optimization, which some drivers do orders of magnitude
+// faster, Background leaves pipeline.pipeline null, and the returned job builds the optimized
+// pipeline through the driver cache. Unoptimized pipelines stay out of the driver cache: it is
+// persisted, and the optimized build supersedes them.
 template <typename Inputs>
 static PipelineCompileQueue::Job
 CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                      std::unique_ptr<Inputs> inputs, vk::PipelineCache driver_cache,
-                     bool defer_optimization) {
+                     PipelineBuildMode mode) {
 	EXIT_IF(pipeline.pipeline != nullptr);
 	const auto device = graphics.device;
 	vk::Result result = vk::Result::eSuccess;
-	if (defer_optimization && driver_cache != nullptr &&
+	if (mode != PipelineBuildMode::Optimized && driver_cache != nullptr &&
 	    graphics.pipeline_creation_cache_control_enabled) {
 		result = BuildPipeline(device, driver_cache, *inputs,
 		                       vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
@@ -366,15 +367,17 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::ePipelineCompileRequired);
 		pipeline.pipeline = nullptr;
 	}
-	if (!defer_optimization) {
+	if (mode == PipelineBuildMode::Optimized) {
 		result = BuildPipeline(device, driver_cache, *inputs, {}, "optimized", pipeline.pipeline);
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
 		return {};
 	}
-	result =
-	    BuildPipeline(device, nullptr, *inputs, vk::PipelineCreateFlagBits::eDisableOptimization,
-	                  "unoptimized", pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+	if (mode == PipelineBuildMode::UnoptimizedFirst) {
+		result = BuildPipeline(device, nullptr, *inputs,
+		                       vk::PipelineCreateFlagBits::eDisableOptimization, "unoptimized",
+		                       pipeline.pipeline);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+	}
 	return [device, driver_cache, inputs = std::move(inputs)]() -> uint64_t {
 		vk::Pipeline optimized = nullptr;
 		const auto   result =
@@ -395,7 +398,7 @@ PipelineCompileQueue::Job CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
     const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
-    vk::PipelineCache driver_cache, bool defer_optimization) {
+    vk::PipelineCache driver_cache, PipelineBuildMode mode) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -719,8 +722,7 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache,
-	                            defer_optimization);
+	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -781,7 +783,8 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache,
-	                            defer_optimization);
+	                            defer_optimization ? PipelineBuildMode::UnoptimizedFirst
+	                                               : PipelineBuildMode::Optimized);
 }
 
 } // namespace Libs::Graphics
