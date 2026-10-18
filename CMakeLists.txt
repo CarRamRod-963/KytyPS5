@@ -614,6 +614,11 @@ add_executable(guest_write_set_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(guest_write_set_tests PRIVATE ${inc_headers})
 
+add_executable(layout_change_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LayoutChangeLogTests.cpp"
+)
+target_include_directories(layout_change_log_tests PRIVATE ${inc_headers})
+
 add_executable(scalar_read_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarReadCacheTests.cpp"
 )
@@ -708,6 +713,7 @@ if(BUILD_TESTING)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
 	add_test(NAME guest_write_set COMMAND $<TARGET_FILE:guest_write_set_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
+	add_test(NAME layout_change_log COMMAND $<TARGET_FILE:layout_change_log_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME gpu_timing COMMAND $<TARGET_FILE:gpu_timing_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
@@ -813,6 +819,7 @@ if(BUILD_TESTING)
 		bindless_translation_tests
 		guest_write_set_tests
 		scalar_read_cache_tests
+		layout_change_log_tests
 		dcc_constant_tests
 		gpu_timing_tests
 		pipeline_compile_queue_tests

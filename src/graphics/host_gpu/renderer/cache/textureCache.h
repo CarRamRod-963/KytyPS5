@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/layoutChangeLog.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -55,15 +56,12 @@ public:
 	// Which image a descriptor resolves to changes only when an image overlapping its memory is
 	// inserted, registered, unregistered, deleted, expanded or given a stencil plane. A stamp
 	// taken at a lookup can later be asked whether such a change touched a range since.
-	struct LayoutStamp {
-		uint64_t sequence = 0;
-		uint64_t resets   = 0;
-	};
-	[[nodiscard]] LayoutStamp LayoutNow() const noexcept {
-		return {m_layout_sequence, m_layout_resets};
+	using LayoutStamp = LayoutChangeLog::Stamp;
+	[[nodiscard]] LayoutStamp LayoutNow() const noexcept { return m_layout_log.Now(); }
+	[[nodiscard]] bool        LayoutChangedSince(LayoutStamp stamp, uint64_t address,
+	                                             uint64_t size) const {
+		return m_layout_log.ChangedSince(stamp, address, size);
 	}
-	[[nodiscard]] bool LayoutChangedSince(LayoutStamp stamp, uint64_t address,
-	                                      uint64_t size) const noexcept;
 	// One caller's last FindImage: the description it passed, the description and image it got
 	// back, and the layout stamp from before the lookup.
 	struct ImageLookup {
@@ -219,15 +217,8 @@ private:
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// Orders native image writes against guest metadata reads (see Image).
 	uint64_t                                          m_event_sequence = 0;
-	struct LayoutChange {
-		uint64_t sequence;
-		uint64_t address;
-		uint64_t size;
-	};
-	void                      NoteLayoutChange(uint64_t address, uint64_t size);
-	std::vector<LayoutChange> m_layout_changes;
-	uint64_t                  m_layout_sequence                                = 0;
-	uint64_t                  m_layout_resets                                  = 0;
+	void NoteLayoutChange(uint64_t address, uint64_t size) { m_layout_log.Note(address, size); }
+	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

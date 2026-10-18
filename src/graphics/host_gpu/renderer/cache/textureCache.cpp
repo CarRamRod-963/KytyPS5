@@ -239,26 +239,6 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-void TextureCache::NoteLayoutChange(uint64_t address, uint64_t size) {
-	if (size == 0) return;
-	constexpr size_t MaxChanges = 4096;
-	if (m_layout_changes.size() >= MaxChanges) {
-		m_layout_changes.clear();
-		++m_layout_resets;
-	}
-	m_layout_changes.push_back({++m_layout_sequence, address, size});
-}
-
-bool TextureCache::LayoutChangedSince(LayoutStamp stamp, uint64_t address,
-                                      uint64_t size) const noexcept {
-	if (stamp.resets != m_layout_resets) return true;
-	for (auto it = m_layout_changes.rbegin(); it != m_layout_changes.rend(); ++it) {
-		if (it->sequence <= stamp.sequence) break;
-		if (address < it->address + it->size && it->address < address + size) return true;
-	}
-	return false;
-}
-
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	NoteLayoutChange(info.data.address, info.data.size);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
