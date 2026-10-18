@@ -34,8 +34,10 @@ public:
 	void Submitted(uint64_t tick, int64_t submit_ns);
 	// A thread that blocked on `tick` woke up.
 	void RecordWake(uint64_t tick);
-	// The guest end-of-pipe label deferred to the completion of `tick` was written.
-	void RecordLabel(uint64_t tick);
+	// The guest end-of-pipe label deferred to the completion of `tick` was written. A label
+	// issued after its tick already ended (nothing recorded since the previous submission)
+	// counts from `issued_ns` (steady clock), not from the GPU end.
+	void RecordLabel(uint64_t tick, int64_t issued_ns);
 	// The renderer's scheduler: its windows carry the per-reason submission and wait counts and
 	// are the ones the performance overlay shows. Other schedulers (presentation) only log.
 	void SetPrimary(bool primary) noexcept { m_primary = primary; }
@@ -53,7 +55,7 @@ private:
 
 	void                                 Collect();
 	void                                 Calibrate();
-	void                                 RecordEndLatency(uint64_t tick, bool label);
+	void RecordEndLatency(uint64_t tick, bool label, int64_t floor_ns = INT64_MIN);
 	void                                 MaybeRotate(int64_t now_ns);
 	[[nodiscard]] uint64_t               DeviceNs(uint64_t ticks) const;
 	[[nodiscard]] std::optional<int64_t> HostNs(uint64_t device_ticks) const;
