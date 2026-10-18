@@ -5,6 +5,10 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <cstdint>
+#include <span>
+#include <utility>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -138,7 +142,8 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // sequence that advances whenever a GPU write is recorded. Off the GPU thread, or for memory the
 // GPU cannot see, nothing is dirty and the sequence is 0.
 [[nodiscard]] bool     HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-void                   ReadGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+// Reads back the GPU-dirty bytes of several (address, size) ranges with one wait for the GPU.
+void                   ReadGpuDirtyBytes(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 [[nodiscard]] uint64_t GpuWriteSequence();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
