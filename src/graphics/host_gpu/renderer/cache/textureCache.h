@@ -72,6 +72,9 @@ public:
 		LayoutStamp stamp;
 		bool        exact_format = false;
 		bool        valid        = false;
+		// Unique per refill of `input` across all lookups: a caller that saw this value after its
+		// own FindImage knows `input` is still the description it passed.
+		uint64_t generation = 0;
 	};
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
@@ -81,6 +84,11 @@ public:
 	// while its registers are unchanged): an equal description resolves to the remembered image
 	// while no image overlapping its memory changed layout since that lookup.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format, ImageLookup& lookup);
+	// FindImage(lookup.input, exact_format, lookup) when it would answer from the remembered
+	// result: stores the image and the output description and returns true. Returns false and
+	// leaves `desc` as it is otherwise; FindImage then does the full lookup.
+	[[nodiscard]] bool FindRememberedImage(ImageLookup& lookup, bool exact_format, ImageDesc& desc,
+	                                       ImageId& id);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -218,6 +226,7 @@ private:
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// Orders native image writes against guest metadata reads (see Image).
 	uint64_t                                          m_event_sequence = 0;
+	uint64_t                                          m_lookup_generation = 0;
 	void NoteLayoutChange(uint64_t address, uint64_t size) { m_layout_log.Note(address, size); }
 	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;

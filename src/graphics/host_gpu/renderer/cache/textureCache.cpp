@@ -1541,28 +1541,39 @@ ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole
 	return result;
 }
 
+bool TextureCache::FindRememberedImage(ImageLookup& lookup, bool exact_format, ImageDesc& desc,
+                                       ImageId& id) {
+	if (!lookup.valid || lookup.exact_format != exact_format ||
+	    lookup.input.type == BindingType::VideoOut) {
+		return false;
+	}
+	if (m_scheduler.Current().IsInvalid()) {
+		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		auto*            image = m_slot_images.try_get(lookup.image);
+		if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+		    image->depth_id ||
+		    LayoutChangedSince(lookup.stamp, lookup.input.info.data.address,
+		                       lookup.input.info.data.size)) {
+			return false;
+		}
+		image->tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(*image);
+	}
+	desc = lookup.output;
+	MaterializeColorClear(lookup.image, desc, desc.metadata_base_layer);
+	id = lookup.image;
+	return true;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, ImageLookup& lookup) {
 	if (lookup.valid && lookup.exact_format == exact_format && desc.type != BindingType::VideoOut &&
 	    lookup.input == desc) {
-		if (m_scheduler.Current().IsInvalid()) {
-			EXIT("TextureCache: image lookup requires a valid command buffer\n");
-		}
-		bool found = false;
-		{
-			std::scoped_lock lock {m_lock};
-			auto*            image = m_slot_images.try_get(lookup.image);
-			if (image != nullptr && image->registered && !image->binding.needs_rebind &&
-			    !image->depth_id &&
-			    !LayoutChangedSince(lookup.stamp, desc.info.data.address, desc.info.data.size)) {
-				image->tick_accessed_last = m_scheduler.CurrentTick();
-				TouchImage(*image);
-				found = true;
-			}
-		}
-		if (found) {
-			desc = lookup.output;
-			MaterializeColorClear(lookup.image, desc, desc.metadata_base_layer);
-			return lookup.image;
+		ImageId id;
+		if (FindRememberedImage(lookup, exact_format, desc, id)) {
+			return id;
 		}
 	}
 	// A layout change made by this lookup itself is seen by the next one. Only a description that
@@ -1570,6 +1581,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, ImageLookup&
 	// a lookup also depends on their contents (aliases it re-resolves, overlaps it may delete).
 	lookup.stamp        = LayoutNow();
 	lookup.input        = desc;
+	lookup.generation   = ++m_lookup_generation;
 	lookup.exact_format = exact_format;
 	bool sole_owner     = false;
 	lookup.image        = LookupImage(desc, exact_format, &sole_owner);
