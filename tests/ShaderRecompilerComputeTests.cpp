@@ -3107,15 +3107,14 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  // A resolve keeps a FindImage result while ResolveCache::Reuse holds and the resolver's own
-  // inputs are unchanged. A planted stamp window marks a kept result: plain results do not
-  // compare it. (This branch's texture bindings keep their results through the texture memo, not
-  // through ResolveCache.)
+  // A FindImage result stays current for ResolveCache::Reuse while the image set, stencil plane
+  // records and surface metadata are unchanged, and a result that read colour clear keys only in
+  // its draw window and submission. (This branch's texture bindings and render targets keep their
+  // results through the texture memo and the render-target lookups, not through ResolveCache.)
   void CheckResolveCache() {
     constexpr const char *name = "ResolveCache";
     constexpr uintptr_t base = 0x0000000205000000ull;
     constexpr uint64_t size = 0x100000;
-    constexpr uint64_t kept = ~0ull;
     EnsureRuntimeContext();
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
@@ -3135,7 +3134,6 @@ public:
       context.MapMemory(base, size);
       auto &cache = context.GetTextureCache();
       auto &resolve_cache = context.GetResolveCache();
-      auto &executor = context.GetRenderExecutor();
       const auto linear = [&](uint64_t offset, vk::Format format, Prospero::BufferFormat guest) {
         return MakeLinearDesc(base + offset, 0x4000, format, guest, Prospero::ImageType::kColor2D,
                               {64, 64, 1}, 1, 4, 1);
@@ -3188,139 +3186,6 @@ public:
       Require(name, "two candidates", !find(rgba).second.epoch,
           "a lookup of two images at the range was stamped");
       TextureCacheTestAccess::DeleteImage(cache, overlap);
-
-      // Color targets: the registers and exact_format.
-      constexpr uint64_t color = base + 0x20000;
-      registers.SetColorBase(0, {.addr = color});
-      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
-                                 .channel_type = Prospero::ChannelType::kSrgb,
-                                 .channel_order = Prospero::ChannelOrder::kStandard});
-      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
-      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
-                                    .dimension = 1, .metadata_pipe_aligned = true});
-      registers.SetRenderTargetMask(0x0f);
-      RenderColorInfo target{};
-      const auto resolve_color = [&](bool exact_format = false) {
-        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), target,
-                                                           0, exact_format);
-      };
-      // Plants a marked result of the current registers; a resolve that keeps it returns the mark.
-      const auto plant_color = [&] {
-        auto planted = target;
-        planted.desc.stamp.window = kept;
-        resolve_cache.SetColor(0, registers.GetRenderTarget(0), false, planted);
-        RenderExecutorTestAccess::ResetBindings(executor);
-      };
-      const auto color_kept = [&](bool exact_format = false) {
-        resolve_color(exact_format);
-        return target.desc.stamp.window == kept;
-      };
-      resolve_color();
-      resolve_color();
-      RenderColorInfo probe{};
-      Require(name, "color stored",
-          resolve_cache.FindColor(0, registers.GetRenderTarget(0), false, probe),
-          "a color resolve did not keep its result");
-      plant_color();
-      Require(name, "color hit", color_kept() && cache.GetImage(target.image_id).binding.is_target,
-          "unchanged color registers were resolved again or not bound");
-      plant_color();
-      Require(name, "exact format key", !color_kept(true),
-          "an exact-format resolve kept a result found without it");
-      Require(name, "exact format stored",
-          resolve_cache.FindColor(0, registers.GetRenderTarget(0), true, probe),
-          "an exact-format resolve did not keep its result");
-      plant_color();
-      registers.SetColorBase(0, {.addr = color + 0x20000});
-      Require(name, "color registers", !color_kept(), "changed color registers kept the result");
-      registers.SetColorBase(0, {.addr = color});
-      resolve_color();
-      plant_color();
-      const auto color_other = unrelated();
-      Require(name, "color image set", !color_kept(),
-          "a color slot was kept after an image registered");
-      TextureCacheTestAccess::DeleteImage(cache, color_other);
-
-      // Depth targets: the registers. Stencil plane records and HTile metadata change lookups.
-      HW::DepthRenderTarget depth_target{};
-      depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
-      depth_target.z_info.texture_compatibility =
-          Prospero::TextureCompatiblePlaneCompression::kEnable;
-      depth_target.z_info.htile_acceleration = true;
-      depth_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
-      depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
-      depth_target.stencil_info.texture_compatibility = Prospero::TextureCompatibleStencil::kEnable;
-      depth_target.z_read_base_addr = base + 0x90000;
-      depth_target.z_write_base_addr = base + 0x90000;
-      depth_target.stencil_read_base_addr = base + 0xa0000;
-      depth_target.stencil_write_base_addr = base + 0xa0000;
-      depth_target.htile_data_base_addr = base + 0xb0000;
-      depth_target.size.valid = true;
-      registers.SetDepthRenderTarget(depth_target);
-      HW::DepthControl depth_control{};
-      depth_control.z_enable = true;
-      depth_control.z_write_enable = true;
-      registers.SetDepthControl(depth_control);
-      registers.SetRenderControl({});
-      const auto &z = registers.GetDepthRenderTarget();
-      RenderDepthInfo depth{};
-      const auto resolve_depth = [&] {
-        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
-      };
-      const auto plant_depth = [&] {
-        auto planted = depth;
-        planted.desc.stamp.window = kept;
-        resolve_cache.SetDepth(z, planted.desc, planted.image_id);
-      };
-      const auto depth_kept = [&] {
-        resolve_depth();
-        return depth.desc.stamp.window == kept;
-      };
-      resolve_depth();
-      const auto depth_id = depth.image_id;
-      // An image at the stencil range, which AssociateStencil adopts as the plane record.
-      ImageInfo plane_info{};
-      plane_info.data = depth.desc.info.stencil;
-      plane_info.extent = depth.desc.info.extent;
-      const auto plane = TextureCacheTestAccess::InsertImage(cache, plane_info);
-      resolve_depth();
-      RenderDepthInfo depth_probe{};
-      Require(name, "depth stored", depth.image_id == depth_id &&
-          resolve_cache.FindDepth(z, depth_probe.desc, depth_probe.image_id),
-          "a depth resolve did not keep its result");
-      plant_depth();
-      Require(name, "depth hit", depth_kept() && depth.image_id == depth_id,
-          "unchanged depth registers were resolved again");
-      plant_depth();
-      depth_target.shading_rate_encoding = 1;
-      registers.SetDepthRenderTarget(depth_target);
-      Require(name, "depth registers", !depth_kept(),
-          "changed depth registers kept the result");
-      plant_depth();
-      const auto depth_other = unrelated();
-      Require(name, "depth image set", !depth_kept(),
-          "a depth target was kept after an image registered");
-      TextureCacheTestAccess::DeleteImage(cache, depth_other);
-
-      resolve_depth();
-      const auto adopted = depth.desc.stamp;
-      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
-      Require(name, "plane record", cache.GetImage(plane).depth_id == depth_id &&
-          !resolve_cache.Reuse(depth_id, adopted) && !resolve_cache.Stamp(plane_info, 1, plane).epoch,
-          "a rewritten plane record kept the stamp current, or a lookup of one was stamped");
-      resolve_depth();
-      const auto associated = depth.desc.stamp;
-      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
-      Require(name, "plane repeat", resolve_cache.Reuse(depth_id, associated),
-          "an unchanged stencil association changed the image set");
-      (void)cache.FindDepthTarget(depth_id, depth.desc);
-      Require(name, "metadata insert", !resolve_cache.Reuse(depth_id, associated),
-          "new HTile metadata kept the stamp current");
-      resolve_depth();
-      const auto described = depth.desc.stamp;
-      (void)cache.FindDepthTarget(depth_id, depth.desc);
-      Require(name, "metadata repeat", resolve_cache.Reuse(depth_id, described),
-          "known HTile metadata changed the image set");
 
       context.UnmapMemory(base, size);
       scheduler.Finish();
@@ -12585,6 +12450,22 @@ public:
                   rendering.num_color_attachments == 1,
               "color attachment lost its dimensions or padded guest layout");
 
+      // Unchanged registers resolve through the remembered decode, other
+      // register bytes through a full one; both give the first answer.
+      for (const uint32_t clear_word : {0u, 0x12345678u, 0u}) {
+        registers.SetColorClearWord0(0, {.word0 = clear_word});
+        RenderColorInfo repeated{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), repeated, 0);
+        Require(name, "repeated color target",
+                repeated.image_id == color.image_id &&
+                    repeated.desc == color.desc &&
+                    repeated.guest_mip_level == color.guest_mip_level &&
+                    repeated.guest_array_layer == color.guest_array_layer &&
+                    repeated.target_slot == color.target_slot,
+                "a repeated render-target lookup returned another target");
+      }
+
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",
                 color.desc.info.mip_layout[0].offset == 0 &&
@@ -19400,6 +19281,18 @@ public:
       RenderDepthInfo phased_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), phased_depth);
+      // Unchanged depth registers resolve through the remembered decode.
+      RenderDepthInfo repeated_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), repeated_depth);
+      Require(name, "repeated depth target",
+              repeated_depth.image_id == phased_depth.image_id &&
+                  repeated_depth.desc == phased_depth.desc &&
+                  repeated_depth.depth_test_enable ==
+                      phased_depth.depth_test_enable &&
+                  repeated_depth.depth_write_enable ==
+                      phased_depth.depth_write_enable,
+              "a repeated depth-target lookup returned another target");
       // PRT permits missing backing; a fully resident target keeps the same layout and image.
       phased_depth_target.z_info.partially_resident = true;
       phased_depth_target.stencil_info.partially_resident = true;

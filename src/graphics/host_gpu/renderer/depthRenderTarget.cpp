@@ -270,10 +270,18 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	if (!m_context.GetResolveCache().FindDepth(z, r.desc, r.image_id)) {
-		r.desc     = MakeDepthTargetDesc(buffer, z);
-		r.image_id = m_context.GetTextureCache().FindImage(r.desc, false, m_depth_target_lookup);
-		m_context.GetResolveCache().SetDepth(z, r.desc, r.image_id);
+	auto& cache  = m_context.GetTextureCache();
+	auto& source = m_depth_target_source;
+	// The description is a function of the depth registers alone (and of the device), and the
+	// lookup still holds the one they decoded to last time.
+	bool found = false;
+	if (source.Matches(z, 0, m_depth_target_lookup)) {
+		found = cache.FindRememberedImage(m_depth_target_lookup, false, r.desc, r.image_id);
+		if (!found) {
+			r.desc = m_depth_target_lookup.input;
+		}
+	} else {
+		r.desc = MakeDepthTargetDesc(buffer, z);
 	}
 	r.depth_clear_enable      = has_depth && rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
@@ -310,6 +318,10 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		} else {
 			r.stencil_back = r.stencil_front;
 		}
+	}
+	if (!found) {
+		r.image_id = cache.FindImage(r.desc, false, m_depth_target_lookup);
+		source.Remember(z, 0, m_depth_target_lookup);
 	}
 	BindRenderTarget(r.image_id);
 }
