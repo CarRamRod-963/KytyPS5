@@ -536,14 +536,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto        vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings));
+	// Barriers to all commands leave indirect-argument reads out (LaterAccess), so this one
+	// covers every earlier write.
 	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
+	                          0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

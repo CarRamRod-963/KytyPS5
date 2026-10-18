@@ -291,8 +291,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	buffer_barrier.dstAccessMask =
-	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstAccessMask       = LaterAccess2;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
@@ -331,8 +330,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	buffer_barrier.dstAccessMask =
-	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	buffer_barrier.dstAccessMask       = LaterAccess2;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);

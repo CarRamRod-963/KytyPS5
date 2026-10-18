@@ -339,7 +339,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	command.dispatch(groups_x, groups_y, 1);
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	barriers[1].dstAccessMask = LaterAccess;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -584,7 +584,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 		}
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	barriers[1].dstAccessMask = LaterAccess;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -738,7 +738,7 @@ void TileManager::ExpandDccConstantBlocks(Result data, uint32_t element_bytes) {
 		first += blocks;
 	}
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = LaterAccess;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &barrier, 0,
 	                        nullptr);
