@@ -95,6 +95,10 @@ struct SyncCounts {
 	// were left for a later submission because the downloads of one submission are capped.
 	uint64_t async_pages    = 0;
 	uint64_t async_deferred = 0;
+	// End-of-pipe labels written by the completion thread, and labels it handed to the GPU
+	// thread (watched pages, or behind such a label).
+	uint64_t labels_direct     = 0;
+	uint64_t labels_gpu_thread = 0;
 
 	void                     Merge(const SyncCounts& other) noexcept;
 	[[nodiscard]] SyncCounts Since(const SyncCounts& earlier) const noexcept;
@@ -129,6 +133,9 @@ public:
 		m_async_pages.fetch_add(recorded, std::memory_order_relaxed);
 		m_async_deferred.fetch_add(deferred, std::memory_order_relaxed);
 	}
+	void AddLabel(bool direct) noexcept {
+		(direct ? m_labels_direct : m_labels_gpu_thread).fetch_add(1, std::memory_order_relaxed);
+	}
 	[[nodiscard]] SyncCounts Snapshot() const noexcept;
 
 private:
@@ -145,6 +152,8 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_joined {};
 	std::atomic<uint64_t>                                m_async_pages {};
 	std::atomic<uint64_t>                                m_async_deferred {};
+	std::atomic<uint64_t>                                m_labels_direct {};
+	std::atomic<uint64_t>                                m_labels_gpu_thread {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.

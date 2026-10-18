@@ -25,6 +25,13 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Writes the bytes through the guest backing when no page of the range has a watcher. The
+	// region lock is held across the check and the write, so a watcher added concurrently
+	// either sees the write (the caches protect a page before they copy it) or makes this
+	// return false. False, with nothing written, when a page is watched, the range crosses a
+	// tracking region or lies outside the tracked space, or it has no backing.
+	[[nodiscard]] bool TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

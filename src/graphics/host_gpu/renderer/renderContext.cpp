@@ -9,6 +9,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstring>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -88,6 +89,38 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemoryAround(fault_vaddr, fault_window);
 	}
 	return true;
+}
+
+void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
+                                 Common::UniqueFunction<void>&& notify) {
+	EXIT_IF(dst == nullptr || (size != sizeof(uint32_t) && size != sizeof(uint64_t)));
+	// The completion thread runs the publications of a submission's downloads before its
+	// labels, so whatever the label announces is already in guest memory.
+	if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
+	    m_page_manager.TryWriteUnwatched(reinterpret_cast<uint64_t>(dst), &value, size)) {
+		Common::GpuTiming::Sync().AddLabel(true);
+		if (notify) {
+			notify();
+		}
+		return;
+	}
+	Common::GpuTiming::Sync().AddLabel(false);
+	m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
+	GetGpu().SendCommand([this, dst, value, size, notify = std::move(notify)]() mutable {
+		// What a write fault would do, without relying on one: the caches drop or read back
+		// what they hold of the label's pages and stop watching them.
+		(void)InvalidateMemory(reinterpret_cast<uint64_t>(dst), size);
+		if (size == sizeof(uint32_t)) {
+			const auto word = static_cast<uint32_t>(value);
+			std::memcpy(dst, &word, sizeof(word));
+		} else {
+			std::memcpy(dst, &value, sizeof(value));
+		}
+		if (notify) {
+			notify();
+		}
+		m_gpu_thread_labels.fetch_sub(1, std::memory_order_release);
+	});
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
