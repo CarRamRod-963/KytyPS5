@@ -128,8 +128,9 @@ public:
 	// vertex/index buffers, push constants, dynamic state.
 	[[nodiscard]] vk::CommandBuffer StateHandle() const;
 	// For one guest dispatch, recorded next with the returned handle. `writes`: the dispatch may
-	// write memory through any path. Records the barrier it needs against earlier commands.
-	[[nodiscard]] vk::CommandBuffer DispatchHandle(bool writes) const;
+	// write memory through any path. `shared`: it uses emulator memory shared between dispatches
+	// (the LDS backing, GDS). Records the barrier it needs against earlier commands.
+	[[nodiscard]] vk::CommandBuffer DispatchHandle(bool writes, bool shared) const;
 	// A guest request to finish all earlier work before later work starts (a partial flush,
 	// a cache writeback or invalidation).
 	void GuestFlush() const;
