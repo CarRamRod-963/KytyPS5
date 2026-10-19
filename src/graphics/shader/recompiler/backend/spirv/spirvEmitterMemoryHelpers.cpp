@@ -312,8 +312,11 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
 	                                                              : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
+	const auto variable   = buffer.coherent_variable != 0 && state.coherent_buffer_access
+	                            ? buffer.coherent_variable
+	                            : buffer.variable;
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
-	                          buffer.variable, array_index);
+	                          variable, array_index);
 	if (non_uniform) {
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);

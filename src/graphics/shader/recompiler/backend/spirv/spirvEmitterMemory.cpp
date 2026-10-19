@@ -10,6 +10,21 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+// Selects the storage buffer variable of the loads emitted in its lifetime: a load without GLC/DLC
+// uses the cached alias (see BufferDefinition::coherent_variable).
+struct CoherentBufferAccessScope {
+	CoherentBufferAccessScope(EmitterState& state_, bool coherent)
+	    : state(state_), saved(state_.coherent_buffer_access) {
+		state.coherent_buffer_access = coherent;
+	}
+	~CoherentBufferAccessScope() { state.coherent_buffer_access = saved; }
+	CoherentBufferAccessScope(const CoherentBufferAccessScope&)            = delete;
+	CoherentBufferAccessScope& operator=(const CoherentBufferAccessScope&) = delete;
+
+	EmitterState& state;
+	bool          saved;
+};
+
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
@@ -1904,6 +1919,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	auto& state        = ctx.state;
+	const CoherentBufferAccessScope coherent(state, mem.coherent);
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto offset = inst.Arg(1).Resolve();
 	auto       index  = offset.IsImmediate()
@@ -1939,6 +1955,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
+	const CoherentBufferAccessScope coherent(ctx.state, mem.coherent);
 	uint32_t   value;
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		value = LoadLocalFlat(ctx, inst);
