@@ -1441,6 +1441,8 @@ private:
 				return true;
 			case ValueOpcode::UndefU1:
 			case ValueOpcode::UndefU32: code.jmp(*m_fail, Code::T_NEAR); return true;
+			// Floating point, varying loads and everything else stay with the interpreter.
+			default: return false;
 		}
 	}
 
