@@ -18,8 +18,9 @@ void Check(bool value, const char *text) {
   }
 }
 
-void TestDispatchSequences() {
+void TestSerializedDispatchSequences() {
   BarrierTracker tracker;
+  tracker.SetSerializeDispatches(true);
   Check(tracker.BeforeDispatch(true) == Barrier::AllToCompute,
         "the first writing dispatch waits for everything recorded before");
   Check(tracker.BeforeDispatch(true) == Barrier::ComputeToCompute,
@@ -40,6 +41,32 @@ void TestDispatchSequences() {
         "a reading dispatch after another command keeps the old order");
   Check(tracker.BeforeDispatch(true) == Barrier::AllToCompute,
         "a writing dispatch after another command waits for everything");
+}
+
+void TestDispatchRuns() {
+  BarrierTracker tracker;
+  Check(tracker.Flush() == Barrier::AllToAll,
+        "a flush with unknown earlier work is recorded");
+  Check(tracker.BeforeDispatch(true) == Barrier::None,
+        "the flush ordered everything before the first dispatch");
+  Check(tracker.BeforeDispatch(true) == Barrier::None,
+        "dispatches without a guest flush between them may overlap");
+  Check(tracker.BeforeDispatch(false) == Barrier::None,
+        "a read without a guest flush may overlap the writes");
+  Check(tracker.Flush() == Barrier::None,
+        "a flush after dispatches only is left to the next dispatch");
+  Check(tracker.BeforeDispatch(false) == Barrier::ComputeToCompute,
+        "a guest flush orders the next dispatch after the earlier writes");
+  Check(tracker.BeforeDispatch(false) == Barrier::None,
+        "two reading dispatches need no barrier");
+  Check(tracker.BeforeDispatch(true, true) == Barrier::None,
+        "a dispatch using shared emulator memory may overlap the others");
+  Check(tracker.BeforeDispatch(false, true) == Barrier::ComputeToCompute,
+        "two dispatches using shared emulator memory are ordered");
+  Check(tracker.BeforeDispatch(true) == Barrier::None,
+        "a dispatch without shared memory may overlap them");
+  Check(tracker.BeforeCommand() == Barrier::ComputeToAll,
+        "another command waits for the dispatches");
 }
 
 void TestFlushes() {
@@ -78,6 +105,9 @@ constexpr uint8_t All = Compute | Other;
 
 struct Item {
   bool barrier = false;
+  // A dispatch using emulator memory shared between dispatches.
+  bool shared = false;
+  uint32_t flushes = 0; // Guest flushes recorded before the command.
   uint8_t stage = 0; // A command's stage.
   bool writes = false;
   uint8_t source = 0; // A barrier's scopes.
@@ -138,8 +168,8 @@ enum class Op {
   End
 };
 
-void TestAgainstPerDispatchBarriers() {
-  std::mt19937 random(1234);
+void TestAgainstPerDispatchBarriers(bool serialize) {
+  std::mt19937 random(serialize ? 1234 : 4321);
   uint64_t legacy_barriers = 0;
   uint64_t tracked_barriers = 0;
   for (int round = 0; round < 3000; round++) {
@@ -148,6 +178,8 @@ void TestAgainstPerDispatchBarriers() {
     std::vector<Item> tracked;
     std::vector<Item> commands;
     BarrierTracker tracker;
+    tracker.SetSerializeDispatches(serialize);
+    uint32_t flushes = 0;
     // Unknown work before the sequence.
     const Item before{.stage = Other, .writes = true, .command = 0};
     legacy.push_back(before);
@@ -160,13 +192,18 @@ void TestAgainstPerDispatchBarriers() {
       case Op::WriteDispatch:
       case Op::ReadDispatch: {
         const bool writes = op == Op::WriteDispatch;
-        const Item item{.stage = Compute, .writes = writes, .command = command};
+        const bool shared = random() % 4 == 0;
+        const Item item{.shared = shared,
+                        .flushes = flushes,
+                        .stage = Compute,
+                        .writes = writes,
+                        .command = command};
         if (writes) {
           AddBarrier(legacy, Barrier::AllToCompute);
         }
         legacy.push_back(item);
         AddBarrier(legacy, Barrier::ComputeToAll);
-        AddBarrier(tracked, tracker.BeforeDispatch(writes));
+        AddBarrier(tracked, tracker.BeforeDispatch(writes, shared));
         tracked.push_back(item);
         commands.push_back(item);
         break;
@@ -180,6 +217,7 @@ void TestAgainstPerDispatchBarriers() {
         break;
       }
       case Op::Flush:
+        flushes++;
         AddBarrier(legacy, Barrier::AllToAll);
         AddBarrier(tracked, tracker.Flush());
         break;
@@ -203,10 +241,19 @@ void TestAgainstPerDispatchBarriers() {
     const auto new_order = Ordered(tracked, count);
     for (uint32_t i = 0; i < count; i++) {
       for (uint32_t j = i + 1; j < count; j++) {
-        const bool read_after_read = commands[i].stage == Compute &&
-                                     commands[j].stage == Compute &&
-                                     !commands[i].writes && !commands[j].writes;
-        if (old_order[i][j] && !read_after_read && !new_order[i][j]) {
+        const bool dispatches =
+            commands[i].stage == Compute && commands[j].stage == Compute;
+        const bool read_after_read =
+            dispatches && !commands[i].writes && !commands[j].writes;
+        // Without a guest flush between them the guest does not order two
+        // dispatches either, unless both use emulator memory shared between
+        // dispatches.
+        const bool guest_unordered =
+            !serialize && dispatches &&
+            commands[i].flushes == commands[j].flushes &&
+            !(commands[i].shared && commands[j].shared);
+        if (old_order[i][j] && !read_after_read && !guest_unordered &&
+            !new_order[i][j]) {
           std::fprintf(stderr, "round %d: commands %u -> %u lost their order\n",
                        round, i, j);
           Check(false,
@@ -231,9 +278,11 @@ void TestAgainstPerDispatchBarriers() {
 } // namespace
 
 int main() {
-  TestDispatchSequences();
+  TestSerializedDispatchSequences();
+  TestDispatchRuns();
   TestFlushes();
-  TestAgainstPerDispatchBarriers();
+  TestAgainstPerDispatchBarriers(true);
+  TestAgainstPerDispatchBarriers(false);
   std::printf("BarrierTrackerTests: ok\n");
   return 0;
 }
