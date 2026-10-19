@@ -171,6 +171,7 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 		w.PutBool(image.cube);
 		w.PutBool(image.fmask);
 		w.PutBool(image.bindless);
+		w.PutBool(image.bindless_byte_keys);
 	}
 	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
 	for (const auto& sampler: specialization.samplers) {
@@ -204,7 +205,8 @@ bool GetSpecialization(Reader& r, Specialization& specialization) {
 		    !r.Get(image.mip_count) || !GetEnum(r, image.conversion_format) ||
 		    !r.Get(image.shader_swizzle) || !r.Get(image.indirect_root) ||
 		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
-		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless)) {
+		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless) ||
+		    !r.GetBool(image.bindless_byte_keys)) {
 			return false;
 		}
 	}
