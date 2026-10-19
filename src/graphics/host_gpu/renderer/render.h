@@ -212,6 +212,7 @@ public:
 	// behalf (a bindless key) may be stale or name a record the game never samples: as an
 	// Optional source, such a T# returns a binding without an image instead.
 	enum class TextureSource : uint8_t { Bound, Optional };
+	void ValidateTextureUse(const ShaderRecompiler::IR::ImageResource& resource);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
 	                                            TextureSource source = TextureSource::Bound);
