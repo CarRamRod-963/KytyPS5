@@ -192,6 +192,8 @@ struct ImageResource {
 	// The key selects a slot of the bindless image array through the translation table
 	// (ResourceSnapshot::BindlessUse); there are no enumerated candidates.
 	bool                          bindless          = false;
+	// The key is a byte offset into the heap's DWORD records (ResourceSpecialization::Image).
+	bool bindless_byte_keys = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };
