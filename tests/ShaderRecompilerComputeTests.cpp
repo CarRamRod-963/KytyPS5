@@ -30023,6 +30023,55 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// A DPP16 source lane that EXEC disables is invalid like an out-of-range one:
+// without bound_ctrl the receiving lane keeps its destination. The row_shr:1
+// add below reads lane i-1; lanes whose source is disabled must keep the
+// sentinel, not add zero. This is the shape of the min/max scans of work-list
+// loops (a zero read as the minimum never ends the loop).
+TestCase VectorDppInactiveSourcePreservesDestination(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  const u32 masks[] = {0xf3cf3cf7u, 0x7bdef7bdu};
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovU32(&code, 1, 100);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  if (wave_size == 64)
+    AppendSMovLiteral(&code, 127, masks[1]);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111));
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  if (wave_size == 64)
+    AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32
+                  ? "VectorDppInactiveSourcePreservesDestinationWave32"
+                  : "VectorDppInactiveSourcePreservesDestinationWave64";
+  test.code = code;
+  test.expected.resize(wave_size, sentinel);
+  const auto active = [&](u32 lane) {
+    return (masks[lane / 32u] & (1u << (lane % 32u))) != 0;
+  };
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    if (active(lane) && lane % 16u != 0 && active(lane - 1u)) {
+      test.expected[lane] = 100u + lane - 1u;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,          O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMadF32RoundsProduct() {
   using O = ShaderOpcode;
 
@@ -46280,6 +46329,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  cases.push_back(VectorDppInactiveSourcePreservesDestination(32));
+  cases.push_back(VectorDppInactiveSourcePreservesDestination(64));
   AddCase(VectorDppPermlaneWaveMinimum);
   cases.push_back(VectorReadlaneFf1Waterfall(64));
   cases.push_back(VectorReadlaneFf1Waterfall(48));
@@ -52775,6 +52826,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination(32));
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination(64));
     RunCase(&vulkan, VectorDppPermlaneWaveMinimum());
     return 0;
   }
