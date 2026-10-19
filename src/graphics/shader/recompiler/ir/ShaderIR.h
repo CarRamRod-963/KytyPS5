@@ -757,6 +757,8 @@ struct ResourcePlan {
 	uint32_t                                                   jit_assumptions = 0;
 	mutable std::vector<std::vector<EvaluationContext::Entry>> jit_assume_values;
 	mutable std::vector<EvaluationContext::Entry*>             jit_assume_bases;
+	// Runs of the compiled walker; each run tags the values it found unknown with its own count.
+	mutable uint64_t jit_runs = 0;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
