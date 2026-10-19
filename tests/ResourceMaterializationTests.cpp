@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <random>
 #include <thread>
 
 #if defined(__linux__)
@@ -680,6 +681,32 @@ void TestGeneralWalkerRemembersUnknownValues() {
   Check(!MaterializeResources(plan, {.user_data = user_data}, snapshot,
                               specialization),
         "compiled walker decided an unknown disjunction");
+}
+
+void TestRangeOverlapIndex() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // The sorted index answers exactly as a scan of every range does, including
+  // empty ranges, nested ranges and ranges that only touch the query.
+  std::mt19937_64 random(7u);
+  for (uint32_t round = 0; round < 200; ++round) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges(random() % 40u);
+    for (auto &[address, bytes] : ranges) {
+      address = 0x1000u + random() % 4096u;
+      bytes = random() % 4u == 0u ? 0u : random() % 512u;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> storage;
+    RangeOverlapIndex index;
+    for (uint32_t query = 0; query < 64; ++query) {
+      const uint64_t base = 0x1000u + random() % 4800u;
+      const uint64_t size = random() % 8u == 0u ? 0u : 1u + random() % 300u;
+      bool expected = false;
+      for (const auto [address, bytes] : ranges)
+        expected |= bytes != 0u && size != 0u && address < base + size &&
+                    base < address + bytes;
+      Check(index.Overlaps(ranges, storage, base, size) == expected,
+            "range overlap index disagrees with a scan");
+    }
+  }
 }
 
 void TestGeneralNativeSrtWalker() {
@@ -2098,6 +2125,7 @@ int main() {
   TestGeneralWalkerLeavesFloatToInterpreter();
   TestGeneralWalkerSharedValuesCompileOnce();
   TestGeneralWalkerRemembersUnknownValues();
+  TestRangeOverlapIndex();
   TestGeneralWalkerLoopFixpoint();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
