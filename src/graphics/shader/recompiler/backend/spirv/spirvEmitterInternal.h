@@ -60,6 +60,9 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct BufferDefinition {
 	uint32_t variable             = 0;
+	// The same bindings decorated Coherent, when the shader has cache-bypassing accesses; only
+	// those use it, so ordinary loads keep the first-level cache.
+	uint32_t coherent_variable    = 0;
 	uint32_t type                 = 0;
 	uint32_t element_type         = 0;
 	uint32_t pointer_type         = 0;
@@ -111,6 +114,9 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
+	// Storage buffer accesses use BufferDefinition::coherent_variable (stores, atomics, GLC/DLC
+	// loads) unless an ordinary load clears this for its emission.
+	bool                                               coherent_buffer_access = true;
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                              memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;

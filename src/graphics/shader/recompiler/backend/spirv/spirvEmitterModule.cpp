@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -321,13 +322,23 @@ void DefineDescriptors(EmitterState& state) {
 					auto& buffer = state.storage_buffers[alias];
 					const auto type = StorageBufferType(state, buffer, 8u << alias);
 					buffer.variable = Define(ArrayType(type), names[alias]);
-					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
+					const bool aliased = info.buffer_u8 || info.buffer_u16 ||
+					                     info.buffer_int64_atomics || info.coherent_buffers;
+					if (aliased) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
 					}
-					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
-					// must participate in visibility for cache-bypassing polling loads.
+					// RDNA2 stores publish to L2 even without GLC; every store, atomic and
+					// cache-bypassing (GLC/DLC) load goes through a Coherent alias so polling
+					// loads see other workgroups' stores. Ordinary loads may hit a stale
+					// first-level cache on the guest too; they keep the cached variable, since
+					// Coherent makes NVIDIA bypass L1 for every access to the variable.
 					if (info.coherent_buffers) {
-						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
+						buffer.coherent_variable = Define(
+						    ArrayType(type), (std::string(names[alias]) + "_coherent").c_str());
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.coherent_variable,
+						                            spv::DecorationAliased);
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.coherent_variable,
+						                            spv::DecorationCoherent);
 					}
 				}
 				break;
