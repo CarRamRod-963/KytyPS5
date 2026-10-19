@@ -37144,7 +37144,9 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   test.bda_mappings = {{0x1f00000000ull, 32}};
   test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::FLAT_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_WAITCNT_VSCNT, O::S_ENDPGM};
-  test.required_spirv = {"OpDecorate %buffers Coherent", " 0 Coherent", "Volatile|Aligned 4"};
+  // The store goes through the coherent alias of the storage buffers.
+  test.required_spirv = {"OpDecorate %buffers_coherent Coherent", " 0 Coherent",
+                         "Volatile|Aligned 4"};
   test.decoded_counts = {{"dlc=1", 2}};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
@@ -39505,7 +39507,10 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                   O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge",
+                         "OpDecorate %buffers_coherent Coherent"};
+  // Only the coherent alias bypasses the first-level cache.
+  test.forbidden_spirv = {"OpDecorate %buffers Coherent"};
   if (store_completion) {
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);
@@ -39520,6 +39525,32 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
   test.dispatch_x = groups;
   // DLC alone does not bypass RDNA2's L0, so only check its translated policy.
   test.compile_only = dlc_only;
+  return test;
+}
+
+// A shader with a GLC load keeps its ordinary loads on the cached variable:
+// Coherent is decorated only on the alias that GLC/DLC loads, stores and
+// atomics use.
+TestCase BufferGlcAndOrdinaryLoads() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferLoadDword(&code, 1, 20);
+  AppendVMovU32(&code, 21, 4);
+  code.push_back(EncodeMubuf0(0x0cu, 0, false, true, true));
+  code.push_back(EncodeMubuf1(2, 0, 21));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(1), 2));
+  AppendStoreVgpr(&code, 3, 2);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferGlcAndOrdinaryLoads";
+  test.code = std::move(code);
+  test.initial = {5, 7, 0};
+  test.expected = {5, 7, 12};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpDecorate %buffers_coherent Coherent", "Volatile"};
+  test.forbidden_spirv = {"OpDecorate %buffers Coherent"};
   return test;
 }
 
@@ -46048,6 +46079,7 @@ std::vector<TestCase> MakeCases() {
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
+  AddCase(BufferGlcAndOrdinaryLoads);
   cases.push_back(BufferWorkgroupPublication(32));
   cases.push_back(BufferWorkgroupPublication(64));
   cases.push_back(BufferWorkgroupPublication(32, true));
@@ -53184,6 +53216,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, CoherentBufferPairContention(wave));
     }
     RunCase(&vulkan, CoherentBufferLoadDwordx2Swizzled());
+    RunCase(&vulkan, BufferGlcAndOrdinaryLoads());
     RunCase(&vulkan, BufferWorkgroupPublication(32));
     RunCase(&vulkan, BufferWorkgroupPublication(64));
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
