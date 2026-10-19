@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -374,7 +375,10 @@ private:
 // under control flow or compute offsets, so this one compiles the plan's value graph as a
 // stack machine over the evaluation memo: every instruction value is computed into its memo
 // slot (tagged with the generation) the first time a path needs it, which also lets the
-// descriptor evaluation that follows hit the memo. Blocks are walked in a topological order with
+// descriptor evaluation that follows hit the memo. Each value is compiled once per memo (plain
+// or clean, and per EXEC-factor assumption) as a subroutine that checks the memo first, so the
+// code grows with the plan rather than with the number of paths that use a value.
+// Blocks are walked in a topological order with
 // the interpreter's reachability rule: a block runs when a reachable predecessor selected it or
 // had a condition the host could not decide, and a control phi takes the incoming of the
 // reachable predecessors, which must agree. Plans with loops run the interpreter's fixpoint
@@ -402,8 +406,6 @@ struct GeneralWalkerContext {
 	uint32_t read_failed = 0;
 	// The stack pointer at entry: a failure with values still pushed unwinds to it.
 	uint64_t frame = 0;
-	// Stack pointers saved by nested logical operators that tolerate an unknown operand.
-	uint64_t saved_sp[16] = {};
 	// Memo arrays of the EXEC-factor assumptions: 2 * mask index + clean.
 	ResourcePlan::EvaluationContext::Entry** assume_values = nullptr;
 	// Plans with loops: the blocks reached in this pass (bit 0) and processed (bit 1), while
@@ -412,6 +414,9 @@ struct GeneralWalkerContext {
 	uint8_t* reachable = nullptr;
 	uint32_t phase     = 0;
 	uint32_t changed   = 0;
+	// Marks memo entries unknown in this run, like the interpreter's completed-unknown entries;
+	// no generation has the top bit set.
+	uint64_t unknown_tag = 0;
 };
 static_assert(offsetof(GeneralWalkerContext, user_data) == 0);
 static_assert(offsetof(GeneralWalkerContext, user_data_count) == 8);
@@ -425,11 +430,11 @@ static_assert(offsetof(GeneralWalkerContext, clean_values) == 64);
 static_assert(offsetof(GeneralWalkerContext, clean_generation) == 72);
 static_assert(offsetof(GeneralWalkerContext, scratch) == 80);
 static_assert(offsetof(GeneralWalkerContext, frame) == 88);
-static_assert(offsetof(GeneralWalkerContext, saved_sp) == 96);
-static_assert(offsetof(GeneralWalkerContext, assume_values) == 224);
-static_assert(offsetof(GeneralWalkerContext, reachable) == 232);
-static_assert(offsetof(GeneralWalkerContext, phase) == 240);
-static_assert(offsetof(GeneralWalkerContext, changed) == 244);
+static_assert(offsetof(GeneralWalkerContext, assume_values) == 96);
+static_assert(offsetof(GeneralWalkerContext, reachable) == 104);
+static_assert(offsetof(GeneralWalkerContext, phase) == 112);
+static_assert(offsetof(GeneralWalkerContext, changed) == 116);
+static_assert(offsetof(GeneralWalkerContext, unknown_tag) == 120);
 
 static bool KYTY_SYSV_ABI GeneralWalkerRead(GeneralWalkerContext* context, uint64_t address,
                                             uint64_t clean) {
@@ -571,8 +576,6 @@ public:
 				const auto& block = program.control_flow[index];
 				auto& next = position + 1 < order.size() ? labels[order[position + 1]] : m_finished;
 				code.L(labels[index]);
-				m_base.by_mode.clear();
-				m_scopes.clear();
 				code.mov(code.rax, code.qword[code.rbx + 48]);
 				code.cmp(code.byte[code.rax + index], 0);
 				code.je(next, Xbyak::CodeGenerator::T_NEAR);
@@ -590,27 +593,25 @@ public:
 			// phase, so each reached block's condition is evaluated once per iteration like in
 			// the interpreter's traversal, and the order of the sweep does not change the result.
 			Xbyak::Label reads, sweep, swept;
-			code.cmp(code.dword[code.rbx + 240], 0);
+			code.cmp(code.dword[code.rbx + 112], 0);
 			code.jne(reads, Xbyak::CodeGenerator::T_NEAR);
 			code.L(sweep);
-			code.mov(code.dword[code.rbx + 244], 0);
+			code.mov(code.dword[code.rbx + 116], 0);
 			for (size_t position = 0; position < order.size(); ++position) {
 				const auto  index = order[position];
 				const auto& block = program.control_flow[index];
 				auto& next = position + 1 < order.size() ? labels[order[position + 1]] : swept;
 				code.L(labels[index]);
-				m_base.by_mode.clear();
-				m_scopes.clear();
-				code.mov(code.rax, code.qword[code.rbx + 232]);
+				code.mov(code.rax, code.qword[code.rbx + 104]);
 				code.cmp(code.byte[code.rax + index], 1);
 				code.jne(next, Xbyak::CodeGenerator::T_NEAR);
 				code.mov(code.byte[code.rax + index], 3);
-				code.mov(code.dword[code.rbx + 244], 1);
+				code.mov(code.dword[code.rbx + 116], 1);
 				m_fail = &m_failed;
-				if (!EmitSuccessors(block, 232, next)) return false;
+				if (!EmitSuccessors(block, 104, next)) return false;
 			}
 			code.L(swept);
-			code.cmp(code.dword[code.rbx + 244], 0);
+			code.cmp(code.dword[code.rbx + 116], 0);
 			code.jne(sweep, Xbyak::CodeGenerator::T_NEAR);
 			code.jmp(m_finished, Xbyak::CodeGenerator::T_NEAR);
 			// Phase 1: the reads of the final visited set in block order, as the interpreter
@@ -620,8 +621,6 @@ public:
 				const auto& block = program.control_flow[index];
 				if (block.srt_reads.empty()) continue;
 				Xbyak::Label skip;
-				m_base.by_mode.clear();
-				m_scopes.clear();
 				m_fail = &m_failed;
 				code.mov(code.rax, code.qword[code.rbx + 48]);
 				code.cmp(code.byte[code.rax + index], 0);
@@ -648,6 +647,7 @@ public:
 		code.pop(code.rbx);
 		code.pop(code.rbp);
 		code.ret();
+		if (!EmitSubroutines()) return false;
 		code.readyRE();
 		if (Xbyak::GetError() != 0) {
 			Xbyak::ClearError();
@@ -732,7 +732,8 @@ private:
 		return true;
 	}
 
-	// Leaves the value in rax: 32-bit results zero-extended, 64-bit results whole.
+	// Leaves the value in rax: 32-bit results zero-extended, 64-bit results whole. An unknown
+	// value continues at m_fail with the stack pointer and the memo registers as they were.
 	bool Emit(Value value) {
 		auto& code = *m_code;
 		value      = value.Resolve();
@@ -755,40 +756,148 @@ private:
 			return true;
 		}
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return false;
+		if (inst == nullptr || !Acyclic(inst)) return false;
 		// A clean read belongs to the clean evaluator: its memo, its reader.
 		if (m_clean_evaluator && m_clean_depth == 0 && IsRawRead(m_program, *inst) &&
 		    inst->Flags<SrtReadFlags>().clean != 0u) {
 			EnterClean();
-			const bool done = Emit(value);
+			code.call(Subroutine(inst));
 			LeaveClean();
-			return done;
+		} else {
+			code.call(Subroutine(inst));
 		}
-		const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
-		const auto slot =
-		    static_cast<uint32_t>(index) * sizeof(ResourcePlan::EvaluationContext::Entry);
-		if (IsEmitted(inst)) {
+		code.jc(*m_fail, Code::T_NEAR);
+		return true;
+	}
+
+	// The subroutine computing a value in the current mode (plain or clean, and the innermost
+	// EXEC-factor assumption), which selects the memo the value lives in. It expects that memo's
+	// base in r12 and its generation in r14 and returns the value in rax with the carry clear, or
+	// sets the carry when the value is unknown; the other registers the walker keeps survive.
+	Xbyak::Label& Subroutine(const Inst* inst) {
+		const SubroutineKey key {inst, Assumption(), m_clean_depth > 0};
+		const auto [found, added] = m_subroutines.try_emplace(key, m_subroutine_labels.size());
+		if (added) {
+			m_subroutine_labels.emplace_back();
+			m_pending.push_back(key);
+		}
+		return m_subroutine_labels[found->second];
+	}
+
+	// The values EmitInst evaluates before an instruction. Handles (resources, U32 pairs) are
+	// evaluated through their own arguments, which walking them as values covers.
+	template <typename Function>
+	void ForEachDependency(const Inst& inst, Function&& visit) {
+		const auto visit_value = [&](Value value) {
+			if (const auto* dependency = value.Resolve().TryInstruction()) visit(dependency);
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::Phi:
+				if (m_phi_blocks.contains(&inst)) break;
+				visit_value(ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst))));
+				return;
+			case ValueOpcode::ReadFirstLane:
+				if (inst.NumArgs() != 0) visit_value(inst.Arg(0));
+				return;
+			default: break;
+		}
+		for (size_t index = 0; index < inst.NumArgs(); ++index) {
+			visit_value(inst.Arg(index));
+		}
+	}
+
+	// A value that depends on itself would meet the interpreter's in-progress marker, whose
+	// outcome depends on the evaluation order; such plans stay interpreted.
+	bool Acyclic(const Inst* root) {
+		if (const auto known = m_acyclic.find(root); known != m_acyclic.end()) {
+			return known->second == Visit::Done;
+		}
+		std::vector<std::pair<const Inst*, std::vector<const Inst*>>> stack;
+		const auto enter = [&](const Inst* inst) {
+			m_acyclic.emplace(inst, Visit::Active);
+			std::vector<const Inst*> dependencies;
+			ForEachDependency(*inst,
+			                  [&](const Inst* dependency) { dependencies.push_back(dependency); });
+			stack.emplace_back(inst, std::move(dependencies));
+		};
+		enter(root);
+		while (!stack.empty()) {
+			auto& dependencies = stack.back().second;
+			if (dependencies.empty()) {
+				m_acyclic[stack.back().first] = Visit::Done;
+				stack.pop_back();
+				continue;
+			}
+			const auto* next = dependencies.back();
+			dependencies.pop_back();
+			const auto state = m_acyclic.find(next);
+			if (state == m_acyclic.end()) {
+				enter(next);
+			} else if (state->second != Visit::Done) {
+				// Every value on the path depends on the cycle as well.
+				for (const auto& entry: stack)
+					m_acyclic[entry.first] = Visit::Cyclic;
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// The subroutine bodies, after the walker's code. Each checks the memo and otherwise computes
+	// the value in a frame of its own: rbp holds the frame's stack pointer, so an unknown operand
+	// anywhere in the body unwinds with one move.
+	bool EmitSubroutines() {
+		auto& code = *m_code;
+		while (!m_pending.empty()) {
+			const auto key = m_pending.front();
+			m_pending.pop_front();
+			code.L(m_subroutine_labels[m_subroutines.at(key)]);
+			const auto index = key.inst->EvaluationIndex(m_program.evaluation_value_count);
+			const auto slot =
+			    static_cast<uint32_t>(index) * sizeof(ResourcePlan::EvaluationContext::Entry);
+			Xbyak::Label stored, compute, unknown;
+			// Equal generations leave the carry clear. A value already found unknown in this run
+			// is not evaluated again: without that, every path to it would repeat the work.
+			code.mov(code.rax, code.qword[code.r12 + slot + 8]);
+			code.cmp(code.rax, code.r14);
+			code.jne(stored, Code::T_NEAR);
 			code.mov(code.rax, code.qword[code.r12 + slot]);
-			return true;
+			code.ret();
+			code.L(stored);
+			code.cmp(code.rax, code.qword[code.rbx + 120]);
+			code.jne(compute, Code::T_NEAR);
+			code.stc();
+			code.ret();
+			code.L(compute);
+			// The code may not grow without bound.
+			if (code.getSize() > MaxCodeSize) return false;
+			code.push(code.rbp);
+			code.push(code.r12);
+			code.push(code.r14);
+			code.mov(code.rbp, code.rsp);
+			m_assume.clear();
+			if (key.assumption != NoAssumption) m_assume.push_back(key.assumption);
+			m_clean_depth = key.clean ? 1 : 0;
+			m_fail        = &unknown;
+			if (!EmitInst(*key.inst)) return false;
+			code.mov(code.rsp, code.rbp);
+			code.pop(code.r14);
+			code.pop(code.r12);
+			code.pop(code.rbp);
+			code.mov(code.qword[code.r12 + slot], code.rax);
+			code.mov(code.qword[code.r12 + slot + 8], code.r14);
+			code.clc();
+			code.ret();
+			code.L(unknown);
+			code.mov(code.rsp, code.rbp);
+			code.pop(code.r14);
+			code.pop(code.r12);
+			code.pop(code.rbp);
+			code.mov(code.rax, code.qword[code.rbx + 120]);
+			code.mov(code.qword[code.r12 + slot + 8], code.rax);
+			code.stc();
+			code.ret();
 		}
-		// The code may not grow without bound: a plan that re-emits shared values in many
-		// nested regions is left to the interpreter.
-		if (code.getSize() > MaxCodeSize) return false;
-		Xbyak::Label compute, done;
-		code.mov(code.rax, code.qword[code.r12 + slot + 8]);
-		code.cmp(code.rax, code.r14);
-		code.jne(compute, Code::T_NEAR);
-		code.mov(code.rax, code.qword[code.r12 + slot]);
-		code.jmp(done, Code::T_NEAR);
-		code.L(compute);
-		// A value that depends on itself would meet the interpreter's in-progress marker,
-		// whose outcome depends on the evaluation order; such plans stay interpreted.
-		if (!m_emitting.insert(inst).second || !EmitInst(*inst)) return false;
-		m_emitting.erase(inst);
-		code.mov(code.qword[code.r12 + slot], code.rax);
-		code.mov(code.qword[code.r12 + slot + 8], code.r14);
-		code.L(done);
-		if (!IsUndef(*inst)) Emitted().insert(inst);
 		return true;
 	}
 
@@ -820,85 +929,18 @@ private:
 	}
 
 	// Evaluates a value whose unknown outcome is handled locally: on "unknown" control
-	// continues at `unknown` with the stack pointer restored.
+	// continues at `unknown` with the stack pointer and the memo registers restored.
 	bool EmitTolerant(Value value, Xbyak::Label& unknown) {
-		auto& code = *m_code;
-		if (m_tolerant_depth >= 16) return false;
-		const auto slot = 96 + m_tolerant_depth++ * 8;
-		code.mov(code.qword[code.rbx + slot], code.rsp);
-		Xbyak::Label restore, done;
-		auto* const  previous = m_fail;
-		m_fail                = &restore;
-		PushScope();
-		const bool emitted = Emit(value);
-		PopScope();
-		m_fail = previous;
-		--m_tolerant_depth;
-		if (!emitted) return false;
-		code.jmp(done, Code::T_NEAR);
-		code.L(restore);
-		code.mov(code.rsp, code.qword[code.rbx + slot]);
-		LoadMemoBase(code.r12);
-		if (m_clean_evaluator) {
-			code.mov(code.r14, code.qword[code.rbx + (m_clean_depth > 0 ? 72 : 32)]);
-		}
-		code.jmp(unknown, Code::T_NEAR);
-		code.L(done);
-		return true;
+		auto* const previous = m_fail;
+		m_fail               = &unknown;
+		const bool emitted   = Emit(value);
+		m_fail               = previous;
+		return emitted;
 	}
-
-	// Values whose memo slot is known to hold the current generation: those emitted
-	// unconditionally earlier in the block, and those emitted earlier in every enclosing
-	// conditional region. A region's set is dropped when the region ends because a later
-	// path may skip it. Each mode (plain, or under an EXEC-factor assumption) has its own
-	// memo array and therefore its own sets.
-	struct Sets {
-		std::unordered_set<const Inst*> emitted;
-		std::unordered_set<const Inst*> emitted_clean;
-	};
-	struct Scope {
-		std::unordered_map<uint32_t, Sets> by_mode;
-	};
 
 	static constexpr uint32_t NoAssumption = ~0u;
 
 	uint32_t Assumption() const { return m_assume.empty() ? NoAssumption : m_assume.back(); }
-
-	std::unordered_set<const Inst*>& Emitted() {
-		auto& sets = (m_scopes.empty() ? m_base : m_scopes.back()).by_mode[Assumption()];
-		return m_clean_depth > 0 ? sets.emitted_clean : sets.emitted;
-	}
-
-	bool IsEmitted(const Inst* inst) const {
-		const auto mode  = Assumption();
-		const bool clean = m_clean_depth > 0;
-		const auto has   = [&](const Scope& scope) {
-			const auto found = scope.by_mode.find(mode);
-			return found != scope.by_mode.end() &&
-			       (clean ? found->second.emitted_clean : found->second.emitted).contains(inst);
-		};
-		if (has(m_base)) return true;
-		for (const auto& scope: m_scopes) {
-			if (has(scope)) return true;
-		}
-		return false;
-	}
-
-	void PushScope() { m_scopes.emplace_back(); }
-	void PopScope() { m_scopes.pop_back(); }
-
-	// A region that either completes or fails its enclosing context: what it emitted
-	// dominates what follows it.
-	void PopScopeMerging() {
-		auto scope = std::move(m_scopes.back());
-		m_scopes.pop_back();
-		auto& parent = m_scopes.empty() ? m_base : m_scopes.back();
-		for (auto& [mode, sets]: scope.by_mode) {
-			auto& target = parent.by_mode[mode];
-			target.emitted.merge(sets.emitted);
-			target.emitted_clean.merge(sets.emitted_clean);
-		}
-	}
 
 	uint32_t AssumptionIndex(Value mask) {
 		for (uint32_t index = 0; index < m_masks.size(); ++index) {
@@ -914,11 +956,7 @@ private:
 	// mode restored.
 	bool EmitAssumed(Value value, Value mask, Xbyak::Label& unknown) {
 		auto& code = *m_code;
-		if (m_tolerant_depth >= 16) return false;
-		const auto slot = 96 + m_tolerant_depth++ * 8;
-		code.mov(code.qword[code.rbx + slot], code.rsp);
 		m_assume.push_back(AssumptionIndex(mask.Resolve()));
-		PushScope();
 		code.push(code.r12);
 		LoadMemoBase(code.r12);
 		Xbyak::Label restore, done;
@@ -926,109 +964,14 @@ private:
 		m_fail                = &restore;
 		const bool emitted    = Emit(value);
 		m_fail                = previous;
-		PopScopeMerging();
 		m_assume.pop_back();
-		--m_tolerant_depth;
 		if (!emitted) return false;
 		code.pop(code.r12);
 		code.jmp(done, Code::T_NEAR);
 		code.L(restore);
-		code.mov(code.rsp, code.qword[code.rbx + slot]);
-		LoadMemoBase(code.r12);
-		if (m_clean_evaluator) {
-			code.mov(code.r14, code.qword[code.rbx + (m_clean_depth > 0 ? 72 : 32)]);
-		}
+		code.pop(code.r12);
 		code.jmp(unknown, Code::T_NEAR);
 		code.L(done);
-		return true;
-	}
-
-	// A value computed from user data and constants alone: evaluating it where the
-	// interpreter would not changes nothing observable.
-	bool IsPure(const Inst& inst) {
-		if (const auto found = m_pure.find(&inst); found != m_pure.end()) return found->second;
-		bool pure = false;
-		switch (inst.GetOpcode()) {
-			case ValueOpcode::GetUserData:
-			case ValueOpcode::GetShaderBase:
-			case ValueOpcode::BitCastU32F32:
-			case ValueOpcode::BitCastF32U32:
-			case ValueOpcode::ConditionRef:
-			case ValueOpcode::CompositeExtractU64:
-			case ValueOpcode::CompositeExtractU32x2:
-			case ValueOpcode::CompositeConstructU64:
-			case ValueOpcode::IAdd32:
-			case ValueOpcode::IAdd64:
-			case ValueOpcode::ISub32:
-			case ValueOpcode::ISub64:
-			case ValueOpcode::IMul32:
-			case ValueOpcode::UMulHi:
-			case ValueOpcode::UMin32:
-			case ValueOpcode::UMax32:
-			case ValueOpcode::BitwiseAnd32:
-			case ValueOpcode::BitwiseAnd64:
-			case ValueOpcode::BitwiseOr32:
-			case ValueOpcode::BitwiseXor32:
-			case ValueOpcode::BitwiseNot32:
-			case ValueOpcode::ShiftLeftLogical32:
-			case ValueOpcode::ShiftLeftLogical64:
-			case ValueOpcode::ShiftRightLogical32:
-			case ValueOpcode::ShiftRightLogical64:
-			case ValueOpcode::ShiftRightArithmetic32:
-			case ValueOpcode::ShiftRightArithmetic64:
-			case ValueOpcode::BitFieldUExtract:
-			case ValueOpcode::BitFieldSExtract:
-			case ValueOpcode::BitFieldInsert:
-			case ValueOpcode::SelectU32:
-			case ValueOpcode::SelectU1:
-			case ValueOpcode::SelectF32:
-			case ValueOpcode::IEqual32:
-			case ValueOpcode::INotEqual32:
-			case ValueOpcode::ULessThan32:
-			case ValueOpcode::ULessThanEqual32:
-			case ValueOpcode::UGreaterThan32:
-			case ValueOpcode::SGreaterThanEqual32:
-			case ValueOpcode::LogicalAnd:
-			case ValueOpcode::LogicalOr:
-			case ValueOpcode::LogicalXor:
-			case ValueOpcode::LogicalNot: {
-				pure = true;
-				for (size_t index = 0; index < inst.NumArgs() && pure; ++index) {
-					const auto* arg = inst.Arg(index).TryInstruction();
-					pure            = arg == nullptr || IsPure(*arg);
-				}
-				break;
-			}
-			default: break;
-		}
-		m_pure.emplace(&inst, pure);
-		return pure;
-	}
-
-	void CollectUses(Value value, std::unordered_map<const Inst*, Value>& uses, size_t& budget) {
-		auto* const inst = value.TryInstruction();
-		if (inst == nullptr || IsEmitted(inst) || uses.contains(inst) || budget == 0) return;
-		--budget;
-		uses.emplace(inst, value);
-		for (size_t index = 0; index < inst->NumArgs(); ++index) {
-			CollectUses(inst->Arg(index), uses, budget);
-		}
-	}
-
-	// Values both arms of a select need are evaluated before the branch when that is
-	// unobservable; otherwise each arm emits its own copy, which doubles the code at every
-	// link of a select chain.
-	bool HoistShared(const Inst& select) {
-		std::unordered_map<const Inst*, Value> left;
-		std::unordered_map<const Inst*, Value> right;
-		size_t                                 budget = 4096;
-		CollectUses(select.Arg(1), left, budget);
-		CollectUses(select.Arg(2), right, budget);
-		for (const auto& [inst, value]: left) {
-			if (right.contains(inst) && IsPure(*inst) && !IsEmitted(inst) && !Emit(value)) {
-				return false;
-			}
-		}
 		return true;
 	}
 
@@ -1036,7 +979,7 @@ private:
 	void LoadMemoBase(const Xbyak::Reg64& reg) {
 		auto& code = *m_code;
 		if (!m_assume.empty()) {
-			code.mov(reg, code.qword[code.rbx + 224]);
+			code.mov(reg, code.qword[code.rbx + 96]);
 			code.mov(reg, code.qword[reg + (2 * m_assume.back() + (m_clean_depth > 0 ? 1 : 0)) *
 			                                   sizeof(void*)]);
 		} else {
@@ -1268,21 +1211,16 @@ private:
 					return Emit(inst.Arg(1));
 				}
 				Xbyak::Label otherwise, done;
-				if (!HoistShared(inst)) return false;
 				EnterClean();
 				const bool predicate = Emit(inst.Arg(0));
 				LeaveClean();
 				if (!predicate) return false;
 				code.test(code.eax, code.eax);
 				code.jz(otherwise, Code::T_NEAR);
-				PushScope();
 				const bool branches = Emit(inst.Arg(1));
-				PopScope();
 				code.jmp(done, Code::T_NEAR);
 				code.L(otherwise);
-				PushScope();
 				const bool other = branches && Emit(inst.Arg(2));
-				PopScope();
 				code.L(done);
 				return other;
 			}
@@ -1302,9 +1240,7 @@ private:
 				code.test(code.eax, code.eax);
 				code.jz(zero, Code::T_NEAR);
 				code.push(code.rax);
-				PushScope();
 				const bool left = Emit(inst.Arg(0));
-				PopScope();
 				if (!left) return false;
 				code.pop(code.rcx);
 				EmitCompare(&Code::setb);
@@ -1320,9 +1256,7 @@ private:
 				code.test(code.eax, code.eax);
 				code.jz(one, Code::T_NEAR);
 				code.push(code.rax);
-				PushScope();
 				const bool right = Emit(inst.Arg(1));
-				PopScope();
 				if (!right) return false;
 				code.mov(code.rcx, code.rax);
 				code.pop(code.rax);
@@ -1354,9 +1288,7 @@ private:
 				}
 				code.test(code.eax, code.eax);
 				code.jz(zero, Code::T_NEAR);
-				PushScope();
 				const bool right = Emit(inst.Arg(1));
-				PopScope();
 				if (!right) return false;
 				code.test(code.eax, code.eax);
 				code.setne(code.al);
@@ -1390,18 +1322,14 @@ private:
 					if (!EmitTolerant(inst.Arg(0), left_unknown)) return false;
 					code.test(code.eax, code.eax);
 					code.jnz(one, Code::T_NEAR);
-					PushScope();
 					const bool emitted = Emit(inst.Arg(1));
-					PopScope();
 					if (!emitted) return false;
 					code.test(code.eax, code.eax);
 					code.setne(code.al);
 					code.movzx(code.eax, code.al);
 					code.jmp(done, Code::T_NEAR);
 					code.L(left_unknown);
-					PushScope();
 					const bool again = Emit(inst.Arg(1));
-					PopScope();
 					if (!again) return false;
 					code.test(code.eax, code.eax);
 					code.jz(*m_fail, Code::T_NEAR);
@@ -1410,9 +1338,7 @@ private:
 					if (!Emit(inst.Arg(0))) return false;
 					code.test(code.eax, code.eax);
 					code.jnz(one, Code::T_NEAR);
-					PushScope();
 					const bool emitted = Emit(inst.Arg(1));
-					PopScope();
 					if (!emitted) return false;
 					code.test(code.eax, code.eax);
 					code.setne(code.al);
@@ -1460,7 +1386,6 @@ private:
 		code.push(0);
 		for (size_t index = 0; index < predecessors.size(); ++index) {
 			Xbyak::Label skip, first;
-			PushScope();
 			code.mov(code.rax, code.qword[code.rbx + 48]);
 			code.cmp(code.byte[code.rax + predecessors[index]], 0);
 			code.je(skip, Code::T_NEAR);
@@ -1474,7 +1399,6 @@ private:
 			code.mov(code.qword[code.rsp], code.rax);
 			code.mov(code.qword[code.rsp + 8], 1);
 			code.L(skip);
-			PopScope();
 		}
 		code.cmp(code.qword[code.rsp + 8], 0);
 		code.je(*m_fail, Code::T_NEAR);
@@ -1576,18 +1500,31 @@ private:
 	Xbyak::Label                              m_exit;
 	static constexpr size_t                   MaxCodeSize = 4u << 20u;
 
-	Scope                                     m_base;
-	std::vector<Scope>                        m_scopes;
 	std::vector<Value>                        m_masks;
 	std::vector<uint32_t>                     m_assume;
 	std::unordered_map<const Inst*, bool>     m_pure;
 	bool                                      m_clean_evaluator = false;
 	int                                       m_clean_depth     = 0;
-	int                                       m_tolerant_depth  = 0;
 	std::unordered_map<const Inst*, bool>     m_may_be_unknown;
 	Xbyak::Label*                             m_fail = &m_failed;
 	std::unordered_map<const Inst*, uint32_t> m_phi_blocks;
-	std::unordered_set<const Inst*>           m_emitting;
+	struct SubroutineKey {
+		const Inst* inst;
+		uint32_t    assumption;
+		bool        clean;
+		bool        operator==(const SubroutineKey&) const = default;
+	};
+	struct SubroutineKeyHash {
+		size_t operator()(const SubroutineKey& key) const {
+			return std::hash<const Inst*> {}(key.inst) ^ (size_t {key.assumption} << 1u) ^
+			       static_cast<size_t>(key.clean);
+		}
+	};
+	enum class Visit : uint8_t { Active, Done, Cyclic };
+	std::unordered_map<SubroutineKey, size_t, SubroutineKeyHash> m_subroutines;
+	std::deque<Xbyak::Label>                                     m_subroutine_labels;
+	std::deque<SubroutineKey>                                    m_pending;
+	std::unordered_map<const Inst*, Visit>                       m_acyclic;
 };
 
 void CompileGeneralSrtWalker(ResourcePlan& program) {
@@ -2514,6 +2451,9 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 		return 0;
 	};
 	const auto run = [&]() {
+		// Unknown values are retried in every run, as the interpreter's ResetUnknowns retries
+		// them when the reachable blocks change.
+		context.unknown_tag = (uint64_t {1} << 63u) | ++m_program.jit_runs;
 		if (m_program.srt_general_code->getCode<Walker>()(&context)) return 1;
 		return context.read_failed != 0u ? -1 : fallback();
 	};
