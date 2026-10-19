@@ -990,6 +990,64 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
 					return read_failed("image heap read", 0u, 0u, table_base, 0u, heap_words.size() * sizeof(uint32_t));
 			}
+			// The T# an image heap holds at a table offset (zero past its end).
+			const auto heap_candidate = [&](uint64_t table_offset) {
+				DescriptorValue candidate {.dword_count = dword_count};
+				const auto      table_word = table_offset / 4u;
+				std::copy_n(heap_words.begin() + table_word,
+				            std::min<size_t>(read_dwords, heap_words.size() - table_word),
+				            candidate.dwords.begin());
+				return candidate;
+			};
+			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+				// An image heap yields a candidate per DWORD start it may hold a T# at, and every
+				// distinct one is bound at every draw (Ghost of Yotei's PS 2a1e4953d280871c: 33,573
+				// per draw). When every usable T# in a large heap is a float 2D texture, the type
+				// the bindless image array holds, the heap is a bindless heap instead: the key is
+				// the T#'s byte offset in the table, and its records are the table's DWORDs. A heap
+				// that also holds T#s of another class (object records with fields for other
+				// operations) keeps its enumerated, class-grouped candidates.
+				const auto&                   image = program.info.images[resource_index];
+				const std::array<uint32_t, 3> float_2d {
+				    static_cast<uint32_t>(Prospero::TextureNumericClass::Float),
+				    static_cast<uint32_t>(Decoder::ImageDimension::Dim2D), 0u};
+				bool bindless = image_heap && read_dwords == 8u && count > BindlessTableKeys &&
+				                image.resource_class == ImageResourceClass::Sampled &&
+				                !image.written && !image.atomic && !image.depth_compare &&
+				                !image.cube && image.dimension == Decoder::ImageDimension::Dim2D;
+				for (uint32_t word = 0; word < count && bindless; ++word) {
+					const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
+					auto       candidate    = heap_candidate(table_offset);
+					if (!normalize(candidate))
+						return normalization_failed(table_offset, word, step, "probe");
+					bindless = NullImageDescriptor(candidate) ||
+					           ImageCandidateClass(image, candidate) == float_2d;
+				}
+				if (bindless) {
+					const auto mapping_offset = bindless_words();
+					snapshot.bindless_uses.push_back(
+					    {.resource       = resource_index,
+					     .base           = table_base & AddressMask & ~uint64_t {3},
+					     .size           = table_size,
+					     .record_stride  = sizeof(uint32_t),
+					     .pointer_offset = BindlessUse::NoPointer,
+					     .table_offset   = 0u,
+					     .layer_stride   = 0u,
+					     .layer_count    = 1u,
+					     .mapping_offset = static_cast<uint32_t>(mapping_offset)});
+					descriptors[resource_index]     = {.dword_count = dword_count};
+					auto& root                      = specializations[resource_index];
+					root.numeric_class              = Prospero::TextureNumericClass::Float;
+					root.dimension                  = Decoder::ImageDimension::Dim2D;
+					root.cube                       = false;
+					root.indirect_root              = resource_index;
+					root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+					root.indirect_search_iterations = 0u;
+					root.bindless                   = true;
+					root.bindless_byte_keys         = true;
+					return true;
+				}
+			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
 			for (uint32_t word = 0; word < count; ++word) {
@@ -1015,10 +1073,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 							return read_failed("table row read", word, child, table_base,
 							                   table_offset, descriptor_bytes);
 					} else {
-						const auto table_word = table_offset / 4u;
-						std::copy_n(heap_words.begin() + table_word,
-						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
-						            candidate.dwords.begin());
+						candidate = heap_candidate(table_offset);
 					}
 					if (!normalize(candidate))
 						return normalization_failed(table_offset, word, step,
@@ -2372,6 +2427,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.cube                       = source.cube;
 		image.heap                       = source.heap;
 		image.bindless                   = source.bindless;
+		image.bindless_byte_keys         = source.bindless_byte_keys;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
