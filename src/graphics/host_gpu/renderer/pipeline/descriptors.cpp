@@ -480,17 +480,22 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value,
-                                              TextureSource                                source) {
+// The checks a texture binding makes on the shader's use of the image, whatever its T#.
+void RenderExecutor::ValidateTextureUse(const ShaderRecompiler::IR::ImageResource& resource) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
-	if (storage) {
+	if (resource.written) {
 		ValidateStorageImageResource(resource);
 	}
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              TextureSource                                source) {
+	ValidateTextureUse(resource);
+	auto       descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage    = resource.written;
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
@@ -749,6 +754,16 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 	binding.image_view = nullptr;
 	binding.layout     = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
+	// A null T# binds no image (ResolveTexture's answer), so it needs neither the memo nor a
+	// description: nothing reads the description of an imageless binding. GPU-selected image
+	// tables pad their candidates with null descriptors, many per draw.
+	if (DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
+		ValidateTextureUse(resource);
+		binding.image_id    = {};
+		binding.layout      = vk::ImageLayout::eGeneral;
+		binding.memo_serial = 0;
+		return;
+	}
 	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
 		auto& entry = found->second;
 		if (TextureMemoEntryValid(entry)) {
