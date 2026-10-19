@@ -655,6 +655,11 @@ add_executable(program_manifest_tests EXCLUDE_FROM_ALL
 target_link_libraries(program_manifest_tests common fmt::fmt xxhash)
 target_include_directories(program_manifest_tests PRIVATE ${inc_headers})
 
+add_executable(memory_budget_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MemoryBudgetTests.cpp"
+)
+target_include_directories(memory_budget_tests PRIVATE ${inc_headers})
+
 add_executable(pending_draw_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PendingDrawPolicyTests.cpp"
 )
@@ -729,6 +734,7 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
+	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
