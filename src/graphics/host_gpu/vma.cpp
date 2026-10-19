@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 
 namespace Libs::Graphics {
@@ -123,6 +124,57 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 		                                                 vk::MemoryHeapFlagBits::eDeviceLocal)};
 	}
 	return count;
+}
+
+GraphicContext::MemoryHeaps GraphicContext::SampleMemoryHeaps() const {
+	MemoryHeaps heaps;
+	const bool  discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	if (!CanReportMemoryUsage() || allocator == nullptr || !discrete) {
+		return heaps;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		auto& state = device_local ? heaps.device : heaps.host;
+		state.budget += budgets[heap].budget;
+		state.usage += budgets[heap].usage;
+		state.blocks += budgets[heap].statistics.blockBytes;
+	}
+	return heaps;
+}
+
+void GraphicContext::MonitorMemoryBudget() {
+	if (!CanReportMemoryUsage() || allocator == nullptr) {
+		return;
+	}
+	vmaSetCurrentFrameIndex(allocator, ++memory_budget_frame);
+	const auto heaps = SampleMemoryHeaps();
+	if (heaps.device.budget == 0) {
+		return;
+	}
+	const auto now_ms =
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                              std::chrono::steady_clock::now().time_since_epoch())
+	                              .count());
+	const auto report = memory_budget_monitor.Sample(heaps.device, heaps.host, now_ms);
+	if (report == MemoryBudget::Monitor::Report::None) {
+		return;
+	}
+	using MemoryBudget::MiB;
+	const auto& device = heaps.device;
+	LOGF("%sGPU memory: device %" PRIu64 " of %" PRIu64 " MiB budget, driver %" PRIu64
+	     " MiB, caches %" PRIu64 " MiB (limit %" PRIu64
+	     " MiB); driver memory in the host heap %" PRIu64 " MiB\n",
+	     report == MemoryBudget::Monitor::Report::Demoted
+	         ? "Warning: driver memory grew in the host heap (demoted from device memory?). "
+	         : "",
+	     device.usage / MiB, device.budget / MiB, MemoryBudget::DriverUsage(device) / MiB,
+	     device.blocks / MiB, MemoryBudget::CacheLimit(device) / MiB,
+	     MemoryBudget::DriverUsage(heaps.host) / MiB);
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
