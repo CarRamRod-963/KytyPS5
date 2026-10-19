@@ -49866,36 +49866,39 @@ void CheckImageSamplerSpecialization() {
     ResourceSpecialization specialization;
     const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
                              .userdata = &memory, .read_specialization_memory = ReadTestMemory};
-    // The null root and the candidates are one class, padded to a power of two
-    // with null spares.
+    // A heap of 560 DWORD starts whose T#s are all float 2D textures is a
+    // bindless heap of DWORD records: the shader's key, the T#'s byte offset,
+    // is looked up at run time instead of binding every candidate.
     Require(name, "bounded native material plan",
-            plan.capture_specialization_reads && !translated.program.has_address_writes &&
+            plan.capture_specialization_reads &&
+                !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == std::bit_ceil(count + 1u) &&
-                std::all_of(
-                    snapshot.images.begin() + count + 1u, snapshot.images.end(),
-                    [](const auto &image) { return image.dwords[0] == 0u; }),
-            "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 byte_offset) {
-      const auto word = byte_offset >> 2u;
-      return word < snapshot.flattened_srt[offset]
-                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
-    };
-    Require(name, "dense table map and coherent snapshot",
-            specialization.images[0].indirect_search_iterations == 0u &&
-                snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
-                ordinal(32u) != 0u &&
-                ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&
+                snapshot.images.size() == plan.info.images.size() &&
+                snapshot.bindless_uses.size() == 1u &&
+                specialization.images[0].bindless &&
+                specialization.images[0].bindless_byte_keys,
+            "GPU-selected material descriptors were not resolved through a "
+            "bindless heap");
+    const auto &use = snapshot.bindless_uses[0];
+    Require(name, "bindless heap of the table and coherent snapshot",
+            use.base == table_base && use.size == count * 32u &&
+                use.record_stride == 4u &&
+                use.pointer_offset == BindlessUse::NoPointer &&
+                use.table_offset == 0u && use.layer_count == 1u &&
+                specialization.images[0].indirect_mapping_offset ==
+                    use.mapping_offset &&
+                snapshot.images[0].dwords[0] == 0u &&
                 snapshot.specialization_reads ==
-                    std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
-            "image table lost its dense offsets, explicit null or single coherent read");
+                    std::vector<std::pair<uint64_t, uint64_t>>{
+                        {table_base, count * 32u}},
+            "image heap lost its DWORD records, explicit null or single "
+            "coherent read");
     const auto previous = specialization;
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
-            "descriptor addresses were frozen or entered the shader specialization");
+                specialization == previous,
+            "descriptor addresses entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);
     if (!scalar) {
