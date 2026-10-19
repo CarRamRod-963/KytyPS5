@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <optional>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
@@ -249,13 +251,18 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		return workgroup->lds_size_dwords;
 	}
+	// The per-invocation array is local memory; drivers reserve it for every resident thread.
+	// It needs neither more than the guest allocation nor more than the addresses can reach.
+	std::optional<uint32_t> dwords;
 	if (state.program.stage == ShaderType::Pixel) {
-		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+		dwords = std::max(state.input_info.pixel->lds_size_dwords, 1u);
+	} else if (state.program.stage == ShaderType::Vertex) {
+		dwords = std::max(state.input_info.vertex->lds_size_dwords, 1u);
 	}
-	if (state.program.stage == ShaderType::Vertex) {
-		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
+	if (const auto addressed = state.program.info.function_lds_dwords; addressed != 0u) {
+		dwords = std::min(dwords.value_or(addressed), addressed);
 	}
-	return FUNCTION_LDS_DWORDS;
+	return dwords.value_or(FUNCTION_LDS_DWORDS);
 }
 
 void EnsureLdsStorage(EmitterState& state) {
