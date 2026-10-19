@@ -95,6 +95,7 @@ struct ConfigOptions {
 	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
+	bool                   serialize_dispatches            = false;
 	bool                   precompile_pipelines            = false;
 	bool                   precompile_only                 = false;
 	bool                   tessellation_enabled        = false;
@@ -175,6 +176,7 @@ bool SyncRawImageBuffersEnabled();
 uint32_t GetFlushDraws();
 bool AsyncPipelinesEnabled();
 bool     SkipPendingDrawsEnabled();
+bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
 bool TessellationEnabled();
