@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <optional>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -256,6 +258,135 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 		}
 		default: break;
 	}
+}
+
+// Guest LDS outside compute is emulated per invocation; the dword count it needs is bounded by the
+// largest address any LDS access can form. Interval reasoning covers the lane-indexed addresses
+// that pixel shaders use for lane exchanges; anything else keeps the full 32 KiB array.
+class LdsAddressBound {
+public:
+	[[nodiscard]] std::optional<uint64_t> Of(const Value& value, uint32_t depth = 0) {
+		const auto resolved = value.Resolve();
+		if (resolved.IsImmediate()) {
+			return resolved.GetType() == Type::U32 ? std::optional<uint64_t>(resolved.U32())
+			                                       : std::nullopt;
+		}
+		const auto* inst = resolved.TryInstruction();
+		if (inst == nullptr || depth > MaxDepth) {
+			return std::nullopt;
+		}
+		if (const auto it = m_bounds.find(inst); it != m_bounds.end()) {
+			return it->second;
+		}
+		// A phi cycle is unknown while it is being visited.
+		m_bounds.emplace(inst, std::nullopt);
+		const auto bound = Compute(*inst, depth + 1);
+		m_bounds[inst]   = bound;
+		return bound;
+	}
+
+private:
+	static constexpr uint32_t MaxDepth = 64;
+	static constexpr uint64_t MaxU32   = UINT32_MAX;
+
+	[[nodiscard]] static std::optional<uint64_t> Fits(uint64_t value) {
+		return value <= MaxU32 ? std::optional<uint64_t>(value) : std::nullopt;
+	}
+
+	[[nodiscard]] static std::optional<uint32_t> ShiftAmount(const Value& value) {
+		const auto resolved = value.Resolve();
+		if (!resolved.IsImmediate() || resolved.GetType() != Type::U32 || resolved.U32() >= 32u) {
+			return std::nullopt;
+		}
+		return resolved.U32();
+	}
+
+	[[nodiscard]] std::optional<uint64_t> Compute(const Inst& inst, uint32_t depth) {
+		const auto arg = [&](size_t index) { return Of(inst.Arg(index), depth); };
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::LaneId: return 63u; // Guest waves have at most 64 lanes.
+			case ValueOpcode::Phi: {
+				uint64_t bound = 0;
+				for (size_t index = 0; index < inst.NumArgs(); index++) {
+					const auto operand = arg(index);
+					if (!operand) return std::nullopt;
+					bound = std::max(bound, *operand);
+				}
+				return bound;
+			}
+			case ValueOpcode::IAdd32: {
+				const auto a = arg(0), b = arg(1);
+				return a && b ? Fits(*a + *b) : std::nullopt;
+			}
+			case ValueOpcode::IMul32: {
+				const auto a = arg(0), b = arg(1);
+				return a && b && (*a == 0 || *b <= MaxU32 / *a) ? std::optional(*a * *b)
+				                                                : std::nullopt;
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto a     = arg(0);
+				const auto shift = ShiftAmount(inst.Arg(1));
+				return a && shift ? Fits(*a << *shift) : std::nullopt;
+			}
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = ShiftAmount(inst.Arg(1));
+				return shift ? std::optional(arg(0).value_or(MaxU32) >> *shift) : std::nullopt;
+			}
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: {
+				const auto a = arg(0), b = arg(1);
+				if (a && b) return std::min(*a, *b);
+				return a ? a : b;
+			}
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::UMax32: {
+				const auto a = arg(0), b = arg(1);
+				if (!a || !b) return std::nullopt;
+				if (inst.GetOpcode() == ValueOpcode::UMax32) return std::max(*a, *b);
+				// The smallest all-ones value covering both operands.
+				uint64_t mask = 0;
+				while (mask < std::max(*a, *b))
+					mask = mask * 2u + 1u;
+				return mask;
+			}
+			case ValueOpcode::SelectU32: {
+				const auto a = arg(1), b = arg(2);
+				return a && b ? std::optional(std::max(*a, *b)) : std::nullopt;
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto count = ShiftAmount(inst.Arg(2));
+				return count ? std::optional((uint64_t {1} << *count) - 1u) : std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	std::unordered_map<const Inst*, std::optional<uint64_t>> m_bounds;
+};
+
+uint32_t FunctionLdsDwords(const Program& program) {
+	constexpr uint32_t FullLdsDwords = 8192;
+	LdsAddressBound    bound;
+	uint64_t           dwords = 1;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op      = inst.GetOpcode();
+			const auto shared  = SharedAccessOf(op);
+			const bool address = AddressOpcodeInfoOf(op).access != AddressAccess::None;
+			if (shared == SharedAccess::None && !address) continue;
+			const auto& memory = program.memory_info[inst.Flags<MemoryFlags>().index];
+			if (memory.kind == ResourceKind::FlatLocal) return FullLdsDwords;
+			if (shared == SharedAccess::None || memory.kind != ResourceKind::Lds) continue;
+			if (shared == SharedAccess::Append || shared == SharedAccess::Consume)
+				return FullLdsDwords;
+			const auto base = bound.Of(inst.Arg(0));
+			if (!base) return FullLdsDwords;
+			const auto last = ((*base + memory.offset) >> 2u) + SharedComponentCount(op);
+			if (last >= FullLdsDwords) return FullLdsDwords;
+			dwords = std::max(dwords, last);
+		}
+	}
+	return static_cast<uint32_t>(dwords);
 }
 
 struct InputUsage {
@@ -579,6 +710,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
 	}
+	info.function_lds_dwords = info.function_lds ? FunctionLdsDwords(program) : 0u;
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
