@@ -743,7 +743,12 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		if (state.flattened_srt_variable == 0 || state.bindless_translation_variable == 0) {
 			ctx.Fail(inst, "has no bindless runtime mapping");
 		}
-		return emit(mem.resource, EmitBindlessSlot(state, image, key));
+		// An image heap's key is a byte offset; its heap has a record per DWORD.
+		const auto record = image.bindless_byte_keys
+		                        ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
+		                                 ConstantU32(state, 2u))
+		                        : key;
+		return emit(mem.resource, EmitBindlessSlot(state, image, record));
 	}
 	if (state.flattened_srt_variable == 0 ||
 	    image.indirect_resources.size() < 2u) {

@@ -44,6 +44,9 @@ struct ResourceSpecialization {
 		bool                          heap                       = false;
 		// Resolved at run time through the bindless translation table (no candidates).
 		bool                          bindless                   = false;
+		// The bindless key is the byte offset of the T# in its heap's records (an image heap the
+		// shader indexes at a scalar offset); the translation index is the key divided by four.
+		bool                          bindless_byte_keys             = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
