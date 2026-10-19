@@ -89,6 +89,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   skip_pending_draws              = false;
+	bool                   serialize_dispatches            = false;
 	bool                   precompile_pipelines            = false;
 	bool                   precompile_only                 = false;
 	bool                   tessellation_enabled        = false;
@@ -160,6 +161,7 @@ bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool AsyncPipelinesEnabled();
 bool     SkipPendingDrawsEnabled();
+bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
 bool TessellationEnabled();

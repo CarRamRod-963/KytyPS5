@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -18,7 +19,9 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {
+	m_barriers.SetSerializeDispatches(Config::SerializeDispatchesEnabled());
+}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
@@ -44,10 +47,10 @@ vk::CommandBuffer CommandBuffer::StateHandle() const {
 	return m_buffer;
 }
 
-vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes) const {
+vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const {
 	EXIT_IF(IsInvalid() || m_rendering);
 	Common::GpuTiming::Sync().AddUnmergedBarriers(writes ? 2 : 1);
-	RecordBarrier(m_barriers.BeforeDispatch(writes));
+	RecordBarrier(m_barriers.BeforeDispatch(writes, shared));
 	m_has_commands = true;
 	m_command_count++;
 	return m_buffer;

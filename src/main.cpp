@@ -107,6 +107,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --precompile-only                    Build the recorded compute pipelines into the\n"
 	    "                                       driver cache, save it and exit.\n");
+	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
+	         "                                       previous one, also where the guest sends no\n"
+	         "                                       flush between them.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -230,6 +233,7 @@ static constexpr Flag FLAGS[] = {
     {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
     {"--precompile-pipelines", &ConfigOptions::precompile_pipelines},
     {"--precompile-only", &ConfigOptions::precompile_only},
+    {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},

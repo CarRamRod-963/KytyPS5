@@ -244,6 +244,13 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Whether a dispatch uses memory the emulator shares between dispatches, which the guest does
+// not order: the LDS backing buffer and GDS.
+static bool DispatchUsesSharedMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                     const PreparedBindings&                         bindings) {
+	return bindings.shared_memory.buffer != nullptr || program.info.uses_gds;
+}
+
 // Whether a dispatch may write memory through any path. A dispatch that only reads is not
 // ordered after earlier dispatches that only read, so no write may be missed here.
 static bool DispatchMayWriteMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -452,7 +459,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// A host fence used to serialize every dispatch; the command buffer keeps that order with
 	// pipeline barriers.
-	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings));
+	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
+	                                             DispatchUsesSharedMemory(program, bindings));
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -543,7 +551,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto        vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings));
+	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
+	                                             DispatchUsesSharedMemory(program, bindings));
 	// Barriers to all commands leave indirect-argument reads out (LaterAccess), so this one
 	// covers every earlier write.
 	vk::MemoryBarrier barrier {};
