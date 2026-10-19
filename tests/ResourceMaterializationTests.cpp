@@ -559,6 +559,129 @@ void TestGeneralWalkerLeavesFloatToInterpreter() {
   }
 }
 
+void TestGeneralWalkerSharedValuesCompileOnce() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Many reads at offsets selected by user data, every arm using one long
+  // chain over a guest read: the chain is compiled once, not once per arm.
+  std::array<uint32_t, 8> table{3u,    0x12u, 0x13u, 0x14u,
+                                0x15u, 0x16u, 0x17u, 0x18u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto read = [&](Value byte_offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+    return value;
+  };
+  const auto base = read(Value(0u));
+  auto chain = base;
+  constexpr uint32_t Links = 256;
+  for (uint32_t link = 0; link < Links; ++link)
+    chain = emit(ValueOpcode::IAdd32, {chain, base});
+  const auto control = emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  constexpr uint32_t Reads = 64;
+  for (uint32_t index = 0; index < Reads; ++index) {
+    const auto chosen = emit(ValueOpcode::IEqual32, {control, Value(index)});
+    const auto element =
+        emit(ValueOpcode::SelectU32,
+             {chosen, chain, emit(ValueOpcode::IAdd32, {chain, Value(1u)})});
+    read(emit(
+        ValueOpcode::ShiftLeftLogical32,
+        {emit(ValueOpcode::BitwiseAnd32, {element, Value(7u)}), Value(2u)}));
+  }
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_general_code != nullptr &&
+            plan.srt_general_code->getSize() < (256u << 10u),
+        "shared values were compiled once per use");
+  ResourceSnapshot snapshot;
+  ResourceSnapshot interpreted;
+  ResourceSpecialization specialization;
+  for (const uint32_t selector : {0u, 17u, 99u}) {
+    user_data[2] = selector;
+    const SrtRuntime runtime{.user_data = user_data};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "compiled walker failed on shared values");
+    // chain = base * (Links + 1); the selected read adds nothing, the others 1.
+    for (uint32_t index = 0; index < Reads; ++index) {
+      const auto element = 3u * (Links + 1u) + (index == selector ? 0u : 1u);
+      Check(snapshot.flattened_srt[1u + index] == table[element & 7u],
+            "compiled walker returned the wrong shared value");
+    }
+    auto code = std::move(plan.srt_general_code);
+    Check(MaterializeResources(plan, runtime, interpreted, specialization) &&
+              interpreted.flattened_srt == snapshot.flattened_srt,
+          "interpreter and compiled walker disagree on shared values");
+    plan.srt_general_code = std::move(code);
+  }
+}
+
+void TestGeneralWalkerRemembersUnknownValues() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A disjunction whose operands are one unknown value evaluates its right
+  // operand on both paths. Each link of the chain doubles the paths, so a
+  // walker that evaluates an unknown value again on every path never ends;
+  // the interpreter remembers it, and so must the compiled walker.
+  std::array<uint32_t, 4> table{0x11u, 0x12u, 0x13u, 0x14u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  auto unknown = emit(ValueOpcode::UndefU1, {});
+  for (uint32_t link = 0; link < 64; ++link)
+    unknown = emit(ValueOpcode::LogicalOr, {unknown, unknown});
+  // The selector word decides the select before the unknown chain is needed.
+  const auto known =
+      emit(ValueOpcode::IEqual32,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))}), Value(1u)});
+  const auto gate = emit(ValueOpcode::LogicalOr, {known, unknown});
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto value =
+      emit(ValueOpcode::LoadAddressU32,
+           {root, emit(ValueOpcode::SelectU32, {gate, Value(4u), Value(8u)}),
+            Value(0u), Value(true)});
+  value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  program.srt_reads.push_back({value, 0u});
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_general_code != nullptr,
+        "an unknown chain did not compile the general walker");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  user_data[2] = 1u;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                             specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{table[1]},
+        "compiled walker did not decide a disjunction with a true operand");
+  user_data[2] = 0u;
+  Check(!MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                              specialization),
+        "compiled walker decided an unknown disjunction");
+}
+
 void TestGeneralNativeSrtWalker() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Two tables; user data holds a pointer to each and a selector/index word.
@@ -1973,6 +2096,8 @@ int main() {
   TestGeneralWalkerAssumesExecFactor();
   TestGeneralWalkerZeroUnsignedBound();
   TestGeneralWalkerLeavesFloatToInterpreter();
+  TestGeneralWalkerSharedValuesCompileOnce();
+  TestGeneralWalkerRemembersUnknownValues();
   TestGeneralWalkerLoopFixpoint();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
