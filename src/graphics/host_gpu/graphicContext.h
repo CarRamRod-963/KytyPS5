@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <atomic>
@@ -116,6 +117,17 @@ struct GraphicContext {
 		bool     device_local = false;
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
+	// Device-local heaps and host heaps of a discrete GPU, each summed. Without
+	// VK_EXT_memory_budget, or on a GPU without dedicated memory, both are empty.
+	struct MemoryHeaps {
+		MemoryBudget::HeapState device;
+		MemoryBudget::HeapState host;
+	};
+	[[nodiscard]] MemoryHeaps SampleMemoryHeaps() const;
+	// Once per frame: refreshes VMA's copy of the budget (otherwise read again only every 30
+	// allocations, so driver allocations went unseen while the caches were stable) and logs
+	// growth of the driver's own device memory or of its memory in the host heap.
+	void                   MonitorMemoryBudget();
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	void                   DestroyRecycledImages();
@@ -136,6 +148,8 @@ struct GraphicContext {
 	uint64_t                   recycled_image_bytes = 0;
 	// Images created outside device-local memory because it was exhausted.
 	std::atomic<uint64_t> image_fallback_count = 0;
+	uint32_t              memory_budget_frame  = 0;
+	MemoryBudget::Monitor memory_budget_monitor;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
