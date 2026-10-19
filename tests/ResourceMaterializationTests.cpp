@@ -489,6 +489,52 @@ void TestGeneralWalkerZeroUnsignedBound() {
         "interpreter decided a compare with an unknown operand");
 }
 
+void TestGeneralWalkerLeavesFloatToInterpreter() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // The compiled walker does not model floating point: a plan whose read
+  // offset goes through float arithmetic stays with the interpreter.
+  std::array<uint32_t, 4> table{0x11u, 0x12u, 0x13u, 0x14u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto index =
+      emit(ValueOpcode::ConvertU32F32,
+           {emit(ValueOpcode::FPMul32,
+                 {emit(ValueOpcode::ConvertF32U32,
+                       {emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))})}),
+                  Value::F32(1.f)})});
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto value =
+      emit(ValueOpcode::LoadAddressU32,
+           {root, emit(ValueOpcode::ShiftLeftLogical32, {index, Value(2u)}),
+            Value(0u), Value(true)});
+  value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+  program.srt_reads.push_back({value, 0u});
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_plan_complete && plan.srt_general_code == nullptr,
+        "the general walker compiled float arithmetic");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t selector : {0u, 3u}) {
+    user_data[2] = selector;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                               specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{table[selector]},
+          "the interpreter did not walk a float-computed offset");
+  }
+}
+
 void TestGeneralNativeSrtWalker() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Two tables; user data holds a pointer to each and a selector/index word.
@@ -1902,6 +1948,7 @@ int main() {
   TestGeneralWalkerScopedMemo();
   TestGeneralWalkerAssumesExecFactor();
   TestGeneralWalkerZeroUnsignedBound();
+  TestGeneralWalkerLeavesFloatToInterpreter();
   TestGeneralWalkerLoopFixpoint();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
