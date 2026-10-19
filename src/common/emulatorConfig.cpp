@@ -201,6 +201,10 @@ bool SkipPendingDrawsEnabled() {
 	return g_config->skip_pending_draws;
 }
 
+bool SerializeDispatchesEnabled() {
+	return g_config->serialize_dispatches;
+}
+
 bool PrecompilePipelinesEnabled() {
 	return g_config->precompile_pipelines;
 }
