@@ -1514,6 +1514,83 @@ void TestTextureDataPlacement() {
         "layout query accepted a multisampled mip chain");
 }
 
+void TestFunctionLdsBound() {
+  using namespace ShaderRecompiler::IR;
+
+  ShaderPixelInputInfo pixel_info{};
+  // Each case adds LDS accesses to a fresh pixel program and returns the
+  // dword count of its per-invocation LDS array.
+  const auto collect = [&](const auto &build) {
+    Program program;
+    program.resource_tracking_complete = true;
+    program.stage = ShaderType::Pixel;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+    program.memory_info.push_back({.kind = ResourceKind::Lds, .offset = 8});
+    build(*block);
+    CollectShaderInfo(program, {.pixel = &pixel_info});
+    Check(program.info.function_lds,
+          "pixel LDS access did not request function LDS");
+    return program.info.function_lds_dwords;
+  };
+  const auto lane_address = [](Block &block, uint32_t base) {
+    auto &lane = block.AppendNewInst(ValueOpcode::LaneId);
+    auto &bytes = block.AppendNewInst(ValueOpcode::ShiftLeftLogical32,
+                                      {Value(&lane), Value(2u)});
+    return &block.AppendNewInst(ValueOpcode::IAdd32,
+                                {Value(&bytes), Value(base)});
+  };
+  const auto access = [](Block &block, ValueOpcode op, Inst *address,
+                         uint32_t memory) {
+    auto &inst =
+        op == ValueOpcode::WriteSharedU32
+            ? block.AppendNewInst(op, {Value(address), Value(1u), Value(true)})
+            : block.AppendNewInst(op, {Value(address), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = memory});
+  };
+
+  // Lane exchange through 4 dword rows: lane*4 + 1024 is the last row.
+  Check(collect([&](Block &block) {
+          access(block, ValueOpcode::WriteSharedU32, lane_address(block, 1024),
+                 0);
+          access(block, ValueOpcode::LoadSharedU32x2, lane_address(block, 256),
+                 1);
+        }) == 320u,
+        "lane-indexed LDS rows did not bound the function LDS array");
+  // The instruction offset and the access width extend the bound.
+  Check(collect([&](Block &block) {
+          access(block, ValueOpcode::LoadSharedU32x4, lane_address(block, 0),
+                 1);
+        }) == 69u,
+        "LDS offset or width was not included in the bound");
+  // An address the analysis cannot bound keeps the full 32 KiB array.
+  Check(collect([&](Block &block) {
+          auto &unknown = block.AppendNewInst(ValueOpcode::LoadSharedU32,
+                                              {Value(0u), Value(true)});
+          unknown.SetFlags(MemoryFlags{.index = 0});
+          access(block, ValueOpcode::WriteSharedU32, &unknown, 0);
+        }) == 8192u,
+        "an unbounded LDS address shrank the function LDS array");
+  // A loop-carried address is unknown.
+  Check(collect([&](Block &block) {
+          auto &phi = block.AppendNewInst(ValueOpcode::Phi);
+          auto &next = block.AppendNewInst(ValueOpcode::IAdd32,
+                                           {Value(&phi), Value(4u)});
+          phi.AddPhiOperand(&block, Value(0u));
+          phi.AddPhiOperand(&block, Value(&next));
+          access(block, ValueOpcode::WriteSharedU32, &next, 0);
+        }) == 8192u,
+        "a loop-carried LDS address shrank the function LDS array");
+  // Addresses past 32 KiB stay out of bounds of the full array.
+  Check(collect([&](Block &block) {
+          access(block, ValueOpcode::WriteSharedU32, lane_address(block, 40000),
+                 0);
+        }) == 8192u,
+        "an LDS address past 32 KiB changed the function LDS array");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -17346,6 +17423,7 @@ int main() {
   TestRebasedTextureMipViews();
   TestTextureDataPlacement();
   TestShaderFeatureCollection();
+  TestFunctionLdsBound();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestDriverSimplifySpeculatesGuardedLoads();
