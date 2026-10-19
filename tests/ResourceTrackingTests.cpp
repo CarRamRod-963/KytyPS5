@@ -384,19 +384,29 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
             snapshot.flattened_srt[mapping + 17u] == 2u &&
             snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 144u}},
         "dense image mapping lost its null slot, trimmed length or coherent read dependency");
-  // A sub-DWORD affine stride reaches every DWORD start. The table also holds T#s of other
-  // image operations, so an unsupported format there reads as null; a usable one is a candidate.
+  // A sub-DWORD affine stride reaches every DWORD start. The table also holds
+  // T#s of other image operations, so an unsupported format there reads as
+  // null; a usable one is a candidate. Its 128 bytes are 32 DWORD starts, which
+  // are still enumerated.
+  std::array<uint32_t, 16> subdword_data = data;
+  subdword_data[5] = 64u << 16u;
+  subdword_data[6] = 2u;
   for (const uint32_t stride : {1u, 2u}) {
     auto subdword = MakeIndirectImageFixture(false, stride, 0u, 0u, nested);
     subdword->PlanAndTrack();
     const auto subdword_plan = ExtractResourcePlan(subdword->program);
     for (const bool usable : {false, true}) {
       auto subdword_memory = memory;
+      std::fill_n(subdword_memory.words.begin() + 0x1064u / 4u, 8u, 0u);
+      std::copy(unreachable.begin(), unreachable.end(),
+                subdword_memory.words.begin() + 0x1054u / 4u);
       auto reachable = descriptor;
       reachable[0] += 2u;
       if (usable)
-        std::copy(reachable.begin(), reachable.end(), subdword_memory.words.begin() + 0x1064u / 4u);
+        std::copy(reachable.begin(), reachable.end(),
+                  subdword_memory.words.begin() + 0x1054u / 4u);
       auto subdword_runtime = runtime;
+      subdword_runtime.user_data = subdword_data;
       subdword_runtime.userdata = &subdword_memory;
       ResourceSnapshot subdword_snapshot;
       ResourceSpecialization subdword_specialization;
@@ -404,11 +414,50 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
         return std::ranges::any_of(subdword_snapshot.images,
                                    [&](const auto &image) { return image.dwords == words; });
       };
-      Check(MaterializeResources(subdword_plan, subdword_runtime, subdword_snapshot,
-                                 subdword_specialization) &&
-                !has(unreachable) && has(reachable) == usable,
-            "sub-DWORD affine stride skipped a reachable descriptor or kept an unusable one");
+      Check(MaterializeResources(subdword_plan, subdword_runtime,
+                                 subdword_snapshot, subdword_specialization) &&
+                subdword_snapshot.bindless_uses.empty() && !has(unreachable) &&
+                has(reachable) == usable,
+            "sub-DWORD affine stride skipped a reachable descriptor or kept an "
+            "unusable one");
     }
+    // A heap with more DWORD starts than BindlessTableKeys (144 bytes: 36)
+    // bakes no candidates: the shader's key, the T#'s byte offset, is resolved
+    // through a bindless heap of DWORD records instead.
+    auto heap_runtime = runtime;
+    auto heap_memory = memory;
+    heap_runtime.userdata = &heap_memory;
+    ResourceSnapshot heap_snapshot;
+    ResourceSpecialization heap_specialization;
+    Check(MaterializeResources(subdword_plan, heap_runtime, heap_snapshot,
+                               heap_specialization) &&
+              heap_snapshot.images.size() == 1u &&
+              heap_snapshot.bindless_uses.size() == 1u &&
+              heap_specialization.images.size() == 1u &&
+              heap_specialization.images[0].bindless &&
+              heap_specialization.images[0].bindless_byte_keys,
+          "large image heap was enumerated instead of resolved through a "
+          "bindless heap");
+    if (heap_snapshot.bindless_uses.size() != 1u)
+      continue;
+    const auto &use = heap_snapshot.bindless_uses[0];
+    Check(use.resource == 0u && use.base == 0x2000u && use.size == 144u &&
+              use.record_stride == 4u &&
+              use.pointer_offset == BindlessUse::NoPointer &&
+              use.table_offset == 0u && use.layer_stride == 0u &&
+              use.layer_count == 1u &&
+              heap_specialization.images[0].indirect_mapping_offset ==
+                  use.mapping_offset &&
+              std::ranges::all_of(heap_snapshot.images[0].dwords,
+                                  [](uint32_t word) { return word == 0u; }),
+          "bindless image heap does not describe its table as DWORD records");
+    // Other T#s in the heap keep the program.
+    const auto heap_original = heap_specialization;
+    std::fill_n(heap_memory.words.begin() + 0x1010u / 4u, 8u, 0u);
+    Check(MaterializeResources(subdword_plan, heap_runtime, heap_snapshot,
+                               heap_specialization) &&
+              heap_specialization == heap_original,
+          "a bindless image heap re-specialized when its contents changed");
   }
   const auto original_specialization = specialization;
   std::fill_n(memory.words.begin() + 0x1040u / 4u, 8u, 0u);
