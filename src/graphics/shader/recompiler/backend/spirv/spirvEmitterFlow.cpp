@@ -780,7 +780,15 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	auto       write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	if (!flags.bound_control && !flags.fetch_inactive && !flags.dpp8) {
+		// A source lane that EXEC disables is invalid like an out-of-range one, and without
+		// bound_ctrl the receiving lane keeps its value; EmitDppMoveU32 read zero from it.
+		const auto target = EmitDppTargetLane(ctx.state, flags);
+		const auto source_active =
+		    EmitBallotLaneActiveBool(ctx.state, ctx.Ballot(inst.Arg(2)), target.lane);
+		write = Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), write, source_active);
+	}
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }
