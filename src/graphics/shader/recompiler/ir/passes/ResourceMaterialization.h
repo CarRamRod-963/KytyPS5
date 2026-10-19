@@ -3,6 +3,11 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <cstdint>
+#include <span>
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -67,6 +72,20 @@ ResourcePlan ExtractResourcePlan(const Program&       program,
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used;
 // snapshot.unavailable tells a failure caused by the draw's guest data from an unsupported shader.
+// Answers whether a range overlaps any of a list of (address, bytes) ranges, in logarithmic
+// time per query after one sort: materialization checks every GPU-selected store candidate (up
+// to thousands) against every read a table walk recorded (up to tens of thousands). The index
+// is built into `index` on the first query; later queries must pass the same list.
+class RangeOverlapIndex {
+public:
+	[[nodiscard]] bool Overlaps(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+	                            std::vector<std::pair<uint64_t, uint64_t>>& index, uint64_t base,
+	                            uint64_t size);
+
+private:
+	bool m_built = false;
+};
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 

@@ -34,6 +34,8 @@ struct MaterializationScratch {
 	std::vector<uint32_t>                                     renumber;
 	std::vector<uint32_t>                                     row_lengths;
 	std::vector<uint32_t>                                     row_batch;
+	// RangeOverlapIndex storage for the specialization reads.
+	std::vector<std::pair<uint64_t, uint64_t>>                read_ends;
 	DescriptorInterner                                        candidates;
 };
 
@@ -1976,6 +1978,28 @@ ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerCompilation wa
 	return plan;
 }
 
+bool RangeOverlapIndex::Overlaps(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+                                 std::vector<std::pair<uint64_t, uint64_t>>& index, uint64_t base,
+                                 uint64_t size) {
+	if (size == 0u) return false;
+	if (!m_built) {
+		index.clear();
+		for (const auto [address, bytes]: ranges) {
+			if (bytes != 0u) index.emplace_back(address, address + bytes);
+		}
+		std::ranges::sort(index);
+		for (size_t position = 1; position < index.size(); ++position) {
+			index[position].second = std::max(index[position].second, index[position - 1].second);
+		}
+		m_built = true;
+	}
+	// The ranges that start before the query ends; one of them overlaps it when the furthest
+	// end among them lies past its start.
+	const auto after = std::ranges::upper_bound(index, base + size - 1u, {},
+	                                            [](const auto& range) { return range.first; });
+	return after != index.begin() && std::prev(after)->second > base;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (program.materialization_scratch == nullptr) {
@@ -2247,7 +2271,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// A GPU-selected store candidate whose range covers descriptor memory this dispatch reads is
 	// not the buffer the shader writes (it would overwrite its own descriptors): a table record the
 	// key never selects can hold a heap-wide V#. Such candidates are null, so the renderer's
-	// write-overlap check applies to the candidates that remain.
+	// write-overlap check applies to the candidates that remain. A table of store candidates is
+	// read record by record, so both lists can hold thousands of entries: the reads are sorted
+	// by address once, with the furthest end among each prefix, and each candidate is a binary
+	// search.
+	RangeOverlapIndex read_index;
 	for (uint32_t i = 0; i < snapshot.buffers.size() && i < specialization.buffers.size(); ++i) {
 		const auto root = specialization.buffers[i].indirect_root;
 		if (root >= program.info.buffers.size() || !program.info.buffers[root].written) continue;
@@ -2256,12 +2284,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		const auto base = descriptor.Base48();
 		const auto size = descriptor.GetSize();
 		if (base == 0u || size == 0u) continue;
-		for (const auto [address, bytes]: snapshot.specialization_reads) {
-			if (bytes != 0u && address < base + size && base < address + bytes) {
-				snapshot.buffers[i].dwords.fill(0u);
-				break;
-			}
-		}
+		if (read_index.Overlaps(snapshot.specialization_reads, scratch.read_ends, base, size))
+			snapshot.buffers[i].dwords.fill(0u);
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!BuildResourceSpecialization(program, snapshot, specialization)) return false;
