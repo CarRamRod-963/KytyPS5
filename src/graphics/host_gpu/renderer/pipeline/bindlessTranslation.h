@@ -15,7 +15,9 @@ namespace Libs::Graphics {
 // slot per host image view. An entry is IR::BindlessPending until the renderer resolves the
 // key a shader flagged; the entries live in the storage the GPU reads (a mapped buffer), so a
 // translation is visible to the next submission. Regions are append-only: nothing a submitted
-// frame may read is given another meaning.
+// frame may read is given another meaning. Heaps are keyed by guest address, and a game that
+// builds its records in per-frame memory creates new heaps every frame, so the owner resets
+// the table (Reset) once no submitted work can read it any more.
 class BindlessTranslation {
 public:
 	// Entry 0 is where out-of-range keys land; slot 0 holds the placeholder image.
@@ -65,6 +67,7 @@ public:
 	[[nodiscard]] uint32_t    FindOrCreateHeap(const HeapKey& key, uint32_t records);
 	[[nodiscard]] const Heap& GetHeap(uint32_t heap) const { return m_heaps[heap]; }
 	[[nodiscard]] uint32_t    UsedEntries() const { return m_used_entries; }
+	[[nodiscard]] uint32_t    Capacity() const { return static_cast<uint32_t>(m_entries.size()); }
 
 	// The key a flagged entry stands for; false when the entry is pending in no live region.
 	[[nodiscard]] bool Decode(uint32_t entry, Request& request) const;
@@ -76,6 +79,9 @@ public:
 	void                      Translate(uint32_t entry, uint32_t slot);
 	// The slot's entries become pending again (its image is gone).
 	void FreeSlot(uint32_t slot);
+	// Drops every heap and region: all entries become pending and the next heap starts at
+	// FirstEntry again. Slots keep their images. Only valid while no GPU work reads the entries.
+	void Reset();
 
 private:
 	struct Region {

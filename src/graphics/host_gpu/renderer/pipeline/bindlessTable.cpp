@@ -169,6 +169,20 @@ void BindlessTable::TakeFeedback(std::vector<uint32_t>& entries, uint32_t limit)
 	}
 }
 
+void BindlessTable::Reset() {
+	EXIT_IF(!Created());
+	const auto bytes = uint64_t {m_entries->UsedEntries()} * sizeof(uint32_t);
+	m_entries->Reset();
+	if (!m_translation->IsCoherent()) {
+		m_translation->Flush(0, bytes);
+	}
+	std::memset(m_feedback->Mapped().data(), 0, bytes);
+	if (!m_feedback->IsCoherent()) {
+		m_feedback->Flush(0, bytes);
+	}
+	m_feedback_cursor = BindlessTranslation::FirstEntry;
+}
+
 void BindlessTable::FlushTranslation() {
 	EXIT_IF(!m_translation);
 	if (!m_translation->IsCoherent()) {
