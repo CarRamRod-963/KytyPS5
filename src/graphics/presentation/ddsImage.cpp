@@ -61,6 +61,7 @@ bool DdsImage::Load(const std::filesystem::path& path) {
 	allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	allocation.flags =
 	    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+	m_graphics.PreparePriorityAllocation(allocation, MemoryPriority::Class::Cache, UINT32_MAX);
 	VmaAllocationInfo mapped {};
 	if (vmaCreateBuffer(m_graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer),
 	                    &allocation, &m_staging, &m_staging_allocation, &mapped) != VK_SUCCESS) {
