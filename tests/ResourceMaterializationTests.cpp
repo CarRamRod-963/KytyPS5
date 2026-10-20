@@ -1029,6 +1029,14 @@ void TestGeneralWalkerLoopFixpoint() {
     Check(active == std::vector<uint8_t>{expected.visited[5]} &&
               snapshot.buffers[0].dwords[0] == expected.flat[1],
           "compiled loop walker activated the wrong descriptors");
+    // The buffer's descriptor is evaluated by the compiled walker in its final
+    // pass when the use block is reached, and left to the interpreter when not.
+    Check(plan.jit_descriptor_sources == std::vector<uint32_t>{0u} &&
+              plan.jit_descriptor_known ==
+                  std::vector<uint8_t>{expected.visited[5]} &&
+              (!expected.visited[5] ||
+               plan.jit_descriptors[0] == expected.flat[1]),
+          "compiled loop walker did not evaluate the active descriptor");
     auto code = std::move(plan.srt_general_code);
     ResourceSnapshot interpreted;
     Check(MaterializeResources(plan, runtime, interpreted, specialization),
