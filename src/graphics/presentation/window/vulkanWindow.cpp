@@ -515,7 +515,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maximal_reconvergence.pNext = &uniform_control_flow;
 		supported_features2.pNext   = &maximal_reconvergence;
 	}
+	// Residency priorities: VK_EXT_memory_priority sets them at allocation,
+	// VK_EXT_pageable_device_local_memory changes them later (vkSetDeviceMemoryPriorityEXT).
+	const bool memory_priority_extension =
+	    HasExtension(device_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+	const bool pageable_memory_extension =
+	    HasExtension(device_extensions, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+	vk::PhysicalDeviceMemoryPriorityFeaturesEXT            memory_priority {};
+	vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_memory {};
+	if (memory_priority_extension) {
+		memory_priority.pNext     = supported_features2.pNext;
+		supported_features2.pNext = &memory_priority;
+	}
+	if (pageable_memory_extension) {
+		pageable_memory.pNext     = supported_features2.pNext;
+		supported_features2.pNext = &pageable_memory;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.memory_priority_enabled =
+	    memory_priority_extension && memory_priority.memoryPriority == VK_TRUE;
+	graphics.pageable_memory_enabled = graphics.memory_priority_enabled &&
+	                                   pageable_memory_extension &&
+	                                   pageable_memory.pageableDeviceLocalMemory == VK_TRUE;
+	LOGF("Vulkan memory priority: %s, pageable device-local memory: %s\n",
+	     graphics.memory_priority_enabled ? "true" : "false",
+	     graphics.pageable_memory_enabled ? "true" : "false");
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -701,6 +725,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		uniform_control_flow.pNext  = const_cast<void*>(create_info.pNext);
 		maximal_reconvergence.pNext = &uniform_control_flow;
 		create_info.pNext           = &maximal_reconvergence;
+	}
+	if (graphics.memory_priority_enabled) {
+		memory_priority.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &memory_priority;
+	}
+	if (graphics.pageable_memory_enabled) {
+		pageable_memory.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &pageable_memory;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1071,6 +1103,15 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// Optional: residency priorities, so the OS demotes cold cached textures first when
+		// device memory is over budget.
+		if (HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			if (HasExtension(available_extensions,
+			                 VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+			}
 		}
 		// Optional: maps GPU timestamps onto the host clock for the submission latencies.
 		if (HasExtension(available_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
