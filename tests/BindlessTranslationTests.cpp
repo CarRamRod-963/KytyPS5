@@ -81,10 +81,56 @@ void TestHeapsAndKeys() {
 	      "regions are appended");
 }
 
+// Heaps keyed by per-frame addresses fill the append-only table; a reset (with
+// no GPU work in flight) must make room again without forgetting which images
+// the slots hold.
+void TestReset() {
+  std::vector<uint32_t> entries(32, 0);
+  BindlessTranslation table(entries, 4);
+  uint64_t base = 0x1000;
+  uint32_t heaps = 0;
+  while (table.FindOrCreateHeap(Key(base), 2) != BindlessTranslation::NoHeap) {
+    base += 0x1000;
+    ++heaps;
+  }
+  Check(heaps == 3 && table.UsedEntries() == 25 && table.Capacity() == 32,
+        "per-frame heaps fill the table");
+  const auto slot = table.AllocateSlot(Common::SlotId{7}, 0x10);
+  table.Translate(9 + 1, slot);
+  Check(table.GetSlot(slot).entries.size() == 1, "the slot lists its entry");
+
+  table.Reset();
+  Check(table.UsedEntries() == BindlessTranslation::FirstEntry,
+        "a reset frees every region");
+  bool pending = true;
+  for (uint32_t entry = BindlessTranslation::FirstEntry; entry < entries.size();
+       ++entry) {
+    pending &= entries[entry] == Pending;
+  }
+  Check(pending && entries[0] == BindlessTranslation::PlaceholderSlot,
+        "a reset makes every entry pending and keeps the placeholder entry");
+  BindlessTranslation::Request request;
+  Check(!table.Decode(10, request), "entries of dropped heaps do not decode");
+  Check(table.GetSlot(slot).InUse() && table.GetSlot(slot).entries.empty() &&
+            table.FindSlot(Common::SlotId{7}, 0x10) == slot,
+        "slots keep their images and forget the dropped entries");
+
+  const auto heap = table.FindOrCreateHeap(Key(base), 2);
+  Check(heap == 0 &&
+            table.GetHeap(heap).region == BindlessTranslation::FirstEntry,
+        "the next heap starts at the first entry again");
+  table.Translate(BindlessTranslation::FirstEntry, slot);
+  table.FreeSlot(slot);
+  Check(entries[BindlessTranslation::FirstEntry] == Pending &&
+            entries[10] == Pending,
+        "freeing a slot after a reset touches only its new entries");
+}
+
 } // namespace
 
 int main() {
 	TestHeapsAndKeys();
-	std::printf("BindlessTranslationTests: all tests passed\n");
+        TestReset();
+        std::printf("BindlessTranslationTests: all tests passed\n");
 	return 0;
 }
