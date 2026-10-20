@@ -151,7 +151,9 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId
+	InsertImage(const ImageInfo&      info,
+	            MemoryPriority::Class memory_class = MemoryPriority::Class::Cache);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);

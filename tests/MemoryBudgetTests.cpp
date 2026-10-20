@@ -96,6 +96,18 @@ void TestMonitor() {
   Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 66 * s) ==
             Monitor::Report::DriverGrew,
         "growth after a shrink is measured from the old reference");
+
+  // Memory at low residency priority is reported when it moves by 512 MiB
+  // either way.
+  Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 76 * s,
+                       511 * MiB) == Monitor::Report::None,
+        "a small priority change is reported");
+  Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 86 * s,
+                       2 * GiB) == Monitor::Report::Priorities,
+        "aging to low priority is not reported");
+  Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 96 * s,
+                       GiB) == Monitor::Report::Priorities,
+        "promotion out of low priority is not reported");
 }
 
 } // namespace
