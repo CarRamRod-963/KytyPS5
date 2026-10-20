@@ -398,12 +398,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
 	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
 	                   vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR,
-	                   vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>
+	                   vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
+	                   vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+	                   vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, uniform_control_flow,
-	       maximal_reconvergence] = supported;
+	       maximal_reconvergence, memory_priority, pageable_memory] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	// Optional: maps GPU timestamps onto the host clock for the submission latencies.
 	graphics.calibrated_timestamps_enabled = add(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
@@ -449,9 +451,24 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		supported.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
 		supported.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
 	}
+	// Residency priorities: VK_EXT_memory_priority sets them at allocation,
+	// VK_EXT_pageable_device_local_memory changes them later (vkSetDeviceMemoryPriorityEXT).
+	if (!add(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+		supported.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+	} else if (!add(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
+	graphics.memory_priority_enabled = memory_priority.memoryPriority == VK_TRUE;
+	graphics.pageable_memory_enabled =
+	    graphics.memory_priority_enabled && pageable_memory.pageableDeviceLocalMemory == VK_TRUE;
+	LOGF("Vulkan memory priority: %s, pageable device-local memory: %s
+",
+	     graphics.memory_priority_enabled ? "true" : "false",
+	     graphics.pageable_memory_enabled ? "true" : "false");
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
@@ -634,6 +651,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR {
 	        .shaderSubgroupUniformControlFlow = VK_TRUE},
 	    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR {.shaderMaximalReconvergence = VK_TRUE},
+	    vk::PhysicalDeviceMemoryPriorityFeaturesEXT {.memoryPriority = VK_TRUE},
+	    vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT {.pageableDeviceLocalMemory = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -674,6 +693,21 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.maximal_reconvergence_enabled) {
 		create.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
 		create.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+	}
+	if (graphics.memory_priority_enabled) {
+		memory_priority.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &memory_priority;
+	}
+	if (graphics.pageable_memory_enabled) {
+		pageable_memory.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &pageable_memory;
+	}
+
+	if (!graphics.memory_priority_enabled) {
+		create.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+	}
+	if (!graphics.pageable_memory_enabled) {
+		create.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
 	}
 
 	vk::Device device = nullptr;
