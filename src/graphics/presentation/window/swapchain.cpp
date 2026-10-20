@@ -195,7 +195,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	               vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
-	if (!graphics.CreateImage(create, dst)) {
+	if (!graphics.CreateImage(create, dst, MemoryPriority::Class::Pinned)) {
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
 		     extent.width, extent.height, static_cast<int>(format));
 	}
