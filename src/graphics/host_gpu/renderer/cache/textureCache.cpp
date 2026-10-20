@@ -239,9 +239,9 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ImageId TextureCache::InsertImage(const ImageInfo& info, MemoryPriority::Class memory_class) {
 	NoteLayoutChange(info.data.address, info.data.size);
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, memory_class);
 	RegisterImage(id);
 	return id;
 }
@@ -334,6 +334,7 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	m_graphics.UseMemory(image.backing.memory);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
@@ -754,7 +755,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.first_tail_level    = cached.info.first_tail_level;
 	}
 	info.htile_initial_clear  = false;
-	const auto replacement_id = InsertImage(info);
+	const auto replacement_id =
+	    InsertImage(info, binding == BindingType::Texture ? cached.backing.memory_class
+	                                                      : MemoryPriority::Class::Target);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	// The copy below carries the native content, and with it the metadata's staleness.
@@ -985,7 +988,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	NoteLayoutChange(info.data.address, info.data.size);
 	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
+	const auto expanded_id = InsertImage(info, m_slot_images[source_id].backing.memory_class);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
@@ -1385,7 +1388,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		ImageInfo info {};
 		info.data   = stencil;
 		info.extent = depth.info.extent;
-		association = InsertImage(info);
+		association = InsertImage(info, MemoryPriority::Class::Target);
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
@@ -1496,7 +1499,10 @@ ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
+			// Images the GPU writes are targets; the rest are cached textures.
+			result         = InsertImage(desc.info, desc.type == BindingType::Texture
+			                                            ? MemoryPriority::Class::Cache
+			                                            : MemoryPriority::Class::Target);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {

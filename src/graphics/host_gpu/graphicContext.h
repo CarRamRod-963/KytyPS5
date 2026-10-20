@@ -5,8 +5,10 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/memoryBudget.h"
+#include "graphics/host_gpu/memoryPriority.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -30,6 +32,10 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_memory_priority: allocations carry a residency priority. With
+	// VK_EXT_pageable_device_local_memory as well, priorities change as contents age.
+	bool                               memory_priority_enabled               = false;
+	bool                               pageable_memory_enabled               = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
@@ -130,18 +136,36 @@ struct GraphicContext {
 	// allocations, so driver allocations went unseen while the caches were stable) and logs
 	// growth of the driver's own device memory or of its memory in the host heap.
 	void                   MonitorMemoryBudget();
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	[[nodiscard]] bool
+	CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	            MemoryPriority::Class memory_class = MemoryPriority::Class::Cache);
 	void                   DeleteImage(VulkanImage& image);
 	void                   DestroyRecycledImages();
+
+	// Residency priorities (memoryPriority.h). Target and Pinned allocations come from pools
+	// created with a high priority, so they never share a block with cached textures.
+	// PreparePriorityAllocation fills `info` for an allocation of the class whose memory type is
+	// `memory_type` (UINT32_MAX when unknown: the default pools); TrackAllocation registers the
+	// allocation's memory object, UntrackAllocation must run before the allocation is freed.
+	void PreparePriorityAllocation(VmaAllocationCreateInfo& info,
+	                               MemoryPriority::Class memory_class, uint32_t memory_type);
+	[[nodiscard]] MemoryPriority::Object*
+	     TrackAllocation(VmaAllocation allocation, MemoryPriority::Class memory_class, bool pooled);
+	void UntrackAllocation(MemoryPriority::Object* object, MemoryPriority::Class memory_class);
+	void SetMemoryPriority(uint64_t memory, float priority) const;
+	// Marks the memory of an allocation used in this frame. Lock-free; null is ignored.
+	void UseMemory(MemoryPriority::Object* object) { memory_priority.Use(object); }
 
 	// Backings of deleted images, handed to the next CreateImage with the same create info. A
 	// title that binds one surface as depth and as color recreates it on every switch; freeing
 	// and allocating a device allocation each time costs more than the copy between them.
 	struct RecycledImage {
-		vk::ImageCreateInfo info;
-		vk::Image           image      = nullptr;
-		VmaAllocation       allocation = nullptr;
-		uint64_t            bytes      = 0;
+		vk::ImageCreateInfo     info;
+		vk::Image               image        = nullptr;
+		VmaAllocation           allocation   = nullptr;
+		uint64_t                bytes        = 0;
+		MemoryPriority::Object* memory       = nullptr;
+		MemoryPriority::Class   memory_class = MemoryPriority::Class::Cache;
 	};
 	static constexpr size_t    RecycledImageLimit      = 256;
 	static constexpr uint64_t  RecycledImageBytesLimit = 256ull << 20u;
@@ -152,6 +176,9 @@ struct GraphicContext {
 	std::atomic<uint64_t> image_fallback_count = 0;
 	uint32_t              memory_budget_frame  = 0;
 	MemoryBudget::Monitor memory_budget_monitor;
+	MemoryPriority::Tracker                  memory_priority;
+	std::mutex                               priority_pools_mutex;
+	std::array<VmaPool, VK_MAX_MEMORY_TYPES> priority_pools {};
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -189,6 +216,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	MemoryPriority::Object*       memory       = nullptr;
+	MemoryPriority::Class         memory_class = MemoryPriority::Class::Cache;
 };
 
 
