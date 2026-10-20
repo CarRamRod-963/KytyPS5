@@ -85,8 +85,9 @@ void TestAgainstBruteForce() {
   };
   for (int round = 0; round < 2000; ++round) {
     GuestWriteSet set;
-    GuestWriteSet::Range ranges[8];
-    const int count = static_cast<int>(next() % 8u);
+    // Sets of more than 16 ranges are answered by the sorted index.
+    GuestWriteSet::Range ranges[48];
+    const int count = static_cast<int>(next() % (round % 2 == 0 ? 8u : 48u));
     for (int i = 0; i < count; ++i) {
       ranges[i] = {next() % 0x10000u, 1u + next() % 0x800u,
                    (next() & 1u) != 0 ? GuestWriteSet::Kind::Image
@@ -117,6 +118,28 @@ void TestAgainstBruteForce() {
   }
 }
 
+// A range added after a query (which built the sorted index) is found, and the
+// set is indexed again from all of its ranges.
+void TestAddAfterQuery() {
+  GuestWriteSet set;
+  for (uint64_t i = 0; i < 32; ++i) {
+    Check(set.Add(0x10000 + i * 0x100, 0x10, GuestWriteSet::Kind::Buffer),
+          "range refused");
+  }
+  Check(set.FindOverlap(0x10010, 0xf0) == nullptr,
+        "a read between indexed writes overlapped");
+  Check(set.Add(0x10080, 0x8, GuestWriteSet::Kind::Image), "range refused");
+  const auto *added = set.FindOverlap(0x10010, 0xf0);
+  Check(added != nullptr && added->kind == GuestWriteSet::Kind::Image,
+        "a range added after a query was missed");
+  const auto *first = set.FindOverlap(0x10000, 0x1000);
+  Check(first != nullptr && first->address == 0x10000,
+        "an indexed set did not report the first added overlapping range");
+  set.Clear();
+  Check(set.FindOverlap(0x10000, 0x1000) == nullptr,
+        "a cleared set kept its index");
+}
+
 } // namespace
 
 int main() {
@@ -124,6 +147,7 @@ int main() {
   TestBoundaries();
   TestClear();
   TestAgainstBruteForce();
+  TestAddAfterQuery();
   std::puts("GuestWriteSetTests: all cases passed");
   return 0;
 }
