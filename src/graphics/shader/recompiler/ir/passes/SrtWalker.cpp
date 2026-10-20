@@ -417,6 +417,9 @@ struct GeneralWalkerContext {
 	// Marks memo entries unknown in this run, like the interpreter's completed-unknown entries;
 	// no generation has the top bit set.
 	uint64_t unknown_tag = 0;
+	// ResourcePlan::jit_descriptors and jit_descriptor_known.
+	uint32_t* descriptors      = nullptr;
+	uint8_t*  descriptor_known = nullptr;
 };
 static_assert(offsetof(GeneralWalkerContext, user_data) == 0);
 static_assert(offsetof(GeneralWalkerContext, user_data_count) == 8);
@@ -435,6 +438,8 @@ static_assert(offsetof(GeneralWalkerContext, reachable) == 104);
 static_assert(offsetof(GeneralWalkerContext, phase) == 112);
 static_assert(offsetof(GeneralWalkerContext, changed) == 116);
 static_assert(offsetof(GeneralWalkerContext, unknown_tag) == 120);
+static_assert(offsetof(GeneralWalkerContext, descriptors) == 128);
+static_assert(offsetof(GeneralWalkerContext, descriptor_known) == 136);
 
 static bool KYTY_SYSV_ABI GeneralWalkerRead(GeneralWalkerContext* context, uint64_t address,
                                             uint64_t clean) {
@@ -634,6 +639,7 @@ public:
 			}
 		}
 		code.L(m_finished);
+		if (!EmitDescriptors(loops)) return false;
 		code.mov(code.eax, 1);
 		code.jmp(m_exit, Xbyak::CodeGenerator::T_NEAR);
 		code.L(m_failed);
@@ -656,6 +662,10 @@ public:
 		program.srt_general_code = std::move(code_holder);
 		program.jit_assumptions  = static_cast<uint32_t>(m_masks.size());
 		program.jit_loops        = loops;
+		program.jit_descriptor_sources = std::move(m_descriptor_sources);
+		program.jit_descriptor_positions.assign(program.descriptor_sources.size(), UINT32_MAX);
+		for (uint32_t position = 0; position < program.jit_descriptor_sources.size(); ++position)
+			program.jit_descriptor_positions[program.jit_descriptor_sources[position]] = position;
 		return true;
 	}
 
@@ -685,6 +695,92 @@ private:
 			}
 		}
 		return {postorder.rbegin(), postorder.rend()};
+	}
+
+	// The direct descriptors MaterializeResources evaluates through the plain walker: those of
+	// the buffers and images the shader does not write (a written one may be evaluated by the
+	// clean evaluator) and of the samplers.
+	std::vector<uint32_t> PlainDescriptorSources() const {
+		const auto&           program = m_program;
+		std::vector<uint32_t> sources;
+		const auto            add = [&](uint32_t source) {
+			if (source >= program.descriptor_sources.size()) return;
+			const auto& descriptor = program.descriptor_sources[source];
+			if (descriptor.indirect_descriptor.has_value() || descriptor.dword_count == 0u ||
+			    descriptor.dword_count > 8u)
+				return;
+			if (std::ranges::find(sources, source) == sources.end()) sources.push_back(source);
+		};
+		for (const auto& buffer: program.info.buffers) {
+			if (!buffer.written) add(buffer.source);
+		}
+		for (const auto& image: program.info.images) {
+			if (!image.written) add(image.source);
+		}
+		for (const auto& sampler: program.info.samplers) {
+			if (sampler.source >= program.descriptor_sources.size()) continue;
+			const auto& indirect = program.descriptor_sources[sampler.source].indirect_descriptor;
+			if (!indirect.has_value()) {
+				add(sampler.source);
+			} else if (!indirect->sources.empty()) {
+				add(indirect->sources[0]);
+			}
+		}
+		return sources;
+	}
+
+	// Evaluates the DWORDs of the plain descriptor sources after the reads, in the plain memo,
+	// as EvaluateDescriptor would after the walk: a source whose blocks were all skipped is
+	// inactive and left unknown, and so is a source with an unknown DWORD (the interpreter then
+	// evaluates it and reaches the same answer). Plans with loops do it in their final pass.
+	bool EmitDescriptors(bool loops) {
+		auto& code           = *m_code;
+		m_descriptor_sources = PlainDescriptorSources();
+		if (m_descriptor_sources.empty()) return true;
+		const auto&  program = m_program;
+		Xbyak::Label done;
+		if (loops) {
+			code.cmp(code.dword[code.rbx + 112], 0);
+			code.je(done, Code::T_NEAR);
+		}
+		for (uint32_t position = 0; position < m_descriptor_sources.size(); ++position) {
+			const auto            source     = m_descriptor_sources[position];
+			const auto&           descriptor = program.descriptor_sources[source];
+			Xbyak::Label          next, active, unknown;
+			std::vector<uint32_t> blocks;
+			for (uint32_t index = 0; index < program.control_flow.size(); ++index) {
+				if (std::ranges::find(program.control_flow[index].sources, source) !=
+				    program.control_flow[index].sources.end())
+					blocks.push_back(index);
+			}
+			if (!blocks.empty()) {
+				code.mov(code.rax, code.qword[code.rbx + 48]);
+				for (const auto block: blocks) {
+					code.cmp(code.byte[code.rax + block], 0);
+					code.jne(active, Code::T_NEAR);
+				}
+				code.jmp(next, Code::T_NEAR);
+			}
+			code.L(active);
+			code.mov(code.rbp, code.rsp);
+			m_fail = &unknown;
+			for (uint32_t dword = 0; dword < descriptor.dword_count; ++dword) {
+				if (!Emit(descriptor.dwords[dword])) return false;
+				code.mov(code.rcx, code.qword[code.rbx + 128]);
+				code.mov(code.dword[code.rcx + (position * 8u + dword) * sizeof(uint32_t)],
+				         code.eax);
+			}
+			code.mov(code.rcx, code.qword[code.rbx + 136]);
+			code.mov(code.byte[code.rcx + position], 1);
+			code.jmp(next, Code::T_NEAR);
+			code.L(unknown);
+			code.mov(code.rsp, code.rbp);
+			RestoreNormalMemo();
+			code.L(next);
+		}
+		m_fail = &m_failed;
+		code.L(done);
+		return true;
 	}
 
 	// Marks the successors a block's condition selects in the byte array at context offset
@@ -1507,6 +1603,7 @@ private:
 	int                                       m_clean_depth     = 0;
 	std::unordered_map<const Inst*, bool>     m_may_be_unknown;
 	Xbyak::Label*                             m_fail = &m_failed;
+	std::vector<uint32_t>                     m_descriptor_sources;
 	std::unordered_map<const Inst*, uint32_t> m_phi_blocks;
 	struct SubroutineKey {
 		const Inst* inst;
@@ -2304,6 +2401,15 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
 	result.dword_count = descriptor.dword_count;
+	// The compiled walker evaluated it in this walk (GeneralWalkerCompiler::EmitDescriptors).
+	if (m_compiled_descriptors) {
+		const auto position = m_program.jit_descriptor_positions[source];
+		if (position != UINT32_MAX && m_program.jit_descriptor_known[position] != 0u) {
+			std::copy_n(m_program.jit_descriptors.begin() + position * 8u, descriptor.dword_count,
+			            result.dwords.begin());
+			return true;
+		}
+	}
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -2442,6 +2548,11 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	    .clean_generation = clean_context.generation,
 	    .assume_values    = m_program.jit_assume_bases.data(),
 	};
+	m_compiled_descriptors = false;
+	m_program.jit_descriptors.resize(m_program.jit_descriptor_sources.size() * 8u);
+	m_program.jit_descriptor_known.assign(m_program.jit_descriptor_sources.size(), 0u);
+	context.descriptors          = m_program.jit_descriptors.data();
+	context.descriptor_known     = m_program.jit_descriptor_known.data();
 	using Walker = bool KYTY_SYSV_ABI (*)(GeneralWalkerContext*);
 	const auto          fallback = [&]() {
 		// A failed run leaves memo entries of this generation behind; the interpreter
@@ -2490,6 +2601,7 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 		if (const auto result = run(); result <= 0) return result;
 		if (blocks != 0) visited = m_program.jit_visited;
 	}
+	m_compiled_descriptors = !m_program.jit_descriptor_sources.empty();
 	auto& active = m_program.active_sources;
 	if (blocks == 0) {
 		active.clear();
