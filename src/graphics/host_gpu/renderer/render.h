@@ -340,6 +340,7 @@ private:
 	[[nodiscard]] uint32_t    ResolveBindlessKey(uint32_t                            heap,
 	                                             const BindlessTranslation::Request& request);
 	void                      FillBindlessHeap(uint32_t heap);
+	void                      ResetFullBindlessTable();
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -355,6 +356,8 @@ private:
 	// descriptor, the image resource each heap's T#s are decoded as, and the texture cache
 	// deletions the slots were validated at.
 	bool                                  m_bindless_placeholder_ready = false;
+	// A heap did not fit in the translation table since the last reset.
+	bool                                             m_bindless_heap_refused = false;
 	std::vector<ShaderRecompiler::IR::ImageResource> m_bindless_resources;
 	uint64_t                              m_bindless_deletion_epoch = 0;
 	std::vector<uint32_t>                 m_bindless_feedback;
