@@ -39,6 +39,9 @@ public:
 	// The entries shaders flagged, up to `limit`, cleared as they are taken.
 	void TakeFeedback(std::vector<uint32_t>& entries, uint32_t limit);
 	void FlushTranslation();
+	// Drops every heap (BindlessTranslation::Reset) and the feedback flags of their entries.
+	// The caller must have waited for every submission that reads the table.
+	void Reset();
 
 private:
 	void Create();
