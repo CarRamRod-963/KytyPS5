@@ -38,17 +38,21 @@ struct HeapState {
 }
 
 // Decides when to print the heap state: at most once per period, and only when the driver's
-// device memory grew or the driver's memory in the host heap grew (allocations demoted out
-// of device memory land there). Shrinking moves the reference down silently. O(1) per sample.
+// device memory grew, the driver's memory in the host heap grew (allocations demoted out
+// of device memory land there), or the memory at low residency priority (the first to be
+// demoted) moved by PriorityChange in either direction. Shrinking driver memory moves the
+// reference down silently. O(1) per sample.
 class Monitor {
 public:
-	static constexpr uint64_t PeriodMs     = 10'000;
-	static constexpr uint64_t DeviceGrowth = 64 * MiB;
-	static constexpr uint64_t HostGrowth   = 64 * MiB;
+	static constexpr uint64_t PeriodMs       = 10'000;
+	static constexpr uint64_t DeviceGrowth   = 64 * MiB;
+	static constexpr uint64_t HostGrowth     = 64 * MiB;
+	static constexpr uint64_t PriorityChange = 512 * MiB;
 
-	enum class Report : uint8_t { None, First, DriverGrew, Demoted };
+	enum class Report : uint8_t { None, First, DriverGrew, Demoted, Priorities };
 
-	[[nodiscard]] Report Sample(const HeapState& device, const HeapState& host, uint64_t now_ms) {
+	[[nodiscard]] Report Sample(const HeapState& device, const HeapState& host, uint64_t now_ms,
+	                            uint64_t low_priority = 0) {
 		if (m_sampled && now_ms - m_last_ms < PeriodMs) {
 			return Report::None;
 		}
@@ -58,11 +62,17 @@ public:
 		const bool first   = !m_sampled;
 		const bool grew    = !first && driver >= m_driver + DeviceGrowth;
 		const bool moved   = !first && demoted >= m_demoted + HostGrowth;
+		const bool aged    = !first && (low_priority >= m_low + PriorityChange ||
+		                                m_low >= low_priority + PriorityChange);
 		m_sampled          = true;
-		if (first || grew || moved) {
+		if (first || grew || moved || aged) {
 			m_driver  = driver;
 			m_demoted = demoted;
-			return first ? Report::First : moved ? Report::Demoted : Report::DriverGrew;
+			m_low     = low_priority;
+			return first   ? Report::First
+			       : moved ? Report::Demoted
+			       : grew  ? Report::DriverGrew
+			               : Report::Priorities;
 		}
 		m_driver  = std::min(m_driver, driver);
 		m_demoted = std::min(m_demoted, demoted);
@@ -73,6 +83,7 @@ private:
 	uint64_t m_last_ms = 0;
 	uint64_t m_driver  = 0;
 	uint64_t m_demoted = 0;
+	uint64_t m_low     = 0;
 	bool     m_sampled = false;
 };
 

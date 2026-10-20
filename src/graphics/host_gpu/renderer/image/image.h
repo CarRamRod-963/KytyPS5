@@ -46,7 +46,9 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// `memory_class` is the residency class of the backing; depth images are always targets.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      MemoryPriority::Class memory_class = MemoryPriority::Class::Cache);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
