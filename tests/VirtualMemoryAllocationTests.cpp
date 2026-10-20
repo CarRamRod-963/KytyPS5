@@ -821,6 +821,12 @@ void TestFlexibleMemoryUsesSharedBacking() {
 	Check(test, Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
 	      "TryReadBacking did not resolve flexible memory");
 	Check(test, value == first_value, "backing did not observe a flexible-memory CPU write");
+	// A second read in the same mapping takes the thread's last mapping instead of a lookup;
+	// the unmap below must invalidate it.
+	*reinterpret_cast<uint64_t*>(base + 8) = second_value;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base + 8, &value, sizeof(value)) &&
+	                value == second_value,
+	      "a read through the last mapping missed a flexible-memory CPU write");
 	Check(test,
 	      Libs::LibKernel::Memory::TryWriteBacking(base + SceKernelPageSize, &second_value,
 	                                               sizeof(second_value)),
