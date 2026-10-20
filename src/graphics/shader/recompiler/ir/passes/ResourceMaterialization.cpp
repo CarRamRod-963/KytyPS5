@@ -37,6 +37,22 @@ struct MaterializationScratch {
 	// RangeOverlapIndex storage for the specialization reads.
 	std::vector<std::pair<uint64_t, uint64_t>>                read_ends;
 	DescriptorInterner                                        candidates;
+	// The usable candidates of an image heap (a T# at any DWORD of a table) and whether all of
+	// them are float 2D, for the heap's last contents. Candidates are a function of the table's
+	// DWORDs and the resource, and heaps are rewritten far less often than they are read: a
+	// heap with unchanged DWORDs takes them from here instead of normalizing every DWORD start.
+	struct HeapCandidates {
+		uint32_t                                          resource = UINT32_MAX;
+		uint64_t                                          first    = 0;
+		uint64_t                                          step     = 0;
+		uint64_t                                          count    = 0;
+		uint32_t                                          dwords   = 0;
+		bool                                              affine   = false;
+		bool                                              float_2d = false;
+		std::vector<uint32_t>                             table;
+		std::vector<std::pair<uint64_t, DescriptorValue>> candidates;
+	};
+	std::vector<HeapCandidates> heaps;
 };
 
 namespace {
@@ -1005,6 +1021,57 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				            candidate.dwords.begin());
 				return candidate;
 			};
+			// An image heap's usable candidates, normalized once per change of its DWORDs (see
+			// MaterializationScratch::HeapCandidates); null while any DWORD start fails to
+			// normalize, which the enumeration below reports.
+			const MaterializationScratch::HeapCandidates* heap = nullptr;
+			if (image_heap) {
+				auto& heaps = program.materialization_scratch->heaps;
+				auto  found = std::ranges::find(heaps, resource_index,
+				                                &MaterializationScratch::HeapCandidates::resource);
+				if (found == heaps.end()) {
+					found = heaps.insert(heaps.end(), {.resource = resource_index});
+				}
+				auto& cached = *found;
+				if (cached.first == first && cached.step == step && cached.count == count &&
+				    cached.dwords == read_dwords && cached.affine == affine &&
+				    cached.table == heap_words) {
+					heap = &cached;
+				} else {
+					cached.table.clear();
+					cached.candidates.clear();
+					const auto&                   image = program.info.images[resource_index];
+					const std::array<uint32_t, 3> float_2d {
+					    static_cast<uint32_t>(Prospero::TextureNumericClass::Float),
+					    static_cast<uint32_t>(Decoder::ImageDimension::Dim2D), 0u};
+					const DescriptorValue null_candidate {.dword_count = dword_count};
+					bool                  normalized = true;
+					bool                  all_float  = true;
+					for (uint32_t word = 0; word < count && normalized; ++word) {
+						const auto table_offset =
+						    affine ? first + word * step : uint64_t {word} * 4u;
+						auto candidate = heap_candidate(table_offset);
+						normalized     = normalize(candidate);
+						if (!normalized || candidate == null_candidate) continue;
+						all_float =
+						    all_float && (NullImageDescriptor(candidate) ||
+						                  ImageCandidateClass(image, candidate) == float_2d);
+						cached.candidates.emplace_back(table_offset, candidate);
+					}
+					if (normalized) {
+						cached.first    = first;
+						cached.step     = step;
+						cached.count    = count;
+						cached.dwords   = read_dwords;
+						cached.affine   = affine;
+						cached.float_2d = all_float;
+						cached.table.assign(heap_words.begin(), heap_words.end());
+						heap = &cached;
+					} else {
+						cached.candidates.clear();
+					}
+				}
+			}
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				// An image heap yields a candidate per DWORD start it may hold a T# at, and every
 				// distinct one is bound at every draw (Ghost of Yotei's PS 2a1e4953d280871c: 33,573
@@ -1021,13 +1088,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				                image.resource_class == ImageResourceClass::Sampled &&
 				                !image.written && !image.atomic && !image.depth_compare &&
 				                !image.cube && image.dimension == Decoder::ImageDimension::Dim2D;
-				for (uint32_t word = 0; word < count && bindless; ++word) {
-					const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
-					auto       candidate    = heap_candidate(table_offset);
-					if (!normalize(candidate))
-						return normalization_failed(table_offset, word, step, "probe");
-					bindless = NullImageDescriptor(candidate) ||
-					           ImageCandidateClass(image, candidate) == float_2d;
+				if (heap != nullptr) {
+					bindless = bindless && heap->float_2d;
+				} else {
+					for (uint32_t word = 0; word < count && bindless; ++word) {
+						const auto table_offset =
+						    affine ? first + word * step : uint64_t {word} * 4u;
+						auto candidate = heap_candidate(table_offset);
+						if (!normalize(candidate))
+							return normalization_failed(table_offset, word, step, "probe");
+						bindless = NullImageDescriptor(candidate) ||
+						           ImageCandidateClass(image, candidate) == float_2d;
+					}
 				}
 				if (bindless) {
 					const auto mapping_offset = bindless_words();
@@ -1057,7 +1129,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
-			for (uint32_t word = 0; word < count; ++word) {
+			// A DWORD start whose candidate normalizes to null interns as the null root (ordinal
+			// 0) and maps nothing, so only the heap's usable candidates are visited.
+			for (const auto& [table_offset, candidate]:
+			     heap != nullptr ? std::span(heap->candidates)
+			                     : std::span<const std::pair<uint64_t, DescriptorValue>> {}) {
+				const auto ordinal = intern_candidate(candidate);
+				if (ordinal == 0u) continue;
+				const auto mapping_word = table_offset / 4u;
+				snapshot.flattened_srt.resize(mapping_offset + 2u + mapping_word, 0u);
+				snapshot.flattened_srt[mapping_offset + 1u + mapping_word] = ordinal;
+			}
+			for (uint32_t word = 0; word < (heap != nullptr ? 0u : count); ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
 				if (pointer != nullptr) {

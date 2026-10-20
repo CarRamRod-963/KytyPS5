@@ -574,6 +574,29 @@ void TestBoundedImageViewEligibility() {
           "invalid heap texture view survived normalization or removed valid neighbors");
   }
   plan.info.images[0].r128 = false;
+  // A heap whose DWORDs did not change takes its candidates from the last walk:
+  // the same candidates, ordinals and byte-offset map as a full enumeration;
+  // one changed DWORD is seen.
+  {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "heap materialization failed");
+    const auto images = snapshot.images;
+    const auto flat = snapshot.flattened_srt;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images == images && snapshot.flattened_srt == flat,
+          "an unchanged heap materialized other candidates the second time");
+    const auto moved = descriptor(0x25u, Type::kColor2D);
+    std::copy(moved.begin(), moved.end(),
+              memory.words.begin() + (0x1010u + 3u * 48u) / 4u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              std::ranges::any_of(
+                  snapshot.images,
+                  [&](const auto &image) { return image.dwords == moved; }),
+          "a changed heap DWORD kept the previous candidates");
+    const auto restored = descriptor(0x23u, Type::kColor2DArray);
+    std::copy(restored.begin(), restored.end(),
+              memory.words.begin() + (0x1010u + 3u * 48u) / 4u);
+  }
 
   // An explicitly selected descriptor is not an unrelated entry in a broad heap.
   const auto image_source = plan.info.images[0].source;
