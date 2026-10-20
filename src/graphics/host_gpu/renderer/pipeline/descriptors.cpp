@@ -1062,6 +1062,7 @@ void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
 		                                        use.layer_stride, use.layer_count};
 		const auto heap = translation.FindOrCreateHeap(key, records);
 		if (heap == BindlessTranslation::NoHeap) {
+			m_bindless_heap_refused = true;
 			static bool reported = false;
 			if (!std::exchange(reported, true)) {
 				LOGF("bindless translation table is full; keys of heap 0x%016" PRIx64
@@ -1247,6 +1248,28 @@ void RenderExecutor::FillBindlessHeap(uint32_t heap) {
 	}
 }
 
+// Translation regions are append-only, and heaps are keyed by guest address: a game that
+// writes its material records to per-frame memory (Ghost of Yotei) adds heaps every frame, and
+// after about fifteen minutes no new heap fits. Its keys then sample the placeholder, and
+// shaders that compute memory addresses from the texels they read fault on the GPU. Once the
+// table is half full, or a heap did not fit, the heaps are dropped at the next flip after every
+// submission that may read them has completed; they are recreated (and refilled from the
+// resolved keys) by the draws that use them next.
+void RenderExecutor::ResetFullBindlessTable() {
+	auto& table       = m_context.GetBindlessTable();
+	auto& translation = table.Translation();
+	if (!m_bindless_heap_refused && translation.UsedEntries() <= translation.Capacity() / 2u) {
+		return;
+	}
+	LOGF("bindless translation table: %u of %u entries used%s; dropping its heaps\n",
+	     translation.UsedEntries(), translation.Capacity(),
+	     m_bindless_heap_refused ? " and a heap did not fit" : "");
+	m_context.GetCommandScheduler().FlushAndWait();
+	table.Reset();
+	m_bindless_resources.clear();
+	m_bindless_heap_refused = false;
+}
+
 void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	auto& table = m_context.GetBindlessTable();
 	if (!table.Created()) {
@@ -1255,6 +1278,7 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
 	constexpr uint32_t budget = 512;
 	buffer.EndRendering();
+	ResetFullBindlessTable();
 	table.MakeFeedbackVisible(buffer.Handle());
 	m_bindless_feedback.clear();
 	table.TakeFeedback(m_bindless_feedback, budget);
