@@ -1338,6 +1338,10 @@ void TestFlexibleRangeEditsCoalesce() {
 	            1, "");
 
 	constexpr uint64_t middle = pages / 2 * page;
+	// Clamped once inside one committed range (the thread remembers it); the hole made
+	// below must still stop the next clamp.
+	Check(test, ClampRangeSize(base + middle - page / 2, page) == page,
+	      "range clamp stopped inside one committed range");
 	CheckOk(test, KernelMunmap(base + middle, page), "KernelMunmap(create hole)");
 	CheckOk(test, KernelSetVirtualRangeName(reinterpret_cast<void*>(base), size, "across_hole"),
 	        "KernelSetVirtualRangeName(across hole)");
