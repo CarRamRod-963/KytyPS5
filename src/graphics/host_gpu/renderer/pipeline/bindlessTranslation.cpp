@@ -123,6 +123,17 @@ void BindlessTranslation::Translate(uint32_t entry, uint32_t slot) {
 	}
 }
 
+void BindlessTranslation::Reset() {
+	std::fill(m_entries.begin() + FirstEntry, m_entries.begin() + m_used_entries,
+	          ShaderRecompiler::IR::BindlessPending);
+	m_used_entries = FirstEntry;
+	m_heaps.clear();
+	m_regions.clear();
+	for (auto& slot: m_slots) {
+		slot.entries.clear();
+	}
+}
+
 void BindlessTranslation::FreeSlot(uint32_t slot) {
 	EXIT_IF(slot == PlaceholderSlot || slot >= m_slots.size() || !m_slots[slot].InUse());
 	for (const auto entry: m_slots[slot].entries) {
