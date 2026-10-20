@@ -228,6 +228,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -258,6 +259,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -287,6 +289,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -300,6 +303,7 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -346,6 +350,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -358,6 +363,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		m_generation = NextGeneration();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -425,11 +431,22 @@ public:
 			return 0;
 		}
 
+		// The GPU thread clamps every buffer it binds; most lie in the committed range of the
+		// thread's previous clamp, which needs no lookup while the ranges are unchanged.
+		auto& last = t_last_committed;
+		if (last.owner == this && last.generation == m_generation &&
+		    virtual_addr >= last.start && virtual_addr < last.end &&
+		    size <= last.end - virtual_addr) {
+			return size;
+		}
+
 		auto vma = FindContaining(virtual_addr);
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
+
+		last = {.owner = this, .generation = m_generation, .start = vma->second.start, .end = vma_end};
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -626,7 +643,23 @@ private:
 	Common::Mutex m_mutex;
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
+	// Changes whenever the ranges may change (under m_mutex); unique across instances.
+	static uint64_t NextGeneration() {
+		static std::atomic<uint64_t> generations {0};
+		return generations.fetch_add(1, std::memory_order_relaxed) + 1u;
+	}
+	uint64_t m_generation = NextGeneration();
+	// The committed range a thread's last ClampRangeSize started in.
+	struct LastCommitted {
+		const VirtualRanges* owner      = nullptr;
+		uint64_t             generation = 0;
+		uint64_t             start      = 0;
+		uint64_t             end        = 0;
+	};
+	static thread_local LastCommitted t_last_committed;
 };
+
+thread_local VirtualRanges::LastCommitted VirtualRanges::t_last_committed;
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
