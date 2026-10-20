@@ -162,6 +162,8 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	// The compiled walker's last successful run evaluated the plan's jit_descriptor_sources.
+	bool                             m_compiled_descriptors = false;
 	int                              RunGeneralWalker(std::vector<uint32_t>& flat);
 };
 

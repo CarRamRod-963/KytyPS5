@@ -774,6 +774,14 @@ struct ResourcePlan {
 	mutable std::vector<EvaluationContext::Entry*>             jit_assume_bases;
 	// Runs of the compiled walker; each run tags the values it found unknown with its own count.
 	mutable uint64_t jit_runs = 0;
+	// The direct descriptors MaterializeResources evaluates through the plain walker (resources
+	// it does not write), which the compiled walker evaluates after its reads: their positions
+	// per source (UINT32_MAX for the others), and the last run's DWORDs (8 per position) and
+	// whether every DWORD of a position was known.
+	std::vector<uint32_t>         jit_descriptor_sources;
+	std::vector<uint32_t>         jit_descriptor_positions;
+	mutable std::vector<uint32_t> jit_descriptors;
+	mutable std::vector<uint8_t>  jit_descriptor_known;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
