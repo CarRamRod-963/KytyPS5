@@ -44,6 +44,9 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	if (memory_priority_enabled) {
+		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
@@ -58,6 +61,12 @@ void GraphicContext::DestroyAllocator() {
 		return;
 	}
 	DestroyRecycledImages();
+	for (auto& pool: priority_pools) {
+		if (pool != nullptr) {
+			vmaDestroyPool(allocator, pool);
+			pool = nullptr;
+		}
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -65,10 +74,74 @@ void GraphicContext::DestroyAllocator() {
 void GraphicContext::DestroyRecycledImages() {
 	std::scoped_lock lock(recycled_images_mutex);
 	for (const auto& recycled: recycled_images) {
+		UntrackAllocation(recycled.memory, recycled.memory_class);
 		vmaDestroyImage(allocator, recycled.image, recycled.allocation);
 	}
 	recycled_images.clear();
 	recycled_image_bytes = 0;
+}
+
+void GraphicContext::PreparePriorityAllocation(VmaAllocationCreateInfo& info,
+                                               MemoryPriority::Class    memory_class,
+                                               uint32_t                 memory_type) {
+	if (!memory_priority_enabled) {
+		return;
+	}
+	// Only dedicated allocations use it; the others take the priority of their block.
+	info.priority = MemoryPriority::Value(MemoryPriority::InUse(memory_class));
+	if (memory_class == MemoryPriority::Class::Cache || memory_type >= VK_MAX_MEMORY_TYPES) {
+		return;
+	}
+	std::scoped_lock lock(priority_pools_mutex);
+	auto&            pool = priority_pools[memory_type];
+	if (pool == nullptr) {
+		VmaPoolCreateInfo pool_info {};
+		pool_info.memoryTypeIndex = memory_type;
+		pool_info.priority        = MemoryPriority::Value(MemoryPriority::Level::High);
+		const auto result = static_cast<vk::Result>(vmaCreatePool(allocator, &pool_info, &pool));
+		if (result != vk::Result::eSuccess) {
+			LOGF("vmaCreatePool failed for memory type %u: %s\n", memory_type,
+			     vk::to_string(result).c_str());
+			pool = nullptr;
+			return;
+		}
+	}
+	info.pool = pool;
+}
+
+MemoryPriority::Object* GraphicContext::TrackAllocation(VmaAllocation         allocation,
+                                                        MemoryPriority::Class memory_class,
+                                                        bool                  pooled) {
+	if (!pageable_memory_enabled || allocation == nullptr) {
+		return nullptr;
+	}
+	VmaAllocationInfo2 info {};
+	vmaGetAllocationInfo2(allocator, allocation, &info);
+	const auto type = info.allocationInfo.memoryType;
+	if (type >= physical_device_memory_properties.memoryTypeCount ||
+	    !(physical_device_memory_properties.memoryTypes[type].propertyFlags &
+	      vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+		return nullptr;
+	}
+	// The priority the memory object was created with: the pool's, the one passed for a
+	// dedicated allocation, or the default pools' 0.5.
+	const auto initial = pooled || info.dedicatedMemory != VK_FALSE
+	                         ? MemoryPriority::InUse(memory_class)
+	                         : MemoryPriority::Level::Normal;
+	return memory_priority.Acquire(reinterpret_cast<uint64_t>(info.allocationInfo.deviceMemory),
+	                               info.blockSize, memory_class, initial);
+}
+
+void GraphicContext::UntrackAllocation(MemoryPriority::Object* object,
+                                       MemoryPriority::Class   memory_class) {
+	memory_priority.Release(object, memory_class, [this](uint64_t memory, float priority) {
+		SetMemoryPriority(memory, priority);
+	});
+}
+
+void GraphicContext::SetMemoryPriority(uint64_t memory, float priority) const {
+	device.setMemoryPriorityEXT(vk::DeviceMemory(reinterpret_cast<VkDeviceMemory>(memory)),
+	                            priority);
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -148,7 +221,14 @@ GraphicContext::MemoryHeaps GraphicContext::SampleMemoryHeaps() const {
 }
 
 void GraphicContext::MonitorMemoryBudget() {
-	if (!CanReportMemoryUsage() || allocator == nullptr) {
+	if (allocator == nullptr) {
+		return;
+	}
+	if (pageable_memory_enabled) {
+		memory_priority.Tick(
+		    [this](uint64_t memory, float priority) { SetMemoryPriority(memory, priority); });
+	}
+	if (!CanReportMemoryUsage()) {
 		return;
 	}
 	vmaSetCurrentFrameIndex(allocator, ++memory_budget_frame);
@@ -160,7 +240,9 @@ void GraphicContext::MonitorMemoryBudget() {
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                              std::chrono::steady_clock::now().time_since_epoch())
 	                              .count());
-	const auto report = memory_budget_monitor.Sample(heaps.device, heaps.host, now_ms);
+	const auto priorities = memory_priority.GetStats();
+	const auto low        = priorities.bytes[static_cast<size_t>(MemoryPriority::Level::Low)];
+	const auto report     = memory_budget_monitor.Sample(heaps.device, heaps.host, now_ms, low);
 	if (report == MemoryBudget::Monitor::Report::None) {
 		return;
 	}
@@ -175,6 +257,13 @@ void GraphicContext::MonitorMemoryBudget() {
 	     device.usage / MiB, device.budget / MiB, MemoryBudget::DriverUsage(device) / MiB,
 	     device.blocks / MiB, MemoryBudget::CacheLimit(device) / MiB,
 	     MemoryBudget::DriverUsage(heaps.host) / MiB);
+	if (pageable_memory_enabled) {
+		LOGF("GPU memory priorities: high %" PRIu64 " MiB, normal %" PRIu64 " MiB, low %" PRIu64
+		     " MiB in %zu memory objects, %" PRIu64 " changes\n",
+		     priorities.bytes[static_cast<size_t>(MemoryPriority::Level::High)] / MiB,
+		     priorities.bytes[static_cast<size_t>(MemoryPriority::Level::Normal)] / MiB, low / MiB,
+		     memory_priority.ObjectCount(), priorities.changes);
+	}
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
@@ -208,44 +297,59 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 MemoryPriority::Class memory_class) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	{
 		std::scoped_lock lock(recycled_images_mutex);
-		const auto       recycled =
-		    std::find_if(recycled_images.begin(), recycled_images.end(),
-		                 [&](const RecycledImage& candidate) { return candidate.info == image_info; });
+		const auto       recycled = std::find_if(
+		    recycled_images.begin(), recycled_images.end(), [&](const RecycledImage& candidate) {
+			    return candidate.memory_class == memory_class && candidate.info == image_info;
+		    });
 		if (recycled != recycled_images.end()) {
 			image.image      = recycled->image;
 			image.allocation = recycled->allocation;
+			image.memory     = recycled->memory;
 			recycled_image_bytes -= recycled->bytes;
 			recycled_images.erase(recycled);
 		}
 	}
 	if (image.image == nullptr) {
-		const auto create = [&](VkMemoryPropertyFlags required) {
+		const auto native_info = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
+		const auto create      = [&](VkMemoryPropertyFlags required, bool pooled) {
 			VmaAllocationCreateInfo alloc_info {};
 			alloc_info.requiredFlags  = required;
 			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			uint32_t memory_type      = UINT32_MAX;
+			if (pooled && memory_priority_enabled && memory_class != MemoryPriority::Class::Cache &&
+			    vmaFindMemoryTypeIndexForImageInfo(allocator, native_info, &alloc_info,
+			                                       &memory_type) != VK_SUCCESS) {
+				memory_type = UINT32_MAX;
+			}
+			PreparePriorityAllocation(alloc_info, memory_class, pooled ? memory_type : UINT32_MAX);
 
 			vk::Image::CType native_image = VK_NULL_HANDLE;
 			const auto       result       = static_cast<vk::Result>(vmaCreateImage(
-			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-			    &alloc_info, &native_image, &image.allocation, nullptr));
+			    allocator, native_info, &alloc_info, &native_image, &image.allocation, nullptr));
 			image.image                   = native_image;
-			return result == vk::Result::eSuccess;
+			if (result != vk::Result::eSuccess) {
+				return false;
+			}
+			image.memory =
+			    TrackAllocation(image.allocation, memory_class, alloc_info.pool != nullptr);
+			return true;
 		};
-		bool created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		bool created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
 		if (!created) {
 			// Device memory is exhausted. The recycled backings are the only memory freed
 			// right away; next, any memory type the image supports (system memory over the bus)
 			// keeps the title running while the caches release what they no longer use.
 			DestroyRecycledImages();
-			created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+			created = create(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
 			if (!created) {
-				created          = create(0);
+				created          = create(0, false);
 				const auto count = created ? ++image_fallback_count : uint64_t {0};
 				if (count % 256 == 1) {
 					LOGF("Image placed outside device-local memory (%" PRIu64 " so far)\n", count);
@@ -268,6 +372,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.usage      = image_info.usage;
 	image.flags      = image_info.flags;
 	image.create_info = image_info;
+	image.memory_class = memory_class;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
 
@@ -287,20 +392,25 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		while (!recycled_images.empty() && (recycled_images.size() >= RecycledImageLimit ||
 		                                    recycled_image_bytes + bytes > RecycledImageBytesLimit)) {
 			const auto& oldest = recycled_images.front();
+			UntrackAllocation(oldest.memory, oldest.memory_class);
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			recycled_image_bytes -= oldest.bytes;
 			recycled_images.erase(recycled_images.begin());
 		}
-		recycled_images.push_back({.info       = image.create_info,
-		                           .image      = image.image,
-		                           .allocation = image.allocation,
-		                           .bytes      = bytes});
+		recycled_images.push_back({.info         = image.create_info,
+		                           .image        = image.image,
+		                           .allocation   = image.allocation,
+		                           .bytes        = bytes,
+		                           .memory       = image.memory,
+		                           .memory_class = image.memory_class});
 		recycled_image_bytes += bytes;
 	} else {
+		UntrackAllocation(image.memory, image.memory_class);
 		vmaDestroyImage(allocator, image.image, image.allocation);
 	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+	image.memory     = nullptr;
 }
 
 } // namespace Libs::Graphics
