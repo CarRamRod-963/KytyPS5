@@ -205,8 +205,18 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
-		const auto end   = vaddr + size;
-		auto       first = m_maps.upper_bound(vaddr);
+		const auto end  = vaddr + size;
+		auto&      last = t_last_mapping;
+		if (last.owner == this && last.generation == m_maps_generation &&
+		    vaddr >= last.entry.vaddr && end <= last.entry.vaddr + last.entry.size) {
+			const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
+			if (!RangeOk(offset, size)) {
+				return false;
+			}
+			std::memcpy(data, m_backing_base + offset, size);
+			return true;
+		}
+		auto first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
 			return false;
 		}
@@ -220,6 +230,9 @@ public:
 			current = std::min(end, mapping->second.vaddr + mapping->second.size);
 		}
 
+		if (end <= first->second.vaddr + first->second.size) {
+			last = {.owner = this, .generation = m_maps_generation, .entry = first->second};
+		}
 		auto* destination = static_cast<uint8_t*>(data);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
@@ -273,6 +286,7 @@ public:
 		}
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
+		m_maps_generation = NextMapsGeneration();
 		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode});
 		return true;
 	}
@@ -282,7 +296,8 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
-			auto            current = vaddr;
+			m_maps_generation = NextMapsGeneration();
+			auto current      = vaddr;
 			while (current < end) {
 				const auto* entry = FindContainingUnlocked(current);
 				if (entry == nullptr) {
@@ -339,10 +354,12 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
-			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
+			m_maps_generation = NextMapsGeneration();
+			old               = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
+			m_maps_generation = NextMapsGeneration();
 			m_maps.emplace(old.vaddr, old);
 			return false;
 		}
@@ -386,6 +403,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		m_maps_generation = NextMapsGeneration();
 		RemoveMappingsUnlocked(vaddr, size);
 
 		return true;
@@ -556,7 +574,26 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Changes whenever m_maps may change (under the exclusive lock); unique across stores, so a
+	// thread's LastMapping of a destroyed store never matches a new one.
+	static uint64_t NextMapsGeneration() {
+		static std::atomic<uint64_t> generations {0};
+		return generations.fetch_add(1, std::memory_order_relaxed) + 1u;
+	}
+	uint64_t m_maps_generation = NextMapsGeneration();
+
+	// The mapping a thread's last TryReadBacking found, valid while the maps are unchanged: the
+	// GPU thread reads guest memory in small pieces (resource walks, descriptor tables) that
+	// mostly fall in the mapping of the previous read, and the lookup was most of their cost.
+	struct LastMapping {
+		const GuestBackingStore* owner      = nullptr;
+		uint64_t                 generation = 0;
+		MapEntry                 entry;
+	};
+	static thread_local LastMapping t_last_mapping;
 };
+
+thread_local GuestBackingStore::LastMapping GuestBackingStore::t_last_mapping;
 
 class GuestAddressSpace {
 public:
