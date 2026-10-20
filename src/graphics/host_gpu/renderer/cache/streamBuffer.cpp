@@ -76,15 +76,43 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+	// Shaders reach device buffers through device addresses without a cache lookup that could
+	// mark them used, so they keep the highest residency priority. Host-side staging and
+	// download buffers live in system memory, where the priority does not matter.
+	const auto native_info = static_cast<const VkBufferCreateInfo*>(buffer_info);
+	const bool device_side = usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream;
+	const auto memory_class =
+	    device_side ? MemoryPriority::Class::Pinned : MemoryPriority::Class::Cache;
+	uint32_t memory_type = UINT32_MAX;
+	if (device_side && graphics.memory_priority_enabled &&
+	    vmaFindMemoryTypeIndexForBufferInfo(graphics.allocator, native_info, &allocation_info,
+	                                        &memory_type) != VK_SUCCESS) {
+		memory_type = UINT32_MAX;
+	}
+	auto pooled_info = allocation_info;
+	graphics.PreparePriorityAllocation(pooled_info, memory_class,
+	                                   device_side ? memory_type : UINT32_MAX);
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result =
+	    static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info, &pooled_info,
+	                                            &native_buffer, &m_allocation, &allocation_result));
+	if (result != vk::Result::eSuccess && pooled_info.pool != nullptr) {
+		// The pool could not grow; the default pools may still have room.
+		pooled_info.pool = nullptr;
+		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info,
+		                                                 &pooled_info, &native_buffer,
+		                                                 &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (device_side) {
+		m_memory =
+		    graphics.TrackAllocation(m_allocation, memory_class, pooled_info.pool != nullptr);
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -105,6 +133,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		m_graphics->UntrackAllocation(m_memory, MemoryPriority::Class::Pinned);
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
