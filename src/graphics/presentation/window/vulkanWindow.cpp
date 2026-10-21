@@ -598,6 +598,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
 	}
+	// Indirect draws read their arguments and count on the GPU when the device can take them
+	// as the guest packets give them (multiDrawIndirect, drawIndirectFirstInstance and
+	// shaderDrawParameters are required); their vertex stages read the offsets from the draw.
+	features12.drawIndirectCount           = supported12.drawIndirectCount;
+	graphics.native_indirect_draws_enabled = features12.drawIndirectCount == VK_TRUE;
+	LOGF("Vulkan native indirect draws: %s\n",
+	     graphics.native_indirect_draws_enabled ? "true" : "false");
 	// Occlusion queries reset their queries from the host and count samples exactly where they can.
 	graphics.occlusion_queries_enabled =
 	    Config::OcclusionQueriesEnabled() && supported12.hostQueryReset;
