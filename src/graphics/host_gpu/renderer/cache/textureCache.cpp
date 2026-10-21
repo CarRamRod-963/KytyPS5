@@ -481,6 +481,15 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
+void TextureCache::InheritImageDownload(ImageId destination_id, ImageId source_id) {
+	// A copy that carries GPU writes into a replacement image (a format swap, an expansion or
+	// a merge) also carries their pending publication: the source is freed next, and with it
+	// its download, so the guest would keep reading what was there before those writes.
+	if (m_download_images.contains(source_id)) {
+		TrackImageDownload(destination_id, m_slot_images[destination_id]);
+	}
+}
+
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
@@ -665,6 +674,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		InheritImageDownload(destination_id, source_id);
 	}
 	destination.ClearBufferModified();
 }
@@ -684,6 +694,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		InheritImageDownload(destination_id, source_id);
 	}
 }
 
