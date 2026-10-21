@@ -109,6 +109,9 @@ public:
 	// can tell a fresh guest write (a re-applied metadata clear) from the bytes it already
 	// honoured.
 	[[nodiscard]] uint64_t WatchedWriteSequence(uint64_t vaddr, uint64_t size);
+	// Advances the watched sequence of a range the host wrote in guest memory on the GPU's
+	// behalf (a compute dispatch it executed itself), as binding it for a GPU write would.
+	void NoteHostWrite(uint64_t vaddr, uint64_t size);
 	// Whether a watched range was bound for GPU writing since the last call: the host reads
 	// such a range soon (a clear code), and a readback of a pending writer flushes the whole
 	// recorded command buffer, so the recorder submits early instead.

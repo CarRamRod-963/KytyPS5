@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/dccRetile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -215,6 +216,66 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+// A recognized copy shader whose source and destination are current in guest memory runs on the
+// CPU: the bytes stay CPU-owned, so the texture cache's clear-code discovery reads the result
+// without a GPU round trip.
+bool RenderExecutor::TryConsumeComputeCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	const auto& resources = *input.stage.resources;
+	const auto& copy      = resources.pattern_copy;
+	if (copy.kind != ShaderRecompiler::IR::PatternCopyKind::DccRetile || mode != 0x41u ||
+	    input.dispatch_thread_dimensions || group_z != 1 ||
+	    std::max(copy.source, copy.destination) >= resources.buffers.size()) {
+		return false;
+	}
+	const auto source =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.source]);
+	const auto destination =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.destination]);
+	// Structured elements without swizzling, out of range exactly when index >= num_records.
+	const auto structured = [](const ShaderBufferResource& descriptor,
+	                           Prospero::BufferFormat format, uint32_t stride) {
+		return descriptor.Format() == format && descriptor.Stride() == stride &&
+		       !descriptor.SwizzleEnabled() && descriptor.IndexStride() == 0 &&
+		       !descriptor.AddTid() && descriptor.OutOfBounds() <= 1 && descriptor.Base48() != 0 &&
+		       descriptor.NumRecords() != 0;
+	};
+	if (!structured(source, Prospero::BufferFormat::k8UInt, 1) ||
+	    !structured(destination, Prospero::BufferFormat::k8_8UInt, 2) || source.DstSelX() != 4 ||
+	    destination.DstSelX() != 4 || destination.DstSelY() != 5) {
+		return false;
+	}
+	const GuestRange from {source.Base48(), source.GetSize()};
+	const GuestRange to {destination.Base48(), destination.GetSize()};
+	auto&            buffers  = m_context.GetBufferCache();
+	auto&            textures = m_context.GetTextureCache();
+	if (!from.Valid() || !to.Valid() || (from.address < to.End() && to.address < from.End()) ||
+	    !m_context.IsMapped(from.address, from.size) || !m_context.IsMapped(to.address, to.size)) {
+		return false;
+	}
+	LibKernel::Memory::SettleLabelAccess(from.address, from.size);
+	LibKernel::Memory::SettleLabelAccess(to.address, to.size);
+	// Bytes the GPU wrote, or will write, are not in guest memory yet; an image over either
+	// range may hold newer contents, and a CPU write would drop a registered image.
+	if (buffers.IsRegionGpuModified(from.address, from.size) ||
+	    buffers.IsRegionGpuModified(to.address, to.size) ||
+	    buffers.HasGpuDirtyBytes(from.address, from.size) ||
+	    buffers.HasGpuDirtyBytes(to.address, to.size) ||
+	    textures.FindImageFromRange(from.address, from.size) ||
+	    textures.IsRegionRegistered(to.address, to.size)) {
+		return false;
+	}
+	std::vector<uint8_t> keys(from.size);
+	std::vector<uint8_t> result(to.size);
+	std::memcpy(keys.data(), reinterpret_cast<const void*>(from.address), keys.size());
+	std::memcpy(result.data(), reinterpret_cast<const void*>(to.address), result.size());
+	DccRetile::Run(copy.pitch, group_x, group_y, keys, result);
+	// Writing through the guest mapping lets write faults invalidate what the caches hold.
+	std::memcpy(reinterpret_cast<void*>(to.address), result.data(), result.size());
+	buffers.NoteHostWrite(to.address, to.size);
+	return true;
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.program->bindings.descriptor_counts[
@@ -348,8 +409,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
-	                           thread_group_z, mode))) {
+	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y, thread_group_z,
+	                           mode) ||
+	     TryConsumeComputeCopy(input_info, thread_group_x, thread_group_y, thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}

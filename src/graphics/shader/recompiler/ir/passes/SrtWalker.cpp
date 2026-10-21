@@ -516,6 +516,8 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 		AddOutput(fill.element_count, UINT32_MAX);
 		for (const auto value: fill.values) AddOutput(value, UINT32_MAX);
 	}
+	if (m_plan.pattern_copy.copy.kind != PatternCopyKind::None)
+		AddOutput(m_plan.pattern_copy.pitch, UINT32_MAX);
 }
 
 WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
