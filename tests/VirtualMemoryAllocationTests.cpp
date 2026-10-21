@@ -720,6 +720,57 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A read inside the thread's last mapping copies without the lock; a write or unmap that runs
+// between its start and the end of its copy makes it read again under the lock.
+void TestLastMappingReadRetriesAfterMutation() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test        = "LastMappingReadRetriesAfterMutation";
+	constexpr uint64_t original    = 0x123456789abcdef0ull;
+	constexpr uint64_t replacement = 0xfedcba9876543210ull;
+	for (const bool unmap: {false, true}) {
+		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+		                                   "last_mapping_retry");
+		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+		std::counting_semaphore<2> entered {0};
+		std::counting_semaphore<2> resume {0};
+		g_backing_reads_entered  = &entered;
+		g_continue_backing_reads = &resume;
+		std::binary_semaphore warmed {0};
+		std::binary_semaphore go {0};
+		uint64_t              warm     = 0;
+		uint64_t              snapshot = 0;
+		bool                  warm_ok  = false;
+		bool                  read_ok  = false;
+		std::thread           reader([&] {
+			warm_ok = TryReadBacking(base, &warm, sizeof(warm));
+			warmed.release();
+			go.acquire();
+			read_ok = TryReadBacking(base, &snapshot, sizeof(snapshot));
+		});
+		warmed.acquire();
+		TestSetBackingReadCallback(ParkBackingRead);
+		go.release();
+		const bool parked = entered.try_acquire_for(std::chrono::seconds(5));
+		bool       mutated = false;
+		if (unmap) {
+			mutated = KernelMunmap(base, SceKernelPageSize) == OK;
+		} else {
+			mutated = TryWriteBacking(base, &replacement, sizeof(replacement));
+		}
+		resume.release();
+		reader.join();
+		TestSetBackingReadCallback(nullptr);
+		if (!unmap) {
+			CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+		}
+		Check(test, warm_ok && warm == original, "the first read did not see the mapping");
+		Check(test, parked && mutated, "a lock-free read blocked a backing write or unmap");
+		Check(test, unmap ? !read_ok : read_ok && snapshot == replacement,
+		      "a read overlapping a backing mutation kept its optimistic copy");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -4866,6 +4917,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestLastMappingReadRetriesAfterMutation);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -4925,6 +4977,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestLastMappingReadRetriesAfterMutation);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
