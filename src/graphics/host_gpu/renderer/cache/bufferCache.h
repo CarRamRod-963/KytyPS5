@@ -7,6 +7,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/filteredRangeSet.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -188,7 +189,7 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
+	FilteredRangeSet                                   m_gpu_modified_ranges;
 	// Pages the guest recently read back (a read fault, a CPU write into GPU-dirty bytes or a
 	// scalar read): the GPU tends to write them every frame and the guest to read them right
 	// after, so their next GPU writes are downloaded ahead of the guest. The epoch advances on
