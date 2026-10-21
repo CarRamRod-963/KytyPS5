@@ -199,6 +199,22 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
+	// Resource walks of compute dispatches the GPU thread has not reached (ResourceLookahead).
+	// A command stream (one per command processor) plans the dispatches of a run of commands
+	// that are all written, then kicks the helpers; the dispatch names its command before it
+	// asks for its program.
+	[[nodiscard]] bool LookaheadEnabled() const;
+	void               BeginLookaheadRun(const void* stream);
+	void PlanLookaheadDispatch(const void* stream, const void* command,
+	                           const HW::ComputeShaderInfo& regs, uint32_t groups_x,
+	                           uint32_t groups_y, uint32_t groups_z, bool thread_dimensions,
+	                           uint64_t indirect_args_address);
+	void PlanLookaheadDraw(const void* stream, const void* command, const HW::VertexShaderInfo& vs,
+	                       const HW::PixelShaderInfo& ps);
+	void KickLookahead();
+	// The command whose programs are asked for next (null after it).
+	void SetLookaheadCommand(const void* stream, const void* command);
+
 private:
 	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
