@@ -1105,6 +1105,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
+		cp.NoteUserDataWrite(cmd_offset + i);
 	}
 
 	return reg_num;
@@ -3307,6 +3308,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
 			    cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
+			    cp.NoteUserDataWrite(cmd_offset);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {

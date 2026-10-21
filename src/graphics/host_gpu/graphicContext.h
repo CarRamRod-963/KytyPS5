@@ -48,6 +48,8 @@ struct GraphicContext {
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
+	// multiDrawIndirect, drawIndirectFirstInstance, drawIndirectCount and shaderDrawParameters.
+	bool                                      native_indirect_draws_enabled           = false;
 	bool                               pipeline_creation_cache_control_enabled = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
