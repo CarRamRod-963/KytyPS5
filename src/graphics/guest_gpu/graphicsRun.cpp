@@ -565,6 +565,9 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	if (submission.type == SubmissionType::Graphics || submission.type == SubmissionType::Compute) {
+		cp.PlanLookahead(submission.execution, submission.commands);
+	}
 
 	switch (submission.type) {
 		case SubmissionType::Compute:
@@ -640,6 +643,176 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
+}
+
+// The packets whose programs ResourceLookahead plans.
+static bool IsLookaheadCommand(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
+		default: return false;
+	}
+}
+
+const uint32_t* CommandProcessor::CurrentPacket() {
+	if (g_current_execution == nullptr || g_current_execution->m_buffer_stack.empty()) {
+		return nullptr;
+	}
+	const auto& cursor = g_current_execution->m_buffer_stack.back();
+	return cursor.commands.data() + cursor.offset_dw;
+}
+
+void CommandProcessor::PlanLookahead(const Pm4Execution&       execution,
+                                     std::span<const uint32_t> commands) {
+	auto& pipelines    = m_renderer.GetPipelineCache();
+	m_lookahead_active = pipelines.LookaheadEnabled();
+	if (!m_lookahead_active) {
+		return;
+	}
+	pipelines.BeginLookaheadRun(this);
+	m_lookahead_stop = nullptr;
+	// The scan applies the shader-register packets to this processor's state to know each
+	// dispatch's registers, then restores it; nothing else changes.
+	const auto saved_sh            = m_sh_ctx;
+	const auto saved_draw_base     = m_draw_indirect_args_base_addr;
+	const auto saved_dispatch_base = m_dispatch_indirect_args_base_addr;
+	if (execution.m_buffer_stack.empty()) {
+		(void)ScanLookahead(commands, 0);
+	} else {
+		for (auto level = execution.m_buffer_stack.rbegin();
+		     level != execution.m_buffer_stack.rend(); ++level) {
+			if (!ScanLookahead(level->commands.subspan(level->offset_dw), 0)) break;
+		}
+	}
+	m_sh_ctx                           = saved_sh;
+	m_draw_indirect_args_base_addr     = saved_draw_base;
+	m_dispatch_indirect_args_base_addr = saved_dispatch_base;
+	pipelines.KickLookahead();
+}
+
+bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_t depth) {
+	constexpr uint32_t MaxDepth  = 4;
+	auto&              pipelines = m_renderer.GetPipelineCache();
+	const auto         total_dw  = static_cast<uint32_t>(commands.size());
+	// The stream is planned again once it executed the packet the scan stopped at.
+	const auto Stop = [this](const uint32_t* packet) {
+		m_lookahead_stop = packet;
+		return false;
+	};
+	uint32_t offset = 0;
+	while (offset < total_dw) {
+		const auto* packet = commands.data() + offset;
+		const auto  header = packet[0];
+		if (header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u) {
+			offset++;
+			continue;
+		}
+		const auto remaining = total_dw - offset;
+		const auto size      = KYTY_PM4_LEN(header);
+		if (remaining < 2 || size > remaining) return Stop(packet);
+		if ((header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			offset += size;
+			continue;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		switch (opcode) {
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_SET_BASE:
+				(void)g_cp_op_func[opcode](*this, header & ~1u, packet + 1, remaining, total_dw);
+				break;
+			case Pm4::IT_NOP:
+				if (KYTY_PM4_R(header) == Pm4::R_DISPATCH_RESET) return Stop(packet);
+				break;
+			case Pm4::IT_DISPATCH_DIRECT:
+				if (size != 5u) return Stop(packet);
+				m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(packet[4]));
+				pipelines.PlanLookaheadDispatch(
+				    this, packet, m_sh_ctx.GetCs(), packet[1], packet[2], packet[3],
+				    (packet[4] & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0, 0);
+				break;
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			case Pm4::IT_DRAW_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				pipelines.PlanLookaheadDraw(this, packet, m_sh_ctx.GetVs(), m_sh_ctx.GetPs());
+				break;
+			case Pm4::IT_DISPATCH_INDIRECT: {
+				uint64_t args = 0;
+				uint32_t mode = 0;
+				if (header == 0xc0021600u) {
+					args = packet[1] | (static_cast<uint64_t>(packet[2]) << 32u);
+					mode = packet[3];
+				} else if (header == 0xc0011600u && m_dispatch_indirect_args_base_addr != 0) {
+					args = m_dispatch_indirect_args_base_addr + packet[1];
+					mode = packet[2];
+				} else {
+					return Stop(packet);
+				}
+				m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+				// Thread dimensions are read from the arguments when the dispatch runs.
+				if (args != 0 && (args & 3u) == 0 &&
+				    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) {
+					pipelines.PlanLookaheadDispatch(this, packet, m_sh_ctx.GetCs(), 0, 0, 0, false,
+					                                args);
+				}
+				break;
+			}
+			case Pm4::IT_INDIRECT_BUFFER: {
+				if (size != 4u || depth >= MaxDepth) return Stop(packet);
+				const auto* buffer = reinterpret_cast<const uint32_t*>(
+				    packet[1] | (static_cast<uint64_t>(packet[2]) << 32u));
+				const auto count = packet[3] & 0xfffffu;
+				if (count != 0 && buffer == nullptr) return Stop(packet);
+				if (count != 0 && !ScanLookahead({buffer, count}, depth + 1)) return false;
+				if ((packet[3] & (1u << 20u)) != 0) return true; // a chain does not return
+				break;
+			}
+			case Pm4::IT_REWIND:
+				// The guest is still writing the commands after an invalid rewind.
+				if ((packet[1] & 0x80000000u) == 0) return Stop(packet);
+				break;
+			case Pm4::IT_WAIT_REG_MEM:
+			case Pm4::IT_WAIT_REG_MEM_64: {
+				// Commands after a wait the memory does not satisfy yet may not be written yet
+				// (the guest releases command buffers it is still writing this way).
+				const bool wide = opcode == Pm4::IT_WAIT_REG_MEM_64;
+				if (size != (wide ? 9u : 7u) || (packet[1] & 0x10u) == 0) return Stop(packet);
+				const auto mask_address = wide ? 0x7ull : 0x3ull;
+				const auto address      = (packet[2] & ~mask_address) |
+				                          (static_cast<uint64_t>(packet[3] & 0x3ffffu) << 32u);
+				uint64_t   value        = 0;
+				uint64_t   ref          = packet[4];
+				uint64_t   mask         = wide ? packet[6] : packet[5];
+				if (wide) {
+					ref |= static_cast<uint64_t>(packet[5]) << 32u;
+					mask |= static_cast<uint64_t>(packet[7]) << 32u;
+				}
+				if (address == 0 ||
+				    !LibKernel::Memory::TryReadBacking(address, &value, wide ? 8u : 4u) ||
+				    !TestWaitRegMemValue(value, ref, mask, packet[1] & 0x7u)) {
+					return Stop(packet);
+				}
+				break;
+			}
+			// Commands whose effect on the stream depends on memory or GPU results.
+			case Pm4::IT_SET_PREDICATION:
+			case Pm4::IT_COND_EXEC: return Stop(packet);
+			default: break;
+		}
+		offset += size;
+	}
+	return true;
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -721,8 +894,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		const bool lookahead_command = m_lookahead_active && IsLookaheadCommand(opcode);
+		if (lookahead_command) m_renderer.GetPipelineCache().SetLookaheadCommand(this, packet);
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (lookahead_command) m_renderer.GetPipelineCache().SetLookaheadCommand(nullptr, nullptr);
+		const bool replan = packet == m_lookahead_stop;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -738,6 +915,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+		if (replan) PlanLookahead(execution, {});
 	}
 }
 
