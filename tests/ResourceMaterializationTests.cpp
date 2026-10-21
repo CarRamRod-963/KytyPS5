@@ -157,6 +157,20 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   return program;
 }
 
+void TestPlanUserDataReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Check(UserDataBufferPlan().user_data_reads == 1u,
+        "a plan reading s0 did not record user-data slot 0");
+  Check(UnbasedFlatPlan().user_data_reads == 0u,
+        "a plan without user data recorded a slot");
+  auto program = MixedSamplerProgram();
+  Check(ExtractResourcePlan(program).user_data_reads == 3u,
+        "a plan reading s0 and s1 did not record slots 0 and 1");
+  program.user_data_base = 1;
+  Check(ExtractResourcePlan(program).user_data_reads == ~uint64_t{0},
+        "a read below the user-data base did not mark every slot");
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -2259,6 +2273,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestPlanUserDataReads();
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestGeneralNativeSrtWalker();
