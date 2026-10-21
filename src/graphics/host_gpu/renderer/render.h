@@ -17,9 +17,10 @@
 #include <cstddef>
 #include <cstring>
 #include <optional>
-#include <unordered_map>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -74,6 +75,36 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+};
+
+// An indirect draw packet whose arguments (and draw count) the GPU reads. The records have the
+// Vulkan layouts of VkDrawIndirectCommand / VkDrawIndexedIndirectCommand.
+struct IndirectDrawSource {
+	uint64_t args_address = 0;
+	uint32_t stride       = 0;
+	// The draw count, or with a count address the most draws the count may select.
+	uint32_t max_draw_count = 0;
+	uint64_t count_address  = 0;
+	bool     indexed        = false;
+	// Indexed: the index buffer the arguments' first index starts in, and its size in elements.
+	uint64_t index_base          = 0;
+	uint32_t index_buffer_size   = 0;
+	uint32_t index_type_and_size = 0;
+	// The user-data slots of the vertex stage the packet writes its base vertex (or first
+	// vertex) and first instance to, -1 for none.
+	int32_t vertex_offset_slot   = -1;
+	int32_t instance_offset_slot = -1;
+	// Vertex user-data slots whose values earlier native draws left on the GPU (one bit each).
+	uint32_t stale_slots = 0;
+};
+
+enum class DrawIndirectResult : uint8_t {
+	// Recorded, or skipped for the state alone as the packet would be with any arguments.
+	Done,
+	// The draw needs its arguments on the host; nothing was recorded.
+	ReadArguments,
+	// Its vertex stage reads stale slots: nothing was recorded, settle them and draw again.
+	SettleRegisters,
 };
 
 struct SubmitInfo {
@@ -139,6 +170,11 @@ public:
 	void GuestFlush() const;
 	// Orders pending guest dispatches before everything recorded next.
 	void OrderDispatches() const;
+	// Before a draw that reads its arguments on the GPU: makes every earlier write visible to
+	// indirect-argument reads (barriers to all commands leave them out, see LaterAccess). Within
+	// the render pass instances that follow such a barrier back to back only draws ran, so it
+	// records nothing there; otherwise it ends the current instance for the barrier.
+	void OrderIndirectReads() const;
 	// Whether anything but barriers was recorded since the buffer began.
 	[[nodiscard]] bool              HasCommands() const noexcept { return m_has_commands; }
 	// Commands recorded through Handle() and DispatchHandle() since the buffer began.
@@ -173,6 +209,9 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	// Render pass instances begun, and the first one OrderIndirectReads covers.
+	mutable uint64_t    m_render_passes        = 0;
+	mutable uint64_t    m_indirect_reads_since = UINT64_MAX;
 	mutable bool        m_has_commands = false;
 	mutable uint32_t    m_command_count = 0;
 	// The compute pipeline BindComputePipeline bound last, until Handle() or the next Begin.
@@ -209,6 +248,10 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	[[nodiscard]] DrawIndirectResult DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                              const IndirectDrawSource& args);
+	// Vertex shaders (code addresses) whose programs need indirect arguments on the host.
+	std::unordered_set<uint64_t> m_indirect_readback_shaders;
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;

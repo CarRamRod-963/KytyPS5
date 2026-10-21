@@ -455,6 +455,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR supported_workgroup_layout {};
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = workgroup_layout_extension ? &supported_workgroup_layout : nullptr;
+	vk::PhysicalDeviceVulkan11Features supported_features11 {};
+	supported_features11.pNext = supported_features12.pNext;
+	supported_features12.pNext = &supported_features11;
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.pNext = &supported_features12;
 
@@ -657,6 +660,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Indirect draws read their arguments and count on the GPU when the device can take them
+	// as the guest packets give them; their vertex stages read the offsets from the draw.
+	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance =
+	    supported_features2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount           = supported_features12.drawIndirectCount;
+	features11.shaderDrawParameters        = supported_features11.shaderDrawParameters;
+	graphics.native_indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                         device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                         features12.drawIndirectCount == VK_TRUE &&
+	                                         features11.shaderDrawParameters == VK_TRUE;
+	LOGF("Vulkan native indirect draws: %s\n",
+	     graphics.native_indirect_draws_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&

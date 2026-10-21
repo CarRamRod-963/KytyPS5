@@ -81,6 +81,24 @@ void CommandBuffer::OrderDispatches() const {
 	RecordBarrier(m_barriers.BeforeBarrier());
 }
 
+void CommandBuffer::OrderIndirectReads() const {
+	EXIT_IF(IsInvalid());
+	if (m_rendering && m_render_passes == m_indirect_reads_since) {
+		return;
+	}
+	EndRendering();
+	vk::MemoryBarrier2 memory {};
+	memory.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	memory.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	memory.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+	memory.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &memory;
+	BarrierHandle().pipelineBarrier2(dependency);
+	m_indirect_reads_since = m_render_passes + 1;
+}
+
 static_assert(static_cast<uint8_t>(BarrierTracker::Barrier::ComputeToCompute) - 1u ==
                   static_cast<uint8_t>(Common::GpuTiming::BarrierKind::ComputeToCompute) &&
               static_cast<uint8_t>(BarrierTracker::Barrier::AllToAll) - 1u ==
@@ -146,9 +164,10 @@ void CommandBuffer::Begin() {
 	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	m_has_commands     = false;
-	m_command_count    = 0;
-	m_compute_pipeline = nullptr;
+	m_has_commands         = false;
+	m_command_count        = 0;
+	m_compute_pipeline     = nullptr;
+	m_indirect_reads_since = UINT64_MAX;
 }
 
 void CommandBuffer::End() const {
@@ -178,6 +197,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
+	const bool ordered = m_rendering && m_render_passes == m_indirect_reads_since;
 	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
@@ -225,6 +245,12 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
+	// A pass that directly follows one OrderIndirectReads covers is covered too: nothing was
+	// recorded between them.
+	m_render_passes++;
+	if (ordered) {
+		m_indirect_reads_since = m_render_passes;
+	}
 }
 
 void CommandBuffer::EndRendering() const {

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/gpuTiming.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -115,6 +116,15 @@ public:
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
+	// A SET_SH_REG of a vertex user-data register: it no longer holds a deferred offset.
+	void NoteUserDataWrite(uint32_t location) {
+		if (!m_deferred_indirect.empty()) {
+			std::erase_if(m_deferred_indirect, [location](const DeferredIndirectValue& value) {
+				return value.location == location;
+			});
+		}
+	}
+
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
 
@@ -165,6 +175,13 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4(Common::GpuTiming::StallKind kind);
+	// Records an indirect draw whose arguments the GPU reads; false when the host needs them.
+	bool DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
+	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
+	                       IndirectDrawRegisters registers, bool indexed);
+	// Reads back the arguments the draws recorded by DrawIndirectOnGpu left the persistent state
+	// in: with `registers` the user SGPRs they wrote, with `num_instances` the instance count.
+	void                SettleIndirectDrawState(bool registers, bool num_instances);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -182,6 +199,21 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Persistent state a draw recorded by DrawIndirectOnGpu set from its arguments on the GPU,
+	// until something reads it on the host (SettleIndirectDrawState) or replaces it: a user SGPR
+	// or the instance count, from the last draw of the packet.
+	struct DeferredIndirectValue {
+		enum class Field : uint8_t { BaseVertex, FirstInstance, InstanceCount };
+		// The SH register; SH_NOP for the instance count.
+		uint32_t                 location     = Pm4::SH_NOP;
+		Field                    field        = Field::BaseVertex;
+		bool                     indexed      = false;
+		uint64_t                 args_address = 0;
+		uint32_t                 stride       = 0;
+		uint32_t                 max_count    = 0;
+		const volatile uint32_t* count_addr   = nullptr;
+	};
+	std::vector<DeferredIndirectValue> m_deferred_indirect;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
