@@ -241,11 +241,6 @@ private:
 	void ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
 	                        const ShaderRecompiler::IR::DescriptorValue& value,
 	                        TextureBinding&                              binding);
-	struct TextureMemoKey {
-		std::array<uint32_t, 8> words;
-		uint64_t                traits;
-		bool                    operator==(const TextureMemoKey&) const = default;
-	};
 	struct TextureMemoKeyHash {
 		size_t operator()(const TextureMemoKey& key) const noexcept {
 			uint64_t hash = key.traits * 0x9E3779B97F4A7C15ull;
@@ -268,6 +263,8 @@ private:
 	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
 	size_t m_texture_memo_sweep_at = TextureMemoFirstSweep;
 	uint64_t m_texture_memo_serial   = 0;
+	// Advances with every erased entry: bindings keep entry pointers only within one epoch.
+	uint64_t m_texture_memo_epoch = 1;
 	// Render-target image lookups per color slot and for depth (TextureCache::ImageLookup).
 	std::array<TextureCache::ImageLookup, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_lookups;
 	TextureCache::ImageLookup                                           m_depth_target_lookup;
