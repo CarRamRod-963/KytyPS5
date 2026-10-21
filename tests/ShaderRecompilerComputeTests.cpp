@@ -43386,7 +43386,10 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
   constexpr std::array small_keys{5u, 0u, 3u, 1u, 4u, 2u};
-  constexpr std::array large_keys{58u, 0u, 33u, 31u, 34u, 32u, 59u, 65535u};
+  // 32 image records and 33 sampler candidates (beyond the 32 native sampler
+  // roots): a larger float image heap would be resolved bindlessly, which this
+  // harness does not bind.
+  constexpr std::array large_keys{31u, 0u, 17u, 15u, 18u, 16u, 32u, 65535u};
   constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
   for (const auto [member_mode, counted] : {std::pair{0u, false}, std::pair{0x98u, false},
        std::pair{0x16cu, false}, std::pair{64u, false}, std::pair{64u, true},
@@ -43403,7 +43406,7 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     if (upper_only && !waterfall) continue;
     const u32 keys_address = child_table ? 1024u : large_samplers ? 512u : 128u;
     const u32 table = waterfall ? 2048u : 256u;
-    const u32 rows = large_samplers ? 59u : child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
+    const u32 rows = large_samplers ? 32u : child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
     const u32 records_count = counted ? 2u : rows, count_address = 768u;
     const u32 stride = large_samplers ? 32u : child_table ? 136u : compact ? 0x330u : 592u;
     const u32 object_stride = large_samplers ? 16u : child_table ? 1536u : 0x430u;
@@ -43606,7 +43609,7 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
                   tools.Disassemble(compiled.spirv, &text) &&
                   CountText(text, "OpImageSampleExplicitLod") == halves &&
                   SpirvCodeWords(compiled.spirv) <= 8192u * halves,
-              "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
+              "33 sampler candidates hit the SGPR root limit or duplicated image sampling bodies");
     }
     if (large_samplers)
       Require(test.name, "GPU waterfall keys remain unread by materialization",
