@@ -16,6 +16,7 @@
 #include <functional>
 #include <numeric>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 
@@ -762,8 +763,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				order[child] = {NullImageDescriptor(value) ? *lead : ImageCandidateClass(image, value),
 				                child};
 			}
-			std::ranges::stable_sort(order, [&](const auto& a, const auto& b) {
-				return std::pair {a.first != *lead, a.first} < std::pair {b.first != *lead, b.first};
+			// Children keep their table order within a class. The child index breaks ties, so an
+			// unstable sort gives the stable order without a stable sort's buffer allocation.
+			std::ranges::sort(order, [&](const auto& a, const auto& b) {
+				return std::tuple {a.first != *lead, a.first, a.second} <
+				       std::tuple {b.first != *lead, b.first, b.second};
 			});
 			// Dynamic-mip candidates never share an access; spares would only add switch arms.
 			const bool pad = image.mip_mode != ImageMipMode::Dynamic;
