@@ -135,12 +135,20 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
+	// Before a run of the stream: plans the resource walks of the compute dispatches ahead, up to
+	// the first command that is not written yet or whose effect depends on memory (see
+	// ResourceLookahead). `commands` is the submission's buffer when the run starts it.
+	void PlanLookahead(const Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
+	// Scans commands for PlanLookahead; false once it reached a command it cannot look past.
+	bool ScanLookahead(std::span<const uint32_t> commands, uint32_t depth);
+	// The packet being executed.
+	[[nodiscard]] static const uint32_t* CurrentPacket();
 	void SuspendPm4(Common::GpuTiming::StallKind kind);
 	void                CountDraw();
 	uint32_t            NumInstances();
@@ -190,6 +198,9 @@ private:
 	uint32_t       m_draws                       = 0; // Since the buffer start or CountDraw's flush
 	uint64_t       m_synthetic_occlusion_counter = 0;
 	bool           m_predicate_skip              = false;
+	// The packet the last lookahead plan stopped at, if any.
+	const uint32_t* m_lookahead_stop   = nullptr;
+	bool            m_lookahead_active = false;
 };
 
 } // namespace Libs::Graphics
