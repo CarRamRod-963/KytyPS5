@@ -69,16 +69,24 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		const auto query = [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); };
+		if (bool modified = false; manager->TryQueryUnlocked(query, modified)) {
+			return modified;
+		}
 		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return query();
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		const auto query = [&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); };
+		if (bool modified = false; manager->TryQueryUnlocked(query, modified)) {
+			return modified;
+		}
 		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return query();
 	});
 }
 
