@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/pendingLabels.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -74,8 +75,26 @@ public:
 	// needs the caches' bookkeeping, which runs on the GPU thread, and is written there. Labels
 	// keep their order: while one waits for the GPU thread, the later ones follow it there.
 	// Command streams suspended on a memory condition are retried after the store.
+	// `label_id`: the label's PendingLabels entry, 0 for none.
 	void DeliverLabel(void* dst, uint64_t value, uint32_t size,
-	                  Common::UniqueFunction<void>&& notify);
+	                  Common::UniqueFunction<void>&& notify, uint64_t label_id = 0);
+
+	// End-of-pipe labels recorded and not yet stored (GPU thread adds, delivery removes).
+	PendingLabels& GetPendingLabels() { return m_pending_labels; }
+	// GPU thread: a WAIT_REG_MEM for `size` bytes at `address` that the latest pending label
+	// satisfies continues behind a guest flush instead of suspending. Only for labels the
+	// completion thread stores at once (no cache watches their pages): an access that starts
+	// watching them reads them first, and settles them (SettleElidedLabels).
+	template <typename Condition>
+	[[nodiscard]] bool ElideLabelWait(uint64_t address, uint32_t size, Condition&& condition) {
+		return m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
+		       m_page_manager.IsUnwatched(address, size) &&
+		       m_pending_labels.Elide(address, size, std::forward<Condition>(condition));
+	}
+	[[nodiscard]] bool HasElidedLabels() const noexcept { return m_pending_labels.HasElided(); }
+	// GPU thread, before a command accesses guest memory: waits until the elided labels in the
+	// range are stored. Other threads return at once.
+	void SettleElidedLabels(uint64_t vaddr, uint64_t size);
 
 private:
 	// Retries command streams suspended on a memory condition (see GuestGpu); any thread.
@@ -107,6 +126,7 @@ private:
 	bool                      m_bda_logged = false;
 	// Labels handed to the GPU thread and not yet written.
 	std::atomic<uint32_t> m_gpu_thread_labels {0};
+	PendingLabels         m_pending_labels;
 	// m_gpu for threads outside the GPU thread's lifetime, and how many of them use it now.
 	std::atomic<GuestGpu*> m_notified_gpu {nullptr};
 	std::atomic<uint32_t>  m_gpu_notifiers {0};
