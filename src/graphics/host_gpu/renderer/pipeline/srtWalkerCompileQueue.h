@@ -31,6 +31,11 @@ public:
 		[[nodiscard]] bool Ready() const noexcept {
 			return m_ready.load(std::memory_order_acquire);
 		}
+		// The plan once Ready(), compiled or not; for an owner that keeps the job instead of
+		// taking the plan. Null before.
+		[[nodiscard]] const ShaderRecompiler::IR::ResourcePlan* Plan() const {
+			return Ready() ? m_plan.get() : nullptr;
+		}
 		// The compiled plan, or null when the general walker does not cover it. Requires Ready().
 		[[nodiscard]] std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> Take() {
 			if (!Ready() || m_plan == nullptr || m_plan->srt_general_code == nullptr)
