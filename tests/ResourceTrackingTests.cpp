@@ -1123,7 +1123,7 @@ void TestNestedPointerImageTable() {
           "nested pointer descriptors lost their row geometry or captured the GPU selector payload");
   }
 
-  constexpr uint32_t table = 0x2000u, objects = 0x10000u, stride = 592u, count = 59u;
+  constexpr uint32_t table = 0x2000u, objects = 0x10000u, stride = 592u, count = 32u;
   LinearTestMemory memory;
   memory.words.resize((objects + count * 0x430u - memory.base) / 4u);
   memory.fail_address = 0x1800u; // The GPU selector's contents are unavailable to the CPU.
@@ -1145,10 +1145,12 @@ void TestNestedPointerImageTable() {
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  // Image candidates of one class are padded to a power of two with the root.
+  // Image candidates of one class are padded to a power of two with the root:
+  // the root and 31 float candidates fill one group, the last row's uint image
+  // forms its own. 33 sampler candidates exceed the 32 native sampler roots;
+  // one more row would make the images a bindless heap.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == std::bit_ceil(count + 1u) &&
-            snapshot.samplers.size() == count + 1u,
+            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
         "bounded nested pointer table lost image/sampler candidates or read the GPU selector");
   for (uint32_t row = 0; row < count; ++row)
     Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
@@ -1193,8 +1195,10 @@ void TestNestedPointerImageTable() {
   *at(table) = objects + 0x430u;
   *at(objects + 0x430u + 0x3d0u) = 10u + count;
   *at(objects + 0x430u + 0x3f8u) = count;
+  // The float group (the root and 30 distinct candidates) keeps its padded
+  // size of 32.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == std::bit_ceil(count) && snapshot.samplers.size() == count &&
+            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count &&
             snapshot.images[1].dwords[0] == 10u + count && snapshot.samplers[1].dwords[0] == count,
         "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
   *at(table) = objects;
@@ -1204,12 +1208,13 @@ void TestNestedPointerImageTable() {
   user_data[2] = count * stride + 4u;
   memory.watched_address = table + count * stride;
   *at(static_cast<uint32_t>(memory.watched_address)) = objects;
+  // The 33rd row makes the images a bindless heap; the samplers still read it.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_reads != 0u && memory.watched_dwords == 1u &&
-            snapshot.images.size() == std::bit_ceil(count + 1u) &&
+            snapshot.images.size() == 1u && specialization.images[0].bindless &&
             snapshot.samplers.size() == count + 1u,
         "partial pointer row was skipped or read beyond its scalar buffer bounds");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = specialization.samplers[0].indirect_mapping_offset;
   Check(snapshot.flattened_srt[mapping] == count + 1u &&
             snapshot.flattened_srt[mapping + count + 1u] == 1u,
         "partial pointer row lost its low-word pointee or dense key mapping");
@@ -3661,10 +3666,10 @@ void TestIndexedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 9u,
+            memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 10u,
         "indexed selector scanned the broad heap or did not share its captured keys");
   ApplyResourceSpecialization(program, specialization);
-  Check(program.info.images[0].indirect_resources.size() == 3u,
+  Check(program.info.images[0].indirect_resources.size() == 4u,
         "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
@@ -3683,7 +3688,7 @@ void TestIndexedMaterialImageKeys() {
           "indexed selector batch escaped writable-alias tracking");
   auto shared_program = make_program(ShaderType::Compute, true);
   auto shared = ExtractResourcePlan(shared_program);
-  Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,
+  Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 10u,
         "inherited indexed selector lost its bounded material domain");
   memory.words[64u / 4u] = 12996u;
   memory.selectors = 0;
@@ -3707,8 +3712,16 @@ void TestIndexedMaterialImageKeys() {
     if (variant == 6u) user_data[1] = 66u << 16u;
     if (variant == 7u) user_data[0] = 0u;
     memory.selectors = 0;
+    // The original domain, 14,517 float 2D T#s, is resolved as a bindless heap.
+    // With a 66-byte material stride, the +68 field of the third root is out of
+    // bounds: its key is the zero every such load returns.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.selectors == 0u && snapshot.images.size() > 100u,
+              memory.selectors == 0u && specialization.images[0].bindless &&
+              specialization.images[1].bindless &&
+              (variant == 6u ? !specialization.images[2].bindless &&
+                                   snapshot.images.size() == 4u
+                             : specialization.images[2].bindless &&
+                                   snapshot.images.size() == 3u),
           "unsupported geometry or writable selector lost the original heap domain");
   }
   user_data = original;
@@ -3845,14 +3858,16 @@ void TestPointerTableIndexedMaterialKeys() {
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The root and two candidates of one class are padded to a power of two.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
-            snapshot.images.size() == 3u,
+            snapshot.images.size() == 4u,
         "pointer-table selector did not read exactly the zero and material-key descriptors");
   Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 8u, 64u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
-  Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_search_iterations == 2u &&
+  // Three keys search a map padded to four entries.
+  Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_search_iterations == 3u &&
             snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
             snapshot.flattened_srt[mapping + 5u] == 9u,
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
@@ -8525,8 +8540,10 @@ void TestPackedDescriptorWaterfall() {
         .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
+    // The null image root and two float candidates are padded to a power of
+    // two.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.samplers.size() == 60u,
+              snapshot.images.size() == 4u && snapshot.samplers.size() == 60u,
           "packed waterfall ignored the two-image/59-sampler heap bounds or lost the null roots");
     Check(std::ranges::all_of(snapshot.specialization_reads, [&](const auto& span) {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
