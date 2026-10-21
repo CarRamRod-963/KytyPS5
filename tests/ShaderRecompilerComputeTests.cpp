@@ -10326,6 +10326,114 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A shader writes a linear R32 float image (Ghost of Yotei's hi-Z pyramid), a
+  // later pass samples the same memory as D32 depth, and the guest CPU reads
+  // the bytes after the frame. The format swap replaces the cached image; the
+  // pending download must move with the GPU writes so the frame-boundary
+  // readback still publishes them.
+  void CheckSwappedDepthReadback() {
+    constexpr const char *name = "SwappedDepthReadback";
+    constexpr uintptr_t base = 0x0000000204400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint32_t width = 8;
+    constexpr uint32_t height = 4;
+    constexpr uint64_t size = uint64_t{width} * height * sizeof(float);
+    constexpr uint32_t stale = 0x3e800000u; // 0.25f
+    constexpr float written = 0.75f;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "swapped depth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "swapped depth fixed mapping failed");
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      auto &resources = context;
+      resources.MapMemory(base, allocation_size);
+      std::array<uint32_t, width * height> guest{};
+      guest.fill(stale);
+      std::memcpy(mapped, guest.data(), sizeof(guest));
+
+      auto &cache = resources.GetTextureCache();
+      TextureCacheTestAccess::SetLinearReadback(cache, true);
+      auto storage = MakeLinearDesc(
+          base, size, vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      storage.type = BindingType::Storage;
+      storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto color_id = cache.FindImage(storage);
+      (void)cache.FindTexture(color_id, storage);
+      vk::ClearValue clear{};
+      clear.color.float32[0] = written;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), color_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      Require(
+          name, "storage write pending download",
+          TextureCacheTestAccess::PendingDownload(cache, color_id),
+          "a GPU-written linear storage image was not enrolled for readback");
+
+      auto depth = MakeLinearDesc(
+          base, size, vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      const auto depth_id = cache.FindImage(depth);
+      Require(name, "depth view replaces the color image",
+              depth_id && depth_id != color_id &&
+                  !TextureCacheTestAccess::Contains(cache, color_id) &&
+                  cache.GetImage(depth_id).info.IsDepth() &&
+                  cache.GetImage(depth_id).IsGpuModified(),
+              "sampling the storage image as D32 did not swap in a GPU-current "
+              "depth image");
+      Require(name, "swap keeps the pending download",
+              TextureCacheTestAccess::PendingDownload(cache, depth_id),
+              "the format swap dropped the GPU writes' pending readback");
+
+      cache.ProcessDownloadImages();
+      TextureCacheTestAccess::SetLinearReadback(cache, false);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::array<uint32_t, width * height> after{};
+      Require(name, "guest backing",
+              Libs::LibKernel::Memory::TryReadBacking(base, after.data(),
+                                                      sizeof(after)),
+              "swapped depth guest backing is unreadable");
+      const auto expected = std::bit_cast<uint32_t>(written);
+      Require(name, "guest sees the GPU writes",
+              std::ranges::all_of(
+                  after, [&](uint32_t value) { return value == expected; }),
+              fmt::format("the guest read 0x{:08x} instead of the GPU-written "
+                          "0x{:08x} after the swap",
+                          after[0], expected)
+                  .c_str());
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "swapped depth fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "swapped depth direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -53926,6 +54034,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-swap-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSwappedDepthReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -54245,6 +54358,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckSwappedDepthReadback();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
