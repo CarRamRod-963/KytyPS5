@@ -629,6 +629,11 @@ add_executable(bindless_translation_tests EXCLUDE_FROM_ALL
 target_link_libraries(bindless_translation_tests common fmt::fmt)
 target_include_directories(bindless_translation_tests PRIVATE ${inc_headers})
 
+add_executable(pending_labels_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PendingLabelsTests.cpp"
+)
+target_include_directories(pending_labels_tests PRIVATE ${inc_headers})
+
 add_executable(layout_change_log_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LayoutChangeLogTests.cpp"
 )
@@ -776,6 +781,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
+	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME layout_change_log COMMAND $<TARGET_FILE:layout_change_log_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
@@ -910,6 +916,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		bindless_translation_tests
+		pending_labels_tests
 		scalar_read_cache_tests
 		layout_change_log_tests
 		dcc_constant_tests
