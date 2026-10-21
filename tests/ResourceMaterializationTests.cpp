@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -434,6 +435,170 @@ void TestRangeOverlapIndex() {
             "range overlap index disagrees with a scan");
     }
   }
+}
+
+// Guest memory for the lookahead test: host memory, with one range holding GPU
+// writes.
+uint64_t g_lookahead_dirty_base = 0;
+uint64_t g_lookahead_dirty_size = 0;
+
+bool LookaheadTestRead(uint64_t address, void *data, uint64_t size) {
+  std::memcpy(data, reinterpret_cast<const void *>(address), size);
+  return true;
+}
+
+bool LookaheadTestDirty(uint64_t address, uint64_t size) {
+  return g_lookahead_dirty_size != 0 &&
+         address < g_lookahead_dirty_base + g_lookahead_dirty_size &&
+         g_lookahead_dirty_base < address + size;
+}
+
+// A helper's walk is adopted only for the planned command, plan and inputs, and
+// only while every byte it read reads the same and holds no GPU write.
+void TestResourceLookahead() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Each table fills its own read-cache chunks: a chunk shared with locals that change
+  // between the helper's read and the check would not read the same.
+  struct alignas(128) Table {
+    std::array<uint32_t, 32> words;
+  };
+  static Table first_table{{0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u, 0x18u}};
+  static Table second_table{{0x21u, 0x22u, 0x23u, 0x24u, 0x25u, 0x26u, 0x27u, 0x28u}};
+  auto &first = first_table.words;
+  auto &second = second_table.words;
+  const auto pointer_words = [](const void *pointer) {
+    const auto address = reinterpret_cast<uint64_t>(pointer);
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(address),
+                                   static_cast<uint32_t>(address >> 32u)};
+  };
+  const auto first_words = pointer_words(first.data());
+  const auto second_words = pointer_words(second.data());
+  LookaheadInputs inputs;
+  inputs.user_data_count = 5;
+  inputs.user_data[0] = first_words[0];
+  inputs.user_data[1] = first_words[1];
+  inputs.user_data[2] = second_words[0];
+  inputs.user_data[3] = second_words[1];
+  inputs.user_data[4] = 2u;
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 5;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto control = emit(ValueOpcode::GetUserData, {Value(ScalarReg(8))});
+  const auto chosen = emit(ValueOpcode::IEqual32, {control, Value(1u)});
+  const auto low =
+      emit(ValueOpcode::SelectU32,
+           {chosen, emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))})});
+  const auto high =
+      emit(ValueOpcode::SelectU32,
+           {chosen, emit(ValueOpcode::GetUserData, {Value(ScalarReg(7))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto root = emit(ValueOpcode::GetAddressResource, {low, high});
+  const auto offset =
+      emit(ValueOpcode::ShiftLeftLogical32,
+           {emit(ValueOpcode::BitwiseAnd32, {control, Value(6u)}), Value(2u)});
+  for (const auto byte_offset : {offset, Value(4u)}) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  }
+
+  SrtWalkerCompileQueue queue;
+  const auto submit = [&] {
+    return queue.Submit(std::make_unique<ResourcePlan>(
+        ExtractResourcePlan(program, SrtWalkerLoads::Reader,
+                            SrtWalkerCompilation::Deferred)));
+  };
+  auto job_a = submit();
+  auto job_b = submit();
+  for (uint32_t wait = 0; wait < 10000u && !(job_a->Ready() && job_b->Ready());
+       ++wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  Check(job_a->Ready() && job_b->Ready(),
+        "the lookahead plans were not compiled");
+  auto plan_a = std::make_shared<LookaheadPlan>(job_a, 0u);
+  auto plan_b = std::make_shared<LookaheadPlan>(job_b, 1u);
+
+  ResourceLookahead lookahead(
+      {.read = LookaheadTestRead, .gpu_dirty = LookaheadTestDirty}, 2u);
+  const int stream = 0;
+  const std::array<int, 4> commands{};
+  using Outcome = ResourceLookahead::Outcome;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto planned =
+      [&](std::initializer_list<std::pair<const int *, const LookaheadPlan *>>
+              jobs) {
+        lookahead.BeginRun(&stream);
+        for (const auto &[command, plan] : jobs)
+          lookahead.Plan(&stream, command,
+                         plan == plan_a.get() ? plan_a : plan_b, inputs);
+        lookahead.Kick();
+        lookahead.WaitIdle();
+      };
+  const auto adopt = [&](const int *command, const LookaheadPlan *plan,
+                         const LookaheadInputs &at) {
+    snapshot = {};
+    return lookahead.TryAdopt(&stream, command, plan, at, snapshot,
+                              specialization);
+  };
+
+  planned({{&commands[0], plan_a.get()}});
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Adopted &&
+            snapshot.flattened_srt == std::vector<uint32_t>{first[2], first[1]},
+        "a finished lookahead walk was not adopted");
+
+  planned({{&commands[0], plan_a.get()}});
+  auto other = inputs;
+  other.user_data[4] = 1u;
+  Check(adopt(&commands[0], plan_a.get(), other) == Outcome::Changed,
+        "a walk planned with other user data was adopted");
+
+  planned({{&commands[0], plan_a.get()}});
+  first[2] = 0x99u;
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Moved &&
+            snapshot.flattened_srt.empty(),
+        "a walk whose guest bytes changed after it ran was adopted");
+
+  planned({{&commands[0], plan_a.get()}});
+  g_lookahead_dirty_base = reinterpret_cast<uint64_t>(&first[1]);
+  g_lookahead_dirty_size = 4u;
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Dirty,
+        "a walk that read GPU-dirty bytes was adopted");
+  g_lookahead_dirty_size = 0u;
+
+  // Commands are reached in plan order; a command's jobs for its other programs
+  // stay.
+  planned({{&commands[0], plan_a.get()},
+           {&commands[1], plan_b.get()},
+           {&commands[1], plan_a.get()}});
+  Check(adopt(&commands[1], plan_a.get(), inputs) == Outcome::Adopted &&
+            snapshot.flattened_srt == std::vector<uint32_t>{first[2], first[1]},
+        "the second program of a command was not adopted");
+  Check(adopt(&commands[1], plan_b.get(), inputs) == Outcome::Adopted,
+        "the first program of a command was dropped");
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::NotPlanned,
+        "a job of a command already passed was kept");
+  Check(adopt(&commands[2], plan_a.get(), inputs) == Outcome::NotPlanned,
+        "an unplanned command found a job");
+
+  // A new run drops the jobs of the last one.
+  planned({{&commands[3], plan_a.get()}});
+  lookahead.BeginRun(&stream);
+  Check(adopt(&commands[3], plan_a.get(), inputs) == Outcome::NotPlanned,
+        "a job survived the start of a new run");
+  const auto stats = lookahead.TakeStats();
+  Check(stats.planned == 8u &&
+            stats.outcomes[static_cast<size_t>(Outcome::Adopted)] == 3u,
+        "lookahead statistics are wrong");
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -1686,6 +1851,7 @@ int main() {
   TestPlanUserDataReads();
   TestNativeNestedSrtRefresh();
   TestReaderLoadsThroughCacheView();
+  TestResourceLookahead();
   TestRangeOverlapIndex();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
