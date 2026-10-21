@@ -92,6 +92,7 @@ struct ConfigOptions {
 	bool                   serialize_dispatches            = false;
 	bool                   precompile_pipelines            = false;
 	bool                   precompile_only                 = false;
+	uint32_t               lookahead_threads               = 2;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -163,6 +164,7 @@ bool     SkipPendingDrawsEnabled();
 bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
+uint32_t LookaheadThreads();
 bool TessellationEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
