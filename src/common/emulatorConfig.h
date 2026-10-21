@@ -98,6 +98,7 @@ struct ConfigOptions {
 	bool                   serialize_dispatches            = false;
 	bool                   precompile_pipelines            = false;
 	bool                   precompile_only                 = false;
+	uint32_t               lookahead_threads               = 2;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -179,6 +180,7 @@ bool     SkipPendingDrawsEnabled();
 bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
+uint32_t LookaheadThreads();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
