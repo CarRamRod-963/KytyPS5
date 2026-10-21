@@ -4509,12 +4509,64 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 	return result;
 }
 
+PatternCopyPlan RecognizePatternCopy(const Program& program, const Decoder::Program& decoded,
+                                     ShaderStageInputInfo input) {
+	// The SDK's DCC retile shader (DccRetile::Locate in the renderer mirrors its arithmetic).
+	constexpr size_t   RetileCodeWords = 223;
+	constexpr uint64_t RetileCodeHash  = 0xf27145354acf8b81ull;
+	if (program.stage != ShaderType::Compute || decoded.instructions.empty() ||
+	    program.user_data_base != 0 || program.user_data_count < 9 ||
+	    program.info.buffers.size() != 2 || !program.info.images.empty() ||
+	    !program.info.samplers.empty() || program.info.uses_gds || program.info.uses_dma)
+		return {};
+	const auto& cs = *input.compute;
+	if (cs.workgroup_register != 9 || cs.thread_ids_num < 2 || !cs.group_id[0] || !cs.group_id[1] ||
+	    cs.group_id[2] || cs.threads_num[0] != 8 || cs.threads_num[1] != 8 ||
+	    cs.threads_num[2] != 1 || cs.dispatch_thread_dimensions)
+		return {};
+	const auto&  last  = decoded.instructions.back();
+	const size_t words = last.pc / sizeof(uint32_t) + last.word_count;
+	if (words != RetileCodeWords || words > decoded.code.size() ||
+	    XXH3_64bits(decoded.code.data(), words * sizeof(uint32_t)) != RetileCodeHash)
+		return {};
+	const auto& first      = program.info.buffers[0];
+	const auto& second     = program.info.buffers[1];
+	const auto  reads_only = [](const BufferResource& buffer) {
+		return buffer.read && !buffer.written && !buffer.atomic;
+	};
+	const auto writes_only = [](const BufferResource& buffer) {
+		return buffer.written && !buffer.read && !buffer.atomic;
+	};
+	PatternCopyPlan result;
+	if (reads_only(first) && writes_only(second)) {
+		result.copy.source      = 0;
+		result.copy.destination = 1;
+	} else if (writes_only(first) && reads_only(second)) {
+		result.copy.source      = 1;
+		result.copy.destination = 0;
+	} else {
+		return {};
+	}
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetUserData &&
+			    RegIndex(inst.Arg(0).ScalarRegister()) == 0) {
+				result.pitch = Value(&inst);
+			}
+		}
+	}
+	if (result.pitch.IsEmpty()) return {};
+	result.copy.kind = PatternCopyKind::DccRetile;
+	return result;
+}
+
 } // namespace
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
                     ShaderStageInputInfo input) {
 	Tracker(program, decoded, native_cfg, input).Run();
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
+	program.pattern_copy = RecognizePatternCopy(program, decoded, input);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -30,6 +30,20 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// A compute shader recognized by its code whose memory effect the host can reproduce: it copies
+// elements from the source buffer resource to the destination one.
+enum class PatternCopyKind { None, DccRetile };
+
+struct PatternCopy {
+	PatternCopyKind kind        = PatternCopyKind::None;
+	uint32_t        source      = 0;
+	uint32_t        destination = 0;
+	// The shader's layout parameter (DccRetile: the source's 4 KiB block pitch).
+	uint32_t pitch = 0;
+
+	bool operator==(const PatternCopy&) const = default;
+};
+
 // A bindless image root: the records (a V#) whose 64-bit pointer at pointer_offset leads to a
 // T# at pointer + table_offset + layer * layer_stride. The renderer gives the heap a region of
 // the translation table and patches [region, entry count] into the flattened SRT at
@@ -61,6 +75,7 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	PatternCopy                                pattern_copy;
 	// Set when a refresh fails only because of this draw's guest data: a GPU-selected candidate
 	// set reads memory that is not mapped or needs more probes than the host enumerates. The
 	// shader is supported; the draw that supplied the data cannot be specialized.
