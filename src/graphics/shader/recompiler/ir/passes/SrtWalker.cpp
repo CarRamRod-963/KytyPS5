@@ -1131,9 +1131,13 @@ private:
 		return true;
 	}
 
-	void EmitCompare(void (Code::*set)(const Xbyak::Operand&)) {
+	void EmitCompare(void (Code::*set)(const Xbyak::Operand&), bool wide = false) {
 		auto& code = *m_code;
-		code.cmp(code.eax, code.ecx);
+		if (wide) {
+			code.cmp(code.rax, code.rcx);
+		} else {
+			code.cmp(code.eax, code.ecx);
+		}
 		(code.*set)(code.al);
 		code.movzx(code.eax, code.al);
 	}
@@ -1335,6 +1339,14 @@ private:
 			case ValueOpcode::INotEqual32:
 				if (!EmitPair(inst, 0, 1)) return false;
 				EmitCompare(&Code::setne);
+				return true;
+			case ValueOpcode::IEqual64:
+				if (!EmitPair(inst, 0, 1)) return false;
+				EmitCompare(&Code::sete, true);
+				return true;
+			case ValueOpcode::INotEqual64:
+				if (!EmitPair(inst, 0, 1)) return false;
+				EmitCompare(&Code::setne, true);
 				return true;
 			case ValueOpcode::ULessThan32: {
 				// Like the interpreter: a zero upper bound decides without the left operand,

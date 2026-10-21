@@ -514,6 +514,71 @@ void TestGeneralWalkerZeroUnsignedBound() {
         "interpreter decided a compare with an unknown operand");
 }
 
+void TestGeneralWalkerCompares64() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A 64-bit pointer tested against null or another address compiles in the
+  // general walker and compares all 64 bits, as the interpreter does: a
+  // pointer with a zero low half is not null.
+  std::array<uint32_t, 4> table{0x11u, 0x12u, 0x13u, 0x14u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 4> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u,
+                                    0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 4;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto pointer =
+      emit(ValueOpcode::CompositeConstructU64,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(7))})});
+  const auto read = [&](Value byte_offset) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, byte_offset, Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  };
+  constexpr uint64_t other = uint64_t{1} << 32u;
+  read(emit(ValueOpcode::SelectU32,
+            {emit(ValueOpcode::IEqual64, {pointer, Value(uint64_t{0})}),
+             Value(0u), Value(4u)}));
+  read(emit(ValueOpcode::SelectU32,
+            {emit(ValueOpcode::INotEqual64, {pointer, Value(other)}), Value(8u),
+             Value(12u)}));
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_general_code != nullptr,
+        "64-bit compares did not compile the general walker");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint64_t value :
+       {uint64_t{0}, other, uint64_t{1}, uint64_t{0xffffffff00000000u}}) {
+    user_data[2] = static_cast<uint32_t>(value);
+    user_data[3] = static_cast<uint32_t>(value >> 32u);
+    const std::vector<uint32_t> expected{value == 0u ? 0x11u : 0x12u,
+                                         value != other ? 0x13u : 0x14u};
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                               specialization) &&
+              snapshot.flattened_srt == expected,
+          "compiled walker compared a 64-bit pointer by its low half");
+    auto code = std::move(plan.srt_general_code);
+    ResourceSnapshot interpreted;
+    Check(MaterializeResources(plan, {.user_data = user_data}, interpreted,
+                               specialization) &&
+              interpreted.flattened_srt == expected,
+          "interpreter and compiled walker disagree on a 64-bit compare");
+    plan.srt_general_code = std::move(code);
+  }
+}
+
 void TestGeneralWalkerLeavesFloatToInterpreter() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // The compiled walker does not model floating point: a plan whose read
@@ -2130,6 +2195,7 @@ int main() {
   TestGeneralWalkerScopedMemo();
   TestGeneralWalkerAssumesExecFactor();
   TestGeneralWalkerZeroUnsignedBound();
+  TestGeneralWalkerCompares64();
   TestGeneralWalkerLeavesFloatToInterpreter();
   TestGeneralWalkerSharedValuesCompileOnce();
   TestGeneralWalkerRemembersUnknownValues();
