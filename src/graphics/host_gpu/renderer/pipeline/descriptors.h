@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -17,6 +18,13 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+
+// A T# and the resource traits that decide how it binds: the key of the texture memo.
+struct TextureMemoKey {
+	std::array<uint32_t, 8> words;
+	uint64_t                traits;
+	bool                    operator==(const TextureMemoKey&) const = default;
+};
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -27,6 +35,11 @@ struct TextureBinding {
 	// The texture memo entry whose description `desc` holds (RenderExecutor::ResolveTextureMemo),
 	// 0 for none: a hit on that entry leaves the description as it is instead of copying it.
 	uint64_t memo_serial = 0;
+	// The memo entry this binding last used and its key, valid while the memo has erased nothing
+	// since memo_epoch: a binding refilled with the same T# reaches the entry without a lookup.
+	const void*    memo_entry = nullptr;
+	TextureMemoKey memo_key {};
+	uint64_t       memo_epoch = 0;
 };
 
 struct PreparedBindings {
