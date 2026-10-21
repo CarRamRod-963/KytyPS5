@@ -61,6 +61,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
+	    kind == IR::StageInputKind::BaseVertex || kind == IR::StageInputKind::BaseInstance ||
 	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
@@ -735,12 +736,28 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
+	// A native indirect draw's command processor writes the argument offsets to user SGPRs; those
+	// read the offsets the GPU took from the arguments.
+	const auto* vertex =
+	    state.program.stage == ShaderType::Vertex || state.program.stage == ShaderType::Local
+	        ? state.input_info.vertex
+	        : nullptr;
+	if (vertex != nullptr && vertex->indirect_draw != 0) {
+		using IR::IndirectDrawRegisters;
+		const auto slot = static_cast<int32_t>(IR::RegIndex(reg)) -
+		                  static_cast<int32_t>(state.program.user_data_base);
+		if (slot == IndirectDrawRegisters::VertexSlot(vertex->indirect_draw)) {
+			return EmitBuiltinU32(state, IR::StageInputKind::BaseVertex, 0);
+		}
+		if (slot == IndirectDrawRegisters::InstanceSlot(vertex->indirect_draw)) {
+			return EmitBuiltinU32(state, IR::StageInputKind::BaseInstance, 0);
+		}
+	}
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {
 		return ConstantU32(state, 0);
-	} else {
-		return EmitShaderDataDwordLoad(state, dword);
 	}
+	return EmitShaderDataDwordLoad(state, dword);
 }
 
 uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {

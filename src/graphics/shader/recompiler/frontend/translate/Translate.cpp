@@ -1139,6 +1139,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                       ? options.embedded_fetch->vertex_offset_sgpr
 			                       : options.embedded_fetch->instance_offset_sgpr;
 			const auto index = builtin(kind);
+			// Under a native indirect draw the GPU applies the argument offsets: the hardware
+			// values are the native indices without them (see IndirectDrawRegisters).
+			if (options.input_info.vertex != nullptr &&
+			    options.input_info.vertex->indirect_draw != 0) {
+				return entry_ir.ISub(index, builtin(kind == IR::StageInputKind::VertexIndex
+				                                        ? IR::StageInputKind::BaseVertex
+				                                        : IR::StageInputKind::BaseInstance));
+			}
 			if (sgpr < 0) {
 				return index;
 			}
