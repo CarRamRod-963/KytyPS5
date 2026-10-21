@@ -335,6 +335,8 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

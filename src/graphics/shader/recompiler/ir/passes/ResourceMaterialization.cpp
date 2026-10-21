@@ -2096,6 +2096,8 @@ ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerCompilation wa
 	for (auto& value: plan.uniform_fill.values) value = Clone(value);
 	plan.uniform_fill.pattern_size = Clone(plan.uniform_fill.pattern_size);
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
+	plan.pattern_copy               = program.pattern_copy;
+	plan.pattern_copy.pitch         = Clone(plan.pattern_copy.pitch);
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
@@ -2230,6 +2232,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.bounded_elements = elements;
+	}
+	snapshot.pattern_copy = {};
+	if (uint32_t pitch = 0; program.pattern_copy.copy.kind != PatternCopyKind::None &&
+	                        clean.Evaluate(program.pattern_copy.pitch, pitch)) {
+		snapshot.pattern_copy       = program.pattern_copy.copy;
+		snapshot.pattern_copy.pitch = pitch;
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
