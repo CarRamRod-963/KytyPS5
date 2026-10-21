@@ -510,10 +510,11 @@ static uint64_t KYTY_SYSV_ABI GeneralWalkerBitFieldInsert(uint64_t a, uint64_t b
 
 class GeneralWalkerCompiler {
 public:
-	explicit GeneralWalkerCompiler(ResourcePlan& program)
+	GeneralWalkerCompiler(ResourcePlan& program, bool inline_single_use)
 	    : m_program(program),
 	      m_clean_evaluator(program.capture_specialization_reads || !program.source_reads.empty() ||
-	                        program.requires_specialization_memory) {}
+	                        program.requires_specialization_memory),
+	      m_inline_single_use(inline_single_use) {}
 
 	bool Compile() {
 		auto&      program = m_program;
@@ -602,6 +603,7 @@ public:
 				code.cmp(code.byte[code.rax + index], 0);
 				code.je(next, Xbyak::CodeGenerator::T_NEAR);
 				m_fail = &m_failed;
+				m_fail_unwinds = true;
 				for (const auto slot: block.srt_reads) {
 					if (slot >= program.srt_reads.size() || !EmitRead(program.srt_reads[slot])) {
 						return false;
@@ -630,6 +632,7 @@ public:
 				code.mov(code.byte[code.rax + index], 3);
 				code.mov(code.dword[code.rbx + 116], 1);
 				m_fail = &m_failed;
+				m_fail_unwinds = true;
 				if (!EmitSuccessors(block, 104, next)) return false;
 			}
 			code.L(swept);
@@ -644,6 +647,7 @@ public:
 				if (block.srt_reads.empty()) continue;
 				Xbyak::Label skip;
 				m_fail = &m_failed;
+				m_fail_unwinds = true;
 				code.mov(code.rax, code.qword[code.rbx + 48]);
 				code.cmp(code.byte[code.rax + index], 0);
 				code.je(skip, Xbyak::CodeGenerator::T_NEAR);
@@ -781,6 +785,7 @@ private:
 			code.L(active);
 			code.mov(code.rbp, code.rsp);
 			m_fail = &unknown;
+			m_fail_unwinds = true;
 			for (uint32_t dword = 0; dword < descriptor.dword_count; ++dword) {
 				if (!Emit(descriptor.dwords[dword])) return false;
 				code.mov(code.rcx, code.qword[code.rbx + 128]);
@@ -796,6 +801,7 @@ private:
 			code.L(next);
 		}
 		m_fail = &m_failed;
+		m_fail_unwinds = true;
 		code.L(done);
 		return true;
 	}
@@ -818,11 +824,13 @@ private:
 		Xbyak::Label otherwise, unknown;
 		code.mov(code.rbp, code.rsp);
 		m_fail = &unknown;
+		m_fail_unwinds = true;
 		EnterClean();
 		const bool condition = Emit(block.condition);
 		LeaveClean();
 		if (!condition) return false;
 		m_fail = &m_failed;
+		m_fail_unwinds = true;
 		code.test(code.eax, code.eax);
 		code.jz(otherwise, Code::T_NEAR);
 		reach(block.successors[0]);
@@ -877,11 +885,28 @@ private:
 			return emitted;
 		}
 		// A clean read belongs to the clean evaluator: its memo, its reader.
-		if (m_clean_evaluator && m_clean_depth == 0 && IsRawRead(m_program, *inst) &&
-		    inst->Flags<SrtReadFlags>().clean != 0u) {
+		const bool clean_read =
+		    IsRawRead(m_program, *inst) && inst->Flags<SrtReadFlags>().clean != 0u;
+		if (m_clean_evaluator && m_clean_depth == 0 && clean_read) {
 			EnterClean();
 			code.call(Subroutine(inst));
 			LeaveClean();
+		} else if (m_inline_single_use && m_fail_unwinds &&
+		           m_single_use_depth < MaxSingleUseDepth && !clean_read && InlineOnce(*inst) &&
+		           SingleUse(*inst)) {
+			// Its only use is here: nothing in the walk asks the memo for it, so the call and the
+			// memo check are skipped. The value is still stored, for the interpreter that
+			// evaluates the remaining descriptors after the walk.
+			++m_single_use_depth;
+			const bool emitted = EmitInst(*inst);
+			--m_single_use_depth;
+			if (!emitted) return false;
+			const auto slot =
+			    static_cast<uint32_t>(inst->EvaluationIndex(m_program.evaluation_value_count)) *
+			    sizeof(ResourcePlan::EvaluationContext::Entry);
+			code.mov(code.qword[code.r12 + slot], code.rax);
+			code.mov(code.qword[code.r12 + slot + 8], code.r14);
+			return true;
 		} else {
 			code.call(Subroutine(inst));
 		}
@@ -923,6 +948,60 @@ private:
 			}
 			default: return false;
 		}
+	}
+
+	// Values a single use may compute in place of a subroutine call, when the use's failure label
+	// unwinds the stack (m_fail_unwinds): such code may leave pushes behind when an operand is
+	// unknown, as a subroutine's frame does. Phis read the walk's block state and ReadFirstLane
+	// enters an assumption; they keep their subroutines.
+	static bool InlineOnce(const Inst& inst) {
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::Phi:
+			case ValueOpcode::ReadFirstLane: return false;
+			default: return true;
+		}
+	}
+
+	// Whether the walker evaluates a value at exactly one place: one use, counting the uses by
+	// instructions (uses through forwarding instructions count as theirs) and the references
+	// from the reads, the plain descriptor DWORDs and the block conditions the walker emits.
+	bool SingleUse(const Inst& inst) {
+		if (m_roots.empty()) {
+			const auto root = [&](Value value) {
+				if (const auto* referenced = value.Resolve().TryInstruction()) {
+					++m_roots[referenced];
+				}
+			};
+			m_roots[nullptr] = 0;
+			for (const auto& read: m_program.srt_reads)
+				root(read.value);
+			for (const auto& descriptor: m_program.descriptor_sources) {
+				for (uint32_t dword = 0; dword < descriptor.dword_count && dword < 8u; ++dword)
+					root(descriptor.dwords[dword]);
+			}
+			for (const auto& block: m_program.control_flow) {
+				if (!block.condition.IsEmpty()) root(block.condition);
+			}
+		}
+		const auto root_uses = [&](const Inst* referenced) -> size_t {
+			const auto found = m_roots.find(referenced);
+			return found == m_roots.end() ? 0u : found->second;
+		};
+		size_t uses = root_uses(&inst);
+		for (const auto& use: inst.Uses()) {
+			switch (use.user->GetOpcode()) {
+				case ValueOpcode::Identity:
+				case ValueOpcode::ConditionRef:
+				case ValueOpcode::BitCastU32F32:
+				case ValueOpcode::BitCastF32U32:
+					// Forwarders are emitted at each of their uses.
+					if (root_uses(use.user) != 0u || use.user->UseCount() != 1u) return false;
+					++uses;
+					break;
+				default: ++uses; break;
+			}
+		}
+		return uses == 1u;
 	}
 
 	// The subroutine computing a value in the current mode (plain or clean, and the innermost
@@ -1034,6 +1113,7 @@ private:
 			if (key.assumption != NoAssumption) m_assume.push_back(key.assumption);
 			m_clean_depth = key.clean ? 1 : 0;
 			m_fail        = &unknown;
+			m_fail_unwinds = true;
 			if (!EmitInst(*key.inst)) return false;
 			code.mov(code.rsp, code.rbp);
 			code.pop(code.r14);
@@ -1086,10 +1166,13 @@ private:
 	// Evaluates a value whose unknown outcome is handled locally: on "unknown" control
 	// continues at `unknown` with the stack pointer and the memo registers restored.
 	bool EmitTolerant(Value value, Xbyak::Label& unknown) {
-		auto* const previous = m_fail;
-		m_fail               = &unknown;
-		const bool emitted   = Emit(value);
-		m_fail               = previous;
+		auto* const previous         = m_fail;
+		const bool  previous_unwinds = m_fail_unwinds;
+		m_fail                       = &unknown;
+		m_fail_unwinds               = false;
+		const bool emitted           = Emit(value);
+		m_fail                       = previous;
+		m_fail_unwinds               = previous_unwinds;
 		return emitted;
 	}
 
@@ -1115,10 +1198,13 @@ private:
 		code.push(code.r12);
 		LoadMemoBase(code.r12);
 		Xbyak::Label restore, done;
-		auto* const  previous = m_fail;
-		m_fail                = &restore;
-		const bool emitted    = Emit(value);
-		m_fail                = previous;
+		auto* const  previous         = m_fail;
+		const bool   previous_unwinds = m_fail_unwinds;
+		m_fail                        = &restore;
+		m_fail_unwinds                = false;
+		const bool emitted            = Emit(value);
+		m_fail                        = previous;
+		m_fail_unwinds                = previous_unwinds;
 		m_assume.pop_back();
 		if (!emitted) return false;
 		code.pop(code.r12);
@@ -1723,6 +1809,12 @@ private:
 	int                                       m_clean_depth     = 0;
 	static constexpr int                      MaxInlineDepth    = 4;
 	int                                       m_inline_depth    = 0;
+	// Single-use values computed in place (Emit), and whether m_fail unwinds the stack.
+	bool                                      m_inline_single_use = false;
+	static constexpr int                      MaxSingleUseDepth   = 16;
+	int                                       m_single_use_depth  = 0;
+	bool                                      m_fail_unwinds      = true;
+	std::unordered_map<const Inst*, size_t>   m_roots;
 	std::unordered_map<const Inst*, bool>     m_may_be_unknown;
 	Xbyak::Label*                             m_fail = &m_failed;
 	std::vector<uint32_t>                     m_descriptor_sources;
@@ -1751,8 +1843,11 @@ void CompileGeneralSrtWalker(ResourcePlan& program) {
 	    program.srt_reads.empty()) {
 		return;
 	}
-	GeneralWalkerCompiler compiler(program);
-	if (!compiler.Compile()) {
+	// Single-use values computed in place make larger code; a plan that no longer fits the
+	// code cap (or fails for any reason) compiles with subroutines for every value.
+	if (GeneralWalkerCompiler compiler(program, true); compiler.Compile()) return;
+	GeneralWalkerCompiler compact(program, false);
+	if (!compact.Compile()) {
 		program.srt_general_code.reset();
 	}
 }
