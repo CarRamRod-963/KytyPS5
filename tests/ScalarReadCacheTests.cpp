@@ -280,6 +280,39 @@ void TestUncachedAndUnmappedReads() {
         "a wide read did not read back its own range");
 }
 
+// Readers that look chunks up themselves (the compiled resource walker) may use
+// only tagged entries: chunks read without GPU-dirty bytes since the last GPU
+// write.
+void TestTagsServeOnlyCleanChunks() {
+  FakeGuestMemory memory;
+  const auto clean = FakeGuestMemory::Base + 0x180;
+  const auto mixed = FakeGuestMemory::Base + 0x200;
+  memory.CpuWrite(clean + 8, 41);
+  memory.CpuWrite(mixed, 42);
+  memory.GpuWrite(mixed + 0x40, 43);
+  Cache cache(memory);
+  const auto index = [](uint64_t address) {
+    return (address / Cache::ChunkBytes) % Cache::Entries;
+  };
+  const auto tag = [&](uint64_t address) {
+    return cache.Tags()[index(address)];
+  };
+  for (size_t entry = 0; entry < Cache::Entries; ++entry)
+    Check(cache.Tags()[entry] == UINT64_MAX, "a new cache has a tagged entry");
+  Check(ReadWord(cache, clean + 8) == 41 && tag(clean) == clean,
+        "a clean chunk was not tagged");
+  uint32_t word = 0;
+  std::memcpy(&word, cache.Data() + index(clean) * Cache::Stride() + 8,
+              sizeof(word));
+  Check(word == 41, "a tagged entry does not hold the chunk's bytes");
+  Check(ReadWord(cache, mixed) == 42 && tag(mixed) == UINT64_MAX,
+        "a chunk with GPU-dirty bytes was tagged");
+  memory.GpuWrite(FakeGuestMemory::Base + 0x900, 1);
+  (void)ReadWord(cache, FakeGuestMemory::Base + 0x300);
+  Check(tag(clean) == UINT64_MAX,
+        "a chunk filled before a GPU write stayed tagged");
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +323,7 @@ int main() {
   TestPublishedWordOfCachedChunk();
   TestWalkReadBacksShareOneWait();
   TestUncachedAndUnmappedReads();
+  TestTagsServeOnlyCleanChunks();
   std::printf("ScalarReadCacheTests: ok\n");
   return 0;
 }
