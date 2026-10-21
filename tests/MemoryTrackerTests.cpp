@@ -1032,6 +1032,61 @@ void TestUploadDoesNotSerializeDisjointRegion() {
         "upload callback serialized an unrelated tracker region");
 }
 
+// Queries of the dirty state read it without the region lock: a query of a page
+// in a region whose lock another thread holds (here across an upload callback)
+// answers without waiting for it.
+void TestQueryDoesNotWaitForRegionLock() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto second = address + page_size;
+  Check(tracker.IsRegionCpuModified(second, page_size),
+        "lock-free query setup did not initialize the region");
+
+  std::binary_semaphore upload_entered{0};
+  std::binary_semaphore finish_upload{0};
+  std::binary_semaphore query_finished{0};
+  std::atomic_bool cpu_result{false};
+  std::atomic_bool gpu_result{true};
+  std::jthread uploader([&] {
+    tracker.ForEachUploadRange(
+        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          upload_entered.release();
+          // Bounded, so a query that waits for the lock fails the test
+          // instead of hanging it.
+          (void)finish_upload.try_acquire_for(std::chrono::seconds(5));
+        });
+  });
+  upload_entered.acquire();
+  std::jthread query([&] {
+    cpu_result.store(tracker.IsRegionCpuModified(second, page_size),
+                     std::memory_order_relaxed);
+    gpu_result.store(tracker.IsRegionGpuModified(second, page_size),
+                     std::memory_order_relaxed);
+    query_finished.release();
+  });
+  const bool answered_while_locked =
+      query_finished.try_acquire_for(std::chrono::seconds(4));
+  finish_upload.release();
+  uploader.join();
+  query.join();
+
+  Check(tracker.IsRegionGpuModified(address, page_size),
+        "upload did not leave its page GPU-dirty");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+  Check(answered_while_locked &&
+            cpu_result.load(std::memory_order_relaxed) &&
+            !gpu_result.load(std::memory_order_relaxed),
+        "a dirty-state query waited for the region lock");
+}
+
 void TestDownloadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1387,6 +1442,7 @@ int main(int argc, char **argv) {
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
+  TestQueryDoesNotWaitForRegionLock();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
