@@ -26,10 +26,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <utility>
@@ -767,6 +769,11 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 	m_num_instances      = num_instances;
 	m_num_instances_addr = 0;
+	if (!m_deferred_indirect.empty()) {
+		std::erase_if(m_deferred_indirect, [](const DeferredIndirectValue& value) {
+			return value.field == DeferredIndirectValue::Field::InstanceCount;
+		});
+	}
 }
 
 uint32_t CommandProcessor::NumInstances() {
@@ -832,6 +839,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	if (args.offset_source == DrawOffsetSource::DrawState) {
+		SettleIndirectDrawState(true, args.instance_count == 0);
+	}
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -888,9 +898,20 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
-	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		SettleLabelAccess(count_addr, sizeof(uint32_t));
+	}
+	if (DrawIndirectOnGpu(data_offset, max_count_or_count, count_addr, stride_in_bytes, registers,
+	                      indexed)) {
+		// The deferred state holds the last instance count.
+		m_num_instances_addr = 0;
+		return;
+	}
+	// The packet replaces the deferred state only when it draws, and its shader may read any.
+	SettleIndirectDrawState(true, true);
+
+	uint32_t draw_count = max_count_or_count;
+	if (count_addr != nullptr) {
 		draw_count = std::min(uint32_t {*count_addr}, max_count_or_count);
 	}
 	if (draw_count == 0) {
@@ -947,6 +968,139 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 }
 
+bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
+                                         const volatile uint32_t* count_addr,
+                                         uint32_t stride_in_bytes, IndirectDrawRegisters registers,
+                                         bool indexed) {
+	// The offsets go to vertex user SGPRs, which the vertex shader then reads from its draw.
+	const auto slot = [](uint32_t location) -> std::optional<int32_t> {
+		if (location == Pm4::SH_NOP) {
+			return -1;
+		}
+		if (location >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+		    location <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
+			return static_cast<int32_t>(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+		}
+		return std::nullopt;
+	};
+	const auto vertex_slot   = slot(registers.vertex_offset);
+	const auto instance_slot = slot(registers.instance_offset);
+	if (registers.index_offset != Pm4::SH_NOP || !vertex_slot || !instance_slot ||
+	    max_count_or_count == 0) {
+		return false;
+	}
+	// User SGPRs earlier packets left on the GPU and this one does not write: the renderer asks
+	// for them only when the draw's vertex stage reads them.
+	uint32_t stale_slots = 0;
+	for (const auto& value: m_deferred_indirect) {
+		if (value.field != DeferredIndirectValue::Field::InstanceCount &&
+		    value.location != registers.vertex_offset &&
+		    value.location != registers.instance_offset) {
+			stale_slots |= 1u << (value.location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+		}
+	}
+	IndirectDrawSource args {
+	    .args_address         = m_draw_indirect_args_base_addr + data_offset,
+	    .stride               = stride_in_bytes,
+	    .max_draw_count       = max_count_or_count,
+	    .count_address        = reinterpret_cast<uint64_t>(count_addr),
+	    .indexed              = indexed,
+	    .index_base           = m_index_base_addr,
+	    .index_buffer_size    = m_index_buffer_size,
+	    .index_type_and_size  = m_index_type_and_size,
+	    .vertex_offset_slot   = *vertex_slot,
+	    .instance_offset_slot = *instance_slot,
+	    .stale_slots          = stale_slots,
+	};
+	auto& executor = m_renderer.GetRenderExecutor();
+	auto  result   = executor.DrawIndirect(m_submit_id, CurrentBuffer(), args);
+	if (result == DrawIndirectResult::SettleRegisters) {
+		SettleIndirectDrawState(true, false);
+		args.stale_slots = 0;
+		result           = executor.DrawIndirect(m_submit_id, CurrentBuffer(), args);
+	}
+	if (result == DrawIndirectResult::ReadArguments) {
+		return false;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws);
+	using Field = DeferredIndirectValue::Field;
+	std::erase_if(m_deferred_indirect, [&](const DeferredIndirectValue& value) {
+		return value.field == Field::InstanceCount || value.location == registers.vertex_offset ||
+		       value.location == registers.instance_offset;
+	});
+	const auto defer = [&](uint32_t location, Field field) {
+		m_deferred_indirect.push_back({.location     = location,
+		                               .field        = field,
+		                               .indexed      = indexed,
+		                               .args_address = args.args_address,
+		                               .stride       = stride_in_bytes,
+		                               .max_count    = max_count_or_count,
+		                               .count_addr   = count_addr});
+	};
+	if (registers.vertex_offset != Pm4::SH_NOP) {
+		defer(registers.vertex_offset, Field::BaseVertex);
+	}
+	if (registers.instance_offset != Pm4::SH_NOP) {
+		defer(registers.instance_offset, Field::FirstInstance);
+	}
+	defer(Pm4::SH_NOP, Field::InstanceCount);
+	return true;
+}
+
+void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instances) {
+	using Field = DeferredIndirectValue::Field;
+	if (m_deferred_indirect.empty()) {
+		return;
+	}
+	std::vector<DeferredIndirectValue> settled;
+	std::erase_if(m_deferred_indirect, [&](const DeferredIndirectValue& value) {
+		const bool take = value.field == Field::InstanceCount ? num_instances : registers;
+		if (take) {
+			settled.push_back(value);
+		}
+		return take;
+	});
+	for (const auto& value: settled) {
+		// The draws read their count and arguments in order; the last one drawn set the state,
+		// and a packet that drew nothing left it as it was.
+		uint32_t count = value.max_count;
+		if (value.count_addr != nullptr) {
+			SettleLabelAccess(value.count_addr, sizeof(uint32_t));
+			const uint32_t selected = *value.count_addr;
+			count                   = std::min(selected, value.max_count);
+		}
+		if (count == 0) {
+			continue;
+		}
+		const auto args_addr =
+		    value.args_address + static_cast<uint64_t>(count - 1u) * value.stride;
+		uint32_t word = 0;
+		switch (value.field) {
+			case Field::BaseVertex:
+				word = value.indexed ? offsetof(vk::DrawIndexedIndirectCommand, vertexOffset) / 4u
+				                     : offsetof(vk::DrawIndirectCommand, firstVertex) / 4u;
+				break;
+			case Field::FirstInstance:
+				word = value.indexed
+				           ? offsetof(vk::DrawIndexedIndirectCommand, firstInstance) / 4u
+				           : offsetof(vk::DrawIndirectCommand, firstInstance) / 4u;
+				break;
+			case Field::InstanceCount:
+				word = value.indexed ? offsetof(vk::DrawIndexedIndirectCommand, instanceCount) / 4u
+				                     : offsetof(vk::DrawIndirectCommand, instanceCount) / 4u;
+				break;
+		}
+		const auto argument = reinterpret_cast<const uint32_t*>(args_addr)[word];
+		if (value.field == Field::InstanceCount) {
+			m_num_instances      = argument;
+			m_num_instances_addr = 0;
+		} else {
+			PatchIndirectDrawOffsets(*this, {value.location, Pm4::SH_NOP, Pm4::SH_NOP}, argument, 0,
+			                         0);
+		}
+	}
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -991,6 +1145,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	if (args.offset_source == DrawOffsetSource::DrawState) {
+		SettleIndirectDrawState(true, args.instance_count == 0);
+	}
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
