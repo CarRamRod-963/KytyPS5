@@ -1906,13 +1906,15 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 
 // State an extracted or loaded plan derives from its fields: one key set per selector group, which
 // extraction numbers densely in order of first use (false when they are not), and the walker.
-static bool DerivePlanState(ResourcePlan& plan, SrtWalkerLoads loads = SrtWalkerLoads::Direct) {
+static bool DerivePlanState(ResourcePlan& plan, SrtWalkerLoads loads = SrtWalkerLoads::Direct,
+                            bool compile = true) {
 	for (const auto group: plan.selector_groups) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.emplace_back();
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
 	plan.user_data_reads = PlanUserDataReads(plan);
-	if (plan.srt_plan_complete && plan.resource_tracking_complete) CompileSrtWalker(plan, {}, loads);
+	if (compile && plan.srt_plan_complete && plan.resource_tracking_complete)
+		CompileSrtWalker(plan, {}, loads);
 	return true;
 }
 
@@ -1976,7 +1978,8 @@ void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& ta
 	}
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerLoads loads) {
+ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerLoads loads,
+                                 SrtWalkerCompilation compilation) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -2169,7 +2172,7 @@ ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerLoads loads) {
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
-	DerivePlanState(plan, loads);
+	DerivePlanState(plan, loads, compilation == SrtWalkerCompilation::Now);
 	return plan;
 }
 

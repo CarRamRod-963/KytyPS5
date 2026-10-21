@@ -66,9 +66,13 @@ struct ResourceSpecialization {
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
-// The plan's walker loads guest memory as `loads` says (see CompileSrtWalker).
-ResourcePlan ExtractResourcePlan(const Program& program,
-                                 SrtWalkerLoads loads = SrtWalkerLoads::Direct);
+// The plan's walker loads guest memory as `loads` says (see CompileSrtWalker). Extraction is
+// deterministic: two plans extracted from one program are interchangeable. A deferred plan has no
+// walker yet; CompileSrtWalker(plan, {}, loads) adds it (e.g. on another thread) before any walk.
+enum class SrtWalkerCompilation { Now, Deferred };
+ResourcePlan ExtractResourcePlan(const Program&       program,
+                                 SrtWalkerLoads       loads       = SrtWalkerLoads::Direct,
+                                 SrtWalkerCompilation compilation = SrtWalkerCompilation::Now);
 
 // Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
 // and scratch state like extraction. A failed load leaves a plan that must not be used.
