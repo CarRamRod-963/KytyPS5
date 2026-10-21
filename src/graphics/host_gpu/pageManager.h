@@ -31,8 +31,13 @@ public:
 	// return false. False, with nothing written, when a page is watched, the range crosses a
 	// tracking region or lies outside the tracked space, or it has no backing.
 	[[nodiscard]] bool TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size);
+	// Whether TryWriteUnwatched would find no watcher on the range now.
+	[[nodiscard]] bool IsUnwatched(uint64_t vaddr, uint64_t size);
 
 private:
+	template <typename Action>
+	bool WithUnwatched(uint64_t vaddr, uint64_t size, Action&& action);
+
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;
 };

@@ -318,7 +318,27 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	// A label the GPU work recorded before stores at the end of that work. Every command recorded
+	// after a guest flush runs after it, so the stream need not stop until the GPU gets there;
+	// the label itself stays pending until then (see PendingLabels).
+	const auto elide = [&] {
+		return m_renderer.ElideLabelWait(
+		    reinterpret_cast<uint64_t>(addr), sizeof(T),
+		    [&](uint64_t value) { return TestWaitRegMemValue(value, ref, mask, func); });
+	};
+	if (m_renderer.HasElidedLabels()) {
+		// The bytes may belong to a label whose earlier wait was elided and that is not stored.
+		if (elide()) {
+			EmitGlobalBarrier();
+			return;
+		}
+		SettleLabelAccess(addr, sizeof(T));
+	}
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		if (elide()) {
+			EmitGlobalBarrier();
+			return;
+		}
 		SuspendPm4(Common::GpuTiming::StallKind::WaitRegMem);
 	}
 }
@@ -345,6 +365,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	SettleLabelAccess(dst, (write_one_address ? 1u : dw_num) * sizeof(uint32_t));
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -360,6 +381,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	SettleLabelAccess(reinterpret_cast<const void*>(dst_address), num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -846,6 +868,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
+			SettleLabelAccess(address, 16u * 2u * sizeof(uint64_t));
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
@@ -864,6 +887,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			SettleLabelAccess(address, sizeof(uint64_t));
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -942,6 +966,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		SettleLabelAccess(count_addr, sizeof(uint32_t));
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -1280,21 +1305,32 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
 		scheduler.Flush();
 	}
+	// Pending until stored, so a WAIT_REG_MEM on it can continue behind a barrier.
+	auto&      labels = m_renderer.GetPendingLabels();
+	const auto label_id =
+	    labels.Add(reinterpret_cast<uint64_t>(dst), sizeof(T), static_cast<uint64_t>(value));
 	// Queued after the flush: the submission queued the publication of its asynchronous
 	// downloads, which then runs before the label on the completion thread.
-	scheduler.DeferPriorityOperationAfterRecorded(
-	    [&renderer = m_renderer, &scheduler, dst, value, with_interrupt, issued_ns,
+	const auto label_tick = scheduler.DeferPriorityOperationAfterRecorded(
+	    [&renderer = m_renderer, &scheduler, dst, value, with_interrupt, issued_ns, label_id,
 	     event_id  = m_interrupt_event_id, interrupt_context_id] {
 		    const auto tick = scheduler.ActivePriorityTick();
-		    renderer.DeliverLabel(dst, static_cast<uint64_t>(value), sizeof(T),
-		                          [&renderer, &scheduler, tick, issued_ns, with_interrupt, event_id,
-		                           interrupt_context_id] {
-			                          scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
-			                          if (with_interrupt) {
-				                          renderer.TriggerInterrupt(event_id, interrupt_context_id);
-			                          }
-		                          });
+		    renderer.DeliverLabel(
+		        dst, static_cast<uint64_t>(value), sizeof(T),
+		        [&renderer, &scheduler, tick, issued_ns, with_interrupt, event_id,
+		         interrupt_context_id] {
+			        scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
+			        if (with_interrupt) {
+				        renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			        }
+		        },
+		        label_id);
 	    });
+	if (label_tick == 0) {
+		labels.Stored(label_id); // Shutdown: already stored.
+	} else {
+		labels.SetTick(label_id, label_tick);
+	}
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

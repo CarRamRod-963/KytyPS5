@@ -886,9 +886,25 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+void SettleLabelAccess(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && g_gpu_resources->HasElidedLabels()) {
+		g_gpu_resources->SettleElidedLabels(vaddr, size);
+	}
+}
+
+// A GPU-thread read after an elided label wait sees the label as stored.
+static bool PatchElidedLabels(bool read, uint64_t vaddr, void* data, uint64_t size) {
+	if (read && g_gpu_resources != nullptr && g_gpu_resources->HasElidedLabels() &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		g_gpu_resources->GetPendingLabels().PatchElided(vaddr, size, data);
+	}
+	return read;
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+	return PatchElidedLabels(g_guest_address_space != nullptr &&
+	                             g_guest_address_space->TryReadBacking(vaddr, data, size),
+	                         vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1012,11 +1028,13 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space->CopySparseMemory<false>(vaddr, data, size);
+	return PatchElidedLabels(g_guest_address_space->CopySparseMemory<false>(vaddr, data, size),
+	                         vaddr, data, size);
 }
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
+	return PatchElidedLabels(g_guest_address_space->CopySparseMemory<true>(vaddr, data, size),
+	                         vaddr, data, size);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

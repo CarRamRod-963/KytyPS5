@@ -259,9 +259,9 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
-void CommandScheduler::DeferPriorityOperationAfterRecorded(
-    Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true, true);
+uint64_t
+CommandScheduler::DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation) {
+	return QueueOperation(std::move(operation), true, true);
 }
 
 uint64_t CommandScheduler::ActivePriorityTick() {
@@ -269,8 +269,8 @@ uint64_t CommandScheduler::ActivePriorityTick() {
 	return m_priority_active ? m_priority_active_tick : 0;
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-                                      bool after_recorded) {
+uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                          bool after_recorded) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -291,7 +291,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 		if (priority) {
 			m_operation_available.notify_one();
 		}
-		return;
+		return tick;
 	}
 	if (g_deferred_callback_scheduler != this) {
 		m_operation_available.wait(lock,
@@ -299,6 +299,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	}
 	lock.unlock();
 	operation();
+	return 0;
 }
 
 bool CommandScheduler::HasPendingPriorityOperations() {
