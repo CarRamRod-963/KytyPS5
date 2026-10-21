@@ -201,6 +201,10 @@ bool SkipPendingDrawsEnabled() {
 	return g_config->skip_pending_draws;
 }
 
+uint32_t LookaheadThreads() {
+	return g_config->lookahead_threads;
+}
+
 bool SerializeDispatchesEnabled() {
 	return g_config->serialize_dispatches;
 }
