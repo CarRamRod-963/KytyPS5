@@ -624,6 +624,12 @@ add_executable(bindless_translation_tests EXCLUDE_FROM_ALL
 target_link_libraries(bindless_translation_tests common fmt::fmt)
 target_include_directories(bindless_translation_tests PRIVATE ${inc_headers})
 
+add_executable(filtered_range_set_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FilteredRangeSetTests.cpp"
+)
+target_include_directories(filtered_range_set_tests PRIVATE ${inc_headers})
+target_link_libraries(filtered_range_set_tests common)
+
 add_executable(pending_labels_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PendingLabelsTests.cpp"
 )
@@ -769,6 +775,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME bindless_translation COMMAND $<TARGET_FILE:bindless_translation_tests>)
+	add_test(NAME filtered_range_set COMMAND $<TARGET_FILE:filtered_range_set_tests>)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME layout_change_log COMMAND $<TARGET_FILE:layout_change_log_tests>)
@@ -904,6 +911,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		bindless_translation_tests
+		filtered_range_set_tests
 		pending_labels_tests
 		scalar_read_cache_tests
 		layout_change_log_tests
