@@ -4,7 +4,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -39,6 +42,35 @@ protected:
 	~ImageHeapSource() = default;
 };
 
+// A direct-mapped cache of guest memory in 128-byte chunks that read_memory keeps: a DWORD read
+// whose chunk address equals the tag of entry (address / ChunkBytes) & index_mask may load the
+// DWORD from that entry, at data + index * stride + address % ChunkBytes, instead of calling
+// read_memory, with the same result. Only read_memory calls change the tags and the entries.
+struct SrtReadCacheView {
+	static constexpr uint64_t ChunkBytes = 128;
+	const uint64_t*           tags       = nullptr;
+	const uint8_t*            data       = nullptr;
+	uint32_t                  stride     = 0;
+	uint32_t                  index_mask = 0;
+};
+
+// The ordinary reads a capture (SrtReadCapture) did not see because the compiled walker served
+// them from the read cache, as [begin, end) ranges; a read that continues the last range extends
+// it. Flush appends them to the capture's ranges. A full log sends the reads to read_memory.
+struct SrtReadLog {
+	static constexpr uint32_t                           Capacity = 64;
+	uint32_t                                            count    = 0;
+	std::array<std::pair<uint64_t, uint64_t>, Capacity> ranges {};
+	std::vector<std::pair<uint64_t, uint64_t>>*         target = nullptr;
+
+	void Flush() {
+		for (uint32_t index = 0; index < count; ++index) {
+			target->emplace_back(ranges[index].first, ranges[index].second - ranges[index].first);
+		}
+		count = 0;
+	}
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -48,12 +80,17 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// Optional: the cache read_memory reads through, and where reads served from it are logged.
+	const SrtReadCacheView* read_cache = nullptr;
+	SrtReadLog*             read_log   = nullptr;
 };
 
 class SrtReadCapture {
 public:
 	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	    m_source(source), m_ranges(ranges) {
+		m_log.target = &m_ranges;
+	}
 	SrtRuntime ObservedRuntime();
 
 private:
@@ -62,6 +99,7 @@ private:
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	SrtReadLog                                  m_log;
 };
 
 // Retained reads no longer need the guest instruction PC. A clean read evaluates
