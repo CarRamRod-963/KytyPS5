@@ -201,7 +201,7 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		ExclusiveSection lock(*this);
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -215,7 +215,7 @@ public:
 		}
 
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
-		std::lock_guard lock(m_mutex);
+		ExclusiveSection lock(*this);
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -248,23 +248,38 @@ public:
 			return false;
 		}
 
-		std::shared_lock lock(m_mutex);
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_backing_read != nullptr) {
-			g_test_backing_read(vaddr, size);
-		}
-#endif
 		const auto end  = vaddr + size;
 		auto&      last = t_last_mapping;
-		if (last.owner == this && last.generation == m_maps_generation &&
+		// A read inside the thread's last mapping takes no lock: it copies optimistically and
+		// keeps the copy only when no exclusive section ran meanwhile, so it is ordered against
+		// map changes and backing writes exactly like a read under the shared lock.
+		[[maybe_unused]] bool hooked = false;
+		if (const auto sequence = m_sequence.load(std::memory_order_acquire);
+		    (sequence & 1u) == 0u && last.owner == this &&
+		    last.generation == m_maps_generation.load(std::memory_order_relaxed) &&
 		    vaddr >= last.entry.vaddr && end <= last.entry.vaddr + last.entry.size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+			if (g_test_backing_read != nullptr) {
+				g_test_backing_read(vaddr, size);
+				hooked = true;
+			}
+#endif
 			const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
 			if (!RangeOk(offset, size)) {
 				return false;
 			}
 			std::memcpy(data, m_backing_base + offset, size);
-			return true;
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (m_sequence.load(std::memory_order_relaxed) == sequence) {
+				return true;
+			}
 		}
+		std::shared_lock lock(m_mutex);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr && !hooked) {
+			g_test_backing_read(vaddr, size);
+		}
+#endif
 		auto first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
 			return false;
@@ -350,14 +365,14 @@ public:
 		}
 
 		{
-			std::lock_guard lock(m_mutex);
+			ExclusiveSection lock(*this);
 			m_maps_generation = NextMapsGeneration();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
-		std::lock_guard lock(m_mutex);
+		ExclusiveSection lock(*this);
 		m_maps_generation = NextMapsGeneration();
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
@@ -378,7 +393,7 @@ public:
 		const auto            end = vaddr + size;
 		std::vector<MapEntry> targets;
 		{
-			std::lock_guard lock(m_mutex);
+			ExclusiveSection lock(*this);
 			m_maps_generation       = NextMapsGeneration();
 			auto            current = vaddr;
 			while (current < end) {
@@ -435,7 +450,7 @@ public:
 
 		MapEntry old {};
 		{
-			std::lock_guard lock(m_mutex);
+			ExclusiveSection lock(*this);
 			m_maps_generation    = NextMapsGeneration();
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
@@ -462,7 +477,7 @@ public:
 			const bool unmapped =
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
-				std::lock_guard lock(m_mutex);
+				ExclusiveSection lock(*this);
 				m_maps_generation = NextMapsGeneration();
 				m_maps.emplace(old.vaddr, old);
 				return false;
@@ -502,7 +517,7 @@ public:
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		ExclusiveSection lock(*this);
 		m_maps_generation = NextMapsGeneration();
 		m_maps.emplace(old.vaddr, old);
 		return false;
@@ -513,7 +528,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		ExclusiveSection lock(*this);
 		m_maps_generation = NextMapsGeneration();
 		RemoveMappingsUnlocked(vaddr, size);
 
@@ -718,7 +733,29 @@ private:
 		static std::atomic<uint64_t> generations {0};
 		return generations.fetch_add(1, std::memory_order_relaxed) + 1u;
 	}
-	uint64_t m_maps_generation = NextMapsGeneration();
+	std::atomic<uint64_t> m_maps_generation = NextMapsGeneration();
+	// Odd while an exclusive section runs: TryReadBacking's lock-free path compares it around
+	// its copy.
+	std::atomic<uint64_t> m_sequence {0};
+
+	// The exclusive lock of every section that changes the maps or writes the backing.
+	class ExclusiveSection {
+	public:
+		explicit ExclusiveSection(GuestBackingStore& store): m_store(store), m_lock(store.m_mutex) {
+			const auto sequence = m_store.m_sequence.load(std::memory_order_relaxed);
+			m_store.m_sequence.store(sequence + 1u, std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_release);
+		}
+		~ExclusiveSection() {
+			const auto sequence = m_store.m_sequence.load(std::memory_order_relaxed);
+			m_store.m_sequence.store(sequence + 1u, std::memory_order_release);
+		}
+		KYTY_CLASS_NO_COPY(ExclusiveSection);
+
+	private:
+		GuestBackingStore&                 m_store;
+		std::lock_guard<std::shared_mutex> m_lock;
+	};
 
 	// The mapping a thread's last TryReadBacking found, valid while the maps are unchanged: the
 	// GPU thread reads guest memory in small pieces (resource walks, descriptor tables) that
