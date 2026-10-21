@@ -127,6 +127,9 @@ public:
 	// For commands that access no memory when they execute: binding pipelines, descriptors and
 	// vertex/index buffers, push constants, dynamic state.
 	[[nodiscard]] vk::CommandBuffer StateHandle() const;
+	// Binds a compute pipeline unless it is still bound: guest dispatches often run one shader
+	// many times in a row. A pipeline bound through Handle() (helper passes) is forgotten there.
+	void BindComputePipeline(vk::Pipeline pipeline) const;
 	// For one guest dispatch, recorded next with the returned handle. `writes`: the dispatch may
 	// write memory through any path. `shared`: it uses emulator memory shared between dispatches
 	// (the LDS backing, GDS). Records the barrier it needs against earlier commands.
@@ -172,6 +175,8 @@ private:
 	mutable bool        m_rendering   = false;
 	mutable bool        m_has_commands = false;
 	mutable uint32_t    m_command_count = 0;
+	// The compute pipeline BindComputePipeline bound last, until Handle() or the next Begin.
+	mutable vk::Pipeline m_compute_pipeline = nullptr;
 	// Kept across submissions: barriers order commands in submission order on the queue.
 	mutable BarrierTracker m_barriers;
 	HW::Context*        m_registers   = nullptr;

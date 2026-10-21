@@ -455,9 +455,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// A host fence used to serialize every dispatch; the command buffer keeps that order with
 	// pipeline barriers.
+	buffer.BindComputePipeline(pipeline.pipeline);
 	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
 	                                             DispatchUsesSharedMemory(program, bindings));
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -553,7 +553,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
 	                          0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	buffer.BindComputePipeline(pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	// The guest clears color metadata with compute; the texture cache reads the clear code

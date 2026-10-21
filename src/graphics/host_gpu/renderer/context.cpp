@@ -32,6 +32,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	RecordBarrier(m_barriers.BeforeCommand());
 	m_has_commands = true;
 	m_command_count++;
+	// The caller may bind a pipeline of its own.
+	m_compute_pipeline = nullptr;
 	return m_buffer;
 }
 
@@ -45,6 +47,14 @@ vk::CommandBuffer CommandBuffer::StateHandle() const {
 	EXIT_IF(IsInvalid());
 	m_has_commands = true;
 	return m_buffer;
+}
+
+void CommandBuffer::BindComputePipeline(vk::Pipeline pipeline) const {
+	if (pipeline == m_compute_pipeline) {
+		return;
+	}
+	StateHandle().bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+	m_compute_pipeline = pipeline;
 }
 
 vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const {
@@ -136,8 +146,9 @@ void CommandBuffer::Begin() {
 	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	m_has_commands  = false;
-	m_command_count = 0;
+	m_has_commands     = false;
+	m_command_count    = 0;
+	m_compute_pipeline = nullptr;
 }
 
 void CommandBuffer::End() const {
