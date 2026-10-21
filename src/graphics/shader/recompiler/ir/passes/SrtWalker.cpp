@@ -23,6 +23,8 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
+	// The compiled walker logs the reads it serves from the cache; the capture takes them.
+	runtime.read_log = m_source.read_cache != nullptr ? &m_log : nullptr;
 	return runtime;
 }
 
@@ -50,6 +52,8 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	runtime.read_cache  = nullptr;
+	runtime.read_log    = nullptr;
 	return runtime;
 }
 
@@ -420,6 +424,9 @@ struct GeneralWalkerContext {
 	// ResourcePlan::jit_descriptors and jit_descriptor_known.
 	uint32_t* descriptors      = nullptr;
 	uint8_t*  descriptor_known = nullptr;
+	// SrtRuntime::read_cache and read_log: ordinary reads that hit the cache load inline.
+	const SrtReadCacheView* read_cache = nullptr;
+	SrtReadLog*             read_log   = nullptr;
 };
 static_assert(offsetof(GeneralWalkerContext, user_data) == 0);
 static_assert(offsetof(GeneralWalkerContext, user_data_count) == 8);
@@ -440,6 +447,16 @@ static_assert(offsetof(GeneralWalkerContext, changed) == 116);
 static_assert(offsetof(GeneralWalkerContext, unknown_tag) == 120);
 static_assert(offsetof(GeneralWalkerContext, descriptors) == 128);
 static_assert(offsetof(GeneralWalkerContext, descriptor_known) == 136);
+static_assert(offsetof(GeneralWalkerContext, read_cache) == 144);
+static_assert(offsetof(GeneralWalkerContext, read_log) == 152);
+static_assert(offsetof(SrtReadCacheView, tags) == 0);
+static_assert(offsetof(SrtReadCacheView, data) == 8);
+static_assert(offsetof(SrtReadCacheView, stride) == 16);
+static_assert(offsetof(SrtReadCacheView, index_mask) == 20);
+static_assert(SrtReadCacheView::ChunkBytes == 128);
+static_assert(offsetof(SrtReadLog, count) == 0);
+static_assert(offsetof(SrtReadLog, ranges) == 8);
+static_assert(sizeof(std::pair<uint64_t, uint64_t>) == 16);
 
 static bool KYTY_SYSV_ABI GeneralWalkerRead(GeneralWalkerContext* context, uint64_t address,
                                             uint64_t clean) {
@@ -1584,6 +1601,7 @@ private:
 			code.ja(m_failed, Code::T_NEAR);
 		}
 		code.L(read);
+		if (m_clean_depth == 0) EmitCachedRead(done);
 		code.mov(code.rsi, code.rax);
 		code.mov(code.rdi, code.rbx);
 		code.mov(code.edx, m_clean_depth > 0 ? 1 : 0);
@@ -1599,6 +1617,54 @@ private:
 		code.mov(code.eax, code.dword[code.rbx + 80]);
 		code.L(done);
 		return true;
+	}
+
+	// An ordinary read of the DWORD at rax whose chunk is in the runtime's read cache loads it
+	// from the cache and logs it for a capture, then continues at `done`; anything else (no
+	// cache, a miss, a full log) falls through to the reader call. Clobbers only registers the
+	// call clobbers.
+	void EmitCachedRead(Xbyak::Label& done) {
+		auto&        code = *m_code;
+		Xbyak::Label slow, load, append;
+		code.mov(code.rcx, code.qword[code.rbx + 144]);
+		code.test(code.rcx, code.rcx);
+		code.jz(slow, Code::T_NEAR);
+		code.mov(code.rdx, code.rax);
+		code.shr(code.rdx, 7);
+		code.and_(code.edx, code.dword[code.rcx + 20]);
+		code.mov(code.rsi, code.qword[code.rcx]);
+		code.mov(code.rdi, code.rax);
+		code.and_(code.rdi, -128);
+		code.cmp(code.qword[code.rsi + code.rdx * 8], code.rdi);
+		code.jne(slow, Code::T_NEAR);
+		code.mov(code.rsi, code.qword[code.rbx + 152]);
+		code.test(code.rsi, code.rsi);
+		code.jz(load, Code::T_NEAR);
+		code.mov(code.r8d, code.dword[code.rsi]);
+		code.test(code.r8d, code.r8d);
+		code.jz(append, Code::T_NEAR);
+		code.mov(code.r9, code.r8);
+		code.shl(code.r9, 4);
+		code.cmp(code.qword[code.rsi + code.r9], code.rax);
+		code.jne(append, Code::T_NEAR);
+		code.add(code.qword[code.rsi + code.r9], 4);
+		code.jmp(load, Code::T_NEAR);
+		code.L(append);
+		code.cmp(code.r8d, SrtReadLog::Capacity);
+		code.jae(slow, Code::T_NEAR);
+		code.mov(code.r9, code.r8);
+		code.shl(code.r9, 4);
+		code.mov(code.qword[code.rsi + code.r9 + 8], code.rax);
+		code.lea(code.r10, code.ptr[code.rax + 4]);
+		code.mov(code.qword[code.rsi + code.r9 + 16], code.r10);
+		code.inc(code.dword[code.rsi]);
+		code.L(load);
+		code.imul(code.edx, code.dword[code.rcx + 16]);
+		code.add(code.rdx, code.qword[code.rcx + 8]);
+		code.and_(code.eax, 127);
+		code.mov(code.eax, code.dword[code.rdx + code.rax]);
+		code.jmp(done, Code::T_NEAR);
+		code.L(slow);
 	}
 
 	ResourcePlan&                             m_program;
@@ -2565,6 +2631,8 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 	m_program.jit_descriptor_known.assign(m_program.jit_descriptor_sources.size(), 0u);
 	context.descriptors          = m_program.jit_descriptors.data();
 	context.descriptor_known     = m_program.jit_descriptor_known.data();
+	context.read_cache           = m_runtime.read_cache;
+	context.read_log             = m_runtime.read_log;
 	using Walker = bool KYTY_SYSV_ABI (*)(GeneralWalkerContext*);
 	const auto          fallback = [&]() {
 		// A failed run leaves memo entries of this generation behind; the interpreter
@@ -2577,7 +2645,9 @@ int SrtWalker::RunGeneralWalker(std::vector<uint32_t>& flat) {
 		// Unknown values are retried in every run, as the interpreter's ResetUnknowns retries
 		// them when the reachable blocks change.
 		context.unknown_tag = (uint64_t {1} << 63u) | ++m_program.jit_runs;
-		if (m_program.srt_general_code->getCode<Walker>()(&context)) return 1;
+		const bool finished = m_program.srt_general_code->getCode<Walker>()(&context);
+		if (context.read_log != nullptr) context.read_log->Flush();
+		if (finished) return 1;
 		return context.read_failed != 0u ? -1 : fallback();
 	};
 	auto& visited = m_program.visited_blocks;
