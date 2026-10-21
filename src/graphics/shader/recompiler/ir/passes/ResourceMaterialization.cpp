@@ -1853,6 +1853,7 @@ static bool DerivePlanState(ResourcePlan& plan) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.emplace_back();
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
+	plan.user_data_reads = PlanUserDataReads(plan);
 	if (plan.srt_plan_complete && plan.resource_tracking_complete) CompileSrtWalker(plan);
 	return true;
 }
@@ -2112,6 +2113,17 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	DerivePlanState(plan);
 	return plan;
+}
+
+uint64_t PlanUserDataReads(const ResourcePlan& plan) {
+	uint64_t slots = 0;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() != ValueOpcode::GetUserData) continue;
+		const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+		if (reg < plan.user_data_base || reg - plan.user_data_base >= 64u) return ~uint64_t {0};
+		slots |= uint64_t {1} << (reg - plan.user_data_base);
+	}
+	return slots;
 }
 
 bool RangeOverlapIndex::Overlaps(std::span<const std::pair<uint64_t, uint64_t>> ranges,
@@ -2811,8 +2823,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       pattern_copy,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys,
-	       materialization_scratch] = plan;
+	       srt_code, srt_user_data, srt_captures, user_data_reads, srt_scratch, material_keys,
+	       selector_keys, materialization_scratch] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, formatted_components,

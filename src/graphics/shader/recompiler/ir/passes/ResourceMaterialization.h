@@ -73,6 +73,10 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
+// The user-data slots (SGPR minus the plan's user_data_base) the plan's values read, one bit each
+// for slots below 64; a slot at or above 64 sets every bit.
+[[nodiscard]] uint64_t PlanUserDataReads(const ResourcePlan& plan);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used;
 // snapshot.unavailable tells a failure caused by the draw's guest data from an unsupported shader.
 // Answers whether a range overlaps any of a list of (address, bytes) ranges, in logarithmic
