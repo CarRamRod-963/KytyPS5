@@ -108,6 +108,13 @@ public:
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
+	// Before a packet reads or writes guest memory itself: end-of-pipe labels there whose waits
+	// were elided are stored first (RenderContext::SettleElidedLabels).
+	void SettleLabelAccess(const volatile void* address, uint64_t size) {
+		if (m_renderer.HasElidedLabels()) {
+			m_renderer.SettleElidedLabels(reinterpret_cast<uint64_t>(address), size);
+		}
+	}
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
