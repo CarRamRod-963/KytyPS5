@@ -2168,12 +2168,24 @@ ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerCompilation wa
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	plan.user_data_reads = PlanUserDataReads(plan);
 	if (walkers == SrtWalkerCompilation::All) {
 		CompileSrtWalkers(plan);
 	} else {
 		CompileSrtWalker(plan);
 	}
 	return plan;
+}
+
+uint64_t PlanUserDataReads(const ResourcePlan& plan) {
+	uint64_t slots = 0;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() != ValueOpcode::GetUserData) continue;
+		const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+		if (reg < plan.user_data_base || reg - plan.user_data_base >= 64u) return ~uint64_t {0};
+		slots |= uint64_t {1} << (reg - plan.user_data_base);
+	}
+	return slots;
 }
 
 bool RangeOverlapIndex::Overlaps(std::span<const std::pair<uint64_t, uint64_t>> ranges,

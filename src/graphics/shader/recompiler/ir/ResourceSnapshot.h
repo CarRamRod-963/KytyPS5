@@ -73,6 +73,8 @@ struct ResourceSnapshot {
 	std::vector<BindlessUse>     bindless_uses;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
+	// The user-data slots the refresh read (ResourcePlan::user_data_reads, plus a call plan's).
+	uint64_t                                   user_data_reads = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 	PatternCopy                                pattern_copy;
