@@ -139,6 +139,10 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The garbage-collection tick and backing of the last TextureCache::TouchImage: binding an
+	// image again within the tick has nothing left to record.
+	uint64_t                      touched_tick   = UINT64_MAX;
+	const MemoryPriority::Object* touched_memory = nullptr;
 	// TextureCache event sequence numbers: the last native GPU write to the image and the last
 	// time its guest color metadata was read for a clear code. Native rendering leaves the guest
 	// metadata untouched, so a code read before a later native write describes an older surface.

@@ -333,6 +333,14 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	// The LRU and the residency tracker keep the tick and frame of the last use only; a bind in
+	// the same tick (hundreds of thousands a second) changes neither. Registration inserts the
+	// image into the LRU at the current tick.
+	if (image.touched_tick == m_gc_tick && image.touched_memory == image.backing.memory) {
+		return;
+	}
+	image.touched_tick   = m_gc_tick;
+	image.touched_memory = image.backing.memory;
 	m_graphics.UseMemory(image.backing.memory);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
