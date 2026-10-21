@@ -3,9 +3,12 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -311,6 +314,99 @@ void TestNativeNestedSrtRefresh() {
                       : std::array<uint32_t, 2>{0xfffffffcu, 0xffffu};
     Check(!MaterializeResources(bounded, {.user_data = base}, snapshot, specialization),
           "native SRT accepted address underflow or 48-bit overflow");
+  }
+}
+
+void TestReaderLoadsThroughCacheView() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Reader loads whose chunk the runtime's read cache tags load from the cache
+  // entry (whose words differ from memory here, to tell the paths apart); the
+  // others call read_memory. A capture still sees every load.
+  alignas(128) static std::array<uint32_t, 64> table{};
+  for (uint32_t index = 0; index < table.size(); ++index)
+    table[index] = 0x100u + index;
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 3> user_data{static_cast<uint32_t>(address),
+                                    static_cast<uint32_t>(address >> 32u), 0u};
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 3;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  const auto zero = emit(ValueOpcode::GetUserData, {Value(ScalarReg(6))});
+  const std::array<uint32_t, 5> offsets{0u, 4u, 8u, 128u + 12u, 16u};
+  for (const auto offset : offsets) {
+    const auto value = emit(
+        ValueOpcode::LoadAddressU32,
+        {root, emit(ValueOpcode::IAdd32, {zero, Value(offset)}), Value(0u),
+         Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  }
+  auto plan = ExtractResourcePlan(program, SrtWalkerLoads::Reader);
+  Check(plan.srt_code != nullptr, "cache-view reads were not compiled");
+  // Two entries: the first chunk of the table is tagged, the second is not.
+  alignas(8) static std::array<std::array<uint32_t, 32>, 2> entries{};
+  std::array<uint64_t, 2> tags{UINT64_MAX, UINT64_MAX};
+  const auto tagged = (address / 128u) & 1u;
+  tags[tagged] = address;
+  for (uint32_t index = 0; index < 32; ++index)
+    entries[tagged][index] = table[index] + 0x1000u;
+  const SrtReadCacheView view{
+      .tags = tags.data(),
+      .data = reinterpret_cast<const uint8_t *>(entries.data()),
+      .stride = sizeof(entries[0]),
+      .index_mask = 1u};
+  struct Reads {
+    uint32_t ordinary = 0;
+  } reads;
+  const auto read_memory = [](void *data, uint64_t at,
+                              std::span<uint32_t> words) {
+    ++static_cast<Reads *>(data)->ordinary;
+    std::memcpy(words.data(), reinterpret_cast<const void *>(at),
+                words.size_bytes());
+    return true;
+  };
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = read_memory,
+                     .userdata = &reads,
+                     .read_specialization_memory = read_memory,
+                     .read_cache = &view};
+  for (const bool capture : {false, true}) {
+    plan.capture_specialization_reads = capture;
+    reads = {};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "reader walk failed with a read cache");
+    Check(snapshot.flattened_srt.size() >= offsets.size() &&
+              snapshot.flattened_srt[0] == table[0] + 0x1000u &&
+              snapshot.flattened_srt[1] == table[1] + 0x1000u &&
+              snapshot.flattened_srt[2] == table[2] + 0x1000u &&
+              snapshot.flattened_srt[3] == table[35] &&
+              snapshot.flattened_srt[4] == table[4] + 0x1000u &&
+              reads.ordinary == 1u,
+          "reader loads did not serve tagged chunks from the read cache");
+    if (!capture)
+      continue;
+    auto captured = snapshot.specialization_reads;
+    std::ranges::sort(captured);
+    const std::vector<std::pair<uint64_t, uint64_t>> expected{
+        {address, 4u},
+        {address + 4u, 4u},
+        {address + 8u, 4u},
+        {address + 16u, 4u},
+        {address + 140u, 4u}};
+    Check(captured == expected,
+          "a capture missed loads served from the read cache");
   }
 }
 
@@ -1645,6 +1741,7 @@ int main() {
   TestWalkerLoadsBypassSpecializationReader();
   TestPlanUserDataReads();
   TestNativeNestedSrtRefresh();
+  TestReaderLoadsThroughCacheView();
   TestRangeOverlapIndex();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();

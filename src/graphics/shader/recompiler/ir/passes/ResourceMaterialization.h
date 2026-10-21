@@ -66,7 +66,9 @@ struct ResourceSpecialization {
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
-ResourcePlan ExtractResourcePlan(const Program& program);
+// The plan's walker loads guest memory as `loads` says (see CompileSrtWalker).
+ResourcePlan ExtractResourcePlan(const Program& program,
+                                 SrtWalkerLoads loads = SrtWalkerLoads::Direct);
 
 // Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
 // and scratch state like extraction. A failed load leaves a plan that must not be used.

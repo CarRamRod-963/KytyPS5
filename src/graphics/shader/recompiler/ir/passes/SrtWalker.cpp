@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <type_traits>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -174,6 +176,10 @@ const uint8_t* Scratch(const ResourcePlan& plan, std::span<const uint64_t> scrat
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+
+// The read thunk loads these fields itself.
+static_assert(std::is_standard_layout_v<SrtRuntime> && std::is_standard_layout_v<SrtReadCacheView>);
+static_assert(SrtReadCacheView::ChunkBytes == 128u);
 
 // The DWORD a reader load reads, or bit 32 set when the runtime's reader refuses it.
 uint64_t KYTY_SYSV_ABI ReadWalkerMemory(const SrtRuntime* runtime, uint64_t address) {
@@ -1005,10 +1011,32 @@ void WalkerCompiler::EmitLoad(const Xbyak::RegExp& address) {
 	c.jc(m_ret, Near);
 }
 
-// Reads the DWORD at r10 through ReadWalkerMemory into rax; keeps rdi, rsi, rdx, r8 and r10.
+// Reads the DWORD at r10 (DWORD-aligned, like every walker load) into rax; keeps rdi, rsi, rdx, r8
+// and r10. A read whose 128-byte chunk the runtime's read cache holds under its tag loads it from
+// there; anything else (no cache, a miss) calls ReadWalkerMemory.
 void WalkerCompiler::EmitReadThunk() {
-	auto& c = m_code;
+	auto&        c = m_code;
+	Xbyak::Label slow;
 	c.L(m_read);
+	c.mov(c.r11, c.qword[c.rdx + m_shader_base + 8u]);
+	c.mov(c.rcx, c.qword[c.r11 + offsetof(SrtRuntime, read_cache)]);
+	c.test(c.rcx, c.rcx);
+	c.jz(slow, Near);
+	c.mov(c.rax, c.r10);
+	c.shr(c.rax, 7);
+	c.and_(c.eax, c.dword[c.rcx + offsetof(SrtReadCacheView, index_mask)]);
+	c.mov(c.r9, c.qword[c.rcx + offsetof(SrtReadCacheView, tags)]);
+	c.mov(c.r11, c.r10);
+	c.and_(c.r11, -static_cast<int32_t>(SrtReadCacheView::ChunkBytes));
+	c.cmp(c.qword[c.r9 + c.rax * 8], c.r11);
+	c.jne(slow, Near);
+	c.imul(c.eax, c.dword[c.rcx + offsetof(SrtReadCacheView, stride)]);
+	c.add(c.rax, c.qword[c.rcx + offsetof(SrtReadCacheView, data)]);
+	c.mov(c.r9, c.r10);
+	c.and_(c.r9d, static_cast<uint32_t>(SrtReadCacheView::ChunkBytes - 1u));
+	c.mov(c.eax, c.dword[c.rax + c.r9]);
+	c.ret();
+	c.L(slow);
 	c.push(c.rbp);
 	c.mov(c.rbp, c.rsp);
 	c.push(c.rdi);
