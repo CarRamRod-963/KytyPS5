@@ -417,6 +417,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 
 	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
+		cp.NoteUserDataWrite(cmd_offset + i);
 	}
 
 	return reg_num;
@@ -2205,6 +2206,7 @@ static constexpr auto MakeShaderIndirectTable() {
 		};
 		table[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
+			cp.NoteUserDataWrite(cmd_offset);
 		};
 		table[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
