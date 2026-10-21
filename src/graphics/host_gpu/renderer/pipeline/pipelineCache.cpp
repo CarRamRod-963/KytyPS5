@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/scalarReadCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -303,15 +304,20 @@ struct PipelineCache::ProgramCache {
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 			                                               specialization)) {
-				resources.user_data_reads =
-				    resource_plan.user_data_reads |
-				    (call_source != nullptr
-				         ? ShaderRecompiler::IR::PlanUserDataReads(call_source->call_targets)
-				         : 0u);
+				NoteUserDataReads();
 				return true;
 			}
 			EXIT_IF(!resources.unavailable);
 			return false;
+		}
+
+		// After a refresh (Materialize, or a lookahead snapshot taken in its place).
+		void NoteUserDataReads() {
+			resources.user_data_reads =
+			    resource_plan.user_data_reads |
+			    (call_source != nullptr
+			         ? ShaderRecompiler::IR::PlanUserDataReads(call_source->call_targets)
+			         : 0u);
 		}
 
 		// Requires a successful Materialize for the current draw.
@@ -341,6 +347,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		// The plan the lookahead helpers evaluate (null when they are off or for stages the
+		// command streams do not plan).
+		std::shared_ptr<LookaheadPlan>             lookahead;
 		bool                                       skip_dispatch = false;
 	};
 
@@ -544,11 +553,20 @@ struct PipelineCache::ProgramCache {
 			Permutation* permutation = nullptr;
 			if (cached.call_source) source_changed = cached.RefreshCallSource(runtime);
 			if (!source_changed) {
-				read_cache.Prefetch(cached.walk_read_backs);
-				const bool materialized = cached.Materialize(runtime);
-				read_cache.Prefetch({});
-				if (const auto read_backs = read_cache.ReadBacks(); !read_backs.empty()) {
-					cached.walk_read_backs.assign(read_backs.begin(), read_backs.end());
+				bool adopted = false;
+				if (cached.lookahead != nullptr) {
+					PublishLookahead(stage, params, cached);
+					adopted =
+					    lookahead_command != nullptr && AdoptLookahead(cached, params, input_info);
+				}
+				bool materialized = adopted;
+				if (!adopted) {
+					read_cache.Prefetch(cached.walk_read_backs);
+					materialized = cached.Materialize(runtime);
+					read_cache.Prefetch({});
+					if (const auto read_backs = read_cache.ReadBacks(); !read_backs.empty()) {
+						cached.walk_read_backs.assign(read_backs.begin(), read_backs.end());
+					}
 				}
 				if (!materialized) return SkipUnavailableDraw(stage, params.hash, input_info);
 				permutation = cached.call_source ? cached.FindPermutation<true>(push_data_cursor)
@@ -636,6 +654,16 @@ struct PipelineCache::ProgramCache {
 			                    translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader),
 			                std::move(retained))
 			            .first;
+			if (lookahead != nullptr && SlotOf(stage) != LookaheadSlot::None &&
+			    !entry->second.call_source && entry->second.resource_plan.srt_code != nullptr) {
+				entry->second.lookahead = std::make_shared<LookaheadPlan>(
+				    walker_queue.Submit(std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+				        ShaderRecompiler::IR::ExtractResourcePlan(
+				            translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader,
+				            ShaderRecompiler::IR::SrtWalkerCompilation::Deferred))),
+				    next_lookahead_helper++);
+				PublishLookahead(stage, params, entry->second);
+			}
 			if (!entry->second.Materialize(runtime))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 		} else if (source_changed) {
@@ -694,9 +722,79 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
+	// Programs whose walks the command streams plan ahead, by the registers that name them.
+	enum class LookaheadSlot : uint64_t { None, Compute, Vertex, Pixel };
+	static LookaheadSlot SlotOf(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Compute: return LookaheadSlot::Compute;
+			case ShaderType::Vertex:
+			case ShaderType::Mesh: return LookaheadSlot::Vertex;
+			case ShaderType::Pixel: return LookaheadSlot::Pixel;
+			default: return LookaheadSlot::None;
+		}
+	}
+	static uint64_t LookaheadKey(LookaheadSlot slot, uint64_t shader_address) {
+		return (shader_address << 2u) | static_cast<uint64_t>(slot);
+	}
+
+	// The program last used at a shader address: planned walks of that address use its plan, and
+	// its user data starts with the same words before the user SGPRs.
+	void PublishLookahead(ShaderType stage, const ShaderParams& params, const SourceEntry& entry) {
+		auto& target = lookahead_targets[LookaheadKey(SlotOf(stage), params.Base())];
+		if (target.plan != entry.lookahead) target.plan = entry.lookahead;
+		target.user_data_count = params.user_data_count;
+		std::copy_n(params.user_data.begin(), target.prefix.size(), target.prefix.begin());
+	}
+
+	// Takes the helper's snapshot for this command when ResourceLookahead allows it.
+	template <typename InputInfo>
+	bool AdoptLookahead(SourceEntry& cached, const ShaderParams& params,
+	                    const InputInfo& input_info) {
+		LookaheadInputs inputs;
+		inputs.shader_base = params.Base();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			inputs.indirect_args_address = input_info.indirect_args_address;
+			inputs.workgroup_counts      = {input_info.workgroup_counts[0],
+			                                input_info.workgroup_counts[1],
+			                                input_info.workgroup_counts[2]};
+		}
+		inputs.user_data_count = params.user_data_count;
+		std::copy_n(params.user_data.begin(), params.user_data_count, inputs.user_data.begin());
+		if (lookahead->TryAdopt(lookahead_stream, lookahead_command, cached.lookahead.get(), inputs,
+		                        cached.resources, cached.specialization) !=
+		    ResourceLookahead::Outcome::Adopted) {
+			return false;
+		}
+		cached.NoteUserDataReads();
+		return true;
+	}
+
+	// Plans the walk of the program at `shader_address` with these user SGPRs, if one was used.
+	void PlanLookahead(const void* stream, const void* command, LookaheadSlot slot,
+	                   uint64_t shader_address, std::span<const uint32_t> user_sgprs,
+	                   LookaheadInputs& inputs) {
+		const auto target = lookahead_targets.find(LookaheadKey(slot, shader_address));
+		if (target == lookahead_targets.end() || target->second.user_data_count < user_sgprs.size())
+			return;
+		const auto prefix = target->second.user_data_count - user_sgprs.size();
+		if (prefix > target->second.prefix.size()) return;
+		inputs.shader_base     = shader_address;
+		inputs.user_data_count = target->second.user_data_count;
+		std::copy_n(target->second.prefix.begin(), prefix, inputs.user_data.begin());
+		std::ranges::copy(user_sgprs, inputs.user_data.begin() + static_cast<ptrdiff_t>(prefix));
+		lookahead->Plan(stream, command, target->second.plan, inputs);
+	}
+
+	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
+	             uint32_t lookahead_threads)
 	    : graphics(graphics), image_heap(image_heap), profile {HostShaderProfile(graphics)} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		if (lookahead_threads != 0) {
+			lookahead = std::make_unique<ResourceLookahead>(
+			    LookaheadMemory {.read      = Libs::LibKernel::Memory::TryReadBacking,
+			                     .gpu_dirty = Libs::LibKernel::Memory::HasGpuDirtyBytes},
+			    lookahead_threads);
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -715,6 +813,23 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 	// Receives every compiled compute permutation; null when there is no manifest.
 	ProgramManifest* manifest = nullptr;
+
+	// Compute dispatches ahead of the GPU thread: the program last used at each shader address
+	// with its registers, and the command the next GetComputeProgram belongs to.
+	struct LookaheadTarget {
+		std::shared_ptr<LookaheadPlan> plan;
+		uint32_t                       user_data_count = 0;
+		std::array<uint32_t, 8>        prefix {};
+	};
+	std::unique_ptr<ResourceLookahead>            lookahead;
+	std::unordered_map<uint64_t, LookaheadTarget> lookahead_targets;
+	const void*                                   lookahead_stream      = nullptr;
+	const void*                                   lookahead_command     = nullptr;
+	uint32_t                                      next_lookahead_helper = 0;
+	std::chrono::steady_clock::time_point         next_lookahead_report {};
+	// Compiles the lookahead plans' walkers. Last, so its thread stops before the entries holding
+	// its jobs are destroyed.
+	SrtWalkerCompileQueue walker_queue;
 };
 
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
@@ -783,7 +898,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              CommandScheduler*                       scheduler)
     : m_graphics(graphics), m_scheduler(scheduler),
-      m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)),
+      // The lookahead plans from the command streams, which run with a scheduler.
+      m_program_cache(std::make_unique<ProgramCache>(
+          graphics, image_heap,
+          scheduler != nullptr ? std::min(Config::LookaheadThreads(), 8u) : 0u)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	ShaderRecompiler::Spirv::SetMaximalReconvergence(graphics.maximal_reconvergence_enabled);
@@ -1331,6 +1449,86 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
+}
+
+bool PipelineCache::LookaheadEnabled() const {
+	return m_program_cache->lookahead != nullptr;
+}
+
+void PipelineCache::BeginLookaheadRun(const void* stream) {
+	m_program_cache->lookahead->BeginRun(stream);
+}
+
+void PipelineCache::PlanLookaheadDispatch(const void* stream, const void* command,
+                                          const HW::ComputeShaderInfo& regs, uint32_t groups_x,
+                                          uint32_t groups_y, uint32_t groups_z,
+                                          bool thread_dimensions, uint64_t indirect_args_address) {
+	const auto& cs = regs.cs_regs;
+	// The inputs RenderExecutor::DispatchDirect/DispatchIndirect give the walk.
+	LookaheadInputs inputs;
+	inputs.indirect_args_address = indirect_args_address;
+	if (indirect_args_address == 0) {
+		if (groups_x == 0 || groups_y == 0 || groups_z == 0) return;
+		inputs.workgroup_counts = {groups_x, groups_y, groups_z};
+		if (thread_dimensions) {
+			const std::array<uint32_t, 3> sizes {cs.num_thread_x, cs.num_thread_y, cs.num_thread_z};
+			for (uint32_t axis = 0; axis < 3u; ++axis) {
+				const auto size               = std::max(sizes[axis], 1u);
+				const auto threads            = inputs.workgroup_counts[axis];
+				inputs.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+			}
+		}
+	}
+	if (cs.user_sgpr > HW::UserSgprInfo::SGPRS_MAX) return;
+	m_program_cache->PlanLookahead(stream, command, ProgramCache::LookaheadSlot::Compute,
+	                               cs.data_addr,
+	                               std::span(regs.cs_user_sgpr.value).first(cs.user_sgpr), inputs);
+}
+
+void PipelineCache::PlanLookaheadDraw(const void* stream, const void* command,
+                                      const HW::VertexShaderInfo& vs,
+                                      const HW::PixelShaderInfo&  ps) {
+	// GetGraphicsPrograms walks the pixel shader first.
+	if (ps.ps_regs.data_addr != 0 && ps.ps_regs.rsrc2.user_sgpr <= HW::UserSgprInfo::SGPRS_MAX) {
+		LookaheadInputs inputs;
+		m_program_cache->PlanLookahead(
+		    stream, command, ProgramCache::LookaheadSlot::Pixel, ps.ps_regs.data_addr,
+		    std::span(ps.ps_user_sgpr.value).first(ps.ps_regs.rsrc2.user_sgpr), inputs);
+	}
+	if (vs.es_regs.data_addr != 0 && vs.gs_regs.rsrc2.user_sgpr <= HW::UserSgprInfo::SGPRS_MAX) {
+		LookaheadInputs inputs;
+		m_program_cache->PlanLookahead(
+		    stream, command, ProgramCache::LookaheadSlot::Vertex, vs.es_regs.data_addr,
+		    std::span(vs.gs_user_sgpr.value).first(vs.gs_regs.rsrc2.user_sgpr), inputs);
+	}
+}
+
+void PipelineCache::KickLookahead() {
+	auto& programs = *m_program_cache;
+	programs.lookahead->Kick();
+	const auto now = std::chrono::steady_clock::now();
+	if (now < programs.next_lookahead_report) return;
+	if (programs.next_lookahead_report != std::chrono::steady_clock::time_point {}) {
+		using Outcome    = ResourceLookahead::Outcome;
+		const auto stats = programs.lookahead->TakeStats();
+		const auto count = [&](Outcome outcome) {
+			return static_cast<unsigned long long>(stats.outcomes[static_cast<size_t>(outcome)]);
+		};
+		LOGF("Lookahead: %u helpers, %llu planned, adopted %llu, not planned %llu, changed %llu, "
+		     "late %llu, failed %llu, dirty %llu, moved %llu (10 s)\n",
+		     programs.lookahead->HelperCount(), static_cast<unsigned long long>(stats.planned),
+		     count(Outcome::Adopted), count(Outcome::NotPlanned), count(Outcome::Changed),
+		     count(Outcome::Late), count(Outcome::Failed), count(Outcome::Dirty),
+		     count(Outcome::Moved));
+	} else {
+		(void)programs.lookahead->TakeStats();
+	}
+	programs.next_lookahead_report = now + std::chrono::seconds(10);
+}
+
+void PipelineCache::SetLookaheadCommand(const void* stream, const void* command) {
+	m_program_cache->lookahead_stream  = stream;
+	m_program_cache->lookahead_command = command;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

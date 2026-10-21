@@ -110,6 +110,10 @@ static void PrintUsage() {
 	    "                                       sessions into the driver cache on background\n"
 	    "                                       threads while the game runs.\n");
 	::printf(
+	    "  --lookahead-threads <n>              Threads that evaluate the resources of upcoming\n"
+	    "                                       draws and dispatches ahead of the GPU thread\n"
+	    "                                       (0 = off, at most 8). Default: 2.\n");
+	::printf(
 	    "  --precompile-only                    Build the recorded compute pipelines into the\n"
 	    "                                       driver cache, save it and exit.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
@@ -404,6 +408,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--lookahead-threads") {
+			if (!ParseUint32(value, options.config.lookahead_threads) ||
+			    options.config.lookahead_threads > 8u) {
+				::printf("invalid lookahead thread count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {
