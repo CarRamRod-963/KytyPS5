@@ -338,6 +338,8 @@ private:
 		Dlss::Creation creation;
 		Dlss::Feature* feature;
 	};
+	[[nodiscard]] bool TryConsumeComputeCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
 	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
