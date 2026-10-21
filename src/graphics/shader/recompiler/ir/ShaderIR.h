@@ -275,6 +275,9 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	// The draw's vertexOffset (indexed) or firstVertex, and its firstInstance.
+	BaseVertex,
+	BaseInstance,
 };
 
 enum class StageOutputKind {
@@ -385,6 +388,29 @@ enum class DescriptorBindingKind : uint32_t {
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
+
+// A vertex stage drawn by native indirect draws, whose offsets the GPU reads from the draw
+// arguments (ShaderVertexInputInfo::indirect_draw; zero for other draws). A command processor
+// writes those offsets to user SGPRs: the shader reads user-data slot VertexSlot() as the draw's
+// base vertex and InstanceSlot() as its first instance, and its VertexID and InstanceID VGPRs are
+// the hardware values, the index and the zero-based instance, without the draw's offsets.
+struct IndirectDrawRegisters {
+	static constexpr uint32_t Enabled = 1u << 31u;
+
+	// Slots of the stage's user data, -1 for none.
+	[[nodiscard]] static constexpr uint32_t Encode(int32_t vertex_slot, int32_t instance_slot) {
+		const auto field = [](int32_t slot) {
+			return slot >= 0 && slot < 0xff ? static_cast<uint32_t>(slot) + 1u : 0u;
+		};
+		return Enabled | field(vertex_slot) | (field(instance_slot) << 8u);
+	}
+	[[nodiscard]] static constexpr int32_t VertexSlot(uint32_t word) {
+		return static_cast<int32_t>(word & 0xffu) - 1;
+	}
+	[[nodiscard]] static constexpr int32_t InstanceSlot(uint32_t word) {
+		return static_cast<int32_t>((word >> 8u) & 0xffu) - 1;
+	}
+};
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

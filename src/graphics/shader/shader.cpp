@@ -463,6 +463,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
 		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
 	}
+	// Last and only when set: the length above already tells the layout apart.
+	if (info.indirect_draw != 0) {
+		key.push_back(info.indirect_draw);
+	}
 }
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
