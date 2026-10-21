@@ -536,31 +536,40 @@ void TestAddContent(const std::filesystem::path& root) {
       resolve("3rHWaV-1KC4"));
   std::array<char, 32> init {}, boot {};
   Check(initialize(init.data(), boot.data()) == OK, "initialize add-on entitlements");
+  constexpr std::array<const char *, 4> existing{"85y-je", "5d5c48", "_mtqu6",
+                                                 "GHOST2BASEME0000"};
+  constexpr uint32_t detected = 65;
+  constexpr uint32_t total = existing.size() + detected;
   uint32_t count = 0;
-  Check(list(0, nullptr, 0, &count) == OK && count == 68,
+  Check(list(0, nullptr, 0, &count) == OK && count == total,
         "query existing and detected add-ons together");
-  Check(list(0, nullptr, 1, &count) == OK && count == 68,
+  Check(list(0, nullptr, 1, &count) == OK && count == total,
         "count-only query ignores output capacity");
-  Check(list(1, nullptr, 0, &count) == OK && count == 68,
+  Check(list(1, nullptr, 0, &count) == OK && count == total,
         "existing service-label handling remains unchanged");
-  std::array<Info, 5> info {};
-  info[4].package_type = 99;
-  Check(list(0, info.data(), 4, &count) == OK && count == 68 && info[4].package_type == 99,
-        "truncated entitlement list reports total and respects output capacity");
-  constexpr std::array<const char*, 3> existing {"85y-je", "5d5c48", "_mtqu6"};
+  constexpr size_t first_detected = existing.size();
+  std::array<Info, existing.size() + 2> info{};
+  info[first_detected + 1].package_type = 99;
+  Check(
+      list(0, info.data(), first_detected + 1, &count) == OK &&
+          count == total && info[first_detected + 1].package_type == 99,
+      "truncated entitlement list reports total and respects output capacity");
   Info single {};
   for (size_t i = 0; i < existing.size(); ++i) {
     Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
               info[i].package_type == 3 && info[i].download_status == 4 &&
               get(1, &info[i].label, &single) == OK &&
               std::memcmp(&single, &info[i], sizeof(single)) == 0,
-          "GTA V entitlements retain their order, metadata, and individual lookups");
+          "owned entitlements retain their order, metadata, and individual "
+          "lookups");
   }
-  Check(std::strcmp(info[3].label.data, label(0).c_str()) == 0 &&
-            info[3].package_type == 2 && info[3].download_status == 4 &&
-            get(0, &info[3].label, &single) == OK &&
-            std::memcmp(&single, &info[3], sizeof(single)) == 0,
-        "detected add-ons follow existing entitlements with matching individual lookups");
+  const auto &first = info[first_detected];
+  Check(std::strcmp(first.label.data, label(0).c_str()) == 0 &&
+            first.package_type == 2 && first.download_status == 4 &&
+            get(0, &first.label, &single) == OK &&
+            std::memcmp(&single, &first, sizeof(single)) == 0,
+        "detected add-ons follow existing entitlements with matching "
+        "individual lookups");
   Label missing {};
   std::memcpy(missing.data, "MISSING000000000", 16);
   MountPoint point {};
@@ -570,7 +579,7 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
             list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
         "null add-on parameters return parameter errors");
-  Check(mount(0, &info[3].label, &point) == OK &&
+  Check(mount(0, &first.label, &point) == OK &&
             !std::string_view(point.data).ends_with('/'),
         "mount owned add-on without trailing slash");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
@@ -581,7 +590,7 @@ void TestAddContent(const std::filesystem::path& root) {
             FileSystem::KernelClose(fd) == OK,
         "guest reads files from the selected title's add-on");
   MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == OK &&
+  Check(mount(0, &first.label, &repeated) == OK &&
             std::strcmp(repeated.data, point.data) == 0,
         "duplicate mount returns the same mount point");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
@@ -604,12 +613,13 @@ void TestAddContent(const std::filesystem::path& root) {
     Check(unmount(&mounts[i]) == OK, "unmount fixture");
   }
   Loader::AddContentLoad(folder / "missing", "PPSA11111");
-  Check(list(0, info.data(), 4, &count) == OK && count == 3,
-        "missing add-ons folder retains GTA V entitlements");
+  Check(list(0, info.data(), first_detected + 1, &count) == OK &&
+            count == existing.size(),
+        "missing add-ons folder retains owned entitlements");
   for (size_t i = 0; i < existing.size(); ++i) {
     Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
               get(0, &info[i].label, &single) == OK,
-          "GTA V entitlement lookup works without detected add-ons");
+          "owned entitlement lookup works without detected add-ons");
   }
 }
 
