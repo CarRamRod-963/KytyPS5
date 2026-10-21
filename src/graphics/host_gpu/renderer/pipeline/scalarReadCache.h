@@ -49,6 +49,15 @@ public:
 	void Prefetch(std::span<const ScalarReadRange> ranges) {
 		m_prefetch = ranges.first(std::min(ranges.size(), MaxReadBacks));
 	}
+	// The direct-mapped entries for readers that look chunks up themselves: entry i holds the
+	// chunk at Tags()[i] in its ChunkBytes at Data() + i * Stride(). A chunk that is not tagged
+	// (absent, or holding GPU-dirty bytes) must be read through Read. Only Read changes them.
+	[[nodiscard]] const uint64_t* Tags() const { return m_tags.data(); }
+	[[nodiscard]] const uint8_t*  Data() const {
+		return reinterpret_cast<const uint8_t*>(m_entries[0].words);
+	}
+	[[nodiscard]] static constexpr uint32_t Stride() { return sizeof(Entry); }
+
 	// The ranges this walk read back (the first MaxReadBacks), for the next walk's Prefetch.
 	[[nodiscard]] std::span<const ScalarReadRange> ReadBacks() const {
 		return std::span(m_read_backs).first(m_read_back_count);
@@ -62,11 +71,12 @@ public:
 			for (auto& entry: m_entries) {
 				entry.base = UINT64_MAX;
 			}
+			m_tags.fill(UINT64_MAX);
 			m_sequence = sequence;
 		}
 		const auto base = address & ~(ChunkBytes - 1u);
 		if (bytes <= ChunkBytes && address - base + bytes <= ChunkBytes) {
-			auto& entry = m_entries[(base / ChunkBytes) % Entries];
+			auto& entry = m_entries[Index(base)];
 			if (entry.base != base) {
 				Fill(entry, base);
 			}
@@ -91,15 +101,24 @@ public:
 	}
 
 private:
+	static constexpr std::array<uint64_t, Entries> MakeEmptyTags() {
+		std::array<uint64_t, Entries> tags {};
+		tags.fill(UINT64_MAX);
+		return tags;
+	}
+
 	struct Entry {
 		uint64_t base  = UINT64_MAX;
 		bool     dirty = false;
 		uint32_t words[ChunkBytes / sizeof(uint32_t)];
 	};
 
+	static size_t Index(uint64_t base) { return (base / ChunkBytes) % Entries; }
+
 	void Fill(Entry& entry, uint64_t base) {
 		entry.base  = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
 		entry.dirty = entry.base == base && m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+		m_tags[Index(base)] = entry.dirty ? UINT64_MAX : entry.base;
 	}
 
 	// A readback also publishes completed asynchronous downloads, which turns GPU-dirty bytes
@@ -122,11 +141,13 @@ private:
 				entry.dirty = false;
 			}
 		}
+		// Dirty entries were never tagged.
 	}
 
 	Backend&                                  m_backend;
 	uint64_t                                  m_sequence = 0;
 	std::array<Entry, Entries>                m_entries;
+	std::array<uint64_t, Entries>             m_tags = MakeEmptyTags();
 	std::span<const ScalarReadRange>          m_prefetch;
 	std::array<ScalarReadRange, MaxReadBacks> m_read_backs {};
 	size_t                                    m_read_back_count = 0;

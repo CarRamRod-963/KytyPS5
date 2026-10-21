@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -134,14 +135,21 @@ struct GuestScalarMemory {
 };
 using GuestScalarReadCache = ScalarReadCache<GuestScalarMemory>;
 
+// Out of line: the cache is several KiB, and a frame that size costs every cached read a stack
+// probe.
+[[gnu::noinline]] void ReadShaderScalarMemoryUncached(uint64_t            address,
+                                                      std::span<uint32_t> values) {
+	GuestScalarMemory    memory;
+	GuestScalarReadCache uncached(memory);
+	uncached.Read(address, values);
+}
+
 bool ReadShaderScalarMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (auto* cache = static_cast<GuestScalarReadCache*>(userdata); cache != nullptr) {
 		cache->Read(address, values);
 		return true;
 	}
-	GuestScalarMemory    memory;
-	GuestScalarReadCache uncached(memory);
-	uncached.Read(address, values);
+	ReadShaderScalarMemoryUncached(address, values);
 	return true;
 }
 
@@ -507,13 +515,23 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		GuestScalarMemory                            scalar_memory;
 		GuestScalarReadCache                         read_cache(scalar_memory);
-		ShaderRecompiler::IR::SrtRuntime             runtime {
+		static_assert(GuestScalarReadCache::ChunkBytes ==
+		                  ShaderRecompiler::IR::SrtReadCacheView::ChunkBytes &&
+		              std::has_single_bit(GuestScalarReadCache::Entries));
+		const ShaderRecompiler::IR::SrtReadCacheView read_cache_view {
+		    .tags       = read_cache.Tags(),
+		    .data       = read_cache.Data(),
+		    .stride     = GuestScalarReadCache::Stride(),
+		    .index_mask = static_cast<uint32_t>(GuestScalarReadCache::Entries - 1u),
+		};
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderScalarMemory,
 		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .image_heap                 = image_heap,
+		    .read_cache                 = &read_cache_view,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -611,12 +629,18 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			entry = programs
+			            .try_emplace(
+			                lookup_key,
+			                ShaderRecompiler::IR::ExtractResourcePlan(
+			                    translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader),
+			                std::move(retained))
+			            .first;
 			if (!entry->second.Materialize(runtime))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 		} else if (source_changed) {
-			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(
+			    translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader);
 			if (!entry->second.Materialize(runtime))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 			if (const auto* permutation = entry->second.FindPermutation<true>(push_data_cursor)) {
