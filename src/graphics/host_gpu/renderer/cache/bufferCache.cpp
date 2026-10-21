@@ -990,6 +990,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
+	if (!is_gds) {
+		LibKernel::Memory::SettleLabelAccess(vaddr, size);
+	}
 	if (is_gds) {
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
 			EXIT("BufferCache: GDS fill range is out of bounds\n");
@@ -1017,6 +1020,12 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
+	if (dst_memory) {
+		LibKernel::Memory::SettleLabelAccess(dst_vaddr, size);
+	}
+	if (src_memory) {
+		LibKernel::Memory::SettleLabelAccess(src_vaddr, size);
+	}
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
 	    ((dst_gds || src_gds) && ((dst_vaddr | src_vaddr | size) & 3u) != 0) ||
 	    size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||

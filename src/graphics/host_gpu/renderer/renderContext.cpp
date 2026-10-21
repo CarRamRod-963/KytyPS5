@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -105,13 +106,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 }
 
 void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
-                                 Common::UniqueFunction<void>&& notify) {
+                                 Common::UniqueFunction<void>&& notify, uint64_t label_id) {
 	EXIT_IF(dst == nullptr || (size != sizeof(uint32_t) && size != sizeof(uint64_t)));
 	// The completion thread runs the publications of a submission's downloads before its
 	// labels, so whatever the label announces is already in guest memory.
 	if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
 	    m_page_manager.TryWriteUnwatched(reinterpret_cast<uint64_t>(dst), &value, size)) {
 		Common::GpuTiming::Sync().AddLabel(true);
+		if (label_id != 0) {
+			m_pending_labels.Stored(label_id);
+		}
 		NotifyGpuMemoryWritten();
 		if (notify) {
 			notify();
@@ -120,15 +124,21 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	}
 	Common::GpuTiming::Sync().AddLabel(false);
 	m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
-	GetGpu().SendCommand([this, dst, value, size, notify = std::move(notify)]() mutable {
+	GetGpu().SendCommand([this, dst, value, size, label_id, notify = std::move(notify)]() mutable {
 		// What a write fault would do, without relying on one: the caches drop or read back
 		// what they hold of the label's pages and stop watching them.
 		(void)InvalidateMemory(reinterpret_cast<uint64_t>(dst), size);
-		if (size == sizeof(uint32_t)) {
-			const auto word = static_cast<uint32_t>(value);
-			std::memcpy(dst, &word, sizeof(word));
-		} else {
-			std::memcpy(dst, &value, sizeof(value));
+		// A settled access may have stored the label, and later ones, already.
+		if (label_id == 0 || m_pending_labels.ShouldStore(label_id)) {
+			if (size == sizeof(uint32_t)) {
+				const auto word = static_cast<uint32_t>(value);
+				std::memcpy(dst, &word, sizeof(word));
+			} else {
+				std::memcpy(dst, &value, sizeof(value));
+			}
+		}
+		if (label_id != 0) {
+			m_pending_labels.Stored(label_id);
 		}
 		NotifyGpuMemoryWritten();
 		if (notify) {
@@ -136,6 +146,30 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 		}
 		m_gpu_thread_labels.fetch_sub(1, std::memory_order_release);
 	});
+}
+
+void RenderContext::SettleElidedLabels(uint64_t vaddr, uint64_t size) {
+	static thread_local bool settling = false;
+	if (settling || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	const auto tick = m_pending_labels.ElidedTick(vaddr, size);
+	if (tick == 0) {
+		return;
+	}
+	settling = true;
+	{
+		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
+		m_command_scheduler.Wait(tick);
+		// The completion thread stores the labels of that submission now ...
+		m_command_scheduler.WaitPriorityOperations(tick);
+	}
+	// ... unless it handed them to this thread, behind the current command. Those are stored
+	// here, through the backing like the completion thread's own stores, and skipped there.
+	m_pending_labels.StoreCompleted(vaddr, size, tick, [](const PendingLabels::Label& label) {
+		(void)LibKernel::Memory::TryWriteBacking(label.address, &label.value, label.size);
+	});
+	settling = false;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
