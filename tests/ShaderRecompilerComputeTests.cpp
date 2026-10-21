@@ -185,6 +185,14 @@ struct BufferCacheTestAccess {
 
   static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
 
+  // Serves a readback on the calling thread, as the GPU thread would.
+  static void ReadBack(BufferCache &cache, uint64_t address, uint64_t size) {
+    const BufferCache::GuestReadback request{
+        BufferCache::GuestReadback::Kind::Read, address, size,
+        Common::GpuTiming::SyncReason::BufferRead, nullptr};
+    cache.ServeGuestReadbacks({&request, 1});
+  }
+
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
@@ -424,6 +432,12 @@ struct RenderExecutorTestAccess {
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     return executor.DrawAuto(0, command, args);
+  }
+
+  static DrawIndirectResult DrawIndirect(RenderExecutor &executor,
+                                         CommandBuffer &command,
+                                         const IndirectDrawSource &args) {
+    return executor.DrawIndirect(0, command, args);
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -2160,6 +2174,7 @@ public:
     return m_rasterization_supported;
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  bool m_native_indirect_draws = false;
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -20739,6 +20754,203 @@ public:
         }
       }
 
+      // The same draws with the arguments on the GPU: a dispatch writes them
+      // (and a draw count), the draw reads them as indirect arguments, and the
+      // vertex shader reads the base vertex and first instance from its draw
+      // where the packet would have written s8/s9. The host registers and guest
+      // memory hold other values meanwhile.
+      if (m_native_indirect_draws) {
+        constexpr const char *gpu_name = "GpuIndirectDrawArguments";
+        // A mapping of their own: the arguments stay GPU-written, and a CPU
+        // write to a mapping with GPU-written bytes reads them back first,
+        // which needs a GPU thread.
+        constexpr uintptr_t args_address = 0x0000000204d00000ull;
+        constexpr uint64_t args_size = 0x10000;
+        constexpr uint64_t count_address = args_address + 0x100;
+        int64_t args_offset = -1;
+        Require(gpu_name, "argument allocation",
+                Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                    0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                    args_size, args_size, 0, &args_offset) == 0,
+                "argument allocation failed");
+        void *args_mapping = reinterpret_cast<void *>(args_address);
+        Require(gpu_name, "argument mapping",
+                Libs::LibKernel::Memory::KernelMapDirectMemory(
+                    &args_mapping, args_size, 0x3, 0x10, args_offset,
+                    args_size) == 0 &&
+                    args_mapping == reinterpret_cast<void *>(args_address),
+                "argument mapping failed");
+        std::memset(args_mapping, 0, args_size);
+        resources.MapMemory(args_address, args_size);
+        auto &buffers = context.GetBufferCache();
+        const auto write_arguments = [&](std::span<const u32> words) {
+          std::vector<u32> code;
+          for (u32 i = 0; i < words.size(); i++) {
+            AppendVMovLiteral(&code, 1, words[i]);
+            code.push_back(EncodeMubuf0(0x1c, i * 4u, false, false));
+            code.push_back(EncodeMubuf1(1, 0, 0));
+          }
+          AppendEnd(&code);
+          static std::vector<std::vector<u32>> programs;
+          programs.push_back(std::move(code));
+          const auto &program = programs.back();
+          ShaderMapUserData(reinterpret_cast<uint64_t>(program.data()),
+                            {.type = Prospero::ShaderBinaryType::kCs,
+                             .code_size_bytes = static_cast<u32>(
+                                 program.size() * sizeof(u32))});
+          shaders.SetCsShader(
+              {.data_addr = reinterpret_cast<uint64_t>(program.data()),
+               .num_thread_x = 1,
+               .num_thread_y = 1,
+               .num_thread_z = 1,
+               .wave_size = 64,
+               .user_sgpr = 4});
+          ShaderBufferResource out{};
+          out.UpdateAddress48(args_address);
+          out.fields[2] = 0x200;
+          out.fields[3] =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+          for (u32 i = 0; i < 4; ++i)
+            shaders.SetCsUserSgpr(i, out.fields[i]);
+          executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u,
+                                  false);
+          Require(gpu_name, "arguments written on the GPU",
+                  buffers.HasGpuDirtyBytes(args_address,
+                                           words.size() * sizeof(u32)),
+                  "the argument writes did not stay GPU-owned");
+        };
+        // Records: indexed {count, instances, first index, base vertex, first
+        // instance}, auto {count, instances, first vertex, first instance}. The
+        // `off` records place nothing.
+        const std::array<u32, 5> indexed_hit{3, 1, 0, 7, 5};
+        const std::array<u32, 5> indexed_off{3, 1, 0, 100, 5};
+        const std::array<u32, 4> auto_hit{3, 1, 7, 5};
+        const std::array<u32, 4> auto_off{3, 1, 7, 6};
+        struct GpuDrawCase {
+          const char *label;
+          bool indexed;
+          bool counted;
+          u32 count;
+          bool drawn;
+        };
+        for (const auto test :
+             {GpuDrawCase{"indexed", true, false, 1, true},
+              GpuDrawCase{"auto", false, false, 1, true},
+              GpuDrawCase{"indexed count 1", true, true, 1, false},
+              GpuDrawCase{"indexed count 2", true, true, 2, true},
+              GpuDrawCase{"auto count 2", false, true, 2, true},
+              GpuDrawCase{"auto count 0", false, true, 0, false}}) {
+          // One record without a count; with one, the hit is the second of two.
+          std::vector<u32> words;
+          const auto append = [&](std::span<const u32> record) {
+            words.insert(words.end(), record.begin(), record.end());
+          };
+          if (test.counted) {
+            test.indexed ? append(indexed_off) : append(auto_off);
+          }
+          test.indexed ? append(indexed_hit) : append(auto_hit);
+          const u32 stride = (test.indexed ? 5u : 4u) * sizeof(u32);
+          if (test.counted) {
+            while (words.size() <
+                   (count_address - args_address) / sizeof(u32)) {
+              words.push_back(0);
+            }
+            words.push_back(test.count);
+          }
+          write_arguments(words);
+          shaders.SetGsUserSgpr(0, 0);
+          shaders.SetGsUserSgpr(1, 0);
+          TextureCacheTestAccess::ClearImage(
+              cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const auto result = RenderExecutorTestAccess::DrawIndirect(
+              executor, scheduler.Current(),
+              {.args_address = args_address,
+               .stride = stride,
+               .max_draw_count = test.counted ? 2u : 1u,
+               .count_address = test.counted ? count_address : 0u,
+               .indexed = test.indexed,
+               .index_base = index_address,
+               .index_buffer_size = 3,
+               .index_type_and_size = 1,
+               .vertex_offset_slot = 0,
+               .instance_offset_slot = 1});
+          Require(gpu_name, test.label, result == DrawIndirectResult::Done,
+                  "the draw asked for its arguments on the host");
+          const auto pixels = ReadCachedTexel(
+              name, context, sparse_color.image_id, {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            const u32 expected = !test.drawn          ? 0u
+                                 : component % 4 == 3 ? 0x3f800000u
+                                                      : 0x3e800000u;
+            Require(gpu_name, test.label, pixels[component] == expected,
+                    "a GPU-read draw used other arguments, offsets or count");
+          }
+        }
+        // The packet's offsets in other registers than the shader adds: the
+        // shader must not see them, and the host registers (zero) do not place
+        // the triangle either.
+        write_arguments(indexed_hit);
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        Require(
+            gpu_name, "other registers",
+            RenderExecutorTestAccess::DrawIndirect(
+                executor, scheduler.Current(),
+                {.args_address = args_address,
+                 .stride = 20,
+                 .max_draw_count = 1,
+                 .indexed = true,
+                 .index_base = index_address,
+                 .index_buffer_size = 3,
+                 .index_type_and_size = 1,
+                 .vertex_offset_slot = 2,
+                 .instance_offset_slot = 3}) == DrawIndirectResult::Done &&
+                std::ranges::all_of(ReadCachedTexel(name, context,
+                                                    sparse_color.image_id, {},
+                                                    {extent, extent, 1}),
+                                    [](u32 value) { return value == 0; }),
+            "the shader read offsets from registers the packet did not name");
+        // Slots earlier native draws left on the GPU: the draw asks for them
+        // only when its vertex stage reads them (s8 here, slot 0), and then
+        // records nothing.
+        for (const auto [stale, expected] :
+             {std::pair{1u << 0u, DrawIndirectResult::SettleRegisters},
+              std::pair{1u << 5u, DrawIndirectResult::Done}}) {
+          Require(gpu_name, "stale slots",
+                  RenderExecutorTestAccess::DrawIndirect(
+                      executor, scheduler.Current(),
+                      {.args_address = args_address,
+                       .stride = 20,
+                       .max_draw_count = 1,
+                       .indexed = true,
+                       .index_base = index_address,
+                       .index_buffer_size = 3,
+                       .index_type_and_size = 1,
+                       .vertex_offset_slot = 1,
+                       .instance_offset_slot = -1,
+                       .stale_slots = stale}) == expected,
+                  "a stale user-data slot was not reported for the shader that "
+                  "reads it");
+        }
+        shaders.SetGsUserSgpr(0, 7);
+        shaders.SetGsUserSgpr(1, 5);
+        // No GPU thread serves readbacks here: the unmap may not find
+        // GPU-written bytes.
+        BufferCacheTestAccess::ReadBack(buffers, args_address, args_size);
+        resources.UnmapMemory(args_address, args_size);
+        Require(gpu_name, "argument unmapping",
+                Libs::LibKernel::Memory::KernelMunmap(args_address,
+                                                      args_size) == 0 &&
+                    Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                        args_offset, args_size) == 0,
+                "argument mapping release failed");
+      } else {
+        std::printf(
+            "[host]    GpuIndirectDrawArguments   unavailable, skipped\n");
+      }
       // Indirect records come from the GPU copy; the CPU backing holds zeros. In each pair the
       // first record draws nothing and the second covers the target, through vertex offset 7
       // for embedded fetches.
@@ -20828,6 +21040,7 @@ public:
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
       }
+
       // A fetch rewritten into Vulkan vertex inputs takes its offsets from the
       // draw, while VertexID and InstanceID stay hardware values: the prolog
       // adds the user-SGPR offsets (s12 and s13) once, for the fetch and for
@@ -22798,6 +23011,7 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.conditional_rendering_enabled = true;
+    m_runtime_context.native_indirect_draws_enabled = m_native_indirect_draws;
     m_runtime_context.pipeline_creation_cache_control_enabled =
         m_pipeline_cache_control;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
@@ -23115,6 +23329,14 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    m_native_indirect_draws = available_features.multiDrawIndirect &&
+                              available_features.drawIndirectFirstInstance &&
+                              available_features12.drawIndirectCount &&
+                              available_features11.shaderDrawParameters;
+    device_features.multiDrawIndirect = m_native_indirect_draws;
+    device_features.drawIndirectFirstInstance = m_native_indirect_draws;
+    device_features12.drawIndirectCount = m_native_indirect_draws;
+    device_features11.shaderDrawParameters = m_native_indirect_draws;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
