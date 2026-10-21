@@ -870,6 +870,12 @@ private:
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || !Acyclic(inst)) return false;
+		if (m_inline_depth < MaxInlineDepth && Inline(*inst)) {
+			++m_inline_depth;
+			const bool emitted = EmitInst(*inst);
+			--m_inline_depth;
+			return emitted;
+		}
 		// A clean read belongs to the clean evaluator: its memo, its reader.
 		if (m_clean_evaluator && m_clean_depth == 0 && IsRawRead(m_program, *inst) &&
 		    inst->Flags<SrtReadFlags>().clean != 0u) {
@@ -881,6 +887,42 @@ private:
 		}
 		code.jc(*m_fail, Code::T_NEAR);
 		return true;
+	}
+
+	// Values cheaper to compute at each use than to call: leaves (user data, the shader base,
+	// undefined values) and one cheap operation whose operands are immediates but one, which is
+	// evaluated as usual. A subroutine would add a call, a frame and the memo traffic, and most
+	// of these values are computed once per walk. They read no memory, so computing one again
+	// gives the same value, and an unknown leaf continues at the caller's m_fail like an unknown
+	// subroutine result. Chains of them are cut after MaxInlineDepth.
+	static bool Inline(const Inst& inst) {
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::GetShaderBase:
+			case ValueOpcode::UndefU1:
+			case ValueOpcode::UndefU32:
+			case ValueOpcode::ConditionRef:
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::LogicalNot:
+			case ValueOpcode::BitwiseNot32: return true;
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32: {
+				size_t computed = 0;
+				for (size_t index = 0; index < inst.NumArgs(); ++index) {
+					if (!inst.Arg(index).Resolve().IsImmediate()) ++computed;
+				}
+				return computed <= 1u;
+			}
+			default: return false;
+		}
 	}
 
 	// The subroutine computing a value in the current mode (plain or clean, and the innermost
@@ -1679,6 +1721,8 @@ private:
 	std::unordered_map<const Inst*, bool>     m_pure;
 	bool                                      m_clean_evaluator = false;
 	int                                       m_clean_depth     = 0;
+	static constexpr int                      MaxInlineDepth    = 4;
+	int                                       m_inline_depth    = 0;
 	std::unordered_map<const Inst*, bool>     m_may_be_unknown;
 	Xbyak::Label*                             m_fail = &m_failed;
 	std::vector<uint32_t>                     m_descriptor_sources;
