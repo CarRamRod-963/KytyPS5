@@ -7,6 +7,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/filteredRangeSet.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -194,7 +195,7 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
+	FilteredRangeSet                                   m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	// Pages the guest recently read back (a read fault, a CPU write into GPU-dirty bytes or a

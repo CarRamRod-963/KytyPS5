@@ -171,7 +171,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	const auto                  buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
@@ -1182,8 +1182,9 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
-		                                           buffer.Size(), "garbage collection");
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges.Ranges(),
+		                                           buffer.CpuAddress(), buffer.Size(),
+		                                           "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
 			return false;
