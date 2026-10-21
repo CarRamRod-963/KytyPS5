@@ -1148,7 +1148,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    const ShaderIndirectOffsets* indirect_offsets) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1166,6 +1167,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	if (!tess_active && !mesh_active && indirect_offsets != nullptr) {
+		vertex_info[0].indirect_offsets = *indirect_offsets;
+		vertex_info[0].indirect_draw    = true;
+	}
 	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
 	if (object_primitive_id) {
 		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
