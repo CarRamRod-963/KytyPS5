@@ -29,7 +29,10 @@ struct MaterializationScratch {
 	std::vector<uint32_t>                                     bindless_mapping;
 	std::vector<uint32_t>                                     padding;
 	std::vector<std::pair<uint32_t, uint32_t>>                class_spares;
-	std::vector<std::pair<std::array<uint32_t, 3>, uint32_t>> class_order;
+	std::vector<uint32_t>                                     class_ranks;
+	std::vector<uint32_t>                                     class_list;
+	std::vector<uint32_t>                                     class_starts;
+	std::vector<uint32_t>                                     class_order;
 	std::vector<DescriptorValue>                              grouped;
 	std::vector<ResourceSpecialization::Image>                grouped_images;
 	std::vector<uint32_t>                                     renumber;
@@ -742,33 +745,55 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto& image = program.info.images[resource_index];
 			const auto  count = descriptors.size() - children_begin;
 			if (count == 0u) return true;
-			using Class = std::array<uint32_t, 3>;
+			// A class packed into one word orders like the triple: each part is below 256.
+			const auto class_of = [&](const DescriptorValue& value) {
+				const auto type = ImageCandidateClass(image, value);
+				return (type[0] << 16u) | (type[1] << 8u) | type[2];
+			};
 			auto& scratch = *program.materialization_scratch;
-			auto& order   = scratch.class_order;
-			order.resize(count);
-			const auto&                             root = descriptors[resource_index];
-			std::optional<Class>                    lead;
-			if (!NullImageDescriptor(root)) lead = ImageCandidateClass(image, root);
+			const auto&             root    = descriptors[resource_index];
+			std::optional<uint32_t> lead;
+			if (!NullImageDescriptor(root)) lead = class_of(root);
 			// A null root takes the class of the first typed candidate, i.e. of the first group.
 			for (uint32_t child = 0; child < count && NullImageDescriptor(root); ++child) {
 				const auto& value = descriptors[children_begin + child];
 				if (NullImageDescriptor(value)) continue;
-				const auto type = ImageCandidateClass(image, value);
+				const auto type = class_of(value);
 				if (!lead || type < *lead) lead = type;
 			}
 			if (!lead) return true;
-			// Null children (only behind a typed root) take the root's class as well.
+			// The lead class first, then the others in ascending order; children keep their table
+			// order within a class. Tables hold a handful of classes, so the children are counted
+			// into their class's run instead of sorted.
+			auto& ranks   = scratch.class_ranks;
+			auto& classes = scratch.class_list;
+			auto& starts  = scratch.class_starts;
+			auto& order   = scratch.class_order;
+			ranks.resize(count);
+			classes.clear();
 			for (uint32_t child = 0; child < count; ++child) {
 				const auto& value = descriptors[children_begin + child];
-				order[child] = {NullImageDescriptor(value) ? *lead : ImageCandidateClass(image, value),
-				                child};
+				// Null children (only behind a typed root) take the root's class as well.
+				const auto type = NullImageDescriptor(value) ? *lead : class_of(value);
+				ranks[child]    = type;
+				if (std::ranges::find(classes, type) == classes.end()) classes.push_back(type);
 			}
-			// Children keep their table order within a class. The child index breaks ties, so an
-			// unstable sort gives the stable order without a stable sort's buffer allocation.
-			std::ranges::sort(order, [&](const auto& a, const auto& b) {
-				return std::tuple {a.first != *lead, a.first, a.second} <
-				       std::tuple {b.first != *lead, b.first, b.second};
+			std::ranges::sort(classes, [&](uint32_t a, uint32_t b) {
+				return std::pair {a != *lead, a} < std::pair {b != *lead, b};
 			});
+			starts.assign(classes.size() + 1u, 0u);
+			for (auto& rank: ranks) {
+				rank = static_cast<uint32_t>(std::ranges::find(classes, rank) - classes.begin());
+				++starts[rank + 1u];
+			}
+			for (size_t rank = 1; rank < starts.size(); ++rank)
+				starts[rank] += starts[rank - 1u];
+			// Placing a child advances its class's start, so starts[rank] ends as the end of the
+			// class's run.
+			order.resize(count);
+			for (uint32_t child = 0; child < count; ++child) {
+				order[starts[ranks[child]]++] = child;
+			}
 			// Dynamic-mip candidates never share an access; spares would only add switch arms.
 			const bool pad = image.mip_mode != ImageMipMode::Dynamic;
 			auto&      grouped                 = scratch.grouped;
@@ -779,14 +804,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			renumber.assign(count + 1u, 0u);
 			auto child_template          = root_resource;
 			child_template.indirect_root = resource_index;
-			for (size_t first = 0; first < count;) {
-				auto last = first;
-				while (last < count && order[last].first == order[first].first) ++last;
-				const auto donor = static_cast<uint32_t>(children_begin + grouped.size());
+			for (size_t rank = 0, first = 0; rank < classes.size(); ++rank) {
+				const size_t last  = starts[rank];
+				const auto   donor = static_cast<uint32_t>(children_begin + grouped.size());
 				for (auto member = first; member < last; ++member) {
-					renumber[order[member].second + 1u] = static_cast<uint32_t>(grouped.size() + 1u);
-					grouped.push_back(descriptors[children_begin + order[member].second]);
-					grouped_specializations.push_back(specializations[children_begin + order[member].second]);
+					renumber[order[member] + 1u] = static_cast<uint32_t>(grouped.size() + 1u);
+					grouped.push_back(descriptors[children_begin + order[member]]);
+					grouped_specializations.push_back(
+					    specializations[children_begin + order[member]]);
 				}
 				// The root (ordinal 0) belongs to the lead group.
 				const bool lead_group = first == 0u;
