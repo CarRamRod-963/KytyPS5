@@ -98,6 +98,21 @@ public:
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
+	// Answers a query of the tracking state without the lock, as a query under the lock would,
+	// or returns false when the state changed meanwhile (the caller then takes the lock). The
+	// GPU thread asks such questions for every buffer it binds while guest threads take the lock
+	// for their write faults; a query that does not write the lock does not contend with them.
+	template <typename Query>
+	[[nodiscard]] bool TryQueryUnlocked(Query&& query, bool& result) const {
+		const auto version = m_version.load(std::memory_order_acquire);
+		if ((version & 1u) != 0u) {
+			return false;
+		}
+		result = query();
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_version.load(std::memory_order_relaxed) == version;
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -111,7 +126,8 @@ public:
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
-		auto& bits = GetBits<source>();
+		const StateChange change(*this);
+		auto&             bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
@@ -137,9 +153,11 @@ public:
 			if (RegionBits(m_gpu_dirty, start, end).None()) {
 				return;
 			}
+			const StateChange change(*this);
 			m_stale_readable.SetRange(start, end);
 			UpdateProtection<false, true>();
 		} else {
+			const StateChange change(*this);
 			m_stale_readable.UnsetRange(start, end);
 			UpdateProtection<true, true>();
 		}
@@ -158,6 +176,7 @@ public:
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			const StateChange change(*this);
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Gpu) {
 				m_stale_readable.UnsetRange(start, end);
@@ -176,6 +195,25 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// Brackets a change of the tracking state and the protection that follows it (under `lock`):
+	// m_version is odd while it runs, for TryQueryUnlocked.
+	class StateChange {
+	public:
+		explicit StateChange(RegionManager& region): m_region(region) {
+			const auto version = m_region.m_version.load(std::memory_order_relaxed);
+			m_region.m_version.store(version + 1u, std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_release);
+		}
+		~StateChange() {
+			const auto version = m_region.m_version.load(std::memory_order_relaxed);
+			m_region.m_version.store(version + 1u, std::memory_order_release);
+		}
+		KYTY_CLASS_NO_COPY(StateChange);
+
+	private:
+		RegionManager& m_region;
+	};
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty | m_stale_readable : m_cpu_dirty;
@@ -223,6 +261,8 @@ private:
 	RegionBits   m_stale_readable;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// See StateChange.
+	std::atomic<uint32_t> m_version {0};
 };
 
 } // namespace Libs::Graphics
