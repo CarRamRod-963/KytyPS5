@@ -348,6 +348,26 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+// Whether a T# of `type` can be viewed with the dimension a shader declares: the image is
+// created with the T#'s type and the view with the shader's.
+static bool TextureTypeFitsDimension(Prospero::ImageType                       type,
+                                     ShaderRecompiler::Decoder::ImageDimension dimension) {
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	using Type      = Prospero::ImageType;
+	switch (dimension) {
+		case Dimension::Dim1D:
+		case Dimension::Dim1DArray: return type == Type::kColor1D || type == Type::kColor1DArray;
+		case Dimension::Dim2D:
+		case Dimension::Dim2DArray:
+			return type == Type::kColor2D || type == Type::kColor2DArray || type == Type::kCube;
+		case Dimension::Dim3D: return type == Type::kColor3D;
+		case Dimension::Dim2DMsaa:
+		case Dimension::Dim2DMsaaArray:
+			return type == Type::kColor2DMsaa || type == Type::kColor2DMsaaArray;
+		default: return false;
+	}
+}
+
 // The view a T# selects; nullopt for a T# the view cannot express when `optional`, which exits
 // otherwise.
 static std::optional<ImageViewInfo>
@@ -506,6 +526,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	EXIT_IF(optional && storage);
 	if (optional && static_cast<uint32_t>(descriptor.Type()) <
 	                    static_cast<uint32_t>(Prospero::ImageType::kColor1D)) {
+		return {};
+	}
+	// The view type comes from the shader's dimension and the image type from the T#; an
+	// optional source (a bindless key read from guest records) may name a T# of another type,
+	// whose view Vulkan does not allow.
+	if (optional && !TextureTypeFitsDimension(descriptor.Type(), resource.dimension)) {
 		return {};
 	}
 
