@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/dccRetile.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -41790,6 +41791,122 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+// The DCC retile shader of the Agc SDK (from Ghost of Yotei): the host's CPU copy of it
+// (DccRetile::Run) must move every key byte where the translated shader moves it.
+void CheckDccRetileMatchesShader(VulkanHarness &vulkan) {
+  static const u32 shader[] = {
+      0xbfa00003u, 0xd746000au, 0x0405060au, 0xd7460004u,
+      0x04010609u, 0xbe8c0301u, 0xbe8d0302u, 0xbe8e0303u,
+      0x34121483u, 0xd5480000u, 0x025d0d0au, 0xd7460007u,
+      0x02210d04u, 0x34101484u, 0xd548000du, 0x025d0704u,
+      0x2c161281u, 0x2c041282u, 0xd569000cu, 0x00020000u,
+      0x34061485u, 0x340c1486u, 0x361e1688u, 0x361c04a0u,
+      0x3400088au, 0x34021488u, 0x2c0a0e89u, 0xd771000fu,
+      0x043e0482u, 0xd771000eu, 0x043a148au, 0x2c140e83u,
+      0xd7470002u, 0x0232190du, 0xd7470005u, 0x02321905u,
+      0xbe8f0304u, 0xd771000du, 0x043a16ffu, 0x00000080u,
+      0xd771000eu, 0x043e12a0u, 0x2c160e84u, 0xd7710009u,
+      0x03fe1491u, 0x00000300u, 0xd771000cu, 0x03fe1491u,
+      0x00000900u, 0xd7710010u, 0x03fe1491u, 0x00000100u,
+      0x2c0e0e82u, 0xd7710001u, 0x043602ffu, 0x00000f00u,
+      0xd771000du, 0x043a10ffu, 0x00000080u, 0xd7710008u,
+      0x03fe1491u, 0x00000b00u, 0x34140886u, 0xd7710009u,
+      0x04261684u, 0xd771000eu, 0x04321684u, 0xd771000cu,
+      0x043606ffu, 0x00000200u, 0xd771000fu, 0x04221684u,
+      0x2c1a1483u, 0xd771000bu, 0x04421684u, 0xd7710010u,
+      0x04260ec0u, 0xd771000eu, 0x043a0ec0u, 0xd771000fu,
+      0x043e0ec0u, 0xd7710008u, 0x04320cffu, 0x00000800u,
+      0x34060887u, 0xd771000cu, 0x03fe1a90u, 0x00000a00u,
+      0x34080888u, 0xd7710011u, 0x043e00ffu, 0x00000400u,
+      0xd7710006u, 0x042e0ec0u, 0x2c0e1484u, 0xd771000bu,
+      0x03fe1a90u, 0x00000800u, 0xbe800305u, 0xbe810306u,
+      0xd7710009u, 0x041a00ffu, 0x00000400u, 0x361e0e84u,
+      0xd7710006u, 0x043a00ffu, 0x00000400u, 0xd771000eu,
+      0x044200ffu, 0x00000400u, 0xd7710010u, 0x03fe1a90u,
+      0x00000200u, 0xd7450009u, 0x04161301u, 0xd7710012u,
+      0x043e1a90u, 0x2c1a1482u, 0xd7450007u, 0x04161d01u,
+      0x361c14c0u, 0xd771000au, 0x042214c0u, 0xd7450006u,
+      0x04160d01u, 0xd7710012u, 0x044a1ac0u, 0xd7450005u,
+      0x04162301u, 0x36221ac0u, 0xd771000au, 0x042a06ffu,
+      0x00000100u, 0xd772000du, 0x043a1090u, 0xbe820307u,
+      0xbe830308u, 0xd7720013u, 0x04461f10u, 0xd772000bu,
+      0x04461f0bu, 0xd772000cu, 0x04461f0cu, 0xd772000fu,
+      0x043a1084u, 0xd771000au, 0x042a08ffu, 0x00000400u,
+      0xd7710011u, 0x044a00ffu, 0x00000400u, 0xd7710010u,
+      0x042e00ffu, 0x00000400u, 0xd771000cu, 0x043200ffu,
+      0x00000400u, 0xd7710000u, 0x044e00ffu, 0x00000400u,
+      0xd7720012u, 0x043a1094u, 0xd771000eu, 0x043e06ffu,
+      0x00000100u, 0xd745000bu, 0x040a2301u, 0xd7450008u,
+      0x040a2101u, 0xd7450000u, 0x040a0101u, 0xd745000cu,
+      0x040a1901u, 0xd7710001u, 0x043606ffu, 0x00000100u,
+      0xd771000du, 0x044a06ffu, 0x00000100u, 0xe0002000u,
+      0x80030309u, 0xe0002000u, 0x80030000u, 0xe0002000u,
+      0x80030505u, 0xd7710001u, 0x040608ffu, 0x00000400u,
+      0xd7710009u, 0x043608ffu, 0x00000400u, 0xd7710004u,
+      0x043a08ffu, 0x00000400u, 0x4a1a0302u, 0x4a1c1302u,
+      0x4a120902u, 0xe0002000u, 0x80030107u, 0xe0002000u,
+      0x8003040cu, 0x4a0e1502u, 0x2c141a81u, 0x2c121281u,
+      0x2c180e81u, 0xe0002000u, 0x8003020bu, 0xe0002000u,
+      0x80030706u, 0xe0002000u, 0x80030608u, 0x2c161c81u,
+      0xbf8c3f72u, 0xe0142000u, 0x8000020cu, 0xe0142000u,
+      0x80000009u, 0xbf8c3f70u, 0xe0142000u, 0x8000060au,
+      0xe0142000u, 0x8000040bu, 0xbf810000u,
+  };
+  constexpr u32 bytes = 0x28000;
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32 ? "DccRetileMatchesShader32" : "DccRetileMatchesShader64";
+    test.code.assign(std::begin(shader), std::end(shader));
+    test.has_compute_info = test.has_user_data = true;
+    test.compute_info.threads_num[0] = DccRetile::GroupWidth;
+    test.compute_info.threads_num[1] = DccRetile::GroupHeight;
+    test.compute_info.threads_num[2] = 1;
+    test.compute_info.workgroup_register = 9;
+    test.compute_info.thread_ids_num = 2;
+    test.compute_info.group_id[0] = test.compute_info.group_id[1] = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.lds_size_dwords = 0;
+    test.dispatch_x = 8;
+    test.dispatch_y = 40;
+    test.user_data[0] = 8;
+    test.user_data[1] = 0;
+    test.user_data[2] = 1u << 16u;
+    test.user_data[3] = bytes;
+    test.user_data[4] = DstSel(4, 5, 6, 7) | (u32(Prospero::BufferFormat::k8UInt) << 12u);
+    test.user_data[5] = bytes;
+    test.user_data[6] = 2u << 16u;
+    test.user_data[7] = bytes / 2u;
+    test.user_data[8] = DstSel(4, 5, 6, 7) | (u32(Prospero::BufferFormat::k8_8UInt) << 12u);
+    test.initial.resize(bytes * 2u / 4u);
+    u32 seed = 0x9e3779b9u;
+    for (u32 i = 0; i < bytes / 4u; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      test.initial[i] = seed;
+    }
+    std::fill(test.initial.begin() + bytes / 4u, test.initial.end(), 0xcdcdcdcdu);
+    test.expected = test.initial;
+    const auto source = std::as_bytes(std::span(test.initial)).first(bytes);
+    auto destination = std::as_writable_bytes(std::span(test.expected)).subspan(bytes);
+    DccRetile::Run(8, test.dispatch_x, test.dispatch_y,
+                   {reinterpret_cast<const uint8_t *>(source.data()), source.size()},
+                   {reinterpret_cast<uint8_t *>(destination.data()), destination.size()});
+    auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "recognized", compiled.resources.pattern_copy.kind ==
+                ShaderRecompiler::IR::PatternCopyKind::DccRetile &&
+                compiled.resources.pattern_copy.pitch == 8u,
+            "the translated shader was not recognized as the DCC retile copy");
+    for (const auto &descriptor : compiled.resources.buffers) {
+      test.storage_buffer_ranges.emplace_back(descriptor.dwords[0], bytes);
+    }
+    auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, output);
+    const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+    vulkan.DestroyBuffer(&output);
+    CompareWords(test, "DCC keys moved by the CPU copy", test.expected, actual);
+  }
+  std::printf("[compute] %-32s ok\n", "DccRetileMatchesShader");
+}
+
 void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   constexpr std::array<u32, 8> lengths{16, 1, 4, 32, 48, 4, 32, 48};
@@ -53098,6 +53215,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
+    CheckDccRetileMatchesShader(vulkan);
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
@@ -53894,6 +54012,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
+  CheckDccRetileMatchesShader(vulkan);
   CheckMaximalReconvergenceExecutionMode();
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);

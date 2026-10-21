@@ -15457,6 +15457,132 @@ void TestPatternFill() {
   }
 }
 
+// The SDK's DCC retile shader (from Ghost of Yotei, PPSA26344): recognized by its code, the
+// copy contract names the source and destination buffers and evaluates the block pitch.
+const uint32_t kDccRetileShader[] = {
+      0xbfa00003u, 0xd746000au, 0x0405060au, 0xd7460004u,
+      0x04010609u, 0xbe8c0301u, 0xbe8d0302u, 0xbe8e0303u,
+      0x34121483u, 0xd5480000u, 0x025d0d0au, 0xd7460007u,
+      0x02210d04u, 0x34101484u, 0xd548000du, 0x025d0704u,
+      0x2c161281u, 0x2c041282u, 0xd569000cu, 0x00020000u,
+      0x34061485u, 0x340c1486u, 0x361e1688u, 0x361c04a0u,
+      0x3400088au, 0x34021488u, 0x2c0a0e89u, 0xd771000fu,
+      0x043e0482u, 0xd771000eu, 0x043a148au, 0x2c140e83u,
+      0xd7470002u, 0x0232190du, 0xd7470005u, 0x02321905u,
+      0xbe8f0304u, 0xd771000du, 0x043a16ffu, 0x00000080u,
+      0xd771000eu, 0x043e12a0u, 0x2c160e84u, 0xd7710009u,
+      0x03fe1491u, 0x00000300u, 0xd771000cu, 0x03fe1491u,
+      0x00000900u, 0xd7710010u, 0x03fe1491u, 0x00000100u,
+      0x2c0e0e82u, 0xd7710001u, 0x043602ffu, 0x00000f00u,
+      0xd771000du, 0x043a10ffu, 0x00000080u, 0xd7710008u,
+      0x03fe1491u, 0x00000b00u, 0x34140886u, 0xd7710009u,
+      0x04261684u, 0xd771000eu, 0x04321684u, 0xd771000cu,
+      0x043606ffu, 0x00000200u, 0xd771000fu, 0x04221684u,
+      0x2c1a1483u, 0xd771000bu, 0x04421684u, 0xd7710010u,
+      0x04260ec0u, 0xd771000eu, 0x043a0ec0u, 0xd771000fu,
+      0x043e0ec0u, 0xd7710008u, 0x04320cffu, 0x00000800u,
+      0x34060887u, 0xd771000cu, 0x03fe1a90u, 0x00000a00u,
+      0x34080888u, 0xd7710011u, 0x043e00ffu, 0x00000400u,
+      0xd7710006u, 0x042e0ec0u, 0x2c0e1484u, 0xd771000bu,
+      0x03fe1a90u, 0x00000800u, 0xbe800305u, 0xbe810306u,
+      0xd7710009u, 0x041a00ffu, 0x00000400u, 0x361e0e84u,
+      0xd7710006u, 0x043a00ffu, 0x00000400u, 0xd771000eu,
+      0x044200ffu, 0x00000400u, 0xd7710010u, 0x03fe1a90u,
+      0x00000200u, 0xd7450009u, 0x04161301u, 0xd7710012u,
+      0x043e1a90u, 0x2c1a1482u, 0xd7450007u, 0x04161d01u,
+      0x361c14c0u, 0xd771000au, 0x042214c0u, 0xd7450006u,
+      0x04160d01u, 0xd7710012u, 0x044a1ac0u, 0xd7450005u,
+      0x04162301u, 0x36221ac0u, 0xd771000au, 0x042a06ffu,
+      0x00000100u, 0xd772000du, 0x043a1090u, 0xbe820307u,
+      0xbe830308u, 0xd7720013u, 0x04461f10u, 0xd772000bu,
+      0x04461f0bu, 0xd772000cu, 0x04461f0cu, 0xd772000fu,
+      0x043a1084u, 0xd771000au, 0x042a08ffu, 0x00000400u,
+      0xd7710011u, 0x044a00ffu, 0x00000400u, 0xd7710010u,
+      0x042e00ffu, 0x00000400u, 0xd771000cu, 0x043200ffu,
+      0x00000400u, 0xd7710000u, 0x044e00ffu, 0x00000400u,
+      0xd7720012u, 0x043a1094u, 0xd771000eu, 0x043e06ffu,
+      0x00000100u, 0xd745000bu, 0x040a2301u, 0xd7450008u,
+      0x040a2101u, 0xd7450000u, 0x040a0101u, 0xd745000cu,
+      0x040a1901u, 0xd7710001u, 0x043606ffu, 0x00000100u,
+      0xd771000du, 0x044a06ffu, 0x00000100u, 0xe0002000u,
+      0x80030309u, 0xe0002000u, 0x80030000u, 0xe0002000u,
+      0x80030505u, 0xd7710001u, 0x040608ffu, 0x00000400u,
+      0xd7710009u, 0x043608ffu, 0x00000400u, 0xd7710004u,
+      0x043a08ffu, 0x00000400u, 0x4a1a0302u, 0x4a1c1302u,
+      0x4a120902u, 0xe0002000u, 0x80030107u, 0xe0002000u,
+      0x8003040cu, 0x4a0e1502u, 0x2c141a81u, 0x2c121281u,
+      0x2c180e81u, 0xe0002000u, 0x8003020bu, 0xe0002000u,
+      0x80030706u, 0xe0002000u, 0x80030608u, 0x2c161c81u,
+      0xbf8c3f72u, 0xe0142000u, 0x8000020cu, 0xe0142000u,
+      0x80000009u, 0xbf8c3f70u, 0xe0142000u, 0x8000060au,
+      0xe0142000u, 0x8000040bu, 0xbf810000u,
+};
+
+void TestPatternCopy() {
+  using namespace ShaderRecompiler::IR;
+  // The game's nine user SGPRs: the pitch and two V#s; the workgroup IDs follow in s9/s10.
+  std::array<uint32_t, 9> userdata = {
+      8u,
+      0x00200000u, 1u << 16u, 0x28000u,
+      0xfacu | (static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 12u),
+      0x00300000u, 2u << 16u, 0x14000u,
+      0xfacu | (static_cast<uint32_t>(Prospero::BufferFormat::k8_8UInt) << 12u),
+  };
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 8;
+  compute.threads_num[1] = 8;
+  compute.threads_num[2] = 1;
+  compute.workgroup_register = 9;
+  compute.thread_ids_num = 2;
+  compute.group_id[0] = true;
+  compute.group_id[1] = true;
+  compute.wave_size = 64;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = compute.wave_size;
+  options.input_info.compute = &compute;
+  options.user_data = userdata;
+  options.shader_hash = 0x12345678u;
+  const auto Build = [&](std::span<const uint32_t> code) {
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    return ExtractResourcePlan(translated.program);
+  };
+  auto plan = Build(kDccRetileShader);
+  Check(plan.pattern_copy.copy.kind == PatternCopyKind::DccRetile,
+        "the DCC retile shader was not recognized");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+        "the DCC retile shader did not materialize");
+  const auto &copy = snapshot.pattern_copy;
+  Check(copy.kind == PatternCopyKind::DccRetile && copy.pitch == 8u &&
+            copy.source != copy.destination && copy.source < snapshot.buffers.size() &&
+            copy.destination < snapshot.buffers.size() &&
+            snapshot.buffers[copy.source].dwords[0] == userdata[1] &&
+            snapshot.buffers[copy.destination].dwords[0] == userdata[5],
+        "the copy contract lost its buffers or pitch");
+  userdata[0] = 12u;
+  Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization) &&
+            snapshot.pattern_copy.pitch == 12u,
+        "the copy contract kept a stale pitch");
+
+  std::vector<uint32_t> changed(std::begin(kDccRetileShader), std::end(kDccRetileShader));
+  changed.push_back(0xbf9f0000u); // Padding after S_ENDPGM does not change identity.
+  Check(Build(changed).pattern_copy.copy.kind == PatternCopyKind::DccRetile,
+        "copy recognition included words after S_ENDPGM");
+  changed[2] ^= 0x00010000u; // V_LSHL_ADD_U32 shift 3 -> another constant.
+  Check(Build(changed).pattern_copy.copy.kind == PatternCopyKind::None,
+        "copy recognition accepted modified executable instructions");
+  for (const uint32_t invalid_input : {0u, 1u, 2u}) {
+    const auto saved = compute;
+    if (invalid_input == 0) compute.workgroup_register = 10;
+    if (invalid_input == 1) compute.threads_num[0] = 16;
+    if (invalid_input == 2) compute.dispatch_thread_dimensions = true;
+    Check(Build(kDccRetileShader).pattern_copy.copy.kind == PatternCopyKind::None,
+          "copy recognition accepted different launch inputs");
+    compute = saved;
+  }
+}
+
 void TestGpuProducedWritableDescriptor() {
   using namespace ShaderRecompiler::IR;
   // Reduced from 994af59d50bedca8: the GPU-built BVH header supplies a relative
@@ -17577,6 +17703,7 @@ int main() {
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
   TestPatternFill();
+  TestPatternCopy();
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
