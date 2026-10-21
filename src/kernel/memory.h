@@ -150,6 +150,10 @@ void                   ReadGpuDirtyBytes(std::span<const std::pair<uint64_t, uin
 [[nodiscard]] uint64_t GpuWriteSequence();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// On the GPU thread, before it writes guest memory for a command: waits until the end-of-pipe
+// labels in the range whose waits the command streams elided are stored (see PendingLabels).
+// The backing reads above return such labels as stored without waiting.
+void                   SettleLabelAccess(uint64_t vaddr, uint64_t size);
 // Stops at the first hole, or with span_holes at the end of the last committed range.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 // The mapped size from vaddr, at most size; 0 when vaddr itself is unmapped.
