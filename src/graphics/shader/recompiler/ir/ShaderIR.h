@@ -793,6 +793,8 @@ struct ResourcePlan {
 	mutable std::vector<EvaluationContext::Entry*>             jit_assume_bases;
 	// Runs of the compiled walker; each run tags the values it found unknown with its own count.
 	mutable uint64_t jit_runs = 0;
+	// User-data slots (SGPR minus user_data_base, below 64) the plan's values read.
+	uint64_t user_data_reads = 0;
 	// The direct descriptors MaterializeResources evaluates through the plain walker (resources
 	// it does not write), which the compiled walker evaluates after its reads: their positions
 	// per source (UINT32_MAX for the others), and the last run's DWORDs (8 per position) and

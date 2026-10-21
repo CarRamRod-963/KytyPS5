@@ -313,6 +313,11 @@ struct PipelineCache::ProgramCache {
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 			                                               specialization)) {
+				resources.user_data_reads =
+				    resource_plan.user_data_reads |
+				    (call_source != nullptr
+				         ? ShaderRecompiler::IR::PlanUserDataReads(call_source->call_targets)
+				         : 0u);
 				return true;
 			}
 			EXIT_IF(!resources.unavailable);
