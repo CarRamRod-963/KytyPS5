@@ -709,6 +709,11 @@ struct UniformFillPlan {
 	Value                element_count;
 };
 
+struct PatternCopyPlan {
+	PatternCopy copy;
+	Value       pitch;
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -744,6 +749,7 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	PatternCopyPlan                       pattern_copy;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
