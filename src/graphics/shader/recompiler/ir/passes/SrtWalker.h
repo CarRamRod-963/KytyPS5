@@ -37,6 +37,18 @@ protected:
 	~ImageHeapSource() = default;
 };
 
+// A direct-mapped cache of guest memory in 128-byte chunks that read_memory keeps: a DWORD read
+// whose chunk address equals the tag of entry (address / ChunkBytes) & index_mask may load the
+// DWORD from that entry, at data + index * stride + address % ChunkBytes, instead of calling
+// read_memory, with the same result. Only read_memory calls change the tags and the entries.
+struct SrtReadCacheView {
+	static constexpr uint64_t ChunkBytes = 128;
+	const uint64_t*           tags       = nullptr;
+	const uint8_t*            data       = nullptr;
+	uint32_t                  stride     = 0;
+	uint32_t                  index_mask = 0;
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -49,6 +61,9 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// Optional: the cache read_memory reads through. A reader load whose chunk it holds loads the
+	// DWORD from it instead of calling read_memory.
+	const SrtReadCacheView* read_cache = nullptr;
 };
 
 // How walker loads read guest memory: in place (a fault completes the load as a zero read), or
