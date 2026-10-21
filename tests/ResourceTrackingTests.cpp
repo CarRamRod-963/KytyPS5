@@ -7619,6 +7619,19 @@ void TestImageTableClassGroupingStability() {
         materialize(signed_row, snapshot, third) && third != first &&
             grouped(third, plan.info.images.size()),
         "a new candidate class did not re-specialize the bounded image table");
+    // The root's class leads; the other classes follow in ascending order and each keeps
+    // its rows in table order.
+    const std::array mixed{F::k32Float, F::k32SInt, F::k32UInt,
+                           F::k32Float, F::k32SInt, F::k32UInt};
+    ResourceSpecialization fourth;
+    Check(materialize(mixed, snapshot, fourth), "a three-class image table did not materialize");
+    std::vector<uint32_t> rows;
+    for (size_t image = plan.info.images.size(); image < snapshot.images.size(); ++image) {
+      const auto identity = snapshot.images[image].dwords[0];
+      if (identity != 0u) rows.push_back((identity - 0x100u) / 0x10u);
+    }
+    Check(rows == std::vector<uint32_t>{0u, 3u, 2u, 5u, 1u, 4u},
+          "image candidates were not ordered root class first, then by class, then by row");
   }
 
   // A key-list table of 32 T#s (a five-bit key): the root is row 0's texture.
