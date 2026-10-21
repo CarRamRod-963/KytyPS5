@@ -1109,6 +1109,14 @@ uint64_t BufferCache::WatchedWriteSequence(uint64_t vaddr, uint64_t size) {
 	return sequence;
 }
 
+void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	for (auto& watched: m_watched_ranges) {
+		if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
+			watched.sequence = ++m_watched_write_sequence;
+		}
+	}
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
