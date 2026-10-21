@@ -13810,6 +13810,79 @@ public:
             "(timeouts after the label per round:" +
                 timeouts + ")");
 
+    // A WAIT_REG_MEM for a label recorded before it does not stop the stream:
+    // it continues behind a barrier while the label is still pending. A packet
+    // that reads the label afterwards (COND_EXEC) waits until it is stored.
+    // The completion thread is held back so the label stays pending.
+    {
+      constexpr uint64_t elided = label + 0x100;
+      constexpr uint32_t value = 0x600du;
+      auto &scheduler = context.GetCommandScheduler();
+      std::binary_semaphore hold{0};
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        scheduler.DeferPriorityOperation([&hold] { hold.acquire(); });
+        scheduler.Flush();
+        write_label(elided, value, 0);
+      });
+      alignas(4) uint32_t passed = 0;
+      alignas(4) uint32_t seen = 0;
+      const auto passed_address = reinterpret_cast<uint64_t>(&passed);
+      const auto seen_address = reinterpret_cast<uint64_t>(&seen);
+      std::array<uint32_t, 22> stream{};
+      stream[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+      stream[1] = 0x10u | 3u; // Memory, equal.
+      stream[2] = static_cast<uint32_t>(elided);
+      stream[3] = static_cast<uint32_t>(elided >> 32u);
+      stream[4] = value;
+      stream[5] = UINT32_MAX;
+      stream[6] = 0;
+      stream[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      stream[8] = 0;
+      stream[9] = static_cast<uint32_t>(passed_address);
+      stream[10] = static_cast<uint32_t>(passed_address >> 32u);
+      stream[11] = 1;
+      // Skips the next 5 DWORDs while the label's DWORD reads 0.
+      stream[12] = KYTY_PM4(5, Pm4::IT_COND_EXEC, 0);
+      stream[13] = static_cast<uint32_t>(elided);
+      stream[14] = static_cast<uint32_t>(elided >> 32u);
+      stream[15] = 0;
+      stream[16] = 5;
+      stream[17] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      stream[18] = 0;
+      stream[19] = static_cast<uint32_t>(seen_address);
+      stream[20] = static_cast<uint32_t>(seen_address >> 32u);
+      stream[21] = 1;
+      const auto before_elision = Common::GpuTiming::Sync().Snapshot();
+      gpu.Submit(stream);
+      const bool continued = wait_for(
+          [&] { return std::atomic_ref<uint32_t>(passed).load() == 1u; });
+      const bool still_pending = backing(elided) == 0;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const bool cond_waited = std::atomic_ref<uint32_t>(seen).load() == 0u;
+      hold.release();
+      const bool cond_ran = wait_for(
+          [&] { return std::atomic_ref<uint32_t>(seen).load() == 1u; });
+      gpu.WaitForIdle();
+      const auto stalls = Common::GpuTiming::Sync()
+                              .Snapshot()
+                              .Since(before_elision)
+                              .stalls[static_cast<size_t>(
+                                  Common::GpuTiming::StallKind::WaitRegMem)];
+      Require(name, "wait on a recorded label elided",
+              continued && still_pending && stalls == 0,
+              "a stream waiting for a recorded label stopped until it was "
+              "stored");
+      Require(name, "packet after an elided wait reads the label",
+              cond_waited && cond_ran && backing(elided) == value,
+              "COND_EXEC after an elided wait read the label before it was "
+              "stored");
+      Require(name, "elided labels settled",
+              !context.HasElidedLabels() &&
+                  context.GetPendingLabels().Size() == 0,
+              "an elided label stayed pending after it was stored");
+    }
+
     (void)Sync::DeleteEqEvent(context, interrupt_queue, 0);
     LibKernel::EventQueue::KernelDeleteEqueue(interrupt_queue);
     gpu.SendCommandSync([&] {
