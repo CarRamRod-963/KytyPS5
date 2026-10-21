@@ -750,25 +750,38 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 		binding.memo_serial = 0;
 		return;
 	}
-	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
-		auto& entry = found->second;
-		if (TextureMemoEntryValid(entry)) {
-			auto& image               = texture_cache.GetImage(entry.image_id);
-			entry.stamp               = texture_cache.LayoutNow();
-			image.tick_accessed_last  = m_context.GetCommandScheduler().CurrentTick();
+	auto* entry = binding.memo_entry != nullptr && binding.memo_epoch == m_texture_memo_epoch &&
+	                      binding.memo_key == key
+	                  ? static_cast<TextureMemoEntry*>(const_cast<void*>(binding.memo_entry))
+	                  : nullptr;
+	auto  found = m_texture_memo.end();
+	if (entry == nullptr) {
+		found = m_texture_memo.find(key);
+		entry = found != m_texture_memo.end() ? &found->second : nullptr;
+	}
+	if (entry != nullptr) {
+		if (TextureMemoEntryValid(*entry)) {
+			auto& image              = texture_cache.GetImage(entry->image_id);
+			entry->stamp             = texture_cache.LayoutNow();
+			image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
 			texture_cache.TouchImage(image);
-			texture_cache.MaterializeColorClear(entry.image_id, entry.desc,
-			                                    entry.desc.metadata_base_layer);
-			binding.image_id = entry.image_id;
+			texture_cache.MaterializeColorClear(entry->image_id, entry->desc,
+			                                    entry->desc.metadata_base_layer);
+			binding.image_id = entry->image_id;
 			// A binding refilled with the same entry (the same stage's slot draw after draw)
 			// already holds its description.
-			if (binding.memo_serial != entry.serial) {
-				binding.desc        = entry.desc;
-				binding.memo_serial = entry.serial;
+			if (binding.memo_serial != entry->serial) {
+				binding.desc        = entry->desc;
+				binding.memo_serial = entry->serial;
 			}
+			binding.memo_entry = entry;
+			binding.memo_key   = key;
+			binding.memo_epoch = m_texture_memo_epoch;
 			return;
 		}
+		if (found == m_texture_memo.end()) found = m_texture_memo.find(key);
 		m_texture_memo.erase(found);
+		++m_texture_memo_epoch;
 	}
 	auto resolved      = ResolveTexture(resource, value);
 	binding.image_id   = resolved.image_id;
@@ -781,12 +794,16 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 	if (m_texture_memo.size() >= m_texture_memo_sweep_at) {
 		std::erase_if(m_texture_memo,
 		              [&](const auto& item) { return !TextureMemoEntryValid(item.second); });
+		++m_texture_memo_epoch;
 		m_texture_memo_sweep_at = std::max(TextureMemoFirstSweep, m_texture_memo.size() * 2u);
 	}
 	binding.memo_serial = ++m_texture_memo_serial;
-	m_texture_memo.insert_or_assign(key, TextureMemoEntry {binding.image_id, binding.desc,
-	                                                       texture_cache.LayoutNow(),
-	                                                       binding.memo_serial});
+	const auto inserted = m_texture_memo.insert_or_assign(
+	    key, TextureMemoEntry {binding.image_id, binding.desc, texture_cache.LayoutNow(),
+	                           binding.memo_serial});
+	binding.memo_entry = &inserted.first->second;
+	binding.memo_key   = key;
+	binding.memo_epoch = m_texture_memo_epoch;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
