@@ -73,6 +73,11 @@ void CollectVertexInputs(const ShaderVertexInputInfo* vertex, ShaderInfo& info,
                          const std::array<uint8_t, 32>& used_components) {
 	AddInput(info, StageInputKind::VertexIndex, 0, 1, "gl_VertexIndex");
 	AddInput(info, StageInputKind::InstanceIndex, 0, 1, "gl_InstanceIndex");
+	if (vertex->indirect_draw != 0) {
+		// The draw's offsets: user SGPRs and index VGPRs read them (IndirectDrawRegisters).
+		AddInput(info, StageInputKind::BaseVertex, 0, 1, "gl_BaseVertex");
+		AddInput(info, StageInputKind::BaseInstance, 0, 1, "gl_BaseInstance");
+	}
 	for (uint32_t attr = 0; attr < static_cast<uint32_t>(vertex->resources_num); attr++) {
 		if (used_components[attr] != 0) {
 			AddInput(info, StageInputKind::Parameter, attr, used_components[attr],
@@ -177,6 +182,8 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::GlobalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
+		case StageInputKind::BaseVertex: AddInput(info, kind, 0, 1, "gl_BaseVertex"); break;
+		case StageInputKind::BaseInstance: AddInput(info, kind, 0, 1, "gl_BaseInstance"); break;
 		case StageInputKind::PackedAncillary:
 		case StageInputKind::Parameter: break;
 	}
@@ -570,6 +577,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 						return Fail("typed pixel scalar input is invalid");
 					}
 					break;
+				case StageInputKind::BaseVertex:
+				case StageInputKind::BaseInstance:
+					if ((program.stage != ShaderType::Vertex &&
+					     program.stage != ShaderType::Local) ||
+					    component != 0u) {
+						return Fail("typed draw-parameter input is invalid");
+					}
+					break;
 				case StageInputKind::VertexIndex:
 				case StageInputKind::InvocationId:
 				case StageInputKind::PrimitiveId:
@@ -638,6 +653,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
+
 		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
