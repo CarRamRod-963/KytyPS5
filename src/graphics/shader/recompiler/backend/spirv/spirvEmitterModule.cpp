@@ -243,6 +243,7 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+
 	bindings.memory_strides =
 	    std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
 		    return buffer.runtime_stride && buffer.descriptor_index != UINT32_MAX;
@@ -520,6 +521,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
+		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		default: return UINT32_MAX;
 	}
 }
@@ -571,6 +574,12 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
+			case IR::StageInputKind::BaseVertex:
+			case IR::StageInputKind::BaseInstance:
+				state.builder.RequireExtension("SPV_KHR_shader_draw_parameters");
+				state.builder.RequireCapability(spv::CapabilityDrawParameters);
+				type = TypeI32(state);
+				break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:

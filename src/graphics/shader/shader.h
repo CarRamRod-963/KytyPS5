@@ -161,6 +161,8 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// Drawn by native indirect draws (IR::IndirectDrawRegisters); zero for other draws.
+	uint32_t indirect_draw = 0;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
