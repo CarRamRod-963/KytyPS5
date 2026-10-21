@@ -47,8 +47,9 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	// For an operation that depends only on GPU work recorded before this call, such as an
 	// end-of-pipe label: while the current command buffer holds no commands it completes with
-	// the previous submission, so it needs no submission of its own.
-	void DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation);
+	// the previous submission, so it needs no submission of its own. Returns the tick the
+	// operation waits for (0 when it ran at once during shutdown).
+	uint64_t DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation);
 	// The tick the running priority operation waited for; 0 outside one.
 	[[nodiscard]] uint64_t    ActivePriorityTick();
 	[[nodiscard]] bool        HasPendingPriorityOperations();
@@ -96,8 +97,8 @@ private:
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-	                    bool after_recorded = false);
+	uint64_t QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                        bool after_recorded = false);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
 

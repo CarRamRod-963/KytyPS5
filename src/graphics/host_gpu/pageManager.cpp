@@ -330,6 +330,16 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 }
 
 bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size) {
+	return WithUnwatched(
+	    vaddr, size, [&] { return Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size); });
+}
+
+bool PageManager::IsUnwatched(uint64_t vaddr, uint64_t size) {
+	return WithUnwatched(vaddr, size, [] { return true; });
+}
+
+template <typename Action>
+bool PageManager::WithUnwatched(uint64_t vaddr, uint64_t size, Action&& action) {
 	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
 		return false;
 	}
@@ -348,7 +358,7 @@ bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t s
 			return false;
 		}
 	}
-	return Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+	return action();
 }
 
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
