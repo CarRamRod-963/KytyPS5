@@ -18,8 +18,62 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime, linked into instrumented builds (CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters from an atexit handler, which the emulator skips (it
+// leaves with quick_exit, a fatal error, or a killed process). Instead a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 60) to KYTY_PGO_FILE (default kyty_emulator.profraw in the
+// working directory), and quick_exit writes them once more. Each dump goes to <file>.tmp first and
+// is renamed over <file>, so a stopped training run leaves its last complete profile behind.
+static std::mutex  g_pgo_mutex;
+static std::string g_pgo_file;
+
+static void WritePgoProfile() {
+	std::scoped_lock lock {g_pgo_mutex};
+	const auto       temp = g_pgo_file + ".tmp";
+	__llvm_profile_set_filename(temp.c_str());
+	if (__llvm_profile_write_file() != 0) {
+		::fprintf(stderr, "PGO: failed to write %s\n", temp.c_str());
+		return;
+	}
+	std::error_code error;
+	std::filesystem::rename(temp, g_pgo_file, error);
+	if (error) {
+		::fprintf(stderr, "PGO: failed to rename %s: %s\n", temp.c_str(), error.message().c_str());
+	}
+}
+
+static void StartPgoDumps() {
+	const char* file    = std::getenv("KYTY_PGO_FILE");
+	g_pgo_file          = (file != nullptr && *file != '\0') ? file : "kyty_emulator.profraw";
+	const char* text    = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds = (text != nullptr && std::atoi(text) > 0) ? std::atoi(text) : 60;
+	::fprintf(stderr, "PGO: writing the profile to %s every %d s and at exit\n", g_pgo_file.c_str(),
+	          seconds);
+	at_quick_exit(WritePgoProfile);
+	std::thread([seconds] {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			WritePgoProfile();
+		}
+	}).detach();
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -470,6 +524,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: its stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;
