@@ -141,6 +141,10 @@ int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int 
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+enum class BackingCompare : uint8_t { Unmapped, Equal, Different };
+// Compares what TryReadBacking would read (elided labels included) with `data`, without copying
+// the backing out when no elided label can overlay it.
+[[nodiscard]] BackingCompare CompareBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.
