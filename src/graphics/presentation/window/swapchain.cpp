@@ -758,7 +758,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
-	auto       vk_command      = command.Handle();
+	auto       vk_command      = command.PipelineHandle();
 	const bool convert_source =
 	    source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
 	const bool blit_source     = source != nullptr && !convert_source;
