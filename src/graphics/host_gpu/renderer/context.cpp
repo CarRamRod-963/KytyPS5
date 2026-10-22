@@ -32,9 +32,14 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	RecordBarrier(m_barriers.BeforeCommand());
 	m_has_commands = true;
 	m_command_count++;
-	// The caller may bind a pipeline of its own.
-	m_compute_pipeline = nullptr;
 	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::PipelineHandle() const {
+	const auto handle   = Handle();
+	m_compute_pipeline  = nullptr;
+	m_graphics_pipeline = nullptr;
+	return handle;
 }
 
 vk::CommandBuffer CommandBuffer::BarrierHandle() const {
@@ -55,6 +60,14 @@ void CommandBuffer::BindComputePipeline(vk::Pipeline pipeline) const {
 	}
 	StateHandle().bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	m_compute_pipeline = pipeline;
+}
+
+void CommandBuffer::BindGraphicsPipeline(vk::Pipeline pipeline) const {
+	if (pipeline == m_graphics_pipeline) {
+		return;
+	}
+	StateHandle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	m_graphics_pipeline = pipeline;
 }
 
 vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const {
@@ -167,6 +180,7 @@ void CommandBuffer::Begin() {
 	m_has_commands         = false;
 	m_command_count        = 0;
 	m_compute_pipeline     = nullptr;
+	m_graphics_pipeline    = nullptr;
 	m_indirect_reads_since = UINT64_MAX;
 }
 
