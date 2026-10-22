@@ -804,9 +804,11 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 		entry = found != m_texture_memo.end() ? &found->second : nullptr;
 	}
 	if (entry != nullptr) {
-		if (TextureMemoEntryValid(*entry)) {
+		const auto now = texture_cache.LayoutNow();
+		if (entry->validated == now.sequence || TextureMemoEntryValid(*entry)) {
 			auto& image              = texture_cache.GetImage(entry->image_id);
-			entry->stamp             = texture_cache.LayoutNow();
+			entry->stamp             = now;
+			entry->validated         = now.sequence;
 			image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
 			texture_cache.TouchImage(image);
 			texture_cache.MaterializeColorClear(entry->image_id, entry->desc,
