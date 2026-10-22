@@ -12,7 +12,9 @@ namespace Libs::Graphics {
 
 class RangeSet final {
 public:
-	void Add(uint64_t address, uint64_t size) {
+	// Returns whether the set changed: a range already covered (a buffer written again) leaves
+	// the set as it is without erasing and re-inserting its covering range.
+	bool Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -22,7 +24,7 @@ public:
 			it = m_ranges.emplace_hint(it, address, end);
 		} else {
 			if (it->second >= end) {
-				return;
+				return false;
 			}
 			it->second = end;
 		}
@@ -31,6 +33,7 @@ public:
 			it->second = std::max(it->second, next->second);
 			next       = m_ranges.erase(next);
 		}
+		return true;
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
