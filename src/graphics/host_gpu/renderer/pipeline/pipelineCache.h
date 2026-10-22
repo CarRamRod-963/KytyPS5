@@ -135,13 +135,16 @@ public:
 	              CommandScheduler* scheduler = nullptr);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	void Save();
+	// Waits for a running background save, then writes the driver cache if it changed. Returns
+	// false when a write failed.
+	bool Save();
 	// Queues a driver-cache build of every compute program the title's manifest recorded in
 	// earlier sessions (--precompile-pipelines). Needs the renderer's bindless set layout.
 	void StartPrecompile(uint32_t thread_count);
 	// --precompile-only: builds every recorded program's pipeline on `thread_count` threads,
-	// then saves the driver cache. Returns the number of pipelines the driver compiled.
-	size_t PrecompileAll(uint32_t thread_count);
+	// waits for all of them, logs the outcome counts and saves the driver cache. Returns false
+	// when the driver cache could not be written.
+	bool PrecompileAll(uint32_t thread_count);
 	// Joins the background compiles. Their pipeline layouts reference the renderer's bindless
 	// set layout, so the owner calls this before destroying it.
 	void StopBackgroundCompiles();
@@ -217,14 +220,6 @@ private:
 	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
 
-	struct PrecompileStats {
-		std::atomic<uint64_t> cached {0};
-		std::atomic<uint64_t> compiled {0};
-		std::atomic<uint64_t> skipped {0};
-		std::atomic<uint64_t> compile_ms {0};
-		std::atomic<uint64_t> finished {0};
-	};
-
 	// A graphics pipeline whose first build runs on the background queue; its handle is null.
 	struct PendingBuild {
 		uint64_t                              ticket = 0;
@@ -289,7 +284,7 @@ private:
 	// cache file.
 	std::unique_ptr<ProgramManifest>        m_manifest;
 	std::unique_ptr<ProgramPrecompileQueue> m_precompile_queue;
-	PrecompileStats                         m_precompile_stats;
+	PrecompileProgress                      m_precompile_progress;
 	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
 	std::atomic<bool> m_precompile_dirty {false};
 	// Live compute pipelines the driver cache provided or compiled.
@@ -335,15 +330,6 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
                        bool* from_driver_cache = nullptr);
 
-enum class PrecompileOutcome : uint8_t {
-	// The driver cache already held the pipeline.
-	Cached,
-	// The driver compiled the pipeline into the driver cache.
-	Compiled,
-	// The program cannot be rebuilt from its record (a shader with calls, or a specialization
-	// this recompiler no longer derives for the shader).
-	Skipped,
-};
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
 // Thread-safe; touches no guest state. `spirv_hash` receives the hash of the module.
