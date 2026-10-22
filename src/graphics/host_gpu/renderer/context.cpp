@@ -25,23 +25,100 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	RecordBarrier(m_barriers.BeforeCommand());
 	m_has_commands = true;
 	return m_buffer;
 }
 
 vk::CommandBuffer CommandBuffer::BarrierHandle() const {
 	EXIT_IF(IsInvalid());
+	RecordBarrier(m_barriers.BeforeBarrier());
 	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::StateHandle() const {
+	EXIT_IF(IsInvalid());
+	m_has_commands = true;
+	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes) const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	RecordBarrier(m_barriers.BeforeDispatch(writes));
+	m_has_commands = true;
+	return m_buffer;
+}
+
+void CommandBuffer::GuestFlush() const {
+	EXIT_IF(IsInvalid());
+	const auto barrier = m_barriers.Flush();
+	if (barrier != BarrierTracker::Barrier::None) {
+		EndRendering();
+		RecordBarrier(barrier);
+	}
+}
+
+void CommandBuffer::OrderDispatches() const {
+	EXIT_IF(IsInvalid());
+	RecordBarrier(m_barriers.BeforeBarrier());
+}
+
+void CommandBuffer::RecordBarrier(BarrierTracker::Barrier barrier) const {
+	using Barrier = BarrierTracker::Barrier;
+	if (barrier == Barrier::None) {
+		return;
+	}
+	// Dispatches end a render pass instance and the start of one orders them first, so no
+	// tracked barrier falls inside one.
+	EXIT_IF(m_rendering);
+	constexpr auto ShaderAccess =
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	constexpr auto ComputeReads = vk::AccessFlagBits2::eShaderRead |
+	                              vk::AccessFlagBits2::eShaderWrite |
+	                              vk::AccessFlagBits2::eUniformRead;
+	constexpr auto MemoryAccess =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::MemoryBarrier2 memory {};
+	switch (barrier) {
+		case Barrier::ComputeToCompute:
+			memory.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+			memory.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+			memory.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+			memory.dstAccessMask = ComputeReads;
+			break;
+		case Barrier::AllToCompute:
+			memory.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			memory.srcAccessMask = MemoryAccess;
+			memory.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+			memory.dstAccessMask = ComputeReads;
+			break;
+		case Barrier::ComputeToAll:
+			memory.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+			memory.srcAccessMask = ShaderAccess;
+			memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			memory.dstAccessMask = MemoryAccess;
+			break;
+		case Barrier::AllToAll:
+			memory.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			memory.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+			memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			memory.dstAccessMask = MemoryAccess;
+			break;
+		case Barrier::None: return;
+	}
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &memory;
+	m_buffer.pipelineBarrier2(dependency);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 
-	auto result = buffer.begin(&begin_info);
+	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	m_has_commands = false;
@@ -49,9 +126,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	// The deferred barrier after the last dispatches stays in this submission.
+	OrderDispatches();
 
-	auto result = buffer.end();
+	auto result = m_buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
@@ -110,6 +188,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	// Attachment loads and stores access memory like any other command.
 	Handle().beginRendering(rendering);
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
