@@ -24,6 +24,8 @@ public:
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           EndRendering() { m_command.EndRendering(); }
+	// Orders pending guest dispatches before a barrier recorded through a saved handle.
+	void OrderDispatches();
 	// Submits the current command buffer and begins the next one. A buffer that holds no
 	// commands (barriers at most) and no operation waits for is kept open instead.
 	void           Flush();
