@@ -674,8 +674,12 @@ struct PipelineCacheTestAccess {
     cache.QueuePrecompile(1);
   }
 
-  static uint64_t PrecompilesFinished(const PipelineCache &cache) {
-    return cache.m_precompile_stats.finished.load();
+  static PrecompileProgress::Counts PrecompileCounts(PipelineCache &cache) {
+    return cache.m_precompile_progress.Get();
+  }
+
+  static uint64_t PrecompilesFinished(PipelineCache &cache) {
+    return cache.m_precompile_progress.Get().finished;
   }
 };
 
@@ -47385,6 +47389,25 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
           PipelineCacheTestAccess::ComputeFromDriverCache(cache) == 1,
           "the first use of a precompiled program compiled its pipeline again");
     }
+  }
+
+  // --precompile-only: every record is built or skipped, each is counted once,
+  // and the call returns after the last one.
+  {
+    PipelineCache cache(graphics, nullptr);
+    auto manifest = std::make_unique<ProgramManifest>();
+    Require(name, "precompile-all records",
+            manifest->Add(*record) && manifest->Add(stale),
+            "the manifest did not take the live and the stale record");
+    PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
+                                               new_driver_cache());
+    Require(name, "precompile-all result", cache.PrecompileAll(2),
+            "precompiling every record reported a failed save");
+    const auto counts = PipelineCacheTestAccess::PrecompileCounts(cache);
+    Require(name, "precompile-all counts",
+            counts.queued == 2 && counts.finished == 2 && counts.skipped == 1 &&
+                counts.cached + counts.compiled == 1,
+            "precompiling every record did not account for each record once");
   }
 
   // A queued precompile is expedited by the first use of its program.
