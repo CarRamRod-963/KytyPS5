@@ -10,8 +10,9 @@ class Presenter;
 
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
-// --precompile-only: builds the recorded pipelines into the driver cache and saves it.
-void                     WindowPrecompilePipelines();
+// --precompile-only: builds the recorded pipelines into the driver cache and saves it. Returns
+// false when the driver cache could not be saved.
+[[nodiscard]] bool       WindowPrecompilePipelines();
 void                     WindowShutdown();
 
 } // namespace Libs::Graphics

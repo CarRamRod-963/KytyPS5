@@ -868,11 +868,11 @@ void WindowRun() {
 	g_window->render_context->GetPipelineCache().Save();
 }
 
-void WindowPrecompilePipelines() {
+bool WindowPrecompilePipelines() {
 	EXIT_IF(g_window == nullptr);
 	// About half the host threads: nothing else runs, and each driver compile is mostly serial.
 	const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
-	(void)g_window->render_context->GetPipelineCache().PrecompileAll(threads);
+	return g_window->render_context->GetPipelineCache().PrecompileAll(threads);
 }
 
 void WindowShutdown() {
