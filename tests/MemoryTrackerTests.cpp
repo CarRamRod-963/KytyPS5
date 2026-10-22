@@ -291,6 +291,12 @@ void TestRangeSet() {
   ranges.Add(0x1000, 0x80);
   ranges.Add(0x1080, 0x80);
   ranges.Add(0x1200, 0x40);
+  // A covered range changes nothing; an adjacent or overlapping one merges.
+  Check(!ranges.Add(0x1010, 0x20) && !ranges.Add(0x1000, 0x100) &&
+            !ranges.Add(0x1200, 0x40) && ranges.Add(0x1240, 0x10) &&
+            ranges.Contains(0x1200, 0x50) && !ranges.Add(0x1248, 0x8),
+        "range set reported the wrong change for an added range");
+  ranges.Subtract(0x1240, 0x10);
   Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
         "range set containment did not require full coverage");
   Check(ranges.Intersects(0x0fff, 2) && ranges.Intersects(0x11ff, 2) &&
