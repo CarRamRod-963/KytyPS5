@@ -377,10 +377,13 @@ void Image::CopyImage(Image& source) {
 	} else if (backing.image_type == vk::ImageType::e3D) {
 		base_depth = backing.extent.depth;
 	}
+	// The stencil aspect is copied when both images have one.
+	const auto stencil = FullAspectMask(source.backing.format) & FullAspectMask(backing.format) &
+	                     vk::ImageAspectFlagBits::eStencil;
 	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    (FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil) | stencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    (FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil) | stencil;
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
