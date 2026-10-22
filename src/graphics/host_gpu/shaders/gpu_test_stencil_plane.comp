@@ -1,0 +1,21 @@
+#version 450
+
+// Rewrites texels of an R8_UINT image in place: XOR_VALUE is applied to the texels whose x
+// coordinate has no bit of COLUMN_MASK set, the others keep their value.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r8ui) uniform uimage2D plane;
+
+layout(push_constant) uniform Push {
+	uint xor_value;
+	uint column_mask;
+}
+push;
+
+void main() {
+	const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(texel, imageSize(plane))) || (uint(texel.x) & push.column_mask) != 0u) {
+		return;
+	}
+	imageStore(plane, texel, uvec4(imageLoad(plane, texel).x ^ push.xor_value));
+}
