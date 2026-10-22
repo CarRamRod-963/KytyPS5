@@ -689,8 +689,9 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 // The slot of a bindless image's key: translation[region + key] when the key is inside the
 // heap's entry count (both patched into the flattened SRT by the renderer), slot 0 (the
 // placeholder) outside it and while the entry is pending. A pending entry is flagged in the
-// feedback buffer for the renderer to resolve; every lane that reads an entry sees the same
-// translation, so the unconditional store never races with a different value.
+// feedback buffer for the renderer to resolve (the renderer clears the flags it takes). Only a
+// pending read stores: the feedback buffer lives in host memory, and a store per lane and access
+// of every resolved read sends every pixel's writes over the bus.
 static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& image,
                                  uint32_t key) {
 	const auto Load = [&](uint32_t variable, uint32_t index) {
@@ -712,13 +713,13 @@ static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& i
 	const auto pending  = Binary(state, spv::OpIEqual, TypeBool(state), raw,
 	                             ConstantU32(state, IR::BindlessPending));
 	if (state.bindless_feedback_variable != 0) {
-		const auto flag    = Select(state, TypeU32(state), pending, ConstantU32(state, 1u),
-		                            ConstantU32(state, 0u));
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
-		                          index);
-		state.builder.AddFunction(spv::OpStore, pointer, flag);
+		EmitIfCondition(state, pending, [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.bindless_feedback_variable,
+			                          ConstantU32(state, 0), index);
+			state.builder.AddFunction(spv::OpStore, pointer, ConstantU32(state, 1u));
+		});
 	}
 	return Select(state, TypeU32(state), pending, ConstantU32(state, 0u), raw);
 }
