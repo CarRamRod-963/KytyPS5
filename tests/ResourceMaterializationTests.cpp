@@ -601,6 +601,101 @@ void TestResourceLookahead() {
         "lookahead statistics are wrong");
 }
 
+// The owner's in-place check (LookaheadMemory::same) of a walk whose two reads
+// fill adjacent read-cache chunks: the helper's reads become one span, compared
+// once, and a change anywhere in it (also in bytes of the chunks the walk did
+// not use) refuses the walk.
+std::vector<std::pair<uint64_t, uint64_t>> g_lookahead_same_calls;
+
+bool LookaheadTestSame(uint64_t address, const void *data, uint64_t size,
+                       bool mapped) {
+  g_lookahead_same_calls.emplace_back(address, size);
+  return mapped &&
+         std::memcmp(reinterpret_cast<const void *>(address), data, size) == 0;
+}
+
+void TestResourceLookaheadMergedReads() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct alignas(256) Table {
+    std::array<uint32_t, 64> words;
+  };
+  static Table table{};
+  for (uint32_t i = 0; i < 64; ++i)
+    table.words[i] = 0x100u + i;
+  const auto address = reinterpret_cast<uint64_t>(table.words.data());
+  LookaheadInputs inputs;
+  inputs.user_data_count = 2;
+  inputs.user_data[0] = static_cast<uint32_t>(address);
+  inputs.user_data[1] = static_cast<uint32_t>(address >> 32u);
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  program.srt_reads.clear();
+  auto &block = *program.blocks[0];
+  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(opcode, args));
+  };
+  const auto root =
+      emit(ValueOpcode::GetAddressResource,
+           {emit(ValueOpcode::GetUserData, {Value(ScalarReg(4))}),
+            emit(ValueOpcode::GetUserData, {Value(ScalarReg(5))})});
+  for (const auto byte_offset : {0u, 128u}) {
+    const auto value = emit(ValueOpcode::LoadAddressU32,
+                            {root, Value(byte_offset), Value(0u), Value(true)});
+    value.Instruction()->SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {value, static_cast<uint32_t>(program.srt_reads.size())});
+  }
+  SrtWalkerCompileQueue queue;
+  auto job = queue.Submit(std::make_unique<ResourcePlan>(
+      ExtractResourcePlan(program, SrtWalkerLoads::Reader,
+                          SrtWalkerCompilation::Deferred)));
+  for (uint32_t wait = 0; wait < 10000u && !job->Ready(); ++wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  Check(job->Ready(), "the merged-read lookahead plan was not compiled");
+  auto plan = std::make_shared<LookaheadPlan>(job, 0u);
+
+  ResourceLookahead lookahead({.read = LookaheadTestRead,
+                               .gpu_dirty = LookaheadTestDirty,
+                               .same = LookaheadTestSame},
+                              1u);
+  const int stream = 0;
+  const int command = 0;
+  using Outcome = ResourceLookahead::Outcome;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // Plans and runs the walk, then applies `between` (a guest write after the
+  // helper's walk) before the owner reaches the command.
+  const auto run = [&](auto &&between) {
+    lookahead.BeginRun(&stream);
+    lookahead.Plan(&stream, &command, plan, inputs);
+    lookahead.Kick();
+    lookahead.WaitIdle();
+    between();
+    g_lookahead_same_calls.clear();
+    snapshot = {};
+    return lookahead.TryAdopt(&stream, &command, plan.get(), inputs, snapshot,
+                              specialization);
+  };
+
+  const auto unchanged = [] {};
+  Check(run(unchanged) == Outcome::Adopted &&
+            snapshot.flattened_srt ==
+                std::vector<uint32_t>{table.words[0], table.words[32]},
+        "a walk over adjacent chunks was not adopted");
+  Check(g_lookahead_same_calls.size() == 1 &&
+            g_lookahead_same_calls[0] ==
+                std::pair<uint64_t, uint64_t>{address, 256u},
+        "the reads of adjacent chunks were not checked as one span");
+  // A byte the walk did not use, in the second chunk: the helper read it, so a
+  // change there refuses the walk exactly as a separate check would.
+  Check(run([&] { table.words[40] ^= 1u; }) == Outcome::Moved,
+        "a change in the second chunk of a merged span was not seen");
+  Check(run(unchanged) == Outcome::Adopted,
+        "a walk over the changed span was not adopted");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtProgram(0x10000);
@@ -1935,6 +2030,7 @@ int main() {
   TestReaderLoadsThroughCacheView();
   TestResourceLookahead();
   TestSpecializationFailureReports();
+  TestResourceLookaheadMergedReads();
   TestRangeOverlapIndex();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
