@@ -434,12 +434,11 @@ public:
 			return 0;
 		}
 
-		// The GPU thread clamps every buffer it binds; most lie in the committed range of the
-		// thread's previous clamp, which needs no lookup while the ranges are unchanged.
+		// The GPU thread clamps every buffer it binds; most lie in the committed range of one
+		// of the thread's recent clamps, which needs no lookup while the ranges are unchanged.
 		auto& last = t_last_committed;
 		if (last.owner == this && last.generation == m_generation &&
-		    virtual_addr >= last.start && virtual_addr < last.end &&
-		    size <= last.end - virtual_addr) {
+		    last.Contains(virtual_addr, size)) {
 			return size;
 		}
 
@@ -449,7 +448,7 @@ public:
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
-		last = {.owner = this, .generation = m_generation, .start = vma->second.start, .end = vma_end};
+		last.Remember(this, m_generation, vma->second.start, vma_end);
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -652,12 +651,38 @@ private:
 		return generations.fetch_add(1, std::memory_order_relaxed) + 1u;
 	}
 	uint64_t m_generation = NextGeneration();
-	// The committed range a thread's last ClampRangeSize started in.
+	// The committed ranges a thread's last ClampRangeSize calls started in (vertex, index and
+	// shader buffers of one draw often lie in different ones).
 	struct LastCommitted {
-		const VirtualRanges* owner      = nullptr;
-		uint64_t             generation = 0;
-		uint64_t             start      = 0;
-		uint64_t             end        = 0;
+		static constexpr uint32_t Count = 4;
+
+		const VirtualRanges*                             owner      = nullptr;
+		uint64_t                                         generation = 0;
+		std::array<std::pair<uint64_t, uint64_t>, Count> ranges {};
+		uint32_t                                         used = 0;
+		uint32_t                                         next = 0;
+
+		[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+			for (uint32_t i = 0; i < used; i++) {
+				const auto [start, end] = ranges[i];
+				if (address >= start && address < end && size <= end - address) {
+					return true;
+				}
+			}
+			return false;
+		}
+		void Remember(const VirtualRanges* store, uint64_t ranges_generation, uint64_t start,
+		              uint64_t end) {
+			if (owner != store || generation != ranges_generation) {
+				owner      = store;
+				generation = ranges_generation;
+				used       = 0;
+				next       = 0;
+			}
+			ranges[next] = {start, end};
+			next         = (next + 1u) % Count;
+			used         = std::max(used, next == 0 ? Count : next);
+		}
 	};
 	static thread_local LastCommitted t_last_committed;
 };
