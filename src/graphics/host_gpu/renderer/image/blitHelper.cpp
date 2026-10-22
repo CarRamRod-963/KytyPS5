@@ -149,7 +149,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	const auto destination_view  = destination.FindView(destination_view_info);
 
 	auto& command_buffer = m_scheduler.Current();
-	auto  command        = command_buffer.Handle();
+	auto  command        = command_buffer.PipelineHandle();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
