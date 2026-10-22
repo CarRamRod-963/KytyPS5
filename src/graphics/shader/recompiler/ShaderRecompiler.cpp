@@ -921,6 +921,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::MakePixelLdsLaneRelative(ir);
+	IR::DropReadOnlyCoherence(ir);
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {
