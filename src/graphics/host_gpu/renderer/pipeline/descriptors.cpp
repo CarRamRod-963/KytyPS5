@@ -1331,7 +1331,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto                           vk_buffer              = buffer.Handle();
+	// Binding commands access no memory. Image transitions order pending dispatches first.
+	auto                           vk_buffer              = buffer.StateHandle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -1363,7 +1364,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
 			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
-			vk_buffer.pipelineBarrier(
+			buffer.BarrierHandle().pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,
