@@ -29875,6 +29875,58 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   return test;
 }
 
+// V_MIN_F32/V_MAX_F32 are IEEE minNum/maxNum: a NaN operand yields the other
+// operand and -0 orders below +0. Every pair of zeros, ones, infinities,
+// quiet/signalling/negative NaNs, the smallest normals and the largest finite
+// value is checked bit for bit, except two NaNs (unspecified payload).
+// Denormal results depend on the float mode and are not pinned down here.
+TestCase VectorMinMaxF32EdgePairs() {
+  using O = ShaderOpcode;
+  const u32 values[] = {0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+                        0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7fa00001u,
+                        0xffc00000u, 0x7f7fffffu, 0x00800000u, 0x80800000u};
+  const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+  const auto as_float = [](u32 v) {
+    float f;
+    std::memcpy(&f, &v, sizeof(f));
+    return f;
+  };
+  const auto reference = [&](u32 a, u32 b, bool max) {
+    if (nan(a))
+      return b;
+    if (nan(b))
+      return a;
+    if ((a & 0x7fffffffu) == 0 && (b & 0x7fffffffu) == 0)
+      return max ? (a & b) : (a | b);
+    const bool a_first =
+        max ? as_float(a) >= as_float(b) : as_float(a) < as_float(b);
+    return a_first ? a : b;
+  };
+  std::vector<u32> code;
+  TestCase test;
+  u32 index = 0;
+  for (const u32 a : values) {
+    for (const u32 b : values) {
+      if (nan(a) && nan(b))
+        continue;
+      AppendVMovLiteral(&code, 0, a);
+      AppendVMovLiteral(&code, 1, b);
+      code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+      code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+      AppendStoreVgpr(&code, 10, index++);
+      AppendStoreVgpr(&code, 11, index++);
+      test.expected.push_back(reference(a, b, false));
+      test.expected.push_back(reference(a, b, true));
+    }
+  }
+  AppendEnd(&code);
+  test.name = "VectorMinMaxF32EdgePairs";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
@@ -45477,6 +45529,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
+  AddCase(VectorMinMaxF32EdgePairs);
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
   cases.push_back(VectorMinMaxF32RuntimeEdges(32));
@@ -51819,6 +51872,16 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination(32));
     RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination(64));
     RunCase(&vulkan, VectorDppPermlaneWaveMinimum());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-minmax-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMinMaxF32NanAndSignedZeroEdges());
+    RunCase(&vulkan, VectorMinMaxF32EdgePairs());
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(32));
+    RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(64));
+    RunCase(&vulkan, VectorMinMaxF32RuntimeEdges(32));
+    RunCase(&vulkan, VectorMinMaxF32RuntimeEdges(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
