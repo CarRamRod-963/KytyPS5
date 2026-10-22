@@ -920,6 +920,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
+	IR::MakePixelLdsLaneRelative(ir);
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {

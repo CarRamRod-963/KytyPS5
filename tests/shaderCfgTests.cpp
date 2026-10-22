@@ -1591,6 +1591,101 @@ void TestFunctionLdsBound() {
         "an LDS address past 32 KiB changed the function LDS array");
 }
 
+void TestPixelLdsLaneRelative() {
+  using namespace ShaderRecompiler::IR;
+
+  ShaderPixelInputInfo pixel_info{};
+  ShaderVertexInputInfo vertex_info{};
+  // Builds LDS accesses into a fresh program, rewrites it and returns the
+  // dword count of its per-invocation LDS array.
+  Inst *row = nullptr;
+  bool row_rewritten = false;
+  const auto collect = [&](ShaderType stage, const auto &build) {
+    Program program;
+    program.resource_tracking_complete = true;
+    program.stage = stage;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+    program.memory_info.push_back({.kind = ResourceKind::Lds, .offset = 8});
+    row = nullptr;
+    build(*block);
+    MakePixelLdsLaneRelative(program);
+    // The program owns the instructions: inspect them before it goes.
+    row_rewritten =
+        row != nullptr && row->Arg(0).IsImmediate() && row->Arg(0).U32() == 0u;
+    CollectShaderInfo(program,
+                      stage == ShaderType::Pixel
+                          ? ShaderStageInputInfo{.pixel = &pixel_info}
+                          : ShaderStageInputInfo{.vertex = &vertex_info});
+    return program.info.function_lds_dwords;
+  };
+
+  const auto lane_address = [](Block &block, uint32_t base,
+                               uint32_t shift = 2) {
+    auto &lane = block.AppendNewInst(ValueOpcode::LaneId);
+    auto &bytes = block.AppendNewInst(ValueOpcode::ShiftLeftLogical32,
+                                      {Value(&lane), Value(shift)});
+    return &block.AppendNewInst(ValueOpcode::IAdd32,
+                                {Value(&bytes), Value(base)});
+  };
+  const auto access = [](Block &block, ValueOpcode op, Inst *address,
+                         uint32_t memory) {
+    auto &inst =
+        op == ValueOpcode::WriteSharedU32
+            ? block.AppendNewInst(op, {Value(address), Value(1u), Value(true)})
+            : block.AppendNewInst(op, {Value(address), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = memory});
+  };
+
+  // Lane-private rows: the lane term goes, the rows are the constant parts.
+  Check(collect(ShaderType::Pixel,
+                [&](Block &block) {
+                  row = lane_address(block, 1024);
+                  access(block, ValueOpcode::WriteSharedU32, row, 0);
+                  access(block, ValueOpcode::LoadSharedU32x2,
+                         lane_address(block, 256), 1);
+                }) == 257u &&
+            row_rewritten,
+        "lane-indexed pixel LDS rows were not made lane-relative");
+  // An address without the lane term would alias differently: keep lanes.
+  Check(collect(ShaderType::Pixel,
+                [&](Block &block) {
+                  access(block, ValueOpcode::WriteSharedU32,
+                         lane_address(block, 1024), 0);
+                  auto &fixed = block.AppendNewInst(ValueOpcode::IAdd32,
+                                                    {Value(4u), Value(16u)});
+                  access(block, ValueOpcode::LoadSharedU32, &fixed, 0);
+                }) == 320u,
+        "an LDS address without a lane term allowed the lane rewrite");
+  // Different lane strides would alias differently: keep lanes.
+  Check(collect(ShaderType::Pixel,
+                [&](Block &block) {
+                  access(block, ValueOpcode::WriteSharedU32,
+                         lane_address(block, 0), 0);
+                  access(block, ValueOpcode::LoadSharedU32,
+                         lane_address(block, 0, 3), 0);
+                }) == 127u,
+        "LDS addresses with different lane strides were made lane-relative");
+  // A sum that also feeds something other than an LDS address stays.
+  Check(collect(ShaderType::Pixel,
+                [&](Block &block) {
+                  auto *shared = lane_address(block, 64);
+                  access(block, ValueOpcode::WriteSharedU32, shared, 0);
+                  block.AppendNewInst(ValueOpcode::IAdd32,
+                                      {Value(shared), Value(1u)});
+                }) == 80u,
+        "an LDS address sum with other users was rewritten");
+  // Only pixel shaders are rewritten.
+  Check(collect(ShaderType::Vertex,
+                [&](Block &block) {
+                  access(block, ValueOpcode::WriteSharedU32,
+                         lane_address(block, 1024), 0);
+                }) == 320u,
+        "a vertex shader's LDS addresses were made lane-relative");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -17550,6 +17645,7 @@ int main() {
   TestTextureDataPlacement();
   TestShaderFeatureCollection();
   TestFunctionLdsBound();
+  TestPixelLdsLaneRelative();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestDriverSimplifySpeculatesGuardedLoads();
