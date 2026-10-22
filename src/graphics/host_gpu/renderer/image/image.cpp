@@ -122,6 +122,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	// Every access to the image starts here; one that is not a shader write to the stencil
+	// plane's color copy needs the stencil values back in the stencil aspect.
+	if (m_stencil_plane_newer) {
+		ReturnStencilPlane();
+	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -619,6 +624,116 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
+Image& Image::StencilPlane(const ImageInfo& plane, const ImageSubresourceRange& range) {
+	// The image keeps its stencil aspect while bound without a stencil plane.
+	if (!info.IsDepth() || backing.image == nullptr || !HasStencilAspect()) {
+		EXIT("stencil plane copy requires a depth/stencil image\n");
+	}
+	if (backing.samples != 1) {
+		EXIT("multisampled stencil plane copies are not implemented\n");
+	}
+	if (range.base_level != 0 || range.level_count != plane.resources.levels ||
+	    range.layer_count != plane.resources.layers || range.level_count > backing.mip_levels ||
+	    range.base_layer >= backing.layers ||
+	    range.layer_count > backing.layers - range.base_layer || plane.extent != info.extent ||
+	    plane.bytes_per_block != 1) {
+		EXIT("invalid stencil plane: levels=%u layers=%u+%u extent=%ux%u\n", range.level_count,
+		     range.base_layer, range.layer_count, plane.extent.width, plane.extent.height);
+	}
+	const bool reuse = m_stencil_plane != nullptr && m_stencil_plane_range == range &&
+	                   m_stencil_plane->info.data == plane.data &&
+	                   m_stencil_plane->info.pitch == plane.pitch &&
+	                   m_stencil_plane->info.tile_mode == plane.tile_mode;
+	if (!reuse) {
+		ReturnStencilPlane();
+		if (m_stencil_plane != nullptr) {
+			m_scheduler.DeferOperation([old_plane   = std::move(m_stencil_plane),
+			                            old_staging = std::move(m_stencil_staging)]() mutable {
+				old_plane.reset();
+				old_staging.reset();
+			});
+		}
+		auto color         = plane;
+		color.pixel_format = vk::Format::eR8Uint;
+		color.guest_format = Prospero::BufferFormat::k8UInt;
+		m_stencil_plane =
+		    std::make_unique<Image>(m_graphics, m_scheduler, color, MemoryPriority::Class::Target);
+		uint64_t staging_size = 0;
+		for (uint32_t level = 0; level < range.level_count; level++) {
+			// Depth/stencil buffer copies start at multiples of four bytes.
+			staging_size = Common::AlignUp(staging_size, 4) +
+			               uint64_t {std::max(info.extent.width >> level, 1u)} *
+			                   std::max(info.extent.height >> level, 1u) * range.layer_count;
+		}
+		m_stencil_staging = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+		    Common::AlignUp(staging_size, 4));
+		m_stencil_plane_range = range;
+	}
+	if (!m_stencil_plane_newer) {
+		CopyStencilPlane(true);
+	}
+	return *m_stencil_plane;
+}
+
+void Image::WriteStencilPlane(std::optional<ImageSubresourceRange> range,
+                              vk::CommandBuffer                    command_buffer) {
+	EXIT_IF(m_stencil_plane == nullptr);
+	m_stencil_plane_newer = true;
+	m_stencil_plane->Transit(vk::ImageLayout::eGeneral,
+	                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+	                         range, command_buffer);
+}
+
+void Image::ReturnStencilPlane() {
+	if (!m_stencil_plane_newer) {
+		return;
+	}
+	// Cleared first: the copy below accesses this image again.
+	m_stencil_plane_newer = false;
+	CopyStencilPlane(false);
+}
+
+void Image::CopyStencilPlane(bool to_plane) {
+	EXIT_IF(m_stencil_plane == nullptr || m_stencil_staging == nullptr);
+	auto&                            plane = *m_stencil_plane;
+	const auto&                      range = m_stencil_plane_range;
+	std::vector<vk::BufferImageCopy> stencil_copies;
+	std::vector<vk::BufferImageCopy> plane_copies;
+	stencil_copies.reserve(range.level_count);
+	plane_copies.reserve(range.level_count);
+	uint64_t offset = 0;
+	for (uint32_t level = 0; level < range.level_count; level++) {
+		const vk::Extent3D extent {std::max(info.extent.width >> level, 1u),
+		                           std::max(info.extent.height >> level, 1u), 1u};
+		offset = Common::AlignUp(offset, 4);
+		stencil_copies.push_back(
+		    {offset,
+		     0,
+		     0,
+		     {vk::ImageAspectFlagBits::eStencil, level, range.base_layer, range.layer_count},
+		     {},
+		     extent});
+		plane_copies.push_back({offset,
+		                        0,
+		                        0,
+		                        {vk::ImageAspectFlagBits::eColor, level, 0, range.layer_count},
+		                        {},
+		                        extent});
+		offset += uint64_t {extent.width} * extent.height * range.layer_count;
+	}
+	const auto staging = m_stencil_staging->Handle();
+	const auto size    = m_stencil_staging->Size();
+	if (to_plane) {
+		Download(stencil_copies, staging, 0, size);
+		plane.Upload(plane_copies, staging, 0, size);
+	} else {
+		plane.Download(plane_copies, staging, 0, size);
+		Upload(stencil_copies, staging, 0, size);
+	}
 }
 
 namespace ImageOps {
