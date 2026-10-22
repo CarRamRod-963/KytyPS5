@@ -59,6 +59,9 @@ struct LookaheadMemory {
 	bool (*read)(uint64_t address, void* data, uint64_t size) = nullptr;
 	// Owner thread only: whether the range holds GPU writes not yet in the backing.
 	bool (*gpu_dirty)(uint64_t address, uint64_t size) = nullptr;
+	// Owner thread: whether `read` would return exactly `data` (true) or fail exactly when
+	// `mapped` is false; null to compare through `read`.
+	bool (*same)(uint64_t address, const void* data, uint64_t size, bool mapped) = nullptr;
 };
 
 // Materializes the resources of commands the GPU thread has not reached yet on helper threads.
