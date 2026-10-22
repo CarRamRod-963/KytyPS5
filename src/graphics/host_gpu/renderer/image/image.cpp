@@ -367,10 +367,13 @@ void Image::CopyImage(Image& source) {
 	                            : backing.image_type == vk::ImageType::e3D
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
-	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	// The stencil aspect is copied when both images have one.
+	const auto stencil = FullAspectMask(source.backing.format) & FullAspectMask(backing.format) &
+	                     vk::ImageAspectFlagBits::eStencil;
+	const auto source_aspect =
+	    (FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil) | stencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    (FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil) | stencil;
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
