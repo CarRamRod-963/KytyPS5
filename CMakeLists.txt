@@ -199,6 +199,72 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Optional code generation for Kyty's own targets (the ones declared below; third-party code keeps
+# its normal flags). Everything is off by default, and nothing here is tied to a game.
+#
+# Profile-guided optimization (clang and clang-cl with lld), IR-level instrumentation. It composes
+# with CMAKE_INTERPROCEDURAL_OPTIMIZATION (ThinLTO). Use a separate build directory per step:
+# 1. -DKYTY_PGO_GENERATE=ON builds an instrumented emulator. Run a representative session with
+#    KYTY_PGO_FILE=<file.profraw>: the emulator writes its counters every KYTY_PGO_DUMP_SECONDS
+#    (default 60) and at quick_exit (src/main.cpp), so a training run that is killed keeps its last
+#    complete dump.
+# 2. llvm-profdata merge -o <file.profdata> <file.profraw...> (the llvm-profdata next to clang-cl).
+# 3. -DKYTY_PGO_USE=<file.profdata> builds the optimized emulator. A profile recorded before later
+#    code changes is still accepted: functions whose control flow changed are optimized without it.
+# KYTY_TARGET_ARCH=<cpu> (clang: -march, e.g. x86-64-v3 for AVX2/BMI2/FMA CPUs) builds for a CPU class;
+# empty (default) keeps the portable x86-64 baseline. The result does not start on older CPUs.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib for clang-cl (empty: search next to the compiler)")
+set(KYTY_TARGET_ARCH "" CACHE STRING "CPU to generate code for, e.g. x86-64-v3 (clang; empty: portable)")
+if((KYTY_PGO_GENERATE OR KYTY_PGO_USE OR KYTY_TARGET_ARCH) AND NOT CLANG)
+	message(FATAL_ERROR "KYTY_PGO_GENERATE, KYTY_PGO_USE and KYTY_TARGET_ARCH need clang or clang-cl")
+endif()
+if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+	message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is invoked directly, so the profile runtime has to be named. clang 19 asks for it
+		# under its newer name too (clang_rt.profile.lib), which the x86_64-suffixed layout lacks.
+		set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		if(NOT kyty_profile_runtime)
+			get_filename_component(kyty_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+			file(GLOB kyty_profile_runtime
+			     "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to "
+			                    "${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		add_link_options("/NODEFAULTLIB:clang_rt.profile.lib")
+	else()
+		add_link_options(-fprofile-generate)
+	endif()
+	message(STATUS "PGO: instrumented build")
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+	endif()
+	# Sources without profile data (launcher, tests) and functions changed since the profile was
+	# recorded are optimized without it, silently.
+	add_compile_options("-fprofile-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+	                    -Wno-profile-instr-out-of-date -Wno-profile-instr-missing -Wno-backend-plugin)
+	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+endif()
+if(KYTY_TARGET_ARCH)
+	if(KYTY_CLANG_CL)
+		add_compile_options("/clang:-march=${KYTY_TARGET_ARCH}")
+	else()
+		add_compile_options("-march=${KYTY_TARGET_ARCH}")
+	endif()
+	message(STATUS "Code generation for ${KYTY_TARGET_ARCH}")
+endif()
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
