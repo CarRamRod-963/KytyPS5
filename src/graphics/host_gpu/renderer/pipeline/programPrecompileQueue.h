@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PROGRAMPRECOMPILEQUEUE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PROGRAMPRECOMPILEQUEUE_H_
 
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
@@ -12,6 +13,84 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+enum class PrecompileOutcome : uint8_t {
+	// The driver cache already held the pipeline.
+	Cached,
+	// The driver compiled the pipeline into the driver cache.
+	Compiled,
+	// The program cannot be rebuilt from its record (a shader with calls, or a specialization
+	// this recompiler no longer derives for the shader).
+	Skipped,
+};
+
+// Counts the outcomes of a precompile run and tells exactly one caller that the run is complete:
+// the job that finishes last, or EndQueueing when no job is left by then (also when nothing was
+// queued). Queueing holds the run open, so a job finishing while others are still being queued
+// never completes it, and keys the queue rejects are never waited for.
+class PrecompileProgress {
+public:
+	struct Counts {
+		uint64_t queued     = 0;
+		uint64_t finished   = 0;
+		uint64_t cached     = 0;
+		uint64_t compiled   = 0;
+		uint64_t skipped    = 0;
+		uint64_t compile_ms = 0;
+	};
+
+	// Starts a run; not allowed while one is open.
+	void BeginQueueing() {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open != 0);
+		m_open = 1;
+	}
+	// Accounts for a job the queue accepted; call before the job can run.
+	void Queued() {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open == 0);
+		m_open++;
+		m_counts.queued++;
+	}
+	// Takes back a Queued() whose job the queue did not accept.
+	void Rejected() {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open < 2 || m_counts.queued == 0);
+		m_open--;
+		m_counts.queued--;
+	}
+	// Ends queueing. Returns whether the run is complete.
+	[[nodiscard]] bool EndQueueing() {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open == 0);
+		return --m_open == 0;
+	}
+	// Records a finished job. Returns whether it completed the run.
+	[[nodiscard]] bool Finish(PrecompileOutcome outcome, uint64_t ms) {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open == 0);
+		m_counts.finished++;
+		switch (outcome) {
+			case PrecompileOutcome::Cached: m_counts.cached++; break;
+			case PrecompileOutcome::Compiled:
+				m_counts.compiled++;
+				m_counts.compile_ms += ms;
+				break;
+			case PrecompileOutcome::Skipped: m_counts.skipped++; break;
+		}
+		return --m_open == 0;
+	}
+	[[nodiscard]] Counts Get() {
+		std::lock_guard lock(m_mutex);
+		return m_counts;
+	}
+
+private:
+	std::mutex m_mutex;
+	Counts     m_counts;
+	// Jobs queued and not finished, plus one while queueing.
+	uint64_t m_open = 0;
+};
 
 // Builds the pipelines of recorded programs (ProgramManifest) on background threads, one job
 // per program key, in the order they were queued. A program the renderer needs before its job
