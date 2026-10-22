@@ -2086,6 +2086,22 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!image.SafeToDownload()) {
 		return false;
 	}
+	// A range that starts at a stencil plane selects its depth image.
+	if (image.info.HasStencil() && vaddr == image.info.stencil.address) {
+		for (const auto id: image.stencil_ids) {
+			auto& association = m_texture_cache.m_slot_images[id];
+			if (association.info.data != image.info.stencil || association.IsCpuDirty() ||
+			    association.IsBufferModified() ||
+			    !m_texture_cache.CanDownloadStencil(association) ||
+			    !buffer.IsInBounds(association.info.data.address, association.info.data.size)) {
+				continue;
+			}
+			m_texture_cache.DownloadStencil(association, buffer,
+			                                buffer.Offset(association.info.data.address));
+			return true;
+		}
+		return false;
+	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
 		return false;
 	}
@@ -2121,13 +2137,33 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+bool TextureCache::CanDownloadStencil(const Image& association) const {
+	const auto* depth = m_slot_images.try_get(association.depth_id);
+	return depth != nullptr && depth->backing.image != nullptr && depth->HasStencilAspect() &&
+	       depth->backing.samples == 1 && association.info.resources.layers != 0 &&
+	       association.info.data.size % association.info.resources.layers == 0 &&
+	       association.info.LinearSize() != 0;
+}
+
+void TextureCache::DownloadStencil(Image& association, Buffer& destination,
+                                   uint64_t destination_offset) {
+	auto& depth = m_slot_images[association.depth_id];
+	auto& plane = depth.StencilPlane(association.info, association.stencil_subresources);
+	DownloadImage(plane, destination, destination_offset, association.info.data.size,
+	              association.info.resources.levels);
+}
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id) {
+	if (!image.SafeToDownload() ||
+	    (image.depth_id ? !CanDownloadStencil(image) : !CanDownload(image))) {
 		return false;
 	}
-	if (!image.SafeToDownload() || !CanDownload(image)) {
-		return false;
+	if (!image.depth_id) {
+		// A depth image's stencil plane is guest memory of its own.
+		for (const auto association: image.stencil_ids) {
+			(void)DownloadImageMemory(association);
+		}
 	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
@@ -2146,7 +2182,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	if (image.depth_id) {
+		DownloadStencil(image, download, offset);
+	} else {
+		DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
