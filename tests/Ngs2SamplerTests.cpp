@@ -671,6 +671,7 @@ void TestSubmixerSetupAndRouting() {
 	submixer.matrices.resize(1);
 	Ngs2RackInternal mastering_rack {};
 	mastering_rack.type = Ngs2RackType::Mastering;
+	mastering_rack.ngs  = &f.system;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
 	mastering.channels = 2;
@@ -903,6 +904,7 @@ void TestMonoRateAndRouting() {
 	f.Queue(pcm.data(), 441, 0);
 	Ngs2RackInternal mastering_rack {};
 	mastering_rack.type = Ngs2RackType::Mastering;
+	mastering_rack.ngs  = &f.system;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
 	mastering.channels = 2;
@@ -927,6 +929,7 @@ void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
 	mastering_rack.type = Ngs2RackType::Mastering;
+	mastering_rack.ngs  = &f.system;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
 	mastering.channels = 8;
@@ -959,6 +962,7 @@ void TestSamplerReuseResetsRouting() {
 		Fixture          f(48000, 1, type);
 		Ngs2RackInternal mastering_rack {};
 		mastering_rack.type = Ngs2RackType::Mastering;
+		mastering_rack.ngs  = &f.system;
 		Ngs2VoiceInternal mastering;
 		mastering.rack     = &mastering_rack;
 		mastering.channels = 2;
