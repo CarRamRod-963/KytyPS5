@@ -241,7 +241,42 @@ public:
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		if (data == nullptr) {
+			return false;
+		}
+		auto* destination = static_cast<uint8_t*>(data);
+		return AccessBacking(vaddr, size,
+		                     [destination](uint64_t at, const uint8_t* from, uint64_t bytes) {
+			                     std::memcpy(destination + at, from, bytes);
+		                     });
+	}
+
+	// Whether the backing of a mapped range holds exactly `data`, without copying it out.
+	BackingCompare CompareBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		if (data == nullptr) {
+			return BackingCompare::Unmapped;
+		}
+		const auto* expected = static_cast<const uint8_t*>(data);
+		bool        equal    = true;
+		// A retried optimistic pass starts over: only the last pass decides.
+		const bool mapped = AccessBacking(
+		    vaddr, size,
+		    [&](uint64_t at, const uint8_t* from, uint64_t bytes) {
+			    equal = equal && std::memcmp(expected + at, from, bytes) == 0;
+		    },
+		    [&] { equal = true; });
+		return !mapped ? BackingCompare::Unmapped
+		               : (equal ? BackingCompare::Equal : BackingCompare::Different);
+	}
+
+private:
+	// Calls access(offset in the range, backing bytes, byte count) for the backing of each
+	// mapping piece of a mapped range, in address order, and returns false (without calling it)
+	// when part of the range is not mapped. A lock-free pass that an exclusive section overlapped
+	// is repeated under the lock, after restart().
+	template <typename Access, typename Restart = void (*)()>
+	bool AccessBacking(uint64_t vaddr, uint64_t size, Access&& access, Restart&& restart = [] {}) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
@@ -266,11 +301,12 @@ public:
 			if (!RangeOk(offset, size)) {
 				return false;
 			}
-			std::memcpy(data, m_backing_base + offset, size);
+			access(0, m_backing_base + offset, size);
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (m_sequence.load(std::memory_order_relaxed) == sequence) {
 				return true;
 			}
+			restart();
 		}
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -300,18 +336,18 @@ public:
 		if (end <= first->second.vaddr + first->second.size) {
 			last.Remember(this, m_maps_generation, first->second);
 		}
-		auto* destination = static_cast<uint8_t*>(data);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
 			const auto  offset = entry.backing_offset + current - entry.vaddr;
-			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
+			access(current - vaddr, m_backing_base + offset, bytes);
 			current += bytes;
 		}
 		return true;
 	}
 
+public:
 	template <typename Gap>
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
@@ -898,6 +934,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	BackingCompare CompareBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		return m_backing->CompareBacking(vaddr, data, size);
 	}
 
 	template <bool copy_private>
