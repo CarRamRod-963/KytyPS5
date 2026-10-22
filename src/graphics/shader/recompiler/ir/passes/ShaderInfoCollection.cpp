@@ -496,6 +496,44 @@ private:
 	std::unordered_map<const Inst*, bool> m_lane;
 };
 
+// Whether the program can write memory other invocations read: buffer, address, image and GDS
+// stores and atomics, or a cache invalidation that asks for another writer's data.
+bool WritesSharedMemory(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			const auto shared = SharedAccessOf(op);
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    op == ValueOpcode::DataCacheInvalidate) {
+				return true;
+			}
+			if (shared != SharedAccess::None && shared != SharedAccess::Read &&
+			    program.memory_info[inst.Flags<MemoryFlags>().index].kind == ResourceKind::Gds) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Whether the block lies on a cycle of the block graph.
+bool OnCycle(const Block* start) {
+	std::vector<const Block*> stack(start->ImmSuccessors().begin(), start->ImmSuccessors().end());
+	std::unordered_set<const Block*> seen;
+	while (!stack.empty()) {
+		const auto* block = stack.back();
+		stack.pop_back();
+		if (block == start) return true;
+		if (!seen.insert(block).second) continue;
+		stack.insert(stack.end(), block->ImmSuccessors().begin(), block->ImmSuccessors().end());
+	}
+	return false;
+}
+
 uint32_t FunctionLdsDwords(const Program& program) {
 	constexpr uint32_t FullLdsDwords = 8192;
 	LdsAddressBound    bound;
@@ -893,6 +931,43 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 void MakePixelLdsLaneRelative(Program& program) {
 	if (program.stage != ShaderType::Pixel) return;
 	LaneRelativeLds(program).Run();
+}
+
+void DropReadOnlyCoherence(Program& program) {
+	const auto memory_index = [&](const Inst& inst) -> std::optional<uint32_t> {
+		const auto op = inst.GetOpcode();
+		if (BufferAccessOf(op) == BufferAccess::None &&
+		    AddressOpcodeInfoOf(op).access == AddressAccess::None) {
+			return std::nullopt;
+		}
+		const auto index = inst.Flags<MemoryFlags>().index;
+		return index < program.memory_info.size() ? std::optional(index) : std::nullopt;
+	};
+	std::vector<bool> drop(program.memory_info.size());
+	bool              any = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto index = memory_index(inst);
+			if (index && program.memory_info[*index].coherent) drop[*index] = any = true;
+		}
+	}
+	if (!any || WritesSharedMemory(program)) return;
+	// A GLC load in a loop may poll for a concurrent writer: it keeps device coherence.
+	for (const auto* block: program.blocks) {
+		bool on_cycle = false, checked = false;
+		for (const auto& inst: *block) {
+			const auto index = memory_index(inst);
+			if (!index || !program.memory_info[*index].coherent) continue;
+			if (!checked) {
+				on_cycle = OnCycle(block);
+				checked  = true;
+			}
+			if (on_cycle) drop[*index] = false;
+		}
+	}
+	for (size_t index = 0; index < drop.size(); ++index) {
+		if (drop[index]) program.memory_info[index].coherent = false;
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

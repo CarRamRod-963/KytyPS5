@@ -1683,6 +1683,51 @@ void TestPixelLdsLaneRelative() {
         "a vertex shader's LDS addresses were made lane-relative");
 }
 
+void TestReadOnlyCoherence() {
+  using namespace ShaderRecompiler::IR;
+
+  // Builds GLC loads (memory 0) into a fresh program and returns whether they
+  // keep device coherence.
+  const auto coherent = [](const auto &build) {
+    Program program;
+    program.resource_tracking_complete = true;
+    program.stage = ShaderType::Pixel;
+    for (int index = 0; index < 2; index++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+    }
+    program.memory_info.push_back(
+        {.kind = ResourceKind::Buffer, .coherent = true});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer});
+    build(*program.blocks[0], *program.blocks[1]);
+    DropReadOnlyCoherence(program);
+    return program.memory_info[0].coherent;
+  };
+  const auto load = [](Block &block, uint32_t memory) {
+    auto &inst = block.AppendNewInst(
+        ValueOpcode::LoadBufferU32,
+        {Value(0u), Value(0u), Value(0u), Value(0u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = memory});
+  };
+
+  Check(!coherent([&](Block &entry, Block &) { load(entry, 0); }),
+        "a GLC load of a read-only program kept device coherence");
+  Check(coherent([&](Block &entry, Block &) {
+          load(entry, 0);
+          auto &store = entry.AppendNewInst(
+              ValueOpcode::StoreBufferU32, {Value(0u), Value(0u), Value(0u),
+                                            Value(0u), Value(1u), Value(true)});
+          store.SetFlags(MemoryFlags{.index = 1});
+        }),
+        "a GLC load of a program with stores lost device coherence");
+  Check(coherent([&](Block &entry, Block &loop) {
+          entry.AddBranch(&loop);
+          loop.AddBranch(&loop);
+          load(loop, 0);
+        }),
+        "a GLC load in a loop lost device coherence");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -18007,6 +18052,7 @@ int main() {
   TestShaderFeatureCollection();
   TestFunctionLdsBound();
   TestPixelLdsLaneRelative();
+  TestReadOnlyCoherence();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestDriverSimplifySpeculatesGuardedLoads();
