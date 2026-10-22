@@ -940,12 +940,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteGpuWrite(vaddr, size);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
-	for (const auto page: m_make_unreadable) {
-		m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, false);
-	}
-	for (const auto page: m_keep_readable) {
-		m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, true);
-	}
+	m_memory_tracker.SetGpuModifiedReadable(m_make_unreadable, CACHING_PAGESIZE, false);
+	m_memory_tracker.SetGpuModifiedReadable(m_keep_readable, CACHING_PAGESIZE, true);
 	m_make_unreadable.clear();
 	m_keep_readable.clear();
 	if (is_written) {

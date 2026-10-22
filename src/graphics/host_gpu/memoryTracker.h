@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -31,6 +32,9 @@ public:
 	// Keeps (or stops keeping) GPU-dirty pages readable while their pending write has not
 	// executed; see RegionManager::SetStaleReadable.
 	void               SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool readable);
+	// The same for each of several pages of `page_size` bytes (ascending, none crossing a
+	// tracking region): one lock and one protection update per region instead of per page.
+	void SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable);
 	[[nodiscard]] bool IsGpuModifiedReadable(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Queue after changing ownership; a concurrent drain must not consume an event

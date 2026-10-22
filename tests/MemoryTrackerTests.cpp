@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <mutex>
 #include <semaphore>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -768,6 +770,59 @@ void TestGpuModifiedReadablePages() {
   Release(memory);
 }
 
+// The page-list form gives each page exactly the single-page result (a clean
+// page is never kept readable) and updates the protection once per region: the
+// changed pages and an unchanged page between them that already has their
+// protection go in one call.
+void TestGpuModifiedReadablePageList() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const std::array<uint64_t, 4> pages{address, address + page_size,
+                                      address + page_size * 2,
+                                      address + page_size * 3};
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.ForEachUploadRange(
+      pages[3], page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.ForEachUploadRange(
+      pages[2], page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+
+  ResetProtectionLog();
+  tracker.SetGpuModifiedReadable(pages, page_size, true);
+  Check(tracker.IsGpuModifiedReadable(pages[0], page_size) &&
+            tracker.IsGpuModifiedReadable(pages[1], page_size) &&
+            !tracker.IsGpuModifiedReadable(pages[2], page_size) &&
+            tracker.IsGpuModifiedReadable(pages[3], page_size),
+        "page list kept a clean page readable or missed a dirty one");
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_READONLY &&
+            Protection(memory + page_size * 3) == PAGE_READONLY &&
+            g_protection_calls == 1,
+        "page list did not update the protection with one call");
+
+  ResetProtectionLog();
+  tracker.SetGpuModifiedReadable(std::span{pages}.first(2), page_size, false);
+  Check(!tracker.IsGpuModifiedReadable(pages[0], page_size * 2) &&
+            tracker.IsGpuModifiedReadable(pages[3], page_size) &&
+            Protection(memory) == PAGE_NOACCESS &&
+            Protection(memory + page_size) == PAGE_NOACCESS &&
+            g_protection_calls == 1,
+        "page list did not return its dirty pages to no-access in one call");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 4);
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1436,6 +1491,7 @@ int main(int argc, char **argv) {
   TestGpuDirtyBits();
   TestPublishGpuModifiedHonoursAccept();
   TestGpuModifiedReadablePages();
+  TestGpuModifiedReadablePageList();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
