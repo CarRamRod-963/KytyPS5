@@ -29,8 +29,10 @@ public:
 	static constexpr uint32_t RebuildSubtracts  = 1024;
 
 	void Add(uint64_t address, uint64_t size) {
-		m_ranges.Add(address, size);
-		Mark(address, size);
+		// A covered range's granules are marked already.
+		if (m_ranges.Add(address, size)) {
+			Mark(address, size);
+		}
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
