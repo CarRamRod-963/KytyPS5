@@ -8508,6 +8508,38 @@ public:
               !texture_cache.IsMeta(base + 0x28000),
               "retiring the HTile image left its metadata registered");
 
+      // A dynamic-resolution depth target replaces its image at the same HTile
+      // range; freeing the superseded image must not reset the clear state its
+      // successor has already consumed.
+      auto drs_old_depth = MakeMetadataDepth(0x12400, 0x29000);
+      auto drs_new_depth = MakeMetadataDepth(0x12500, 0x29000);
+      const auto drs_old_depth_id = texture_cache.FindImage(drs_old_depth);
+      (void)texture_cache.FindDepthTarget(drs_old_depth_id, drs_old_depth);
+      const auto drs_new_depth_id = texture_cache.FindImage(drs_new_depth);
+      (void)texture_cache.FindDepthTarget(drs_new_depth_id, drs_new_depth);
+      Require(name, "successor HTile clear consumed",
+              drs_old_depth_id != drs_new_depth_id &&
+                  texture_cache.IsMetaCleared(base + 0x29000, 0) &&
+                  texture_cache.TouchMeta(base + 0x29000, 0, false) &&
+                  !texture_cache.IsMetaCleared(base + 0x29000, 0),
+              "the shared HTile range did not start cleared or kept its clear "
+              "after a draw");
+      texture_cache.UnmapMemory(drs_old_depth.info.data.address,
+                                drs_old_depth.info.data.size);
+      (void)texture_cache.FindDepthTarget(drs_new_depth_id, drs_new_depth);
+      Require(
+          name, "superseded HTile owner retirement",
+          !TextureCacheTestAccess::Contains(texture_cache, drs_old_depth_id) &&
+              texture_cache.IsMeta(base + 0x29000) &&
+              !texture_cache.IsMetaCleared(base + 0x29000, 0),
+          "freeing a superseded depth image reset its successor's HTile "
+          "clear state");
+      texture_cache.UnmapMemory(drs_new_depth.info.data.address,
+                                drs_new_depth.info.data.size);
+      Require(name, "successor HTile final retirement",
+              !texture_cache.IsMeta(base + 0x29000),
+              "freeing the HTile owner left its metadata registered");
+
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
           MakeLinearDesc(base + partial_unmap_image_offset, 0x2000,
