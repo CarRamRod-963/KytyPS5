@@ -123,6 +123,28 @@ void MemoryTracker::SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool r
 	               });
 }
 
+void MemoryTracker::SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size,
+                                           bool readable) {
+	CheckNotInUploadCallback();
+	for (size_t first = 0; first < pages.size();) {
+		ValidateRange(pages[first], page_size);
+		const auto index = pages[first] / TRACKER_REGION_SIZE;
+		auto       last  = first + 1;
+		while (last < pages.size() && pages[last] / TRACKER_REGION_SIZE == index) {
+			ValidateRange(pages[last], page_size);
+			last++;
+		}
+		if ((pages[last - 1] + page_size - 1) / TRACKER_REGION_SIZE != index) {
+			EXIT("readable pages cross a tracking region\n");
+		}
+		if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
+			std::scoped_lock lock(manager->lock);
+			manager->SetStaleReadable(pages.subspan(first, last - first), page_size, readable);
+		}
+		first = last;
+	}
+}
+
 bool MemoryTracker::IsGpuModifiedReadable(uint64_t vaddr, uint64_t size) {
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
