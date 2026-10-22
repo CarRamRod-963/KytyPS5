@@ -809,6 +809,38 @@ void TestLastMappingReadRetriesAfterMutation() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Reads that alternate between mappings stay exact: each mapping's lock-free entry answers only
+// for its own range, and an unmap makes every entry of the thread fall back to the lookup.
+void TestRecentMappingsReadAlternatingMappings() {
+	using namespace Libs::LibKernel::Memory;
+	const char*                  test = "RecentMappingsReadAlternatingMappings";
+	constexpr size_t             Count = 6;
+	std::array<uint64_t, Count> bases {};
+	for (size_t i = 0; i < Count; ++i) {
+		bases[i] = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "recent_mappings");
+		const uint64_t value = 0x1000u + i;
+		std::memcpy(reinterpret_cast<void*>(bases[i]), &value, sizeof(value));
+	}
+	bool exact = true;
+	for (size_t round = 0; round < 4; ++round) {
+		for (size_t i = 0; i < Count; ++i) {
+			// Strides through more mappings than the thread remembers.
+			const auto index = (i * 5u + round) % Count;
+			uint64_t   value = 0;
+			exact &= TryReadBacking(bases[index], &value, sizeof(value)) && value == 0x1000u + index;
+		}
+	}
+	CheckOk(test, KernelMunmap(bases[2], SceKernelPageSize), "KernelMunmap");
+	uint64_t value = 0;
+	exact &= !TryReadBacking(bases[2], &value, sizeof(value));
+	exact &= TryReadBacking(bases[3], &value, sizeof(value)) && value == 0x1003u;
+	for (size_t i = 0; i < Count; ++i) {
+		if (i != 2) CheckOk(test, KernelMunmap(bases[i], SceKernelPageSize), "KernelMunmap");
+	}
+	Check(test, exact, "an alternating read returned another mapping's bytes or a stale mapping");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -4995,6 +5027,7 @@ int main(int argc, char** argv) {
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestLastMappingReadRetriesAfterMutation);
+		RunTest(TestRecentMappingsReadAlternatingMappings);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -5056,6 +5089,7 @@ int main(int argc, char** argv) {
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestLastMappingReadRetriesAfterMutation);
+	RunTest(TestRecentMappingsReadAlternatingMappings);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
