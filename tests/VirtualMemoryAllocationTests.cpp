@@ -887,6 +887,35 @@ void TestTrackerProtectSharesBackingReads() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// CompareBacking answers what TryReadBacking + memcmp would: equal, different or unmapped,
+// including a compare that a backing write or unmap overlaps after its lock-free pass started.
+void TestCompareBackingMatchesRead() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test        = "CompareBackingMatchesRead";
+	{
+		const auto base = MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw,
+		                                   "compare_backing");
+		std::vector<uint8_t> bytes(SceKernelPageSize * 2);
+		for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 7u);
+		Check(test, TryWriteBacking(base, bytes.data(), bytes.size()), "TryWriteBacking");
+		Check(test, CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Equal,
+		      "equal bytes did not compare equal");
+		bytes[bytes.size() - 1] ^= 1u;
+		Check(test,
+		      CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Different,
+		      "a different last byte compared equal");
+		Check(test,
+		      CompareBacking(base + 16, bytes.data() + 16, 64) == BackingCompare::Equal,
+		      "an equal inner range did not compare equal");
+		CheckOk(test, KernelMunmap(base + SceKernelPageSize, SceKernelPageSize), "KernelMunmap");
+		Check(test,
+		      CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Unmapped,
+		      "a range with an unmapped page was not unmapped");
+		CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -5917,6 +5946,7 @@ int main(int argc, char** argv) {
 		RunTest(TestQueriesWaitForStateChanges);
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestClampRangeSkipsStateLock);
+		RunTest(TestCompareBackingMatchesRead);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -5983,6 +6013,7 @@ int main(int argc, char** argv) {
 	RunTest(TestQueriesWaitForStateChanges);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestClampRangeSkipsStateLock);
+	RunTest(TestCompareBackingMatchesRead);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFragmentedGuestFreeRangeHints);
