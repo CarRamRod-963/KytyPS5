@@ -7,7 +7,10 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_test_shaders/gpu_test_stencil_bits_spv.h"
+#include "gpu_test_shaders/gpu_test_stencil_plane_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -10054,6 +10057,556 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "swapped depth direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A shader writes a depth image's stencil plane as an R8_UINT storage image
+  // (Ghost of Yotei writes the main depth target's plane every frame).
+  // Depth/stencil images cannot be storage images, so the writes go to a color
+  // copy of the plane: a draw with a stencil test, a guest readback and an
+  // image copy must all see them.
+  void CheckStencilPlaneStorage() {
+    constexpr const char *name = "StencilPlaneStorage";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint32_t width = 256;
+    constexpr uint32_t height = 16;
+    constexpr uint32_t texels = width * height;
+    constexpr uint64_t depth_address = base;
+    constexpr uint64_t stencil_address = base + 0x10000;
+    constexpr uint64_t copy_depth_address = base + 0x40000;
+    constexpr uint64_t copy_stencil_address = base + 0x50000;
+    // The first write inverts the even columns, the second flips the low nibble
+    // of all texels.
+    constexpr std::array<std::pair<uint32_t, uint32_t>, 2> writes{
+        {{0xffu, 1u}, {0x0fu, 0u}}};
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "stencil plane direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "stencil plane fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    std::vector<uint8_t> expected(texels);
+    for (uint32_t i = 0; i < texels; i++) {
+      expected[i] = static_cast<uint8_t>(i * 37u + 11u);
+    }
+    std::memcpy(reinterpret_cast<void *>(stencil_address), expected.data(),
+                texels);
+    const auto apply_write = [&](uint32_t xor_value, uint32_t column_mask) {
+      for (uint32_t i = 0; i < texels; i++) {
+        if (((i % width) & column_mask) == 0) {
+          expected[i] = static_cast<uint8_t>(expected[i] ^ xor_value);
+        }
+      }
+    };
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+    {
+      auto &resources = context;
+      resources.MapMemory(base, allocation_size);
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      auto command = [&] { return scheduler.Current().Handle(); };
+
+      const auto make_depth = [&](uint64_t address, uint64_t stencil) {
+        auto desc = MakeLinearDesc(
+            address, uint64_t{texels} * sizeof(float),
+            vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.stencil = {stencil, texels};
+        desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+        desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      auto depth_desc = make_depth(depth_address, stencil_address);
+      const auto depth_id = cache.FindImage(depth_desc);
+      const auto depth_view = cache.FindDepthTarget(depth_id, depth_desc);
+      const auto association =
+          cache.FindImageFromRange(stencil_address, texels, false);
+      Require(name, "stencil association",
+              depth_view != nullptr && association &&
+                  cache.GetImage(association).depth_id == depth_id &&
+                  cache.GetImage(association).info.data ==
+                      GuestRange{stencil_address, texels},
+              "the depth target did not associate its linear stencil plane");
+
+      // Reads the stencil aspect of a depth image in texel order.
+      const auto read_stencil = [&](ImageId id) {
+        auto readback = CreateHostBuffer(name, texels,
+                                         vk::BufferUsageFlagBits::eTransferDst,
+                                         std::vector<u32>(texels / 4u));
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        cache.GetImage(id).Download(
+            std::span<const vk::BufferImageCopy>(&copy, 1), readback.buffer, 0,
+            readback.size);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        command().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                  vk::PipelineStageFlagBits::eHost, {}, 0,
+                                  nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, texels / 4u);
+        DestroyBuffer(&readback);
+        std::vector<uint8_t> bytes(texels);
+        std::memcpy(bytes.data(), words.data(), texels);
+        return bytes;
+      };
+      Require(name, "stencil upload", read_stencil(depth_id) == expected,
+              "the guest stencil plane did not reach the stencil aspect");
+
+      // The stencil T# a shader writes: k8UInt over the plane, 256x16, linear.
+      ShaderTextureResource plane_descriptor{};
+      plane_descriptor.fields[0] = static_cast<uint32_t>(stencil_address >> 8u);
+      plane_descriptor.fields[1] =
+          static_cast<uint32_t>(stencil_address >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u) |
+          (((width - 1u) & 3u) << 30u);
+      plane_descriptor.fields[2] =
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+      plane_descriptor.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      plane_descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::Program plane_program{};
+      plane_program.stage = ShaderType::Compute;
+      plane_program.resource_tracking_complete = true;
+      ShaderRecompiler::IR::ImageResource plane_resource{};
+      plane_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      plane_resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      plane_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      plane_resource.read = true;
+      plane_resource.written = true;
+      plane_program.info.images.push_back(plane_resource);
+      for (auto &image : plane_program.info.images) {
+        const auto kind =
+            *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+        const auto index = static_cast<size_t>(kind);
+        image.descriptor_index =
+            plane_program.bindings.descriptor_counts[index];
+        plane_program.bindings.descriptor_counts[index] += image.mip_count;
+        plane_program.bindings.descriptor_mask |= uint64_t{1} << index;
+      }
+      ShaderRecompiler::IR::CompiledShaderInfo plane_info{};
+      plane_info.stage = plane_program.stage;
+      plane_info.info = std::move(plane_program.info);
+      plane_info.bindings = std::move(plane_program.bindings);
+      ShaderRecompiler::IR::ResourceSnapshot plane_snapshot{};
+      auto &plane_value = plane_snapshot.images.emplace_back();
+      std::copy(std::begin(plane_descriptor.fields),
+                std::end(plane_descriptor.fields), plane_value.dwords.begin());
+      plane_value.dword_count = 8;
+      ShaderStageRuntime plane_runtime{&plane_info, &plane_snapshot};
+
+      // The writer: a compute pipeline over one R8_UINT storage image.
+      vk::ShaderModuleCreateInfo module_info{};
+      module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+      module_info.codeSize = sizeof(GPU_TEST_STENCIL_PLANE_SPV);
+      module_info.pCode = GPU_TEST_STENCIL_PLANE_SPV;
+      vk::ShaderModule writer_module = nullptr;
+      RequireVk(
+          name, "writer",
+          m_device.createShaderModule(&module_info, nullptr, &writer_module),
+          "vkCreateShaderModule");
+      vk::DescriptorSetLayoutBinding writer_binding{};
+      writer_binding.binding = 0;
+      writer_binding.descriptorType = vk::DescriptorType::eStorageImage;
+      writer_binding.descriptorCount = 1;
+      writer_binding.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      vk::DescriptorSetLayoutCreateInfo writer_set_info{};
+      writer_set_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+      writer_set_info.flags =
+          vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+      writer_set_info.bindingCount = 1;
+      writer_set_info.pBindings = &writer_binding;
+      vk::DescriptorSetLayout writer_set_layout = nullptr;
+      RequireVk(name, "writer",
+                m_device.createDescriptorSetLayout(&writer_set_info, nullptr,
+                                                   &writer_set_layout),
+                "vkCreateDescriptorSetLayout");
+      const vk::PushConstantRange writer_push{vk::ShaderStageFlagBits::eCompute,
+                                              0, 2 * sizeof(uint32_t)};
+      vk::PipelineLayoutCreateInfo writer_layout_info{};
+      writer_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+      writer_layout_info.setLayoutCount = 1;
+      writer_layout_info.pSetLayouts = &writer_set_layout;
+      writer_layout_info.pushConstantRangeCount = 1;
+      writer_layout_info.pPushConstantRanges = &writer_push;
+      vk::PipelineLayout writer_layout = nullptr;
+      RequireVk(name, "writer",
+                m_device.createPipelineLayout(&writer_layout_info, nullptr,
+                                              &writer_layout),
+                "vkCreatePipelineLayout");
+      vk::ComputePipelineCreateInfo writer_pipeline_info{};
+      writer_pipeline_info.sType =
+          vk::StructureType::eComputePipelineCreateInfo;
+      writer_pipeline_info.stage.sType =
+          vk::StructureType::ePipelineShaderStageCreateInfo;
+      writer_pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+      writer_pipeline_info.stage.module = writer_module;
+      writer_pipeline_info.stage.pName = "main";
+      writer_pipeline_info.layout = writer_layout;
+      vk::Pipeline writer_pipeline = nullptr;
+      RequireVk(name, "writer",
+                m_device.createComputePipelines(nullptr, 1,
+                                                &writer_pipeline_info, nullptr,
+                                                &writer_pipeline),
+                "vkCreateComputePipelines");
+
+      // Binds the stencil T# for a storage write the way a guest dispatch does,
+      // then writes it.
+      const auto write_plane = [&](uint32_t xor_value, uint32_t column_mask) {
+        PreparedBindings bindings;
+        executor.PrepareBindings(plane_runtime, bindings);
+        executor.RebindImages(bindings);
+        const auto &binding = bindings.images[0];
+        auto &depth = cache.GetImage(depth_id);
+        Require(name, "storage binding",
+                binding.image_id == depth_id && binding.image_view != nullptr &&
+                    std::ranges::none_of(depth.views,
+                                         [&](const auto &view) {
+                                           return view.view ==
+                                                  binding.image_view;
+                                         }),
+                "the stencil T# was bound to a view of the depth/stencil image "
+                "itself");
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), bindings));
+        Require(name, "plane ownership",
+                depth.StencilPlaneIsNewer() &&
+                    binding.layout == vk::ImageLayout::eGeneral &&
+                    cache.GetImage(association).IsGpuModified(),
+                "the storage binding did not move the stencil values to the "
+                "plane copy");
+        vk::DescriptorImageInfo image_info{nullptr, binding.image_view,
+                                           vk::ImageLayout::eGeneral};
+        vk::WriteDescriptorSet write{};
+        write.sType = vk::StructureType::eWriteDescriptorSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageImage;
+        write.pImageInfo = &image_info;
+        const std::array<uint32_t, 2> push{xor_value, column_mask};
+        auto handle = scheduler.Current().DispatchHandle(true, false);
+        handle.bindPipeline(vk::PipelineBindPoint::eCompute, writer_pipeline);
+        handle.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+                                    writer_layout, 0, 1, &write);
+        handle.pushConstants(writer_layout, vk::ShaderStageFlagBits::eCompute,
+                             0, sizeof(push), push.data());
+        handle.dispatch(width / 8u, height / 8u, 1);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        apply_write(xor_value, column_mask);
+      };
+      write_plane(writes[0].first, writes[0].second);
+
+      // The guest reads the plane back while the copy still holds the newer
+      // values.
+      Require(name, "plane readback",
+              TextureCacheTestAccess::TryDownload(cache, association),
+              "the GPU-written stencil plane could not be published to guest "
+              "memory");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> guest(texels);
+      Require(name, "guest backing",
+              Libs::LibKernel::Memory::TryReadBacking(stencil_address,
+                                                      guest.data(), texels),
+              "stencil guest backing is unreadable");
+      Require(name, "guest sees the stencil writes", guest == expected,
+              "the stencil readback lost the shader's storage writes");
+      Require(name, "readback keeps plane ownership",
+              cache.GetImage(depth_id).StencilPlaneIsNewer(),
+              "a readback copied the plane back although nothing else used the "
+              "depth image");
+
+      // A draw whose stencil test compares one bit at a time reads every
+      // stencil value.
+      if (m_rasterization_supported) {
+        auto output =
+            CreateHostBuffer(name, uint64_t{texels} * sizeof(uint32_t),
+                             vk::BufferUsageFlagBits::eStorageBuffer,
+                             std::vector<u32>(texels, 0));
+        vk::ShaderModuleCreateInfo vertex_info{};
+        vertex_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+        vertex_info.codeSize = sizeof(GPU_BLIT_FS_TRIANGLE_SPV);
+        vertex_info.pCode = GPU_BLIT_FS_TRIANGLE_SPV;
+        vk::ShaderModule vertex_module = nullptr;
+        RequireVk(
+            name, "draw",
+            m_device.createShaderModule(&vertex_info, nullptr, &vertex_module),
+            "vkCreateShaderModule");
+        vk::ShaderModuleCreateInfo fragment_info{};
+        fragment_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+        fragment_info.codeSize = sizeof(GPU_TEST_STENCIL_BITS_SPV);
+        fragment_info.pCode = GPU_TEST_STENCIL_BITS_SPV;
+        vk::ShaderModule fragment_module = nullptr;
+        RequireVk(name, "draw",
+                  m_device.createShaderModule(&fragment_info, nullptr,
+                                              &fragment_module),
+                  "vkCreateShaderModule");
+        vk::DescriptorSetLayoutBinding output_binding{};
+        output_binding.binding = 0;
+        output_binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+        output_binding.descriptorCount = 1;
+        output_binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+        vk::DescriptorSetLayoutCreateInfo draw_set_info{};
+        draw_set_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+        draw_set_info.flags =
+            vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+        draw_set_info.bindingCount = 1;
+        draw_set_info.pBindings = &output_binding;
+        vk::DescriptorSetLayout draw_set_layout = nullptr;
+        RequireVk(name, "draw",
+                  m_device.createDescriptorSetLayout(&draw_set_info, nullptr,
+                                                     &draw_set_layout),
+                  "vkCreateDescriptorSetLayout");
+        const vk::PushConstantRange draw_push{
+            vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(uint32_t)};
+        vk::PipelineLayoutCreateInfo draw_layout_info{};
+        draw_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+        draw_layout_info.setLayoutCount = 1;
+        draw_layout_info.pSetLayouts = &draw_set_layout;
+        draw_layout_info.pushConstantRangeCount = 1;
+        draw_layout_info.pPushConstantRanges = &draw_push;
+        vk::PipelineLayout draw_layout = nullptr;
+        RequireVk(name, "draw",
+                  m_device.createPipelineLayout(&draw_layout_info, nullptr,
+                                                &draw_layout),
+                  "vkCreatePipelineLayout");
+        std::array<vk::PipelineShaderStageCreateInfo, 2> stages{};
+        stages[0].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+        stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+        stages[0].module = vertex_module;
+        stages[0].pName = "main";
+        stages[1].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+        stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+        stages[1].module = fragment_module;
+        stages[1].pName = "main";
+        vk::PipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.sType =
+            vk::StructureType::ePipelineVertexInputStateCreateInfo;
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+        input_assembly.sType =
+            vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+        input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+        const vk::Viewport viewport{
+            0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+            0.0f, 1.0f};
+        const vk::Rect2D scissor{{0, 0}, {width, height}};
+        vk::PipelineViewportStateCreateInfo viewport_state{};
+        viewport_state.sType =
+            vk::StructureType::ePipelineViewportStateCreateInfo;
+        viewport_state.viewportCount = 1;
+        viewport_state.pViewports = &viewport;
+        viewport_state.scissorCount = 1;
+        viewport_state.pScissors = &scissor;
+        vk::PipelineRasterizationStateCreateInfo raster{};
+        raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+        raster.polygonMode = vk::PolygonMode::eFill;
+        raster.cullMode = vk::CullModeFlagBits::eNone;
+        raster.lineWidth = 1.0f;
+        vk::PipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType =
+            vk::StructureType::ePipelineMultisampleStateCreateInfo;
+        multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+        vk::StencilOpState stencil_op{};
+        stencil_op.failOp = vk::StencilOp::eKeep;
+        stencil_op.passOp = vk::StencilOp::eKeep;
+        stencil_op.depthFailOp = vk::StencilOp::eKeep;
+        stencil_op.compareOp = vk::CompareOp::eEqual;
+        vk::PipelineDepthStencilStateCreateInfo depth_stencil{};
+        depth_stencil.sType =
+            vk::StructureType::ePipelineDepthStencilStateCreateInfo;
+        depth_stencil.stencilTestEnable = true;
+        depth_stencil.front = stencil_op;
+        depth_stencil.back = stencil_op;
+        vk::PipelineColorBlendStateCreateInfo color_blend{};
+        color_blend.sType =
+            vk::StructureType::ePipelineColorBlendStateCreateInfo;
+        const std::array dynamic_states{vk::DynamicState::eStencilCompareMask,
+                                        vk::DynamicState::eStencilReference};
+        vk::PipelineDynamicStateCreateInfo dynamic{};
+        dynamic.sType = vk::StructureType::ePipelineDynamicStateCreateInfo;
+        dynamic.dynamicStateCount =
+            static_cast<uint32_t>(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
+        vk::PipelineRenderingCreateInfo rendering_info{};
+        rendering_info.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+        rendering_info.depthAttachmentFormat = vk::Format::eD32SfloatS8Uint;
+        rendering_info.stencilAttachmentFormat = vk::Format::eD32SfloatS8Uint;
+        vk::GraphicsPipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+        pipeline_info.pNext = &rendering_info;
+        pipeline_info.stageCount = static_cast<uint32_t>(stages.size());
+        pipeline_info.pStages = stages.data();
+        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pInputAssemblyState = &input_assembly;
+        pipeline_info.pViewportState = &viewport_state;
+        pipeline_info.pRasterizationState = &raster;
+        pipeline_info.pMultisampleState = &multisample;
+        pipeline_info.pDepthStencilState = &depth_stencil;
+        pipeline_info.pColorBlendState = &color_blend;
+        pipeline_info.pDynamicState = &dynamic;
+        pipeline_info.layout = draw_layout;
+        vk::Pipeline draw_pipeline = nullptr;
+        RequireVk(name, "draw",
+                  m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info,
+                                                   nullptr, &draw_pipeline),
+                  "vkCreateGraphicsPipelines");
+
+        // The attachment use is what takes the stencil values back from the
+        // plane copy.
+        auto &depth = cache.GetImage(depth_id);
+        depth.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+                      vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                          vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                      {}, command());
+        Require(name, "attachment use takes the plane back",
+                !depth.StencilPlaneIsNewer(),
+                "binding the depth image as an attachment left the stencil in "
+                "the plane copy");
+        vk::RenderingAttachmentInfo attachment{};
+        attachment.imageView = depth_view;
+        attachment.imageLayout =
+            vk::ImageLayout::eDepthStencilAttachmentOptimal;
+        attachment.loadOp = vk::AttachmentLoadOp::eLoad;
+        attachment.storeOp = vk::AttachmentStoreOp::eStore;
+        vk::RenderingInfo rendering{};
+        rendering.sType = vk::StructureType::eRenderingInfo;
+        rendering.renderArea.extent = vk::Extent2D{width, height};
+        rendering.layerCount = 1;
+        rendering.pDepthAttachment = &attachment;
+        rendering.pStencilAttachment = &attachment;
+        vk::DescriptorBufferInfo output_info{output.buffer, 0, output.size};
+        vk::WriteDescriptorSet output_write{};
+        output_write.sType = vk::StructureType::eWriteDescriptorSet;
+        output_write.dstBinding = 0;
+        output_write.descriptorCount = 1;
+        output_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        output_write.pBufferInfo = &output_info;
+        auto draw = command();
+        draw.beginRendering(rendering);
+        draw.bindPipeline(vk::PipelineBindPoint::eGraphics, draw_pipeline);
+        draw.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, draw_layout,
+                                  0, 1, &output_write);
+        for (uint32_t bit = 0; bit < 8; bit++) {
+          const std::array<uint32_t, 2> push{width, bit};
+          draw.pushConstants(draw_layout, vk::ShaderStageFlagBits::eFragment, 0,
+                             sizeof(push), push.data());
+          draw.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack,
+                                     1u << bit);
+          draw.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack,
+                                   1u << bit);
+          draw.draw(3, 1, 0, 0);
+        }
+        draw.endRendering();
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = output.buffer;
+        barrier.size = output.size;
+        draw.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+                             vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+                             1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto drawn = ReadBuffer(name, output, texels);
+        uint32_t mismatches = 0;
+        for (uint32_t i = 0; i < texels; i++) {
+          mismatches += drawn[i] != expected[i] ? 1u : 0u;
+        }
+        Require(name, "stencil test sees the storage writes", mismatches == 0,
+                fmt::format("{} of {} pixels passed the stencil test of "
+                            "another value, first "
+                            "pixel 0x{:02x} instead of 0x{:02x}",
+                            mismatches, texels, drawn[0], expected[0])
+                    .c_str());
+        m_device.destroyPipeline(draw_pipeline, nullptr);
+        m_device.destroyPipelineLayout(draw_layout, nullptr);
+        m_device.destroyDescriptorSetLayout(draw_set_layout, nullptr);
+        m_device.destroyShaderModule(fragment_module, nullptr);
+        m_device.destroyShaderModule(vertex_module, nullptr);
+        DestroyBuffer(&output);
+      }
+
+      // An image copy of the depth target carries the stencil values a shader
+      // wrote last.
+      write_plane(writes[1].first, writes[1].second);
+      auto copy_desc = make_depth(copy_depth_address, copy_stencil_address);
+      const auto copy_id = cache.FindImage(copy_desc);
+      (void)cache.FindDepthTarget(copy_id, copy_desc);
+      Require(name, "copy target", copy_id && copy_id != depth_id,
+              "the copy target reused the source depth image");
+      cache.GetImage(copy_id).CopyImage(cache.GetImage(depth_id));
+      Require(name, "copy takes the plane back",
+              !cache.GetImage(depth_id).StencilPlaneIsNewer(),
+              "copying the depth image left the stencil in the plane copy");
+      Require(name, "copied stencil", read_stencil(copy_id) == expected,
+              "the depth image copy dropped the stencil aspect or the shader's "
+              "writes");
+      Require(name, "source stencil", read_stencil(depth_id) == expected,
+              "the source stencil aspect lost the shader's writes");
+
+      // The target is bound with another stencil plane; a T# of the first plane
+      // still names the depth image through its association (Ghost of Yotei
+      // alternates two planes).
+      auto moved_desc = make_depth(depth_address, base + 0x60000);
+      Require(name, "rebound stencil plane",
+              cache.FindImage(moved_desc) == depth_id &&
+                  cache.FindDepthTarget(depth_id, moved_desc) != nullptr &&
+                  cache.GetImage(depth_id).info.stencil.address ==
+                      base + 0x60000,
+              "binding another stencil plane replaced the depth image");
+      write_plane(writes[0].first, writes[0].second);
+
+      m_device.destroyPipeline(writer_pipeline, nullptr);
+      m_device.destroyPipelineLayout(writer_layout, nullptr);
+      m_device.destroyDescriptorSetLayout(writer_set_layout, nullptr);
+      m_device.destroyShaderModule(writer_module, nullptr);
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(
+          executor, descriptor_pipelines);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "stencil plane fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "stencil plane direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -22701,6 +23254,7 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     m_native_indirect_draws = available_features.multiDrawIndirect &&
                               available_features.drawIndirectFirstInstance &&
                               available_features12.drawIndirectCount &&
@@ -53287,6 +53841,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSwappedDepthReadback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilPlaneStorage();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -53607,6 +54166,7 @@ int main(int argc, char **argv) {
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckSwappedDepthReadback();
+  vulkan.CheckStencilPlaneStorage();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
