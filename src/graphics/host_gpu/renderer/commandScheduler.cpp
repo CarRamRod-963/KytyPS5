@@ -169,6 +169,12 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
+void CommandScheduler::OrderDispatches() {
+	if (Active() && !m_command.IsInvalid()) {
+		Current().OrderDispatches();
+	}
+}
+
 void CommandScheduler::Flush() {
 	if (!m_command.IsInvalid() && !m_command.HasCommands()) {
 		std::unique_lock lock(m_operation_mutex);
@@ -388,6 +394,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_context.GetBufferCache().RecordAsyncDownloads();
 	m_command.EndRendering();
+	m_command.OrderDispatches();
 	m_timestamps.End(m_command.m_buffer, CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;

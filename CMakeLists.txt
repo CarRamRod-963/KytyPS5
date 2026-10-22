@@ -641,6 +641,11 @@ add_executable(pending_draw_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(pending_draw_policy_tests PRIVATE ${inc_headers})
 
+add_executable(barrier_tracker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BarrierTrackerTests.cpp"
+)
+target_include_directories(barrier_tracker_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_cache_writer_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineCacheWriterTests.cpp"
 )
@@ -706,6 +711,7 @@ if(BUILD_TESTING)
 	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
+	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -800,6 +806,7 @@ if(BUILD_TESTING)
 		pipeline_compile_queue_tests
 		pipeline_cache_writer_tests
 		pending_draw_policy_tests
+		barrier_tracker_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
