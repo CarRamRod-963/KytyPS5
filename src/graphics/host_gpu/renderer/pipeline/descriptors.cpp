@@ -721,6 +721,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
+		if (storage) {
+			// Shaders write the plane through an R8_UINT color copy (Image::StencilPlane).
+			ValidateStorageColorView(vk::Format::eR8Uint, view_format, descriptor.DstSelXYZW());
+		}
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
@@ -1477,6 +1481,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 	bool                                    bindless = false;
+	bool                                    stencil_plane_writes = false;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1524,6 +1529,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+			} else if (storage && image.info.IsDepth()) {
+				// A stencil plane's color copy: transitioned after every access to its depth
+				// image below, since any of them copies the plane back into the depth image.
+				binding.layout       = vk::ImageLayout::eGeneral;
+				stencil_plane_writes = true;
+				continue;
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
@@ -1621,6 +1632,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
 			has_push_data = true;
+		}
+	}
+
+	if (stencil_plane_writes) {
+		for (const auto* prepared: prepared_bindings) {
+			for (const auto& binding: prepared->images) {
+				if (!binding.image_id || binding.desc.type != TextureCache::BindingType::Storage) {
+					continue;
+				}
+				auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+				if (image.info.IsDepth()) {
+					const auto& view = binding.desc.view_info;
+					image.WriteStencilPlane(
+					    ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+					                           view.layer_count},
+					    vk_buffer);
+				}
+			}
 		}
 	}
 
