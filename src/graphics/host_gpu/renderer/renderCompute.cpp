@@ -244,6 +244,21 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Whether a dispatch may write memory through any path. A dispatch that only reads is not
+// ordered after earlier dispatches that only read, so no write may be missed here.
+static bool DispatchMayWriteMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                   const PreparedBindings&                         bindings) {
+	const auto& info = program.info;
+	return bindings.shared_memory.buffer != nullptr || program.has_address_writes ||
+	       program.scratch_dwords != 0 || info.uses_dma || info.uses_gds || info.function_scratch ||
+	       std::ranges::any_of(
+	           info.buffers,
+	           [](const auto& resource) { return resource.written || resource.atomic; }) ||
+	       std::ranges::any_of(info.images, [](const auto& resource) {
+		       return resource.written || resource.atomic;
+	       });
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -372,24 +387,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -451,6 +450,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// A host fence used to serialize every dispatch; the command buffer keeps that order with
+	// pipeline barriers.
+	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings));
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -464,7 +466,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			for (uint32_t y = 0; y < thread_group_y; ++y) {
 				for (uint32_t x = 0; x < thread_group_x; ++x) {
 					if ((x | y | z) != 0u) {
-						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						// A group sees the GDS and memory writes of the groups before it.
+						vk::MemoryBarrier order {};
+						order.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+						order.dstAccessMask =
+						    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+						vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+						                          vk::PipelineStageFlagBits::eComputeShader,
+						                          vk::DependencyFlags {}, 1, &order, 0, nullptr, 0,
+						                          nullptr);
 					}
 					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
 				}
@@ -474,9 +484,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	// The guest clears color metadata with compute; the texture cache reads the clear code
 	// back on the next bind of the target. Submitting now keeps that readback a short copy
 	// instead of a flush of everything recorded since.
@@ -536,16 +543,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
-	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
+	const auto        vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings));
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
@@ -557,7 +555,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	// The guest clears color metadata with compute; the texture cache reads the clear code
 	// back on the next bind of the target. Submitting now keeps that readback a short copy
 	// instead of a flush of everything recorded since.
