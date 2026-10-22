@@ -12,6 +12,11 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
 // is LaneId times one stride plus a lane-independent part (see ShaderInfoCollection.cpp).
 void MakePixelLdsLaneRelative(Program& program);
 
+// Drops device-scope coherence from the GLC/DLC loads of a program that writes no memory other
+// invocations read: no invocation of the same draw or dispatch can produce new data for them, and
+// the renderer's barriers make earlier commands' writes visible. Loads in loops (polling) keep it.
+void DropReadOnlyCoherence(Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERINFOCOLLECTION_H_ */
