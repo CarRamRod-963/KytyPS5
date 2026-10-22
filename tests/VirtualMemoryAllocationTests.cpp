@@ -882,6 +882,78 @@ void TestRecentMappingsReadAlternatingMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// CompareBacking answers what TryReadBacking + memcmp would: equal, different or unmapped,
+// including a compare that a backing write or unmap overlaps after its lock-free pass started.
+void TestCompareBackingMatchesRead() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test        = "CompareBackingMatchesRead";
+	constexpr uint64_t original    = 0x123456789abcdef0ull;
+	constexpr uint64_t replacement = 0xfedcba9876543210ull;
+	{
+		const auto base = MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw,
+		                                   "compare_backing");
+		std::vector<uint8_t> bytes(SceKernelPageSize * 2);
+		for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 7u);
+		Check(test, TryWriteBacking(base, bytes.data(), bytes.size()), "TryWriteBacking");
+		Check(test, CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Equal,
+		      "equal bytes did not compare equal");
+		bytes[bytes.size() - 1] ^= 1u;
+		Check(test,
+		      CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Different,
+		      "a different last byte compared equal");
+		Check(test,
+		      CompareBacking(base + 16, bytes.data() + 16, 64) == BackingCompare::Equal,
+		      "an equal inner range did not compare equal");
+		CheckOk(test, KernelMunmap(base + SceKernelPageSize, SceKernelPageSize), "KernelMunmap");
+		Check(test,
+		      CompareBacking(base, bytes.data(), bytes.size()) == BackingCompare::Unmapped,
+		      "a range with an unmapped page was not unmapped");
+		CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	}
+	for (const bool unmap: {false, true}) {
+		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+		                                   "compare_backing_retry");
+		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+		std::counting_semaphore<2> entered {0};
+		std::counting_semaphore<2> resume {0};
+		g_backing_reads_entered  = &entered;
+		g_continue_backing_reads = &resume;
+		std::binary_semaphore warmed {0};
+		std::binary_semaphore go {0};
+		uint64_t              warm    = 0;
+		bool                  warm_ok = false;
+		BackingCompare        result  = BackingCompare::Equal;
+		std::thread           reader([&] {
+			warm_ok = TryReadBacking(base, &warm, sizeof(warm));
+			warmed.release();
+			go.acquire();
+			result = CompareBacking(base, &original, sizeof(original));
+		});
+		warmed.acquire();
+		TestSetBackingReadCallback(ParkBackingRead);
+		go.release();
+		const bool parked  = entered.try_acquire_for(std::chrono::seconds(5));
+		bool       mutated = false;
+		if (unmap) {
+			mutated = KernelMunmap(base, SceKernelPageSize) == OK;
+		} else {
+			mutated = TryWriteBacking(base, &replacement, sizeof(replacement));
+		}
+		resume.release();
+		reader.join();
+		TestSetBackingReadCallback(nullptr);
+		if (!unmap) {
+			CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+		}
+		Check(test, warm_ok && warm == original, "the first read did not see the mapping");
+		Check(test, parked && mutated, "a lock-free compare blocked a backing write or unmap");
+		Check(test,
+		      result == (unmap ? BackingCompare::Unmapped : BackingCompare::Different),
+		      "a compare overlapping a backing mutation kept its optimistic answer");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -5857,6 +5929,7 @@ int main(int argc, char** argv) {
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestLastMappingReadRetriesAfterMutation);
 		RunTest(TestRecentMappingsReadAlternatingMappings);
+		RunTest(TestCompareBackingMatchesRead);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -5920,6 +5993,7 @@ int main(int argc, char** argv) {
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestLastMappingReadRetriesAfterMutation);
 	RunTest(TestRecentMappingsReadAlternatingMappings);
+	RunTest(TestCompareBackingMatchesRead);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFragmentedGuestFreeRangeHints);
