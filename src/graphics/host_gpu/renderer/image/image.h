@@ -10,6 +10,7 @@
 #include <atomic>
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -70,6 +71,22 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+
+	// Depth/stencil images cannot be storage images, so a shader that writes a stencil plane
+	// writes an R8_UINT color copy of it instead. `plane` is the plane's guest layout (its
+	// stencil association) and `range` its subresources in this image. Returns the copy holding
+	// the current stencil values: the stencil aspect is copied into it unless it already holds
+	// newer values.
+	[[nodiscard]] Image& StencilPlane(const ImageInfo& plane, const ImageSubresourceRange& range);
+	// The copy now receives shader writes and holds the newer stencil values: the next access to
+	// this image through any other path copies them back into the stencil aspect first.
+	void               WriteStencilPlane(std::optional<ImageSubresourceRange> range,
+	                                     vk::CommandBuffer                    command_buffer);
+	[[nodiscard]] bool StencilPlaneIsNewer() const noexcept { return m_stencil_plane_newer; }
+	[[nodiscard]] bool HasStencilAspect() const noexcept {
+		return static_cast<bool>(FullAspectMask(backing.format) &
+		                         vk::ImageAspectFlagBits::eStencil);
+	}
 
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
@@ -179,6 +196,11 @@ private:
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+	// Copies the stencil plane's values back into the stencil aspect if they are newer.
+	void ReturnStencilPlane();
+	// Moves the stencil values between the stencil aspect and the color copy of the plane
+	// through the staging buffer.
+	void CopyStencilPlane(bool to_plane);
 
 	// The last read-only transition that went through the per-subresource states. Repeating it
 	// changes nothing and emits no barrier, so it is answered without walking the subresources
@@ -193,6 +215,11 @@ private:
 		size_t                  subresources = 0;
 	};
 	std::optional<SettledTransition> m_settled;
+
+	std::unique_ptr<Image>  m_stencil_plane;
+	std::unique_ptr<Buffer> m_stencil_staging;
+	ImageSubresourceRange   m_stencil_plane_range;
+	bool                    m_stencil_plane_newer = false;
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
