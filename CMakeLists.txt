@@ -780,6 +780,25 @@ add_custom_command(
 )
 target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
+function(add_gpu_test_shader shader_name shader_file)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
+	set(shader_spv "${gpu_test_generated_dir}/${shader_name}.spv")
+	set(shader_header "${gpu_test_generated_dir}/${shader_name}_spv.h")
+	string(TOUPPER "${shader_name}_SPV" shader_symbol)
+	add_custom_command(
+		OUTPUT "${shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${shader_source}"
+		VERBATIM
+	)
+	target_sources(shader_recompiler_compute_tests PRIVATE "${shader_header}")
+endfunction()
+add_gpu_test_shader(gpu_test_stencil_plane gpu_test_stencil_plane.comp)
+add_gpu_test_shader(gpu_test_stencil_bits gpu_test_stencil_bits.frag)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
@@ -901,6 +920,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME texture_cache_stencil_plane
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-only)
 	add_test(NAME texture_cache_depth_swap_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-swap-readback-only)
 	add_test(NAME compute_meta_clear_classification
