@@ -306,6 +306,11 @@ private:
 		TextureCache::LayoutStamp stamp;
 		// Unique per insertion; the description of an entry never changes after it.
 		uint64_t serial = 0;
+		// The layout generation TextureMemoEntryValid last accepted the entry at. Every change
+		// that check depends on (an image registered, unregistered or deleted, replaced or
+		// expanded so that its bindings need a rebind, a stencil associated) notes a layout
+		// change, so while the generation is unchanged the entry is still valid.
+		uint64_t validated = UINT64_MAX;
 	};
 	// Whether a memo hit may return the entry's image (the checks a lookup would otherwise redo).
 	[[nodiscard]] bool      TextureMemoEntryValid(const TextureMemoEntry& entry);
