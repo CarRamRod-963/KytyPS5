@@ -160,6 +160,9 @@ public:
 	// commands recorded through it may access any memory: pending guest dispatches are ordered
 	// before them, and later dispatches after them.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Handle() for a helper pass that binds a pipeline of its own: BindComputePipeline and
+	// BindGraphicsPipeline bind theirs again afterwards.
+	[[nodiscard]] vk::CommandBuffer PipelineHandle() const;
 	// For a pipeline barrier only. A barrier orders earlier submissions against the commands
 	// recorded after it, so it keeps its meaning when the buffer is submitted later, and a buffer
 	// holding nothing else is not worth a submission. Pending guest dispatches are ordered
@@ -169,8 +172,11 @@ public:
 	// vertex/index buffers, push constants, dynamic state.
 	[[nodiscard]] vk::CommandBuffer StateHandle() const;
 	// Binds a compute pipeline unless it is still bound: guest dispatches often run one shader
-	// many times in a row. A pipeline bound through Handle() (helper passes) is forgotten there.
+	// many times in a row. A pipeline bound through PipelineHandle() is forgotten there.
 	void BindComputePipeline(vk::Pipeline pipeline) const;
+	// The same for graphics pipelines: guest draws often use one pipeline many times in a row.
+	// A pipeline stays bound across render pass instances.
+	void BindGraphicsPipeline(vk::Pipeline pipeline) const;
 	// For one guest dispatch, recorded next with the returned handle. `writes`: the dispatch may
 	// write memory through any path. `shared`: it uses emulator memory shared between dispatches
 	// (the LDS backing, GDS). Records the barrier it needs against earlier commands.
@@ -224,8 +230,10 @@ private:
 	mutable uint64_t    m_indirect_reads_since = UINT64_MAX;
 	mutable bool        m_has_commands = false;
 	mutable uint32_t    m_command_count = 0;
-	// The compute pipeline BindComputePipeline bound last, until Handle() or the next Begin.
-	mutable vk::Pipeline m_compute_pipeline = nullptr;
+	// The pipelines BindComputePipeline and BindGraphicsPipeline bound last, until
+	// PipelineHandle() or the next Begin.
+	mutable vk::Pipeline m_compute_pipeline  = nullptr;
+	mutable vk::Pipeline m_graphics_pipeline = nullptr;
 	// Kept across submissions: barriers order commands in submission order on the queue.
 	mutable BarrierTracker m_barriers;
 	HW::Context*        m_registers   = nullptr;
