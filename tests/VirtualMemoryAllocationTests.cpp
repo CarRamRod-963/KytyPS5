@@ -913,6 +913,33 @@ void TestCompareBackingMatchesRead() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Clamps that alternate between committed ranges stay exact: a remembered range answers only
+// inside itself, and an unmap makes every remembered range of the thread fall back to the lookup.
+void TestRecentCommittedRangesClampAlternating() {
+	using namespace Libs::LibKernel::Memory;
+	const char*                 test  = "RecentCommittedRangesClampAlternating";
+	constexpr size_t            Count = 6;
+	std::array<uint64_t, Count> bases {};
+	for (auto& base: bases) {
+		base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "recent_ranges");
+	}
+	bool exact = true;
+	for (size_t round = 0; round < 4; ++round) {
+		for (size_t i = 0; i < Count; ++i) {
+			const auto index = (i * 5u + round) % Count;
+			exact &= MappedRangeSize(bases[index] + 16, 32) == 32;
+		}
+	}
+	CheckOk(test, KernelMunmap(bases[2], SceKernelPageSize), "KernelMunmap");
+	exact &= MappedRangeSize(bases[2] + 16, 32) == 0;
+	exact &= MappedRangeSize(bases[3] + 16, 32) == 32;
+	for (size_t i = 0; i < Count; ++i) {
+		if (i != 2) CheckOk(test, KernelMunmap(bases[i], SceKernelPageSize), "KernelMunmap");
+	}
+	Check(test, exact, "an alternating clamp answered from another or an unmapped range");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -5101,6 +5128,7 @@ int main(int argc, char** argv) {
 		RunTest(TestLastMappingReadRetriesAfterMutation);
 		RunTest(TestRecentMappingsReadAlternatingMappings);
 		RunTest(TestCompareBackingMatchesRead);
+		RunTest(TestRecentCommittedRangesClampAlternating);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
@@ -5164,6 +5192,7 @@ int main(int argc, char** argv) {
 	RunTest(TestLastMappingReadRetriesAfterMutation);
 	RunTest(TestRecentMappingsReadAlternatingMappings);
 	RunTest(TestCompareBackingMatchesRead);
+	RunTest(TestRecentCommittedRangesClampAlternating);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
