@@ -175,6 +175,29 @@ public:
 		return true;
 	}
 
+	// Whether the backing of a backed range holds exactly `data`, without copying it out. Needs no
+	// lock, like TryReadBacking: a page unmapped meanwhile compares as zeros, as it would read.
+	[[nodiscard]] BackingCompare CompareBacking(uint64_t vaddr, const void* data,
+	                                            uint64_t size) const {
+		if (data == nullptr || !IsBacked(vaddr, size)) {
+			return BackingCompare::Unmapped;
+		}
+		const auto* expected = static_cast<const uint8_t*>(data);
+		bool        equal    = true;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    equal = equal && std::memcmp(expected + (start - vaddr), m_backing_base + offset,
+			                                 bytes) == 0;
+		    },
+		    [&](uint64_t start, uint64_t bytes) {
+			    equal = equal &&
+			            std::all_of(expected + (start - vaddr), expected + (start - vaddr) + bytes,
+			                        [](uint8_t byte) { return byte == 0; });
+		    });
+		return equal ? BackingCompare::Equal : BackingCompare::Different;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
 		auto* destination = static_cast<uint8_t*>(data);
@@ -554,6 +577,11 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	[[nodiscard]] BackingCompare CompareBacking(uint64_t vaddr, const void* data,
+	                                            uint64_t size) const {
+		return m_backing->CompareBacking(vaddr, data, size);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
