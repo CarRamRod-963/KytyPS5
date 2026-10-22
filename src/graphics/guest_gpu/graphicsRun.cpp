@@ -539,6 +539,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint: {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
+			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			const Common::GpuTiming::SyncScope sync_reason(
@@ -1020,6 +1021,11 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 }
 
+void CommandProcessor::EmitGlobalBarrier() {
+	Common::LockGuard lock(m_renderer.GetMutex());
+	CurrentBuffer().GuestFlush();
+}
+
 template <typename T>
 void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
                                              uint32_t interrupt_context_id) {
@@ -1072,13 +1078,13 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
-	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
-	// barriers already order.
+	// The command buffer records partial flushes and cache writebacks as guest flushes
+	// (CommandBuffer::GuestFlush): its own barriers leave some work unordered until one.
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010: EmitGlobalBarrier(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
@@ -1090,6 +1096,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
+			EmitGlobalBarrier();
 			break;
 		case 0x0000000d:
 		case 0x0000000e:

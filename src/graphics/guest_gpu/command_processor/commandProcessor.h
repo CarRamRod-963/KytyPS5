@@ -89,6 +89,7 @@ public:
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
+	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	template <typename T>
 	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id);

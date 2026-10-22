@@ -61,6 +61,31 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
+constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
+constexpr uint32_t GcrGl1Invalidate         = 1u << 3u;
+constexpr uint32_t GcrGl2Unshared           = 1u << 4u;
+constexpr uint32_t GcrGl2Invalidate         = 1u << 8u;
+constexpr uint32_t GcrGl2Writeback          = 1u << 9u;
+constexpr uint32_t GcrOrder012              = 1u << 10u;
+constexpr uint32_t GcrOrder210              = 2u << 10u;
+constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate |
+                                              GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
+                                              GcrGl2Writeback | GcrOrder012 | GcrOrder210;
+
+bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
+	return eop_event_type != 0x28u ||
+	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
+	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
+}
+
+void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
+	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
+	if (unknown != 0) {
+		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
+	}
+}
+
 } // namespace
 
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
@@ -2051,12 +2076,25 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 
-	// The event type, cache actions and destination cache only order GPU work, which the renderer's
-	// resource barriers already order.
-	cp.ReleaseMem(
-	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
-	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
-	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	const uint32_t eop_event_type     = buffer[0] & 0x3fu;
+	const uint32_t gcr_cntl           = (buffer[0] >> 12u) & 0xfffu;
+	const uint32_t data_sel           = (buffer[1] >> 29u) & 0x7u;
+	const uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
+	auto*          address =
+	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u));
+
+	LogUnknownReleaseMemGcr(gcr_cntl);
+
+	// A release with a cache action is a guest flush (CommandBuffer::GuestFlush). The destination
+	// cache only orders GPU work, which the renderer's barriers already order.
+	const bool label = (data_sel != 0 && address != nullptr && interrupt_selector != 4);
+	if (label ? ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)
+	          : (eop_event_type != 0x28u || gcr_cntl != 0)) {
+		cp.EmitGlobalBarrier();
+	}
+
+	cp.ReleaseMem(data_sel, interrupt_selector, address,
+	              buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
 
 	return 7;
 }
