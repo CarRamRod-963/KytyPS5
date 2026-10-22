@@ -1636,13 +1636,46 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	// A depth image is bound for storage only through its stencil association (ResolveTexture).
+	const bool stencil_storage = desc.type == BindingType::Storage && image.info.IsDepth();
 	RefreshImage(id);
+	ImageId stencil_id {};
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
-		if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
+		stencil_id = FindStencilPlane(image, image.info.stencil);
+		if (stencil_id) {
 			RefreshImage(stencil_id);
 		}
+	}
+	if (stencil_storage) {
+		// The descriptor names its association, which need not be the depth image's current
+		// stencil plane (a layered target last bound with another layer range).
+		stencil_id = {};
+		for (const auto candidate:
+		     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+			const auto* stencil = m_slot_images.try_get(candidate);
+			if (stencil != nullptr && stencil->depth_id == id &&
+			    stencil->info.data == desc.info.data) {
+				stencil_id = candidate;
+				break;
+			}
+		}
+		if (!stencil_id) {
+			EXIT("TextureCache: depth storage binding without a stencil association: "
+			     "addr=0x%016" PRIx64 " size=0x%" PRIx64 " plane=0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			     desc.info.data.address, desc.info.data.size, image.info.stencil.address,
+			     image.info.stencil.size);
+		}
+		RefreshImage(stencil_id);
+		// Depth/stencil images cannot be storage images: the shader writes a color copy of the
+		// plane, which the depth image takes back before its next use.
+		auto& association = m_slot_images[stencil_id];
+		auto& plane       = image.StencilPlane(association.info, association.stencil_subresources);
+		TrackImage(stencil_id);
+		CommitGpuWrite(association);
+		TrackImageDownload(stencil_id, association);
+		return plane.FindView(desc.view_info);
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
