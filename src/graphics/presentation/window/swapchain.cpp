@@ -772,7 +772,7 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
-	auto       vk_command      = command.Handle();
+	auto       vk_command      = command.PipelineHandle();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
 	if (source != nullptr) {
