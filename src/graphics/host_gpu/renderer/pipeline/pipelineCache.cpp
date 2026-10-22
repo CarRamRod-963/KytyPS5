@@ -890,6 +890,12 @@ struct PipelineCache::ProgramCache {
 		return plan;
 	}
 
+	static bool SameBacking(uint64_t address, const void* data, uint64_t size, bool mapped) {
+		const auto result = Libs::LibKernel::Memory::CompareBacking(address, data, size);
+		return mapped ? result == Libs::LibKernel::Memory::BackingCompare::Equal
+		              : result == Libs::LibKernel::Memory::BackingCompare::Unmapped;
+	}
+
 	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
 	             uint32_t lookahead_threads)
 	    : graphics(graphics), image_heap(image_heap), profile {HostShaderProfile(graphics)} {
@@ -897,7 +903,8 @@ struct PipelineCache::ProgramCache {
 		if (lookahead_threads != 0) {
 			lookahead = std::make_unique<ResourceLookahead>(
 			    LookaheadMemory {.read      = Libs::LibKernel::Memory::TryReadBacking,
-			                     .gpu_dirty = Libs::LibKernel::Memory::HasGpuDirtyBytes},
+			                     .gpu_dirty = Libs::LibKernel::Memory::HasGpuDirtyBytes,
+			                     .same      = SameBacking},
 			    lookahead_threads);
 		}
 	}
