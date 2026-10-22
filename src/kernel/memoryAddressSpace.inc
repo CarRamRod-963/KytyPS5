@@ -246,22 +246,23 @@ public:
 		}
 
 		const auto end  = vaddr + size;
-		auto&      last = t_last_mapping;
-		// A read inside the thread's last mapping takes no lock: it copies optimistically and
-		// keeps the copy only when no exclusive section ran meanwhile, so it is ordered against
-		// map changes and backing writes exactly like a read under the shared lock.
+		auto&      last = t_last_mappings;
+		// A read inside one of the thread's last mappings takes no lock: it copies optimistically
+		// and keeps the copy only when no exclusive section ran meanwhile, so it is ordered
+		// against map changes and backing writes exactly like a read under the shared lock.
 		[[maybe_unused]] bool hooked = false;
+		const MapEntry*       cached = nullptr;
 		if (const auto sequence = m_sequence.load(std::memory_order_acquire);
 		    (sequence & 1u) == 0u && last.owner == this &&
 		    last.generation == m_maps_generation.load(std::memory_order_relaxed) &&
-		    vaddr >= last.entry.vaddr && end <= last.entry.vaddr + last.entry.size) {
+		    (cached = last.Find(vaddr, end)) != nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 			if (g_test_backing_read != nullptr) {
 				g_test_backing_read(vaddr, size);
 				hooked = true;
 			}
 #endif
-			const auto offset = last.entry.backing_offset + vaddr - last.entry.vaddr;
+			const auto offset = cached->backing_offset + vaddr - cached->vaddr;
 			if (!RangeOk(offset, size)) {
 				return false;
 			}
@@ -297,7 +298,7 @@ public:
 		}
 
 		if (end <= first->second.vaddr + first->second.size) {
-			last = {.owner = this, .generation = m_maps_generation, .entry = first->second};
+			last.Remember(this, m_maps_generation, first->second);
 		}
 		auto* destination = static_cast<uint8_t*>(data);
 		current = vaddr;
@@ -762,18 +763,45 @@ private:
 		std::lock_guard<std::shared_mutex> m_lock;
 	};
 
-	// The mapping a thread's last TryReadBacking found, valid while the maps are unchanged: the
-	// GPU thread reads guest memory in small pieces (resource walks, descriptor tables) that
-	// mostly fall in the mapping of the previous read, and the lookup was most of their cost.
-	struct LastMapping {
-		const GuestBackingStore* owner      = nullptr;
-		uint64_t                 generation = 0;
-		MapEntry                 entry;
+	// The mappings a thread's last TryReadBacking calls found, valid while the maps are
+	// unchanged: the GPU thread reads guest memory in small pieces (resource walks, descriptor
+	// tables) that mostly fall in the mappings of recent reads, and the lookup was most of their
+	// cost. A few entries cover reads that alternate between tables in different mappings.
+	struct LastMappings {
+		static constexpr uint32_t Count = 4;
+
+		const GuestBackingStore*    owner      = nullptr;
+		uint64_t                    generation = 0;
+		std::array<MapEntry, Count> entries {};
+		uint32_t                    used = 0;
+		uint32_t                    next = 0;
+
+		[[nodiscard]] const MapEntry* Find(uint64_t vaddr, uint64_t end) const {
+			for (uint32_t i = 0; i < used; i++) {
+				const auto& entry = entries[i];
+				if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
+					return &entry;
+				}
+			}
+			return nullptr;
+		}
+		void Remember(const GuestBackingStore* store, uint64_t maps_generation,
+		              const MapEntry& entry) {
+			if (owner != store || generation != maps_generation) {
+				owner      = store;
+				generation = maps_generation;
+				used       = 0;
+				next       = 0;
+			}
+			entries[next] = entry;
+			next          = (next + 1u) % Count;
+			used          = std::max(used, next == 0 ? Count : next);
+		}
 	};
-	static thread_local LastMapping t_last_mapping;
+	static thread_local LastMappings t_last_mappings;
 };
 
-thread_local GuestBackingStore::LastMapping GuestBackingStore::t_last_mapping;
+thread_local GuestBackingStore::LastMappings GuestBackingStore::t_last_mappings;
 
 class GuestAddressSpace {
 public:
