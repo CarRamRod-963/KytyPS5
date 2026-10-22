@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -364,6 +365,135 @@ private:
 	}
 
 	std::unordered_map<const Inst*, std::optional<uint64_t>> m_bounds;
+};
+
+// A pixel shader keeps guest LDS in a per-invocation array, so each invocation only sees its own
+// writes, and LaneId is fixed within it. When every LDS address is LaneId * stride plus a
+// lane-independent part, dropping the shared lane term shifts all of an invocation's addresses by
+// the same amount: every alias it can observe is kept, and the indices become the lane-independent
+// parts. Those are usually constants, which drivers keep in registers instead of local memory.
+class LaneRelativeLds {
+public:
+	explicit LaneRelativeLds(Program& program): m_program(program) {}
+
+	void Run() {
+		std::vector<Inst*> accesses;
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				const auto op      = inst.GetOpcode();
+				const auto shared  = SharedAccessOf(op);
+				const bool address = AddressOpcodeInfoOf(op).access != AddressAccess::None;
+				if (shared == SharedAccess::None && !address) continue;
+				const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
+				if (memory.kind == ResourceKind::FlatLocal) return;
+				if (shared == SharedAccess::None || memory.kind != ResourceKind::Lds) continue;
+				if (shared == SharedAccess::Append || shared == SharedAccess::Consume) return;
+				accesses.push_back(&inst);
+			}
+		}
+		if (accesses.empty()) return;
+		// Each access contributes the operand slot that holds its lane term.
+		std::vector<std::pair<Inst*, size_t>> lane_slots;
+		for (auto* access: accesses) {
+			Inst*  holder = access;
+			size_t slot   = 0;
+			if (!FindLaneTerm(access->Arg(0), access, 0, holder, slot, 0)) return;
+			lane_slots.emplace_back(holder, slot);
+		}
+		// The rewritten sums must feed nothing but LDS addresses.
+		for (auto* node: m_chain) {
+			for (const auto& use: node->Uses()) {
+				const bool lds_address =
+				    use.operand == 0 && std::ranges::find(accesses, use.user) != accesses.end();
+				if (!lds_address && !m_chain.contains(use.user)) return;
+			}
+		}
+		for (const auto& [holder, slot]: lane_slots) {
+			holder->SetArg(slot, Value(0u));
+		}
+	}
+
+private:
+	static constexpr uint32_t MaxDepth = 64;
+
+	// Finds the single lane term of the IAdd32 sum `value` (the operand `slot` of `parent`).
+	bool FindLaneTerm(const Value& value, Inst* parent, size_t slot, Inst*& holder,
+	                  size_t& holder_slot, uint32_t depth) {
+		const auto resolved = value.Resolve();
+		auto*      inst     = resolved.TryInstruction();
+		if (inst == nullptr || depth > MaxDepth) return false;
+		if (const auto stride = LaneStride(*inst)) {
+			// A stride of whole DWORDs keeps the shift out of the DWORD index's rounding.
+			if (*stride % 4u != 0u || (m_stride != 0 && m_stride != *stride)) return false;
+			m_stride    = *stride;
+			holder      = parent;
+			holder_slot = slot;
+			return true;
+		}
+		if (inst->GetOpcode() != ValueOpcode::IAdd32) return false;
+		m_chain.insert(inst);
+		const bool lane0 = DependsOnLane(inst->Arg(0), 0);
+		const bool lane1 = DependsOnLane(inst->Arg(1), 0);
+		if (lane0 == lane1) return false;
+		const size_t operand = lane0 ? 0u : 1u;
+		return FindLaneTerm(inst->Arg(operand), inst, operand, holder, holder_slot, depth + 1);
+	}
+
+	[[nodiscard]] static std::optional<uint32_t> LaneStride(const Inst& inst) {
+		const auto immediate = [](const Value& value) -> std::optional<uint32_t> {
+			const auto resolved = value.Resolve();
+			if (!resolved.IsImmediate() || resolved.GetType() != Type::U32) return std::nullopt;
+			return resolved.U32();
+		};
+		const auto is_lane = [](const Value& value) {
+			const auto* lane = value.Resolve().TryInstruction();
+			return lane != nullptr && lane->GetOpcode() == ValueOpcode::LaneId;
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto shift = immediate(inst.Arg(1));
+				if (!is_lane(inst.Arg(0)) || !shift || *shift >= 26u) return std::nullopt;
+				return 1u << *shift;
+			}
+			case ValueOpcode::IMul32: {
+				const auto a = immediate(inst.Arg(0)), b = immediate(inst.Arg(1));
+				if (is_lane(inst.Arg(0)) && b && *b != 0u && *b <= (1u << 25u)) return b;
+				if (is_lane(inst.Arg(1)) && a && *a != 0u && *a <= (1u << 25u)) return a;
+				return std::nullopt;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	// Conservative: an operand counts as lane-dependent unless every input is known not to be.
+	bool DependsOnLane(const Value& value, uint32_t depth) {
+		const auto resolved = value.Resolve();
+		if (resolved.IsImmediate()) return false;
+		const auto* inst = resolved.TryInstruction();
+		if (inst == nullptr || depth > MaxDepth) return true;
+		if (const auto it = m_lane.find(inst); it != m_lane.end()) return it->second;
+		m_lane.emplace(inst, true);
+		bool depends = false;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LaneId:
+			case ValueOpcode::Phi: depends = true; break;
+			default:
+				if (inst->MayHaveSideEffects()) {
+					depends = true;
+					break;
+				}
+				for (size_t index = 0; index < inst->NumArgs() && !depends; index++) {
+					depends = DependsOnLane(inst->Arg(index), depth + 1);
+				}
+		}
+		m_lane[inst] = depends;
+		return depends;
+	}
+
+	Program&                              m_program;
+	uint32_t                              m_stride = 0;
+	std::unordered_set<Inst*>             m_chain;
+	std::unordered_map<const Inst*, bool> m_lane;
 };
 
 uint32_t FunctionLdsDwords(const Program& program) {
@@ -758,6 +888,11 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		AddBuiltinInput(info, inputs.builtins[i]);
 	}
 	program.shader_info_complete = true;
+}
+
+void MakePixelLdsLaneRelative(Program& program) {
+	if (program.stage != ShaderType::Pixel) return;
+	LaneRelativeLds(program).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
