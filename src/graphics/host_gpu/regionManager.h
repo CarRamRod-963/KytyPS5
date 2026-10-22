@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <span>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -159,6 +160,23 @@ public:
 		} else {
 			const StateChange change(*this);
 			m_stale_readable.UnsetRange(start, end);
+			UpdateProtection<true, true>();
+		}
+	}
+	// SetStaleReadable for each page of `page_size` bytes, with one protection update.
+	void SetStaleReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable) {
+		const StateChange change(*this);
+		for (const auto page: pages) {
+			const auto [start, end] = GetPageRange(page, page_size);
+			if (!readable) {
+				m_stale_readable.UnsetRange(start, end);
+			} else if (RegionBits(m_gpu_dirty, start, end).Any()) {
+				m_stale_readable.SetRange(start, end);
+			}
+		}
+		if (readable) {
+			UpdateProtection<false, true>();
+		} else {
 			UpdateProtection<true, true>();
 		}
 	}
