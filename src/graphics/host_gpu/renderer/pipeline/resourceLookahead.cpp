@@ -46,6 +46,18 @@ public:
 private:
 	void Record(uint64_t address, uint64_t size, bool mapped, const void* data) {
 		auto& job = m_job;
+		// A mapped read that continues the previous one extends it: the owner then checks the
+		// union with one read, which is mapped exactly when both pieces are.
+		if (mapped && !job.reads.empty()) {
+			auto& last = job.reads.back();
+			if (last.mapped && last.address + last.size == address &&
+			    uint64_t {last.size} + size <= UINT32_MAX) {
+				last.size += static_cast<uint32_t>(size);
+				const auto* bytes = static_cast<const uint8_t*>(data);
+				job.bytes.insert(job.bytes.end(), bytes, bytes + size);
+				return;
+			}
+		}
 		job.reads.push_back({.address = address,
 		                     .size    = static_cast<uint32_t>(size),
 		                     .offset  = static_cast<uint32_t>(job.bytes.size()),
@@ -231,11 +243,18 @@ bool ResourceLookahead::Unchanged(const Job& job, Outcome& outcome) {
 		}
 	}
 	for (const auto& read: job.reads) {
-		if (m_check.size() < read.size) m_check.resize(read.size);
-		const bool mapped = m_memory.read(read.address, m_check.data(), read.size);
-		if (mapped != read.mapped ||
-		    (mapped &&
-		     std::memcmp(m_check.data(), job.bytes.data() + read.offset, read.size) != 0)) {
+		bool same = false;
+		if (m_memory.same != nullptr) {
+			same =
+			    m_memory.same(read.address, job.bytes.data() + read.offset, read.size, read.mapped);
+		} else {
+			if (m_check.size() < read.size) m_check.resize(read.size);
+			const bool mapped = m_memory.read(read.address, m_check.data(), read.size);
+			same = mapped == read.mapped &&
+			       (!mapped ||
+			        std::memcmp(m_check.data(), job.bytes.data() + read.offset, read.size) == 0);
+		}
+		if (!same) {
 			outcome = Outcome::Moved;
 			return false;
 		}
