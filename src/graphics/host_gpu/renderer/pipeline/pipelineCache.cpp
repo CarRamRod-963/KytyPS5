@@ -923,7 +923,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 PipelineCache::~PipelineCache() {
 	StopBackgroundCompiles();
-	Save();
+	(void)Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -1118,41 +1118,43 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	if (m_precompile_queue == nullptr) {
 		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(thread_count);
 	}
-	const auto records = m_manifest->Records();
-	for (const auto& record: records) {
-		(void)m_precompile_queue->Enqueue(record->Key(), [this, record, total = records.size()] {
+	auto& progress = m_precompile_progress;
+	progress.BeginQueueing();
+	for (const auto& record: m_manifest->Records()) {
+		// Counted before the job can run; a key the queue rejects is uncounted again below.
+		progress.Queued();
+		const bool queued = m_precompile_queue->Enqueue(record->Key(), [this, record] {
 			const auto start   = std::chrono::steady_clock::now();
 			const auto outcome = PrecompileComputeProgram(m_graphics, m_driver_cache, *record);
 			const auto ms      = std::chrono::duration_cast<std::chrono::milliseconds>(
 			                         std::chrono::steady_clock::now() - start)
 			                         .count();
-			auto&      stats   = m_precompile_stats;
-			switch (outcome) {
-				case PrecompileOutcome::Cached: stats.cached++; break;
-				case PrecompileOutcome::Compiled:
-					stats.compiled++;
-					stats.compile_ms += static_cast<uint64_t>(ms);
-					m_driver_cache_dirty.store(true, std::memory_order_relaxed);
-					m_precompile_dirty.store(true, std::memory_order_relaxed);
-					break;
-				case PrecompileOutcome::Skipped: stats.skipped++; break;
+			if (outcome == PrecompileOutcome::Compiled) {
+				m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+				m_precompile_dirty.store(true, std::memory_order_relaxed);
 			}
-			if (++stats.finished == total) {
+			if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms))) {
 				LogPrecompileStats("done");
 			}
 		});
+		if (!queued) {
+			progress.Rejected();
+		}
 	}
-	PipelineCacheLog("Precompile: {} recorded compute programs queued on {} threads",
-	                 m_precompile_queue->Queued(), thread_count);
+	const auto queued = progress.Get().queued;
+	PipelineCacheLog("Precompile: {} recorded compute programs queued on {} threads", queued,
+	                 thread_count);
+	if (progress.EndQueueing()) {
+		LogPrecompileStats("done");
+	}
 }
 
 void PipelineCache::LogPrecompileStats(const char* when) {
-	const auto& stats = m_precompile_stats;
+	const auto counts = m_precompile_progress.Get();
 	PipelineCacheLog(
 	    "Precompile {}: {} pipelines already in the driver cache, {} compiled ({} s of "
 	    "driver time), {} skipped",
-	    when, stats.cached.load(), stats.compiled.load(), stats.compile_ms.load() / 1000u,
-	    stats.skipped.load());
+	    when, counts.cached, counts.compiled, counts.compile_ms / 1000u, counts.skipped);
 }
 
 void PipelineCache::StartPrecompile(uint32_t thread_count) {
@@ -1163,10 +1165,10 @@ void PipelineCache::StartPrecompile(uint32_t thread_count) {
 	QueuePrecompile(thread_count);
 }
 
-size_t PipelineCache::PrecompileAll(uint32_t thread_count) {
+bool PipelineCache::PrecompileAll(uint32_t thread_count) {
 	StartPrecompile(thread_count);
 	if (m_precompile_queue == nullptr) {
-		return 0;
+		return Save();
 	}
 	auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds {30};
 	for (;;) {
@@ -1180,10 +1182,10 @@ size_t PipelineCache::PrecompileAll(uint32_t thread_count) {
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds {250});
 	}
+	// Every job has returned, so the one that finished last has logged the outcome.
 	m_precompile_queue->Stop();
 	m_precompile_queue.reset();
-	Save();
-	return m_precompile_stats.compiled.load();
+	return Save();
 }
 
 void PipelineCache::CheckpointDriverCache() {
@@ -1207,7 +1209,7 @@ void PipelineCache::CheckpointDriverCache() {
 	});
 }
 
-void PipelineCache::Save() {
+bool PipelineCache::Save() {
 	if (m_compute_from_cache + m_compute_compiled != 0) {
 		PipelineCacheLog("Compute pipelines this session: {} from the driver cache, {} compiled",
 		                 m_compute_from_cache, m_compute_compiled);
@@ -1215,12 +1217,14 @@ void PipelineCache::Save() {
 	m_driver_cache_writer.Wait();
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||
 	    !m_driver_cache_dirty.exchange(false)) {
-		return;
+		return true;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
 	if (!WriteDriverCache()) {
 		m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+		return false;
 	}
+	return true;
 }
 
 bool PipelineCache::WriteDriverCache() {
