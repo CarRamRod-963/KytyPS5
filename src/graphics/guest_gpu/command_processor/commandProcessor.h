@@ -104,6 +104,7 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
+	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	template <typename T>
 	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id);
