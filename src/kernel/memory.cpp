@@ -908,6 +908,24 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	                         vaddr, data, size);
 }
 
+BackingCompare CompareBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		return BackingCompare::Unmapped;
+	}
+	if (g_gpu_resources != nullptr && g_gpu_resources->HasElidedLabels() &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		// The read sees elided labels overlaid: compare what it returns.
+		thread_local std::vector<uint8_t> bytes;
+		bytes.resize(size);
+		if (!TryReadBacking(vaddr, bytes.data(), size)) {
+			return BackingCompare::Unmapped;
+		}
+		return std::memcmp(bytes.data(), data, size) == 0 ? BackingCompare::Equal
+		                                                  : BackingCompare::Different;
+	}
+	return g_guest_address_space->CompareBacking(vaddr, data, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
