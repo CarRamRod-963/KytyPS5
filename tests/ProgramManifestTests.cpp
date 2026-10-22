@@ -17,6 +17,8 @@
 namespace {
 
 using Libs::Graphics::ComputeProgramRecord;
+using Libs::Graphics::PrecompileOutcome;
+using Libs::Graphics::PrecompileProgress;
 using Libs::Graphics::ProgramManifest;
 using Libs::Graphics::ProgramPrecompileQueue;
 using Specialization =
@@ -358,6 +360,75 @@ void TestPrecompileQueue() {
   Check(!stopped.Enqueue(5, [] {}), "a stopped queue takes no jobs");
 }
 
+void TestPrecompileProgress() {
+  {
+    PrecompileProgress progress;
+    progress.BeginQueueing();
+    Check(progress.EndQueueing(),
+          "a run without jobs completes when queueing ends");
+    const auto counts = progress.Get();
+    Check(counts.queued == 0 && counts.finished == 0,
+          "an empty run counts nothing");
+  }
+  {
+    PrecompileProgress progress;
+    progress.BeginQueueing();
+    progress.Queued();
+    Check(!progress.Finish(PrecompileOutcome::Cached, 0),
+          "a job finishing while others are queued does not complete the run");
+    progress.Queued();
+    progress.Queued();
+    progress.Rejected();
+    Check(!progress.EndQueueing(), "a run with a running job is not complete");
+    Check(progress.Finish(PrecompileOutcome::Compiled, 1500),
+          "the last job completes the run");
+    const auto counts = progress.Get();
+    Check(counts.queued == 2 && counts.finished == 2 && counts.cached == 1 &&
+              counts.compiled == 1 && counts.skipped == 0 &&
+              counts.compile_ms == 1500,
+          "outcomes are counted and a rejected job is not");
+  }
+  {
+    // The pattern of PipelineCache::QueuePrecompile on a real queue: duplicate
+    // keys are rejected, jobs finish while queueing goes on, and exactly one
+    // caller learns that the run is complete, after every job has finished.
+    constexpr uint64_t Jobs = 400;
+    PrecompileProgress progress;
+    std::atomic<int> completions{0};
+    std::atomic<uint64_t> finished_at_completion{0};
+    ProgramPrecompileQueue queue(4);
+    const auto complete = [&] {
+      completions++;
+      finished_at_completion = progress.Get().finished;
+    };
+    progress.BeginQueueing();
+    for (uint64_t i = 0; i < Jobs; i++) {
+      const uint64_t key = 1 + i / 2; // every key twice
+      progress.Queued();
+      const auto outcome = static_cast<PrecompileOutcome>(i % 3);
+      const bool queued = queue.Enqueue(key, [&, outcome] {
+        if (progress.Finish(outcome, 1)) {
+          complete();
+        }
+      });
+      if (!queued) {
+        progress.Rejected();
+      }
+    }
+    if (progress.EndQueueing()) {
+      complete();
+    }
+    queue.WaitIdle();
+    const auto counts = progress.Get();
+    Check(completions == 1, "a run completes exactly once");
+    Check(counts.queued == Jobs / 2 && counts.finished == Jobs / 2 &&
+              counts.cached + counts.compiled + counts.skipped == Jobs / 2,
+          "every accepted job is counted once");
+    Check(finished_at_completion == Jobs / 2,
+          "the run completes only after its last job");
+    Check(queue.Remaining() == 0, "the queue is drained");
+  }
+}
 } // namespace
 
 int main() {
@@ -368,6 +439,7 @@ int main() {
   TestCorruption();
   TestMemoryOnly();
   TestPrecompileQueue();
+  TestPrecompileProgress();
   std::printf("ProgramManifestTests: all tests passed\n");
   return 0;
 }
