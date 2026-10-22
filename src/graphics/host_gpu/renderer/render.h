@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/barrierTracker.h"
 #include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -112,15 +113,26 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	// Recording through the handle marks the buffer as holding work worth submitting.
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept {
-		m_has_commands = true;
-		return m_buffer;
-	}
+	// Recording through the handle marks the buffer as holding work worth submitting. The
+	// commands recorded through it may access any memory: pending guest dispatches are ordered
+	// before them, and later dispatches after them.
+	[[nodiscard]] vk::CommandBuffer Handle() const;
 	// For a pipeline barrier only. A barrier orders earlier submissions against the commands
 	// recorded after it, so it keeps its meaning when the buffer is submitted later, and a buffer
-	// holding nothing else is not worth a submission.
-	[[nodiscard]] vk::CommandBuffer BarrierHandle() const noexcept { return m_buffer; }
+	// holding nothing else is not worth a submission. Pending guest dispatches are ordered
+	// before it.
+	[[nodiscard]] vk::CommandBuffer BarrierHandle() const;
+	// For commands that access no memory when they execute: binding pipelines, descriptors and
+	// vertex/index buffers, push constants, dynamic state.
+	[[nodiscard]] vk::CommandBuffer StateHandle() const;
+	// For one guest dispatch, recorded next with the returned handle. `writes`: the dispatch may
+	// write memory through any path. Records the barrier it needs against earlier commands.
+	[[nodiscard]] vk::CommandBuffer DispatchHandle(bool writes) const;
+	// A guest request to finish all earlier work before later work starts (a partial flush,
+	// a cache writeback or invalidation).
+	void GuestFlush() const;
+	// Orders pending guest dispatches before everything recorded next.
+	void OrderDispatches() const;
 	// Whether anything but barriers was recorded since the buffer began.
 	[[nodiscard]] bool              HasCommands() const noexcept { return m_has_commands; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -139,6 +151,7 @@ private:
 
 	void Begin();
 	void End() const;
+	void RecordBarrier(BarrierTracker::Barrier barrier) const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -146,6 +159,8 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_has_commands = false;
+	// Kept across submissions: barriers order commands in submission order on the queue.
+	mutable BarrierTracker m_barriers;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
