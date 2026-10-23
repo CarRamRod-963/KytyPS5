@@ -1937,6 +1937,290 @@ void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& ta
 	}
 }
 
+// Candidate layouts across draws. A GPU-selected image table's candidates differ from draw to
+// draw (Ghost of Yotei streams the objects whose records the tables hold), and so do the class
+// groups and their power-of-two padding, which the module bakes. A module compiled for a layout
+// with at least the slots a draw needs serves it once the draw's candidates are moved into those
+// slots; and a draw that no module serves gets a module for the union of its layout and the last
+// one, so a shader's layouts only grow and settle after a few modules.
+namespace {
+
+using SpecImage = ResourceSpecialization::Image;
+
+// A deeper key search finds every key a shallower one finds: the search is bounded by the
+// map's run-time key count.
+bool SearchServes(uint32_t compiled, uint32_t current) {
+	return (compiled == 0u) == (current == 0u) && compiled >= current;
+}
+
+template <typename T>
+bool SameExceptSearch(const T& compiled, const T& current) {
+	auto layout                       = compiled;
+	layout.indirect_search_iterations = current.indirect_search_iterations;
+	return layout == current &&
+	       SearchServes(compiled.indirect_search_iterations, current.indirect_search_iterations);
+}
+
+template <typename T>
+T DeeperSearch(const T& a, const T& b) {
+	auto result = b;
+	result.indirect_search_iterations =
+	    std::max(a.indirect_search_iterations, b.indirect_search_iterations);
+	return result;
+}
+
+bool MappedImageRoot(const std::vector<SpecImage>& images, uint32_t root) {
+	return images[root].indirect_root == root && !images[root].bindless;
+}
+
+bool SameImageClass(const SpecImage& a, const SpecImage& b) {
+	return a.numeric_class == b.numeric_class && a.dimension == b.dimension &&
+	       a.mip_count == b.mip_count && a.conversion_format == b.conversion_format &&
+	       a.shader_swizzle == b.shader_swizzle && a.cube == b.cube && a.fmask == b.fmask &&
+	       a.bindless == b.bindless && a.bindless_byte_keys == b.bindless_byte_keys;
+}
+
+// A root the draw does not map (an inactive source, or a table without candidates) still has
+// its header naming the empty map. A layout that maps the root then selects the root's slot
+// for every key, as the draw does, provided that slot reads the root's descriptor alike.
+bool EmptyRootServed(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                     const SpecImage& compiled, const SpecImage& current, uint32_t root,
+                     const DescriptorValue& root_descriptor) {
+	const auto* source = Source(program, program.info.images[root].source);
+	if (source == nullptr || !source->indirect_descriptor || current.bindless ||
+	    current.indirect_root == root || !compiled.indirect_mapping_header)
+		return false;
+	const auto& flat   = snapshot.flattened_srt;
+	const auto  header = compiled.indirect_mapping_offset;
+	if (header >= flat.size() || flat[header] >= flat.size() || flat[flat[header]] != 0u)
+		return false;
+	return NullImageDescriptor(root_descriptor) || SameImageClass(compiled, current);
+}
+
+// Visits the key map words of a mapped root that hold candidate ordinals: a bounded map holds
+// one ordinal per entry, a searched map a (key, ordinal) pair per entry.
+template <typename Visit>
+bool VisitOrdinals(std::vector<uint32_t>& flat, const SpecImage& root, Visit&& visit) {
+	const auto offset = KeyMapOffset(flat, root);
+	if (offset >= flat.size()) return false;
+	const size_t count  = flat[offset];
+	const size_t stride = root.indirect_search_iterations == 0u ? 1u : 2u;
+	const size_t first  = offset + stride;
+	if (count != 0u && first + (count - 1u) * stride >= flat.size()) return false;
+	for (size_t entry = 0; entry < count; ++entry)
+		visit(flat[first + entry * stride]);
+	return true;
+}
+
+// Moves the draw's image candidates into the slots of `compiled` (see AdaptToSpecialization);
+// with `apply` false, only answers whether they fit.
+bool AdaptImages(const ResourcePlan& program, const std::vector<SpecImage>& compiled,
+                 ResourceSnapshot& snapshot, const std::vector<SpecImage>& current, bool apply) {
+	const auto direct = static_cast<uint32_t>(program.info.images.size());
+	if (compiled.size() < direct || current.size() < direct) return false;
+	// Snapshot images skip FMASK entries (BuildResourceSpecialization), which are direct only.
+	std::vector<uint32_t> snapshot_index(current.size(), UINT32_MAX);
+	for (uint32_t index = 0, position = 0; index < current.size(); ++index) {
+		if (!current[index].fmask) snapshot_index[index] = position++;
+	}
+	const auto descriptor = [&](uint32_t index) -> const DescriptorValue* {
+		const auto position = snapshot_index[index];
+		return position < snapshot.images.size() ? &snapshot.images[position] : nullptr;
+	};
+	for (uint32_t root = 0; root < direct; ++root) {
+		if (compiled[root].fmask != current[root].fmask) return false;
+		if (SameExceptSearch(compiled[root], current[root])) continue;
+		const auto* root_descriptor = descriptor(root);
+		if (root_descriptor == nullptr || !MappedImageRoot(compiled, root) ||
+		    !EmptyRootServed(program, snapshot, compiled[root], current[root], root,
+		                     *root_descriptor))
+			return false;
+	}
+	std::vector<std::vector<uint32_t>> slots(direct);
+	std::vector<std::vector<uint32_t>> children(direct);
+	for (uint32_t index = direct; index < compiled.size(); ++index) {
+		const auto root = compiled[index].indirect_root;
+		if (root >= direct || !MappedImageRoot(compiled, root)) return false;
+		slots[root].push_back(index);
+	}
+	for (uint32_t index = direct; index < current.size(); ++index) {
+		const auto root = current[index].indirect_root;
+		if (root >= direct || !MappedImageRoot(current, root) || !MappedImageRoot(compiled, root))
+			return false;
+		children[root].push_back(index);
+	}
+	// Per root: the draw's candidate ordinal -> the compiled layout's (0 stays the root).
+	std::vector<std::vector<uint32_t>> renumber(direct);
+	std::vector<uint8_t>               used;
+	std::vector<uint8_t>               referenced;
+	for (uint32_t root = 0; root < direct; ++root) {
+		if (children[root].empty()) continue;
+		referenced.assign(children[root].size() + 1u, 0u);
+		bool valid_ordinals = true;
+		if (!VisitOrdinals(snapshot.flattened_srt, current[root],
+		                   [&](uint32_t ordinal) {
+			                   if (ordinal < referenced.size()) {
+				                   referenced[ordinal] = 1u;
+			                   } else {
+				                   valid_ordinals = false;
+			                   }
+		                   }) ||
+		    !valid_ordinals)
+			return false;
+		auto& map = renumber[root];
+		map.assign(children[root].size() + 1u, 0u);
+		used.assign(slots[root].size(), 0u);
+		// A typed candidate needs a slot of its own layout; a null one reads the null descriptor
+		// through any slot, so it takes what the typed ones left.
+		for (const bool typed: {true, false}) {
+			for (uint32_t ordinal = 1; ordinal < referenced.size(); ++ordinal) {
+				if (!referenced[ordinal]) continue;
+				const auto  child = children[root][ordinal - 1u];
+				const auto* value = descriptor(child);
+				if (value == nullptr) return false;
+				if (NullImageDescriptor(*value) == typed) continue;
+				uint32_t found = UINT32_MAX;
+				for (uint32_t slot = 0; slot < slots[root].size() && found == UINT32_MAX; ++slot) {
+					if (!used[slot] && compiled[slots[root][slot]] == current[child]) found = slot;
+				}
+				for (uint32_t slot = 0; !typed && slot < slots[root].size() && found == UINT32_MAX;
+				     ++slot) {
+					if (!used[slot]) found = slot;
+				}
+				if (found == UINT32_MAX) return false;
+				used[found]  = 1u;
+				map[ordinal] = found + 1u;
+			}
+		}
+	}
+	if (!apply) return true;
+	std::vector<uint32_t> slot_source(compiled.size(), UINT32_MAX);
+	for (uint32_t root = 0; root < direct; ++root) {
+		for (uint32_t ordinal = 1; ordinal < renumber[root].size(); ++ordinal) {
+			if (renumber[root][ordinal] != 0u)
+				slot_source[slots[root][renumber[root][ordinal] - 1u]] =
+				    children[root][ordinal - 1u];
+		}
+	}
+	std::vector<DescriptorValue> images;
+	images.reserve(compiled.size());
+	for (uint32_t index = 0; index < compiled.size(); ++index) {
+		if (compiled[index].fmask) continue;
+		const auto source = index < direct ? index : slot_source[index];
+		images.push_back(source != UINT32_MAX ? *descriptor(source)
+		                                      : DescriptorValue {.dword_count = 8u});
+	}
+	for (uint32_t root = 0; root < direct; ++root) {
+		if (children[root].empty()) continue;
+		VisitOrdinals(snapshot.flattened_srt, current[root],
+		              [&](uint32_t& ordinal) { ordinal = renumber[root][ordinal]; });
+	}
+	snapshot.images = std::move(images);
+	return true;
+}
+
+} // namespace
+
+bool AdaptToSpecialization(const ResourcePlan& program, const ResourceSpecialization& compiled,
+                           ResourceSnapshot& snapshot, ResourceSpecialization& current) {
+	if (compiled.buffers.size() != current.buffers.size() ||
+	    compiled.samplers.size() != current.samplers.size())
+		return false;
+	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
+		if (!SameExceptSearch(compiled.buffers[i], current.buffers[i]) &&
+		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i]))
+			return false;
+	}
+	for (uint32_t i = 0; i < current.samplers.size(); ++i) {
+		if (!SameExceptSearch(compiled.samplers[i], current.samplers[i])) return false;
+	}
+	if (compiled.images != current.images) {
+		if (!AdaptImages(program, compiled.images, snapshot, current.images, false)) return false;
+		AdaptImages(program, compiled.images, snapshot, current.images, true);
+	}
+	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
+		current.buffers[i].indirect_search_iterations =
+		    compiled.buffers[i].indirect_search_iterations;
+	}
+	current.images   = compiled.images;
+	current.samplers = compiled.samplers;
+	return true;
+}
+
+void WidenSpecialization(const ResourcePlan& program, const ResourceSpecialization& prior,
+                         ResourceSnapshot& snapshot, ResourceSpecialization& current) {
+	const auto direct = static_cast<uint32_t>(program.info.images.size());
+	if (prior.images.size() < direct || current.images.size() < direct) return;
+	const auto either_way = [](const auto& a, const auto& b) {
+		return SameExceptSearch(a, b) || SameExceptSearch(b, a);
+	};
+	auto widened = current;
+	if (prior.buffers.size() == current.buffers.size()) {
+		for (uint32_t i = 0; i < current.buffers.size(); ++i) {
+			if (either_way(prior.buffers[i], current.buffers[i]))
+				widened.buffers[i] = DeeperSearch(prior.buffers[i], current.buffers[i]);
+		}
+	}
+	if (prior.samplers.size() == current.samplers.size()) {
+		for (uint32_t i = 0; i < current.samplers.size(); ++i) {
+			if (either_way(prior.samplers[i], current.samplers[i]))
+				widened.samplers[i] = DeeperSearch(prior.samplers[i], current.samplers[i]);
+		}
+	}
+	const auto children_of = [&](const std::vector<SpecImage>& images, uint32_t root) {
+		std::vector<SpecImage> result;
+		for (size_t index = direct; index < images.size(); ++index) {
+			if (images[index].indirect_root == root) result.push_back(images[index]);
+		}
+		return result;
+	};
+	std::vector<uint32_t> snapshot_index(current.images.size(), UINT32_MAX);
+	for (uint32_t index = 0, position = 0; index < current.images.size(); ++index) {
+		if (!current.images[index].fmask) snapshot_index[index] = position++;
+	}
+	// Per root, the children layouts in order: the prior layout's, then the slots the draw has
+	// beyond it, placed after the last slot of the same layout so that runs stay contiguous.
+	std::vector<std::vector<SpecImage>> layouts(direct);
+	for (uint32_t root = 0; root < direct; ++root) {
+		const auto& old      = prior.images[root];
+		const auto& draw     = current.images[root];
+		const auto  position = snapshot_index[root];
+		if (either_way(old, draw)) {
+			widened.images[root] = DeeperSearch(old, draw);
+			if (!MappedImageRoot(current.images, root)) continue;
+			auto       layout = children_of(prior.images, root);
+			const auto mine   = children_of(current.images, root);
+			for (const auto& child: mine) {
+				const auto need = std::ranges::count(mine, child);
+				const auto have = std::ranges::count(layout, child);
+				if (need <= have) continue;
+				const auto last = std::find(layout.rbegin(), layout.rend(), child);
+				const auto at   = last == layout.rend() ? layout.end() : last.base();
+				layout.insert(at, static_cast<size_t>(need - have), child);
+			}
+			layouts[root] = std::move(layout);
+		} else if (MappedImageRoot(prior.images, root) && position < snapshot.images.size() &&
+		           EmptyRootServed(program, snapshot, old, draw, root, snapshot.images[position])) {
+			widened.images[root] = old;
+			layouts[root]        = children_of(prior.images, root);
+		} else if (MappedImageRoot(current.images, root)) {
+			layouts[root] = children_of(current.images, root);
+		}
+	}
+	widened.images.resize(direct);
+	for (uint32_t root = 0; root < direct; ++root) {
+		widened.images.insert(widened.images.end(), layouts[root].begin(), layouts[root].end());
+	}
+	// A layout that keeps growing is not worth its descriptors; the draw keeps its own.
+	if (widened.images.size() > std::max<size_t>(2u * current.images.size(), 1024u)) return;
+	auto adapted = snapshot;
+	auto result  = current;
+	if (AdaptToSpecialization(program, widened, adapted, result)) {
+		snapshot = std::move(adapted);
+		current  = std::move(result);
+	}
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program, SrtWalkerCompilation walkers) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
