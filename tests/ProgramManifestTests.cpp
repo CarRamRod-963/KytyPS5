@@ -198,6 +198,38 @@ void TestVersion() {
         "the rewritten manifest has the current version");
 }
 
+// Version 2 stored no key map header flags. A version 2 manifest is read while
+// the current one is missing: a record without GPU-selected resources reads the
+// same in both versions and is kept, the current file is written, and the
+// previous one is left to the builds using it.
+void TestPreviousVersion() {
+  const auto previous = TempPath("previous.programs");
+  const auto path = TempPath("previous.v3.programs");
+  std::filesystem::remove(path);
+  {
+    ProgramManifest manifest(previous);
+    auto record = MakeRecord(8, Code(8, 50));
+    record.specialization = {};
+    Check(manifest.Add(record), "add");
+  }
+  auto data = ReadFile(previous);
+  Check(data.size() > 12 && data[8] == ProgramManifest::FormatVersion,
+        "file has a header");
+  data[8] = 2u;
+  WriteFile(previous, data);
+  {
+    ProgramManifest manifest(path, previous);
+    Check(manifest.Size() == 1 && manifest.Loaded().rewritten,
+          "a version 2 manifest lost its records or was not upgraded");
+    Check(manifest.Add(MakeRecord(9, Code(9, 50))), "add after the upgrade");
+  }
+  Check(ReadFile(previous) == data,
+        "the upgrade changed the previous version's file");
+  ProgramManifest manifest(path, previous);
+  Check(manifest.Size() == 2 && !manifest.Loaded().rewritten,
+        "the upgraded manifest does not have the current version");
+}
+
 void TestCorruption() {
   const auto path = TempPath("corrupt.programs");
   {
@@ -436,6 +468,7 @@ int main() {
   TestKey();
   TestDedupe();
   TestVersion();
+  TestPreviousVersion();
   TestCorruption();
   TestMemoryOnly();
   TestPrecompileQueue();
