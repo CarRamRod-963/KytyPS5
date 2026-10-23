@@ -1700,6 +1700,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		TrackImageDownload(stencil_id, association);
 		return plane.FindView(desc.view_info);
 	}
+	if (desc.type == BindingType::Texture && image.info.IsDepth() && !stencil_id) {
+		// A plane the depth image is not bound with: its values live in its saved copy.
+		if (auto* saved = image.SavedStencilPlane(desc.info.data); saved != nullptr) {
+			return saved->FindView(desc.view_info);
+		}
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -1769,7 +1775,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		const auto  stencil_id  = AssociateStencil(id, desc.info.stencil);
+		const auto& association = m_slot_images[stencil_id];
+		// Before the guest bytes: a newer guest plane still replaces the restored values.
+		if (image.IsValidStencilPlane(association.info, association.stencil_subresources)) {
+			image.SelectStencilPlane(association.info, association.stencil_subresources);
+		}
+		RefreshImage(stencil_id);
 	}
 	return image.FindView(desc.view_info);
 }
@@ -2124,8 +2136,10 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::CanDownloadStencil(const Image& association) const {
 	const auto* depth = m_slot_images.try_get(association.depth_id);
+	// A plane the image was rebound away from without a saved copy has no values to read.
 	return depth != nullptr && depth->backing.image != nullptr && depth->HasStencilAspect() &&
-	       depth->backing.samples == 1 && association.info.resources.layers != 0 &&
+	       depth->HoldsStencilPlane(association.info.data) && depth->backing.samples == 1 &&
+	       association.info.resources.layers != 0 &&
 	       association.info.data.size % association.info.resources.layers == 0 &&
 	       association.info.LinearSize() != 0;
 }
