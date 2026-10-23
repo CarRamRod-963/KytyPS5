@@ -151,6 +151,8 @@ struct BufferResource {
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
+	// indirect_mapping_offset names a flattened-SRT word that holds the key map's offset.
+	bool                   indirect_mapping_header = false;
 	std::vector<uint32_t>  indirect_resources;
 	// The stride field of packed_stride only says whether the V# stride is nonzero; indexed
 	// accesses read the stride from the binding's shader-data stride word.
@@ -188,6 +190,8 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// indirect_mapping_offset names a flattened-SRT word that holds the key map's offset.
+	bool                          indirect_mapping_header = false;
 	std::vector<uint32_t>         indirect_resources;
 	// The key selects a slot of the bindless image array through the translation table
 	// (ResourceSnapshot::BindlessUse); there are no enumerated candidates.
@@ -225,6 +229,8 @@ struct SamplerResource {
 	uint32_t indirect_root = NoIndirectSampler;
 	uint32_t indirect_mapping_offset = 0;
 	uint32_t indirect_search_iterations = 0;
+	// indirect_mapping_offset names a flattened-SRT word that holds the key map's offset.
+	bool                  indirect_mapping_header = false;
 	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;

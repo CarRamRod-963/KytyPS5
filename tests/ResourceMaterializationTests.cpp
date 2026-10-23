@@ -1954,7 +1954,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
                       snapshot.specialization_reads.capacity(), specialization.images.capacity()};
   };
   const auto check_mapping = [&](std::array<uint32_t, 4> ordinals) {
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = KeyMapOffset(snapshot, specialization.images[0]);
     Check(snapshot.images.size() == 2 && snapshot.flattened_srt[offset] == 4,
           "finite image candidates were not deduplicated");
     for (uint32_t key = 0; key < ordinals.size(); ++key) {
@@ -2421,7 +2421,7 @@ void TestIndirectImageSamplerClasses(bool mixed) {
             specialization.images[1].numeric_class ==
                 (mixed ? TextureNumericClass::Uint : TextureNumericClass::Float),
         "indirect image materialization rejected or changed a typed candidate");
-  const auto offset = specialization.images[0].indirect_mapping_offset;
+  const auto offset = KeyMapOffset(snapshot, specialization.images[0]);
   Check(snapshot.flattened_srt[offset] == 3u &&
             snapshot.flattened_srt[offset + 2u] == 0u &&
             snapshot.flattened_srt[offset + 4u] == 1u &&
