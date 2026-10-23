@@ -10486,10 +10486,11 @@ public:
     }
     std::memcpy(reinterpret_cast<void *>(stencil_address), expected.data(),
                 texels);
-    const auto apply_write = [&](uint32_t xor_value, uint32_t column_mask) {
+    const auto apply_write = [&](std::vector<uint8_t> &values,
+                                 uint32_t xor_value, uint32_t column_mask) {
       for (uint32_t i = 0; i < texels; i++) {
         if (((i % width) & column_mask) == 0) {
-          expected[i] = static_cast<uint8_t>(expected[i] ^ xor_value);
+          values[i] = static_cast<uint8_t>(values[i] ^ xor_value);
         }
       }
     };
@@ -10611,6 +10612,13 @@ public:
                 std::end(plane_descriptor.fields), plane_value.dwords.begin());
       plane_value.dword_count = 8;
       ShaderStageRuntime plane_runtime{&plane_info, &plane_snapshot};
+      // The same T# over the second stencil plane the target is bound with
+      // below.
+      constexpr uint64_t second_stencil_address = base + 0x60000;
+      auto second_snapshot = plane_snapshot;
+      second_snapshot.images[0].dwords[0] =
+          static_cast<uint32_t>(second_stencil_address >> 8u);
+      ShaderStageRuntime second_runtime{&plane_info, &second_snapshot};
 
       // The writer: a compute pipeline over one R8_UINT storage image.
       vk::ShaderModuleCreateInfo module_info{};
@@ -10669,9 +10677,12 @@ public:
 
       // Binds the stencil T# for a storage write the way a guest dispatch does,
       // then writes it.
-      const auto write_plane = [&](uint32_t xor_value, uint32_t column_mask) {
+      const auto write_plane = [&](ShaderStageRuntime &runtime,
+                                   std::vector<uint8_t> &values,
+                                   uint32_t xor_value, uint32_t column_mask,
+                                   bool bound_plane) {
         PreparedBindings bindings;
-        executor.PrepareBindings(plane_runtime, bindings);
+        executor.PrepareBindings(runtime, bindings);
         executor.RebindImages(bindings);
         const auto &binding = bindings.images[0];
         auto &depth = cache.GetImage(depth_id);
@@ -10687,7 +10698,7 @@ public:
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), bindings));
         Require(name, "plane ownership",
-                depth.StencilPlaneIsNewer() &&
+                depth.StencilPlaneIsNewer() == bound_plane &&
                     binding.layout == vk::ImageLayout::eGeneral &&
                     cache.GetImage(association).IsGpuModified(),
                 "the storage binding did not move the stencil values to the "
@@ -10709,9 +10720,10 @@ public:
                              0, sizeof(push), push.data());
         handle.dispatch(width / 8u, height / 8u, 1);
         RenderExecutorTestAccess::ResetBindings(executor);
-        apply_write(xor_value, column_mask);
+        apply_write(values, xor_value, column_mask);
       };
-      write_plane(writes[0].first, writes[0].second);
+      write_plane(plane_runtime, expected, writes[0].first, writes[0].second,
+                  true);
 
       // The guest reads the plane back while the copy still holds the newer
       // values.
@@ -10947,7 +10959,8 @@ public:
 
       // An image copy of the depth target carries the stencil values a shader
       // wrote last.
-      write_plane(writes[1].first, writes[1].second);
+      write_plane(plane_runtime, expected, writes[1].first, writes[1].second,
+                  true);
       auto copy_desc = make_depth(copy_depth_address, copy_stencil_address);
       const auto copy_id = cache.FindImage(copy_desc);
       (void)cache.FindDepthTarget(copy_id, copy_desc);
@@ -10963,17 +10976,121 @@ public:
       Require(name, "source stencil", read_stencil(depth_id) == expected,
               "the source stencil aspect lost the shader's writes");
 
-      // The target is bound with another stencil plane; a T# of the first plane
-      // still names the depth image through its association (Ghost of Yotei
-      // alternates two planes).
-      auto moved_desc = make_depth(depth_address, base + 0x60000);
+      // Ghost of Yotei binds one depth image with two stencil planes in turn.
+      // The image has one stencil aspect, but each plane keeps its own values:
+      // the second plane's guest bytes reach the aspect, and the first plane's
+      // values (including a shader write made while the second was bound) come
+      // back when it is bound again.
+      const auto read_guest = [&](uint64_t address) {
+        std::vector<uint8_t> bytes(texels);
+        Require(name, "guest backing",
+                Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(),
+                                                        texels),
+                "stencil guest backing is unreadable");
+        return bytes;
+      };
+      std::vector<uint8_t> second(texels);
+      for (uint32_t i = 0; i < texels; i++) {
+        second[i] = static_cast<uint8_t>(i * 11u + 5u);
+      }
+      std::memcpy(reinterpret_cast<void *>(second_stencil_address),
+                  second.data(), texels);
+      auto moved_desc = make_depth(depth_address, second_stencil_address);
       Require(name, "rebound stencil plane",
               cache.FindImage(moved_desc) == depth_id &&
                   cache.FindDepthTarget(depth_id, moved_desc) != nullptr &&
                   cache.GetImage(depth_id).info.stencil.address ==
-                      base + 0x60000,
+                      second_stencil_address,
               "binding another stencil plane replaced the depth image");
-      write_plane(writes[0].first, writes[0].second);
+      const auto second_association =
+          cache.FindImageFromRange(second_stencil_address, texels, false);
+      Require(name, "second association",
+              second_association && second_association != association &&
+                  cache.GetImage(second_association).depth_id == depth_id,
+              "the second stencil plane has no association of its own");
+      Require(name, "second plane in the aspect",
+              read_stencil(depth_id) == second,
+              "the second plane's guest values did not reach the stencil "
+              "aspect");
+      write_plane(second_runtime, second, writes[1].first, writes[1].second,
+                  true);
+      Require(name, "bound plane write", read_stencil(depth_id) == second,
+              "a write through the bound second plane's T# was lost");
+      // A T# of the first plane still names the depth image; its shader write
+      // goes to the first plane's saved values.
+      write_plane(plane_runtime, expected, writes[0].first, writes[0].second,
+                  false);
+      Require(name, "bound plane kept", read_stencil(depth_id) == second,
+              "a write through the first plane's T# changed the bound second "
+              "plane");
+
+      // A sampled read of the first plane while the second is bound reads its
+      // saved copy.
+      {
+        ShaderRecompiler::IR::Program read_program{};
+        read_program.stage = ShaderType::Compute;
+        read_program.resource_tracking_complete = true;
+        ShaderRecompiler::IR::ImageResource read_resource = plane_resource;
+        read_resource.resource_class =
+            ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        read_resource.written = false;
+        read_program.info.images.push_back(read_resource);
+        for (auto &image : read_program.info.images) {
+          const auto kind =
+              *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+          const auto index = static_cast<size_t>(kind);
+          image.descriptor_index =
+              read_program.bindings.descriptor_counts[index];
+          read_program.bindings.descriptor_counts[index] += image.mip_count;
+          read_program.bindings.descriptor_mask |= uint64_t{1} << index;
+        }
+        ShaderRecompiler::IR::CompiledShaderInfo read_info{};
+        read_info.stage = read_program.stage;
+        read_info.info = std::move(read_program.info);
+        read_info.bindings = std::move(read_program.bindings);
+        ShaderStageRuntime read_runtime{&read_info, &plane_snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(read_runtime, bindings);
+        executor.RebindImages(bindings);
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), bindings));
+        const auto &binding = bindings.images[0];
+        auto &depth = cache.GetImage(depth_id);
+        auto *saved = depth.SavedStencilPlane({stencil_address, texels});
+        Require(
+            name, "sampled saved plane",
+            binding.image_id == depth_id && saved != nullptr &&
+                depth.StencilPlaneCopyOf(binding.image_view) == saved &&
+                binding.layout == vk::ImageLayout::eShaderReadOnlyOptimal,
+            "a sampled T# of the unbound plane did not read its saved copy");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
+      // The guest reads the unbound first plane back.
+      Require(name, "unbound plane readback",
+              TextureCacheTestAccess::TryDownload(cache, association),
+              "the saved stencil plane could not be published to guest memory");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "guest sees the unbound plane",
+              read_guest(stencil_address) == expected,
+              "the readback of the unbound plane lost its values");
+
+      // Binding the first plane again restores it and saves the second.
+      Require(name, "first plane rebound",
+              cache.FindImage(depth_desc) == depth_id &&
+                  cache.FindDepthTarget(depth_id, depth_desc) != nullptr,
+              "binding the first stencil plane again replaced the depth image");
+      Require(name, "first plane restored", read_stencil(depth_id) == expected,
+              "binding the first plane again did not restore its values");
+      Require(name, "second plane readback",
+              TextureCacheTestAccess::TryDownload(cache, second_association),
+              "the saved second plane could not be published to guest memory");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "guest sees the second plane",
+              read_guest(second_stencil_address) == second,
+              "the second plane's values were lost when the first came back");
 
       m_device.destroyPipeline(writer_pipeline, nullptr);
       m_device.destroyPipelineLayout(writer_layout, nullptr);
