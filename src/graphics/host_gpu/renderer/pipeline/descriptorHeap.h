@@ -24,10 +24,13 @@ public:
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
 
+	// A layout's preallocated sets. The batch doubles each time the layout uses all of its sets
+	// in one pool: most heap layouts (one per large compute program) take a few sets before the
+	// pool is exhausted and every batch is dropped.
 	struct Batch {
 		std::array<vk::DescriptorSet, DescriptorSetBatch> sets {};
 		uint32_t                                          size       = 0;
-		uint32_t                                          allocation = DescriptorSetBatch;
+		uint32_t                                          allocation = 1;
 	};
 
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
