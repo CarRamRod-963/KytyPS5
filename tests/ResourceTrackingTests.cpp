@@ -383,7 +383,7 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
             memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
-  const auto mapping = root.indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, root);
   Check(root.indirect_search_iterations == 0u && snapshot.flattened_srt[mapping] == 17u &&
             snapshot.flattened_srt[mapping + 1u] == 0u &&
             snapshot.flattened_srt[mapping + 5u] == 1u &&
@@ -674,7 +674,7 @@ void TestBoundedImageViewEligibility() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 4u && memory.reads == 1u,
         "unrelated cube/3D heap entries prevented a typed 2D table view");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
   Check(snapshot.flattened_srt[mapping] == 53u &&
             snapshot.flattened_srt[mapping + 5u] == 1u &&
             snapshot.flattened_srt[mapping + 17u] == 0u &&
@@ -693,12 +693,17 @@ void TestBoundedImageViewEligibility() {
   for (const bool r128 : {false, true}) {
     plan.info.images[0].r128 = r128;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              // Two or three candidates of one class with the root, padded to a power of two.
+              // Two or three candidates of one class with the root, padded to a
+              // power of two.
               snapshot.images.size() == 4u &&
-              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 17u] == 0u &&
+              snapshot.flattened_srt[KeyMapOffset(snapshot,
+                                                  specialization.images[0]) +
+                                     17u] == 0u &&
               snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-              snapshot.images[r128 ? 2u : 3u].dwords == descriptor(0x24u, Type::kColor2D),
-          "invalid heap texture view survived normalization or removed valid neighbors");
+              snapshot.images[r128 ? 2u : 3u].dwords ==
+                  descriptor(0x24u, Type::kColor2D),
+          "invalid heap texture view survived normalization or removed valid "
+          "neighbors");
   }
   plan.info.images[0].r128 = false;
   // A heap whose DWORDs did not change takes its candidates from the last walk:
@@ -1219,7 +1224,7 @@ void TestNestedPointerImageTable() {
             snapshot.images.size() == 1u && specialization.images[0].bindless &&
             snapshot.samplers.size() == count + 1u,
         "partial pointer row was skipped or read beyond its scalar buffer bounds");
-  const auto mapping = specialization.samplers[0].indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, specialization.samplers[0]);
   Check(snapshot.flattened_srt[mapping] == count + 1u &&
             snapshot.flattened_srt[mapping + count + 1u] == 1u,
         "partial pointer row lost its low-word pointee or dense key mapping");
@@ -1452,7 +1457,7 @@ void TestIndexedPointerImageTable() {
       Check(captured(high + objects + row * row_bytes + child * 368u + 64u, 32u),
             "nested child read was absent from the captured alias ranges");
   }
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
   Check(snapshot.flattened_srt[mapping] == 6u,
         "nested child table did not produce one dense composite-key mapping");
   for (uint32_t key = 0; key < 6u; ++key)
@@ -2006,8 +2011,10 @@ void TestGuardedDirectImageTable() {
   memory.descriptor_reads = 0u;
   fill_table(memory, table);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u && specialization.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.images.size() == 32u &&
+            specialization.images.size() == 32u &&
+            snapshot.flattened_srt[KeyMapOffset(
+                snapshot, specialization.images[0])] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
@@ -2019,10 +2026,12 @@ void TestGuardedDirectImageTable() {
              memory.words.begin() + captured_word);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.flattened_srt[KeyMapOffset(
+                snapshot, specialization.images[0])] == 32u &&
             std::ranges::all_of(snapshot.images[16].dwords,
                                 [](uint32_t word) { return word == 0u; }),
-        "captured non-descriptor record became a host image or lost its key mapping");
+        "captured non-descriptor record became a host image or lost its key "
+        "mapping");
   std::copy(original_descriptor.begin(), original_descriptor.end(),
              memory.words.begin() + captured_word);
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
@@ -2134,7 +2143,8 @@ void TestGuardedDirectImageTable() {
             "empty bit loop retained a reachable image");
       continue;
     }
-    Check(snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == count,
+    Check(snapshot.flattened_srt[KeyMapOffset(
+              snapshot, specialization.images[0])] == count,
           "finite bit table lost its candidate count");
     for (uint32_t key = 0; key < count; ++key) {
       Check(std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
@@ -2583,8 +2593,8 @@ void TestBoundedComputeImageLoop() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.images.size() == std::bit_ceil(count) &&
               specialization.images.size() == std::bit_ceil(count) &&
-              snapshot.flattened_srt[
-                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.flattened_srt[KeyMapOffset(
+                  snapshot, specialization.images[0])] == count &&
               snapshot.images[count - 1u].dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
@@ -2901,7 +2911,7 @@ void TestDescendingImageRange() {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u,
           "descending descriptor subtraction failed when the runtime key underflowed");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = KeyMapOffset(snapshot, specialization.images[0]);
     Check(snapshot.flattened_srt[offset] == 128u, "descending mapping lost candidate keys");
     uint32_t previous = 0u;
     for (uint32_t entry = 0; entry < 128u; ++entry) {
@@ -2962,7 +2972,7 @@ void TestDescendingImageRange() {
             "a single bitmap rank became empty or required an indirect image mapping");
       return;
     }
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = KeyMapOffset(snapshot, specialization.images[0]);
     Check(snapshot.flattened_srt[offset] == keys.size(), "bitmap mapping lost a selected key");
     for (uint32_t index = 0; index < keys.size(); ++index) {
       const auto descriptor_record = uint32_t(0x1000u + keys[index] * 32u) / 32u;
@@ -3439,14 +3449,16 @@ void TestUniformizedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u &&
-            memory.reads == 4u && memory.descriptor_reads == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset] == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 1u] == 7u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 3u] == 4096u,
+            snapshot.images.size() == 2u && memory.reads == 4u &&
+            memory.descriptor_reads == 2u &&
+            snapshot.flattened_srt[KeyMapOffset(
+                snapshot, specialization.images[0])] == 2u &&
+            snapshot.flattened_srt[KeyMapOffset(snapshot,
+                                                specialization.images[0]) +
+                                   1u] == 7u &&
+            snapshot.flattened_srt[KeyMapOffset(snapshot,
+                                                specialization.images[0]) +
+                                   3u] == 4096u,
         "material mask did not limit sparse descriptor reads");
   user_data[8] = first_material;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -3678,7 +3690,7 @@ void TestIndexedMaterialImageKeys() {
         "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
-    const auto offset = image.indirect_mapping_offset;
+    const auto offset = KeyMapOffset(snapshot, image);
     Check(snapshot.images[root].dwords[0] == 0u && image.indirect_search_iterations == 2u &&
               snapshot.flattened_srt[offset] == 2u && snapshot.flattened_srt[offset + 1u] == 0u &&
               snapshot.flattened_srt[offset + 3u] == (root == 2u ? 12996u : 12994u) * 32u,
@@ -3753,7 +3765,7 @@ void TestIndexedMaterialImageKeys() {
             memory.selectors == 2u && memory.descriptors == 2u && snapshot.images.size() == 5u,
         "overflowed scalar immediate read a descriptor or lost valid wrapped keys");
   for (uint32_t root = 0; root < 2u; ++root) {
-    const auto offset = specialization.images[root].indirect_mapping_offset;
+    const auto offset = KeyMapOffset(snapshot, specialization.images[root]);
     Check(snapshot.images[root].dwords[0] == 0u && snapshot.flattened_srt[offset] == 2u &&
               snapshot.flattened_srt[offset + 1u] == 32u && snapshot.flattened_srt[offset + 3u] == UINT32_MAX &&
               snapshot.flattened_srt[offset + 4u] == 0u,
@@ -3870,7 +3882,7 @@ void TestPointerTableIndexedMaterialKeys() {
   Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 8u, 64u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
   // Three keys search a map padded to four entries.
   Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_search_iterations == 3u &&
             snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
@@ -5034,7 +5046,7 @@ void TestCountedRowImageSelector() {
       return;
     }
     if (expected.size() > 1u) {
-      const auto map = specialization.images[0].indirect_mapping_offset;
+      const auto map = KeyMapOffset(snapshot, specialization.images[0]);
       Check(snapshot.flattened_srt[map] == expected.size(), "counted-row mapping lost selected keys");
       for (uint32_t index = 0; index < expected.size(); ++index)
         Check(snapshot.flattened_srt[map + 1u + index * 2u] == expected[index],
@@ -6991,7 +7003,7 @@ void TestGpuSelectedBufferRecords() {
     }
     for (uint32_t member = 0; member < 2u; ++member) {
       const auto root = roots[member];
-      const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+      const auto mapping = KeyMapOffset(snapshot, specialization.buffers[root]);
       Check(specialization.buffers[root].indirect_search_iterations == 0u &&
                 snapshot.flattened_srt[mapping] == 4u,
             "affine descriptor table lost its compact dense mapping");
@@ -7389,7 +7401,7 @@ void TestGpuSelectedFormattedRecordStore() {
                   plan.info.buffers.size() + (count == 0u ? 0u : std::bit_ceil(count + 1u) - 1u),
           "exact formatted records read GPU selector bytes, row padding or stale candidates");
   }
-  const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+  const auto mapping = KeyMapOffset(snapshot, specialization.buffers[root]);
   Check(snapshot.flattened_srt[mapping] == 6u, "exact formatted records lost the dense row map");
   for (uint32_t row = 0; row < 6u; ++row)
     Check(snapshot.flattened_srt[mapping + 1u + row] == row + 1u &&
@@ -7415,8 +7427,10 @@ void TestGpuSelectedFormattedRecordStore() {
   user_data[2] = 5u * 592u + 448u + 12u;
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
   Check(materialize() && memory.watched_dwords == 3u &&
-            snapshot.flattened_srt[specialization.buffers[root].indirect_mapping_offset] == 5u &&
-            snapshot.buffers.size() == plan.info.buffers.size() + std::bit_ceil(5u + 1u) - 1u,
+            snapshot.flattened_srt[KeyMapOffset(
+                snapshot, specialization.buffers[root])] == 5u &&
+            snapshot.buffers.size() ==
+                plan.info.buffers.size() + std::bit_ceil(5u + 1u) - 1u,
         "partial direct V# did not zero-fill its missing format DWORD");
   user_data[1] = 592u << 16u;
   user_data[2] = 6u;
@@ -7494,7 +7508,8 @@ void TestGpuSelectedFormattedRecordStore() {
                   wide_plan.info.buffers.size() + (populated ? std::bit_ceil(2u + 1u) - 1u : 0u),
           "finite RGBA16 table read GPU keys or retained stale null/active candidates");
   }
-  const auto wide_mapping = specialization.buffers[wide_root].indirect_mapping_offset;
+  const auto wide_mapping =
+      KeyMapOffset(snapshot, specialization.buffers[wide_root]);
   Check(snapshot.flattened_srt[wide_mapping] == 32u,
         "finite RGBA16 table lost its complete key map");
   for (uint32_t row = 0; row < 32u; ++row)
@@ -7705,7 +7720,7 @@ void TestImageTableClassGroupingStability() {
       if (!MaterializeResources(plan, runtime, snapshot, specialization))
         return false;
       // Every row's key still selects that row's T#.
-      const auto mapping = specialization.images[0].indirect_mapping_offset;
+      const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
       for (uint32_t row = 0; row < rows.size(); ++row) {
         const auto ordinal =
             snapshot.flattened_srt[mapping + 1u + (row * 440u + 32u) / 4u];
@@ -7786,7 +7801,7 @@ void TestImageTableClassGroupingStability() {
       ResourceSnapshot snapshot;
       if (!MaterializeResources(plan, runtime, snapshot, specialization))
         return false;
-      const auto mapping = specialization.images[0].indirect_mapping_offset;
+      const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
       for (uint32_t row = 0; row < 32u; ++row) {
         const auto ordinal = snapshot.flattened_srt[mapping + 2u + row * 2u];
         const auto image =
@@ -7958,20 +7973,18 @@ void TestRecordTableSpecializationStability() {
         "a changed object list baked its store candidate count or key map "
         "lengths");
   // Key maps past the next power of two move the maps that follow them (here
-  // the sampler's), but neither the store candidates nor the heap's mapping
-  // words.
+  // the sampler's), but the module reads every map's offset from its header
+  // word, so neither the specialization nor the heap's mapping words change.
   Check(materialize(72u, 27u, 0x200000u, snapshot, specialization) &&
-            specialization.buffers == first.buffers &&
-            specialization.images == first.images &&
-            snapshot.bindless_uses.size() == 1u &&
+            specialization == first && snapshot.bindless_uses.size() == 1u &&
             snapshot.bindless_uses[0].mapping_offset ==
                 first_snapshot.bindless_uses[0].mapping_offset,
-        "a longer object list changed the store candidates or moved the heap's "
+        "a longer object list changed the specialization or moved the heap's "
         "mapping words");
   // The candidates share one layout (one dynamically indexed access); spare
   // slots are null and no key selects them.
   const auto mapping =
-      specialization.buffers[store_root].indirect_mapping_offset;
+      KeyMapOffset(snapshot, specialization.buffers[store_root]);
   const auto first_child = static_cast<uint32_t>(plan.info.buffers.size());
   std::vector<uint32_t> selected(snapshot.buffers.size());
   for (uint32_t row = 0; row < snapshot.flattened_srt[mapping]; ++row)

@@ -27,6 +27,9 @@ struct ResourceSpecialization {
 		// A direct V# the renderer binds as the null buffer (no base or no records), where every
 		// access is out of bounds. It never changes the module; SpecializationServes uses it.
 		bool                   unbound                         = false;
+		// indirect_mapping_offset is a plan-fixed flattened-SRT word holding the key map's
+		// offset, so the module does not depend on where the scene's key maps end up.
+		bool                   indirect_mapping_header         = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
@@ -47,6 +50,8 @@ struct ResourceSpecialization {
 		// The bindless key is the byte offset of the T# in its heap's records (an image heap the
 		// shader indexes at a scalar offset); the translation index is the key divided by four.
 		bool                          bindless_byte_keys             = false;
+		// See Buffer::indirect_mapping_header.
+		bool                          indirect_mapping_header        = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -54,6 +59,8 @@ struct ResourceSpecialization {
 		uint32_t indirect_root = SamplerResource::NoIndirectSampler;
 		uint32_t indirect_mapping_offset = 0;
 		uint32_t indirect_search_iterations = 0;
+		// See Buffer::indirect_mapping_header.
+		bool indirect_mapping_header          = false;
 		bool operator==(const Sampler&) const = default;
 	};
 
@@ -113,6 +120,12 @@ bool SpecializationServes(const ResourcePlan& program, const ResourceSpecializat
 // module compiled for `target` also serves those bound cases.
 void AdoptServingBuffers(const ResourcePlan& program, ResourceSpecialization& target,
                          const ResourceSpecialization& donor);
+
+// Where an indirect root's key map starts in the snapshot's flattened SRT: its mapping offset, or
+// the word its header holds (SIZE_MAX when the header is out of range).
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Buffer& root);
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Image& root);
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Sampler& root);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

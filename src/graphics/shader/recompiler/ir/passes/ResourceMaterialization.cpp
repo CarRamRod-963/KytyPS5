@@ -28,6 +28,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // assigns its vector before reading it.
 struct MaterializationScratch {
 	std::vector<uint32_t>                                     bindless_mapping;
+	std::vector<uint32_t>                                     buffer_headers;
+	std::vector<uint32_t>                                     image_headers;
+	std::vector<uint32_t>                                     sampler_headers;
 	std::vector<uint32_t>                                     padding;
 	std::vector<std::pair<uint32_t, uint32_t>>                class_spares;
 	std::vector<uint32_t>                                     class_ranks;
@@ -649,15 +652,13 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 }
 
 template <typename Specialization, typename Normalize>
-bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
-                                   uint32_t source_index,
-                                   uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, ResourceSnapshot& snapshot,
-                                   std::vector<DescriptorValue>& descriptors,
-                                   std::vector<Specialization>&  specializations,
-                                   uint32_t bindless_mapping, std::vector<uint32_t>& padding,
-                                   std::vector<std::pair<uint32_t, uint32_t>>& class_spares,
-                                   Normalize&& normalize) {
+bool MaterializeIndirectDescriptor(
+    const ResourcePlan& program, uint32_t source_index, uint32_t resource_index,
+    uint32_t dword_count, uint32_t read_dwords, const SrtRuntime& runtime,
+    ResourceSnapshot& snapshot, std::vector<DescriptorValue>& descriptors,
+    std::vector<Specialization>& specializations, uint32_t bindless_mapping,
+    uint32_t mapping_header, std::vector<uint32_t>& padding,
+    std::vector<std::pair<uint32_t, uint32_t>>& class_spares, Normalize&& normalize) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -809,6 +810,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	};
 	// A heap's two words live at a place fixed by the plan, so the mapping offsets the program
 	// bakes do not move with the length of other tables' key maps.
+	// A key map's offset depends on the lengths of the maps before it, which change with the
+	// scene; a module that baked it would be compiled again for every change. The plan reserves
+	// a header word per indirect root that holds the offset (MaterializeResources), and the
+	// module reads it from there.
+	const auto publish_mapping = [&](Specialization& root, size_t offset) {
+		if (mapping_header == UINT32_MAX) {
+			root.indirect_mapping_offset = static_cast<uint32_t>(offset);
+			return;
+		}
+		snapshot.flattened_srt[mapping_header] = static_cast<uint32_t>(offset);
+		root.indirect_mapping_offset           = mapping_header;
+		root.indirect_mapping_header           = true;
+	};
 	const auto bindless_words = [&] {
 		if (bindless_mapping != UINT32_MAX) return bindless_mapping;
 		const auto offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
@@ -1213,7 +1227,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (!group_image_candidates(mapping_offset + 1u, entries, 1u)) return false;
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
-				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+				publish_mapping(root, mapping_offset);
 				root.indirect_search_iterations = 0u;
 			}
 			return true;
@@ -1351,7 +1365,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
-		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+		publish_mapping(root, mapping_offset);
 		root.indirect_search_iterations = std::bit_width(padded_keys);
 	}
 	return true;
@@ -1407,6 +1421,24 @@ private:
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };
+
+// Where an indirect root's key map starts in the flattened SRT (SIZE_MAX when out of range).
+template <typename Specialization>
+size_t KeyMapOffset(std::span<const uint32_t> flat, const Specialization& root) {
+	if (!root.indirect_mapping_header) return root.indirect_mapping_offset;
+	return root.indirect_mapping_offset < flat.size() ? flat[root.indirect_mapping_offset]
+	                                                  : SIZE_MAX;
+}
+
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Buffer& root) {
+	return KeyMapOffset(std::span<const uint32_t>(snapshot.flattened_srt), root);
+}
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Image& root) {
+	return KeyMapOffset(std::span<const uint32_t>(snapshot.flattened_srt), root);
+}
+size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Sampler& root) {
+	return KeyMapOffset(std::span<const uint32_t>(snapshot.flattened_srt), root);
+}
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
@@ -1512,8 +1544,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    specialization.images[base_index].indirect_search_iterations == 0u &&
 			    !source->indirect_descriptor->pointer_table) {
 				const auto& indirect = *source->indirect_descriptor;
-				const size_t mapping = specialization.images[base_index].indirect_mapping_offset;
-				const auto& flat = snapshot.flattened_srt;
+				const auto&  flat     = snapshot.flattened_srt;
+				const size_t mapping  = KeyMapOffset(flat, specialization.images[base_index]);
 				if (mapping < flat.size() && flat[mapping] <= flat.size() - mapping - 1u) {
 					uint32_t ordinal = 0;
 					for (size_t child = program.info.images.size(); child <= i; ++child)
@@ -1537,15 +1569,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (root.indirect_root != root_index || root.bindless) {
 			continue; // bindless: resolved at run time, the class comes from the instruction
 		}
-		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
-		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
-		                           : 0u;
+		const auto map_offset = KeyMapOffset(snapshot.flattened_srt, root);
+		const auto key_count =
+		    map_offset < snapshot.flattened_srt.size() ? snapshot.flattened_srt[map_offset] : 0u;
 		// A heap maps its slot count and slot address; tables map each key.
 		size_t mapping_words = 3u;
 		if (!root.heap)
 			mapping_words = 1u + size_t {key_count} * (root.indirect_search_iterations == 0u ? 1u : 2u);
-		if (key_count == 0u ||
-		    root.indirect_mapping_offset + mapping_words > snapshot.flattened_srt.size()) {
+		if (key_count == 0u || map_offset + mapping_words > snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
@@ -2242,6 +2273,40 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		bindless_mapping[i] = static_cast<uint32_t>(snapshot.flattened_srt.size());
 		snapshot.flattened_srt.resize(bindless_mapping[i] + 2u, 0u);
 	}
+	// Every indirect root's key map offset lives in a header word at a place fixed by the plan
+	// (see MaterializeIndirectDescriptor). Until a map is published, a header names the shared
+	// empty map, which maps no key: the root's own descriptor (ordinal 0) is selected.
+	// The empty map is reserved with the first header.
+	uint32_t   empty_map       = UINT32_MAX;
+	const auto reserve_headers = [&](std::vector<uint32_t>& headers, size_t count,
+	                                 auto&& indirect) {
+		headers.assign(count, UINT32_MAX);
+		for (uint32_t i = 0; i < count; ++i) {
+			if (!indirect(i)) continue;
+			if (empty_map == UINT32_MAX) {
+				empty_map = static_cast<uint32_t>(snapshot.flattened_srt.size());
+				snapshot.flattened_srt.push_back(0u);
+			}
+			headers[i] = static_cast<uint32_t>(snapshot.flattened_srt.size());
+			snapshot.flattened_srt.push_back(empty_map);
+		}
+	};
+	const auto indirect_source = [&](uint32_t source_index) {
+		const auto* source = Source(program, source_index);
+		return source != nullptr
+		           ? (source->indirect_descriptor ? &*source->indirect_descriptor : nullptr)
+		           : nullptr;
+	};
+	reserve_headers(scratch.buffer_headers, program.info.buffers.size(), [&](uint32_t i) {
+		return indirect_source(program.info.buffers[i].source) != nullptr;
+	});
+	reserve_headers(scratch.image_headers, program.info.images.size(), [&](uint32_t i) {
+		return indirect_source(program.info.images[i].source) != nullptr;
+	});
+	reserve_headers(scratch.sampler_headers, program.info.samplers.size(), [&](uint32_t i) {
+		const auto* indirect = indirect_source(program.info.samplers[i].source);
+		return indirect != nullptr && indirect->sources.empty();
+	});
 	auto& padding      = scratch.padding;
 	auto& class_spares = scratch.class_spares;
 	padding.clear();
@@ -2261,7 +2326,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (WalkedActive(program, base.source)) {
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers, UINT32_MAX, padding, class_spares,
+					        snapshot.buffers, specialization.buffers, UINT32_MAX,
+					        scratch.buffer_headers[i], padding, class_spares,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
@@ -2352,9 +2418,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			// belong to other image operations.
 			const bool table_candidates = bounded_table || indirect.sources.empty();
 			if (!MaterializeIndirectDescriptor(
-			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, bindless_mapping[i], padding, class_spares,
-			        [&](DescriptorValue& value) {
+			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot,
+			        snapshot.images, specialization.images, bindless_mapping[i],
+			        scratch.image_headers[i], padding, class_spares, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations;
 				        // a selector names exactly the records the shader uses, so a malformed one
 				        // still fails the specialization. Another dimension is only nulled in a
@@ -2394,10 +2460,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
+				if (WalkedActive(program, source) &&
+				    !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
-				        specialization.samplers, UINT32_MAX, padding, class_spares,
-				        [](DescriptorValue&) { return true; }))
+				        specialization.samplers, UINT32_MAX, scratch.sampler_headers[i], padding,
+				        class_spares, [](DescriptorValue&) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];
@@ -2532,6 +2599,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.indirect_mapping_header    = source.indirect_mapping_header;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {
@@ -2559,6 +2627,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
+		image.indirect_mapping_header    = source.indirect_mapping_header;
 		image.cube                       = source.cube;
 		image.heap                       = source.heap;
 		image.bindless                   = source.bindless;
@@ -2587,6 +2656,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[index].indirect_root = source.indirect_root;
 		samplers[index].indirect_mapping_offset = source.indirect_mapping_offset;
 		samplers[index].indirect_search_iterations = source.indirect_search_iterations;
+		samplers[index].indirect_mapping_header    = source.indirect_mapping_header;
 	}
 	for (uint32_t index = 0; index < samplers.size(); ++index) {
 		const auto root = samplers[index].indirect_root;
