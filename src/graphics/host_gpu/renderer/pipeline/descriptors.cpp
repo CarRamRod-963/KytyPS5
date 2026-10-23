@@ -805,9 +805,19 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 	                  ? static_cast<TextureMemoEntry*>(const_cast<void*>(binding.memo_entry))
 	                  : nullptr;
 	auto  found = m_texture_memo.end();
-	if (entry == nullptr) {
-		found = m_texture_memo.find(key);
-		entry = found != m_texture_memo.end() ? &found->second : nullptr;
+	auto* front = entry == nullptr
+	                  ? &m_texture_memo_front[TextureMemoKeyHash {}(key) % TextureMemoFrontSize]
+	                  : nullptr;
+	if (front != nullptr) {
+		if (front->epoch == m_texture_memo_epoch && front->key == key) {
+			entry = front->entry;
+		} else {
+			found = m_texture_memo.find(key);
+			entry = found != m_texture_memo.end() ? &found->second : nullptr;
+			if (entry != nullptr) {
+				*front = {key, entry, m_texture_memo_epoch};
+			}
+		}
 	}
 	if (entry != nullptr) {
 		const auto now = texture_cache.LayoutNow();
@@ -856,6 +866,9 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 	binding.memo_entry = &inserted.first->second;
 	binding.memo_key   = key;
 	binding.memo_epoch = m_texture_memo_epoch;
+	if (front != nullptr) {
+		*front = {key, &inserted.first->second, m_texture_memo_epoch};
+	}
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
