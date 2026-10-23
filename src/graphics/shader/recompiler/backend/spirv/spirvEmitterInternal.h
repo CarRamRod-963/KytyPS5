@@ -456,8 +456,11 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
+// The candidate ordinal a GPU-selected key maps to. With `mapping_header`, the flattened-SRT word
+// at `mapping_offset` holds the key map's offset, so the module does not bake where the map is.
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource);
+                                   bool mapping_header, uint32_t search_iterations,
+                                   uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,

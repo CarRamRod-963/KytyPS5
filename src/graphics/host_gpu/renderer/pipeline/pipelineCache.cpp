@@ -1098,8 +1098,10 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 
-	SetManifest(std::make_unique<ProgramManifest>(m_driver_cache_path.parent_path() /
-	                                              (title_id + ".programs")));
+	const auto directory = m_driver_cache_path.parent_path();
+	SetManifest(
+	    std::make_unique<ProgramManifest>(ProgramManifest::PathFor(directory, title_id),
+	                                      ProgramManifest::PreviousPathFor(directory, title_id)));
 	const auto loaded = m_manifest->Loaded();
 	PipelineCacheLog("Program manifest: {} compute programs in {}{}", loaded.records,
 	                 Common::PathToString(m_manifest->Path()),
