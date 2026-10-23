@@ -64,6 +64,9 @@ struct SrtRuntime {
 	// Optional: the cache read_memory reads through. A reader load whose chunk it holds loads the
 	// DWORD from it instead of calling read_memory.
 	const SrtReadCacheView* read_cache = nullptr;
+	// A walk ahead of the commands that may still write its guest data (ResourceLookahead):
+	// MaterializeResources reports none of its failures, the caller counts them.
+	bool speculative = false;
 };
 
 // How walker loads read guest memory: in place (a fault completes the load as a zero read), or
