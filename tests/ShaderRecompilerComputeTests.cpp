@@ -5985,6 +5985,13 @@ public:
               ImageHeapTestAccess::ElementCount(heap) <= skipped_elements + 2u,
               "elements released by skipped draws were never freed");
       draw();
+      // A view interns at most one element per probe the table's size allows: a request naming
+      // half the heap's capacity over a small table is bounded by its probes and kept.
+      Require(name, "oversized view", acquire(sampled, left_table, IR::ImageHeapCapacity / 2u),
+              "a request whose table bounds its probes was declined");
+      Require(name, "view after an oversized one", acquire(sampled, left_table),
+              "a declined oversized view declined the table's other views");
+      draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
