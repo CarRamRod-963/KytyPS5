@@ -70,17 +70,30 @@ uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_
 }
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource) {
-	const auto mapping = ConstantU32(state, mapping_offset);
-	const auto count = LoadFlattenedSrt(state, mapping);
+                                   bool mapping_header, uint32_t search_iterations,
+                                   uint32_t default_resource) {
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto mapping = mapping_header ? LoadMapping(ConstantU32(state, mapping_offset))
+	                                    : ConstantU32(state, mapping_offset);
+	const auto count   = LoadMapping(mapping);
 	if (search_iterations == 0u) {
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
 		                          ConstantU32(state, 2u));
 		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
 		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
 		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
-		return Select(state, TypeU32(state), valid, LoadFlattenedSrt(state, entry),
+		                          mapping_header ? Binary(state, spv::OpIAdd, TypeU32(state),
+		                                                  mapping, ConstantU32(state, 1u))
+		                                         : ConstantU32(state, mapping_offset + 1u));
+		return Select(state, TypeU32(state), valid, LoadMapping(entry),
 		              ConstantU32(state, default_resource));
 	}
 	const auto entry_at = [&](uint32_t index) {
