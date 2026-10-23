@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -54,11 +55,18 @@ class ProgramManifest {
 public:
 	// Bump when the stored fields change; the static_asserts in programManifest.cpp trip when
 	// a serialized struct changes size.
-	static constexpr uint32_t FormatVersion = 2;
+	static constexpr uint32_t FormatVersion = 3;
 
 	// Loads the manifest at `path`, creating it when missing. An empty path keeps the manifest
-	// in memory only.
-	explicit ProgramManifest(std::filesystem::path path = {});
+	// in memory only. While `path` is missing, the manifest of the previous format at
+	// `previous` is read (and left as it is, for the builds that still use it).
+	explicit ProgramManifest(std::filesystem::path path = {}, std::filesystem::path previous = {});
+
+	// Where a title's manifest of the current format lives, and the previous format's.
+	static std::filesystem::path PathFor(const std::filesystem::path& directory,
+	                                     const std::string&           title_id);
+	static std::filesystem::path PreviousPathFor(const std::filesystem::path& directory,
+	                                             const std::string&           title_id);
 	~ProgramManifest();
 	KYTY_CLASS_NO_COPY(ProgramManifest);
 
@@ -94,12 +102,13 @@ private:
 	};
 
 	void                        Load();
-	bool                        ParseEntry(std::span<const uint8_t> payload);
+	bool                        ParseEntry(std::span<const uint8_t> payload, uint32_t version);
 	bool                        Rewrite();
 	void                        AppendEntry(std::span<const uint8_t> payload);
 	static std::vector<uint8_t> EncodeCode(uint64_t hash, std::span<const uint32_t> code);
 
 	std::filesystem::path                                    m_path;
+	std::filesystem::path                                    m_previous;
 	mutable std::mutex                                       m_mutex;
 	std::ofstream                                            m_file;
 	LoadStats                                                m_loaded;
