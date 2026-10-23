@@ -499,6 +499,9 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 			case Format::ComponentType::Uscaled:
 				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
 				break;
+			case Format::ComponentType::Unorm:
+				value = ConstantU32(ctx.state, selector == 1u ? std::bit_cast<uint32_t>(1.0f) : 0u);
+				break;
 			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
 		}
 		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
