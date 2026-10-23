@@ -1047,10 +1047,15 @@ bool MaterializeIndirectDescriptor(
 			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 				const auto& image = program.info.images[resource_index];
 				// A resident heap maps slot words instead of materializing its entries.
+				const bool heap_root = image_heap &&
+				                       image.resource_class == ImageResourceClass::Sampled &&
+				                       image.mip_mode != ImageMipMode::Dynamic;
+				// Heaps are acquired on the GPU thread only: a lookahead walk that enumerated the
+				// table instead would give the draw another specialization than the GPU thread's.
+				if (heap_root && runtime.speculative)
+					return failed("image heap on a lookahead walk");
 				ImageHeapView view;
-				if (image_heap && runtime.image_heap != nullptr &&
-				    image.resource_class == ImageResourceClass::Sampled &&
-				    image.mip_mode != ImageMipMode::Dynamic &&
+				if (heap_root && runtime.image_heap != nullptr &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
 				                                view)) {
 					snapshot.specialization_reads.emplace_back(table_base, table_size);
