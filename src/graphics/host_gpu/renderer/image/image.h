@@ -75,13 +75,30 @@ public:
 	// Depth/stencil images cannot be storage images, so a shader that writes a stencil plane
 	// writes an R8_UINT color copy of it instead. `plane` is the plane's guest layout (its
 	// stencil association) and `range` its subresources in this image. Returns the copy holding
-	// the current stencil values: the stencil aspect is copied into it unless it already holds
-	// newer values.
+	// the plane's current values: for the plane in the stencil aspect, the aspect is copied
+	// into it unless it already holds newer values; a plane saved by SelectStencilPlane is
+	// returned as saved.
 	[[nodiscard]] Image& StencilPlane(const ImageInfo& plane, const ImageSubresourceRange& range);
-	// The copy now receives shader writes and holds the newer stencil values: the next access to
-	// this image through any other path copies them back into the stencil aspect first.
-	void               WriteStencilPlane(std::optional<ImageSubresourceRange> range,
-	                                     vk::CommandBuffer                    command_buffer);
+	// The guest binds one depth image with different stencil planes over time, but the image has
+	// one stencil aspect. Binding `plane` where another plane in other memory held the same layers
+	// saves that plane's values into its copy and restores `plane`'s saved values, so each plane
+	// keeps its own contents. Planes in overlapping memory or on other layers share the aspect.
+	void SelectStencilPlane(const ImageInfo& plane, const ImageSubresourceRange& range);
+	// Whether `plane` and `range` describe a stencil plane of this image that a color copy can
+	// hold (single-sampled, the image's extent, whole mip chains).
+	[[nodiscard]] bool IsValidStencilPlane(const ImageInfo&             plane,
+	                                       const ImageSubresourceRange& range) const noexcept;
+	// The copy of `plane` now receives shader writes. For the plane in the stencil aspect it
+	// holds the newer values: the next access to this image through any other path copies them
+	// back into the stencil aspect first.
+	void WriteStencilPlane(const GuestRange& plane, std::optional<ImageSubresourceRange> range,
+	                       vk::CommandBuffer command_buffer);
+	// Whether the image holds the values of `plane`, in its stencil aspect or in a saved copy.
+	[[nodiscard]] bool HoldsStencilPlane(const GuestRange& plane) const noexcept;
+	// The copy holding a plane that is not in the stencil aspect, if one was saved.
+	[[nodiscard]] Image* SavedStencilPlane(const GuestRange& plane) noexcept;
+	// The stencil plane copy that owns `view`, if any.
+	[[nodiscard]] Image* StencilPlaneCopyOf(vk::ImageView view) noexcept;
 	[[nodiscard]] bool StencilPlaneIsNewer() const noexcept { return m_stencil_plane_newer; }
 	[[nodiscard]] bool HasStencilAspect() const noexcept {
 		return static_cast<bool>(FullAspectMask(backing.format) &
@@ -196,11 +213,28 @@ private:
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+
+	struct StencilPlaneCopy {
+		ImageInfo               info;
+		ImageSubresourceRange   range;
+		std::unique_ptr<Image>  color;
+		std::unique_ptr<Buffer> staging;
+		// The copy holds the plane's values and the stencil aspect does not.
+		bool saved = false;
+
+		[[nodiscard]] bool Describes(const ImageInfo&             plane,
+		                             const ImageSubresourceRange& plane_range) const noexcept;
+	};
+	[[nodiscard]] StencilPlaneCopy* FindStencilPlaneCopy(const GuestRange& plane) noexcept;
+	[[nodiscard]] StencilPlaneCopy& ObtainStencilPlaneCopy(const ImageInfo&             plane,
+	                                                       const ImageSubresourceRange& range);
+	void ValidateStencilPlane(const ImageInfo& plane, const ImageSubresourceRange& range) const;
+
 	// Copies the stencil plane's values back into the stencil aspect if they are newer.
 	void ReturnStencilPlane();
-	// Moves the stencil values between the stencil aspect and the color copy of the plane
-	// through the staging buffer.
-	void CopyStencilPlane(bool to_plane);
+	// Moves the stencil values between the stencil aspect and a color copy of a plane through
+	// the copy's staging buffer.
+	void CopyStencilPlane(StencilPlaneCopy& copy, bool to_plane);
 
 	// The last read-only transition that went through the per-subresource states. Repeating it
 	// changes nothing and emits no barrier, so it is answered without walking the subresources
@@ -216,10 +250,12 @@ private:
 	};
 	std::optional<SettledTransition> m_settled;
 
-	std::unique_ptr<Image>  m_stencil_plane;
-	std::unique_ptr<Buffer> m_stencil_staging;
-	ImageSubresourceRange   m_stencil_plane_range;
-	bool                    m_stencil_plane_newer = false;
+	std::vector<StencilPlaneCopy> m_stencil_planes;
+	// The plane whose values the stencil aspect holds, and its subresources in this image.
+	std::optional<ImageInfo> m_stencil_owner;
+	ImageSubresourceRange    m_stencil_owner_range;
+	// The owner's copy holds newer values than the stencil aspect.
+	bool m_stencil_plane_newer = false;
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;

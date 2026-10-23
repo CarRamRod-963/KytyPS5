@@ -1602,6 +1602,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			if (!storage && image.info.IsDepth()) {
+				// A stencil plane the depth image is not bound with is read from its saved copy.
+				if (auto* plane = image.StencilPlaneCopyOf(binding.image_view); plane != nullptr) {
+					plane->Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+					               vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+					binding.layout = plane->backing.state.layout;
+					continue;
+				}
+			}
 			if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
@@ -1741,6 +1750,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				if (image.info.IsDepth()) {
 					const auto& view = binding.desc.view_info;
 					image.WriteStencilPlane(
+					    binding.desc.info.data,
 					    ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 					                           view.layer_count},
 					    vk_buffer);
