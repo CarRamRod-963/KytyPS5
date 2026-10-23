@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -71,10 +72,37 @@ constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 // hundreds of entries), so the renderer resolves the keys the GPU asks for instead.
 constexpr size_t BindlessTableKeys = 32u;
 
+// The reasons a MaterializeResources call on this thread gave up, joined into the one line it
+// reports when it fails (a reason recorded on a path that still succeeds is dropped).
+struct FailureReasons {
+	bool        speculative = false;
+	std::string text;
+};
+thread_local FailureReasons t_failure_reasons;
+
+std::atomic<uint64_t> g_failure_reports {0};
+
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	auto& reasons = t_failure_reasons;
+	if (!reasons.speculative) {
+		if (!reasons.text.empty()) reasons.text += "; ";
+		reasons.text += message;
+	}
 	return false;
+}
+
+// A shader that cannot be specialized usually fails the same way for every draw; its first
+// failure names the reasons and later ones are not printed.
+void ReportSpecializationFailure(uint64_t shader_hash, const std::string& reasons) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	{
+		std::scoped_lock lock(mutex);
+		if (!reported.insert(shader_hash).second) return;
+	}
+	g_failure_reports.fetch_add(1u, std::memory_order_relaxed);
+	std::fprintf(stderr, "shader resource specialization failed: hash=%016llx %s\n",
+	             static_cast<unsigned long long>(shader_hash), reasons.c_str());
 }
 
 // The draw's guest data cannot be enumerated (see ResourceSnapshot::unavailable). The data can
@@ -83,7 +111,7 @@ bool SpecializationUnavailable(uint64_t shader_hash, ResourceSnapshot& snapshot,
                                std::string_view message) {
 	snapshot.unavailable = true;
 	static std::atomic<uint32_t> reports {0};
-	if (reports.fetch_add(1u, std::memory_order_relaxed) < 64u) {
+	if (!t_failure_reasons.speculative && reports.fetch_add(1u, std::memory_order_relaxed) < 64u) {
 		std::fprintf(stderr, "shader resource specialization unavailable: hash=%016llx %.*s\n",
 		             static_cast<unsigned long long>(shader_hash), static_cast<int>(message.size()),
 		             message.data());
@@ -351,10 +379,18 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    descriptor.SwizzleEnabled(), descriptor.AddTid(), descriptor.OutOfBounds(), indexed,
 		    resource.formatted, resource.read, resource.written, resource.max_byte_extent));
 	}
+	const auto rejected = [&](std::string_view reason) {
+		return SpecializationFail(fmt::format(
+		    "{}: descriptor={:08x},{:08x},{:08x},{:08x} format={} stride={} dst_sel={:#x} "
+		    "max_extent={}",
+		    reason, value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+		    static_cast<uint32_t>(descriptor.Format()), descriptor.Stride(),
+		    descriptor.DstSelXYZW(), resource.max_byte_extent));
+	};
 	if (resource.formatted) {
 		const auto format = Format::GetFormatInfo(descriptor.Format());
 		if (!indexed || format.type == Format::ComponentType::Unknown)
-			return SpecializationFail("indirect formatted buffers require a supported indexed format");
+			return rejected("indirect formatted buffers require a supported indexed format");
 		if (!formatted_read) {
 			const bool scalar = resource.max_byte_extent == 4u &&
 			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
@@ -363,7 +399,8 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
 			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
 			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
-				return SpecializationFail("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records");
+				return rejected("indirect formatted stores require tight identity SInt8, UInt32 or "
+				                "RGBA16Float records");
 		}
 		if (formatted_read &&
 		    (descriptor.Base48() == 0u || descriptor.Stride() == 0u || descriptor.NumRecords() == 0u)) {
@@ -376,10 +413,10 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		if (descriptor.Stride() < format.byte_size ||
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
-			return SpecializationFail("indirect formatted buffers require aligned full-format records");
+			return rejected("indirect formatted buffers require aligned full-format records");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||
 	           (indexed && resource.max_byte_extent != 1u && descriptor.Stride() != 4u)) {
-		return SpecializationFail("indirect buffer stores require exact linear DWORD or byte bounds");
+		return rejected("indirect buffer stores require exact linear DWORD or byte bounds");
 	}
 	return true;
 }
@@ -2635,8 +2672,13 @@ bool RangeOverlapIndex::Overlaps(std::span<const std::pair<uint64_t, uint64_t>> 
 	return after != index.begin() && std::prev(after)->second > base;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+uint64_t SpecializationFailureReports() {
+	return g_failure_reports.load(std::memory_order_relaxed);
+}
+
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot&       snapshot,
+                                     ResourceSpecialization& specialization) {
 	if (program.materialization_scratch == nullptr) {
 		program.materialization_scratch = std::make_shared<MaterializationScratch>();
 	}
@@ -2965,6 +3007,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (const auto& [spare, donor]: class_spares)
 		specialization.images[spare] = specialization.images[donor];
 	return true;
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	auto& reasons       = t_failure_reasons;
+	reasons.speculative = runtime.speculative;
+	reasons.text.clear();
+	const bool done = MaterializeResourcesImpl(program, runtime, snapshot, specialization);
+	// An unavailable draw has already named its reason.
+	if (!done && !snapshot.unavailable && !reasons.text.empty())
+		ReportSpecializationFailure(program.shader_hash, reasons.text);
+	reasons.text.clear();
+	return done;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
