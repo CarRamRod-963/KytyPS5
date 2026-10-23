@@ -78,6 +78,7 @@ MakeRecord(uint32_t seed, std::shared_ptr<const std::vector<uint32_t>> code) {
   image.mip_count = seed;
   image.cube = true;
   image.bindless = (seed & 1u) != 0;
+  image.heap = (seed & 2u) != 0;
   record.specialization.images = {image};
   record.specialization.samplers.resize(3);
   record.specialization.samplers[2].indirect_search_iterations = 7;
@@ -198,14 +199,15 @@ void TestVersion() {
         "the rewritten manifest has the current version");
 }
 
-// Version 2 stored no key map header flags. A version 2 manifest is read while
-// the current one is missing: a record without GPU-selected resources reads the
-// same in both versions and is kept, the current file is written, and the
-// previous one is left to the builds using it.
-void TestPreviousVersion() {
+// Version 2 stored no key map header flags, version 3 no heap flags. An older
+// manifest is read while the current one is missing: a record without
+// GPU-selected resources reads the same in every version and is kept, the
+// current file is written, and the previous one is left to the builds using it.
+void TestPreviousVersion(uint8_t version) {
   const auto previous = TempPath("previous.programs");
-  const auto path = TempPath("previous.v3.programs");
+  const auto path = TempPath("previous.v4.programs");
   std::filesystem::remove(path);
+  std::filesystem::remove(previous);
   {
     ProgramManifest manifest(previous);
     auto record = MakeRecord(8, Code(8, 50));
@@ -215,12 +217,12 @@ void TestPreviousVersion() {
   auto data = ReadFile(previous);
   Check(data.size() > 12 && data[8] == ProgramManifest::FormatVersion,
         "file has a header");
-  data[8] = 2u;
+  data[8] = version;
   WriteFile(previous, data);
   {
     ProgramManifest manifest(path, previous);
     Check(manifest.Size() == 1 && manifest.Loaded().rewritten,
-          "a version 2 manifest lost its records or was not upgraded");
+          "an older manifest lost its records or was not upgraded");
     Check(manifest.Add(MakeRecord(9, Code(9, 50))), "add after the upgrade");
   }
   Check(ReadFile(previous) == data,
@@ -468,7 +470,8 @@ int main() {
   TestKey();
   TestDedupe();
   TestVersion();
-  TestPreviousVersion();
+  TestPreviousVersion(2u);
+  TestPreviousVersion(3u);
   TestCorruption();
   TestMemoryOnly();
   TestPrecompileQueue();
