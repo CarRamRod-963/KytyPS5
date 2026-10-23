@@ -253,13 +253,18 @@ void ImageHeap::Unwatch(const Memory& memory) {
 
 void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_mutex};
+	// A table watches whole pages, so a write to a page it shares with a neighbouring table (or
+	// other data) faults for it too, even where the bytes are not its own.
+	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (auto& memory: m_memories) {
-		const auto begin = std::max(address, memory->base);
-		const auto end   = std::min(address + size, memory->base + memory->size);
-		if (begin >= end) continue;
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
+		const auto limit  = Common::AlignUp(memory->base + memory->size, TRACKER_PAGE_SIZE);
+		const auto begin  = std::max(first, origin);
+		const auto end    = std::min(last, limit);
+		if (begin >= end) continue;
 		MarkDirty(*memory, (begin - origin) / TRACKER_PAGE_SIZE,
-		          (end - 1u - origin) / TRACKER_PAGE_SIZE + 1u);
+		          (end - origin) / TRACKER_PAGE_SIZE);
 	}
 }
 
