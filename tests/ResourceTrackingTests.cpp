@@ -7927,6 +7927,212 @@ void TestImageTableClassGroupingStability() {
   }
 }
 
+// Ghost of Yotei (PPSA26344) CS 0x7e9e7b2644d28bbe: object tables streamed in
+// with the scene change the number of candidates per class (and which classes
+// there are) from dispatch to dispatch, and every change compiled a module
+// synchronously. A module whose candidate slots hold a draw's candidates
+// serves it after they are moved there; a draw no module serves gets the union
+// of its layout and the last one.
+void TestImageCandidateLayoutAdaptation() {
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using T = Libs::Graphics::Prospero::ImageType;
+  const auto texture = [](uint32_t identity, F format) {
+    return std::array<uint32_t, 8>{identity,
+                                   uint32_t(format) << 20u,
+                                   3u | (3u << 14u),
+                                   Libs::Graphics::DstSel(4, 5, 6, 7) |
+                                       (uint32_t(T::kColor2D) << 28u),
+                                   0u,
+                                   0u,
+                                   0u,
+                                   0u};
+  };
+  // The bounded table of 440-byte records probed every 8 bytes, as in the
+  // class grouping test.
+  auto fixture = MakeIndirectImageFixture(false, 440u, 0u, 32u);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  const auto direct = plan.info.images.size();
+  constexpr uint32_t table = 0x4000u;
+  LinearTestMemory memory;
+  memory.words.resize((table + 16u * 440u - memory.base) / 4u);
+  memory.fail_address = 0x3000u;
+  const auto materialize = [&](std::span<const F> rows,
+                               ResourceSnapshot &snapshot,
+                               ResourceSpecialization &specialization) {
+    std::fill(memory.words.begin(), memory.words.end(), 0u);
+    for (uint32_t row = 0; row < rows.size(); ++row) {
+      const auto value = texture(0x100u + row * 0x10u, rows[row]);
+      std::copy(value.begin(), value.end(),
+                memory.words.begin() +
+                    (table + row * 440u + 32u - memory.base) / 4u);
+    }
+    const std::array<uint32_t, 8> data{
+        0x3000u, 16u << 16u, 1u, 0u, table, 440u << 16u, uint32_t(rows.size()),
+        0u};
+    const SrtRuntime runtime{.user_data = data,
+                             .userdata = &memory,
+                             .read_specialization_memory =
+                                 ReadLinearTestMemory};
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  // Every row's key selects that row's T# through the snapshot's key map, and
+  // the snapshot binds one descriptor per image of the specialization.
+  const auto selects_rows = [&](std::span<const F> rows,
+                                const ResourceSnapshot &snapshot,
+                                const ResourceSpecialization &specialization) {
+    if (snapshot.images.size() != specialization.images.size())
+      return false;
+    const auto mapping = KeyMapOffset(snapshot, specialization.images[0]);
+    for (uint32_t row = 0; row < rows.size(); ++row) {
+      const auto ordinal =
+          snapshot.flattened_srt[mapping + 1u + (row * 440u + 32u) / 4u];
+      if (ordinal == 0u || snapshot.images[direct - 1u + ordinal].dwords !=
+                               texture(0x100u + row * 0x10u, rows[row]))
+        return false;
+      // The slot's layout is the candidate's class.
+      const auto &slot = specialization.images[direct - 1u + ordinal];
+      const bool uint_row = rows[row] == F::k32UInt;
+      if ((slot.numeric_class ==
+           Libs::Graphics::Prospero::TextureNumericClass::Uint) != uint_row)
+        return false;
+    }
+    return true;
+  };
+
+  // Four float and two uint textures; then five uint textures, whose group pads
+  // to eight slots instead of two: before, another module.
+  const std::array few{F::k32Float, F::k32UInt,  F::k32Float,
+                       F::k32UInt,  F::k32Float, F::k32Float};
+  const std::array many{F::k32UInt, F::k32Float, F::k32UInt,
+                        F::k32UInt, F::k32UInt,  F::k32UInt};
+  ResourceSnapshot few_snapshot, many_snapshot;
+  ResourceSpecialization few_spec, many_spec;
+  Check(materialize(few, few_snapshot, few_spec) &&
+            materialize(many, many_snapshot, many_spec) &&
+            few_spec != many_spec,
+        "the two scenes did not need different candidate layouts");
+  // Neither layout holds the other's candidates.
+  {
+    auto snapshot = many_snapshot;
+    auto current = many_spec;
+    Check(!AdaptToSpecialization(plan, few_spec, snapshot, current) &&
+              current == many_spec && snapshot.images == many_snapshot.images &&
+              snapshot.flattened_srt == many_snapshot.flattened_srt,
+          "a layout with too few uint slots served a scene, or a refused "
+          "adaptation changed it");
+  }
+  // The union serves both scenes.
+  auto widened_snapshot = many_snapshot;
+  auto widened = many_spec;
+  WidenSpecialization(plan, few_spec, widened_snapshot, widened);
+  Check(widened != many_spec &&
+            widened.images.size() > many_spec.images.size() &&
+            selects_rows(many, widened_snapshot, widened),
+        "widening did not move the scene into the union of both layouts");
+  {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization current;
+    Check(materialize(few, snapshot, current) &&
+              AdaptToSpecialization(plan, widened, snapshot, current) &&
+              current == widened && selects_rows(few, snapshot, current),
+          "the union layout did not serve the scene of the earlier module");
+  }
+  // A scene within both bands (three float, three uint) is served too, and
+  // widening against the union adds nothing.
+  {
+    const std::array mixed{F::k32UInt, F::k32Float, F::k32Float,
+                           F::k32UInt, F::k32Float, F::k32UInt};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization current;
+    Check(materialize(mixed, snapshot, current),
+          "the mixed scene did not materialize");
+    auto again_snapshot = snapshot;
+    auto again = current;
+    Check(AdaptToSpecialization(plan, widened, snapshot, current) &&
+              current == widened && selects_rows(mixed, snapshot, current),
+          "the union layout did not serve a scene inside its bands");
+    WidenSpecialization(plan, widened, again_snapshot, again);
+    Check(again == widened && selects_rows(mixed, again_snapshot, again),
+          "widening a served scene grew the layout");
+  }
+  // A new class still needs another module.
+  {
+    const std::array signed_row{F::k32Float, F::k32SInt, F::k32Float};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization current;
+    Check(materialize(signed_row, snapshot, current) &&
+              !AdaptToSpecialization(plan, widened, snapshot, current),
+          "a layout without a sint slot served a sint candidate");
+  }
+  // A root the dispatch does not reach (an inactive source) is not mapped and
+  // its header names the empty map: a mapped layout selects the root's slot,
+  // which reads the null root, for every key.
+  {
+    auto snapshot = few_snapshot;
+    auto current = few_spec;
+    current.images.resize(direct);
+    snapshot.images.resize(direct);
+    auto &root = current.images[0];
+    const auto header = root.indirect_mapping_offset;
+    root.indirect_root = ImageResource::NoIndirectImage;
+    root.indirect_mapping_offset = 0u;
+    root.indirect_mapping_header = false;
+    root.indirect_search_iterations = 0u;
+    snapshot.flattened_srt[header] = static_cast<uint32_t>(snapshot.flattened_srt.size());
+    snapshot.flattened_srt.push_back(0u);
+    Check(snapshot.images[0].dwords[0] == 0u && current != widened &&
+              AdaptToSpecialization(plan, widened, snapshot, current) && current == widened &&
+              snapshot.images.size() == widened.images.size() &&
+              std::ranges::all_of(snapshot.images, [](const DescriptorValue &value) {
+                return value.dwords[0] == 0u;
+              }) &&
+              snapshot.flattened_srt[KeyMapOffset(snapshot, current.images[0])] == 0u,
+          "a mapped layout did not serve a dispatch that does not reach the table");
+    // While the header names a map with keys, the root is not empty.
+    snapshot = few_snapshot;
+    snapshot.images.resize(direct);
+    current = few_spec;
+    current.images.resize(direct);
+    current.images[0].indirect_root = ImageResource::NoIndirectImage;
+    Check(!AdaptToSpecialization(plan, widened, snapshot, current),
+          "a mapped layout served an unmapped root whose header names a key map");
+  }
+}
+
+// A key search bounded by the run-time key count finds every key with more
+// iterations than it needs; a bounded map is another access form.
+void TestKeySearchDepthServes() {
+  ResourcePlan plan;
+  ResourceSpecialization compiled;
+  compiled.buffers.push_back({.indirect_root = 0u,
+                              .indirect_mapping_offset = 3u,
+                              .indirect_search_iterations = 6u,
+                              .indirect_mapping_header = true});
+  ResourceSnapshot snapshot;
+  auto current = compiled;
+  current.buffers[0].indirect_search_iterations = 4u;
+  Check(AdaptToSpecialization(plan, compiled, snapshot, current) &&
+            current == compiled,
+        "a deeper key search did not serve a shallower one");
+  current = compiled;
+  current.buffers[0].indirect_search_iterations = 7u;
+  Check(!AdaptToSpecialization(plan, compiled, snapshot, current),
+        "a shallower key search served a deeper one");
+  current = compiled;
+  current.buffers[0].indirect_search_iterations = 0u;
+  Check(!AdaptToSpecialization(plan, compiled, snapshot, current),
+        "a key search served a bounded key map");
+  current = compiled;
+  current.buffers[0].indirect_search_iterations = 7u;
+  WidenSpecialization(plan, compiled, snapshot, current);
+  Check(current.buffers[0].indirect_search_iterations == 7u,
+        "widening lost the deeper search");
+  current.buffers[0].indirect_search_iterations = 2u;
+  WidenSpecialization(plan, compiled, snapshot, current);
+  Check(current == compiled, "widening did not take the prior deeper search");
+}
+
 // Ghost of Yotei (PPSA26344) CS 0x8457901d80b91921: a wave-uniform object key
 // selects one record of a 592-byte table that holds a store V# (+448) and an
 // object pointer (+0) whose T# and S# the shader samples. Both enumerate the
@@ -10175,6 +10381,9 @@ int main() {
         TestRecordTableSpecializationStability);
     Run("image table class grouping stability",
         TestImageTableClassGroupingStability);
+    Run("image candidate layout adaptation",
+        TestImageCandidateLayoutAdaptation);
+    Run("key search depth serves", TestKeySearchDepthServes);
     Run("structured buffer stride specialization",
         TestStructuredBufferStrideSpecialization);
     Run("finite buffer selection", TestFiniteBufferSelection);
