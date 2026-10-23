@@ -161,7 +161,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Records the copy of `copies` (uploaded to `source`) into `buffer`.
+	void RecordUpload(Buffer& buffer, vk::Buffer source, std::span<const vk::BufferCopy> copies);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -226,6 +227,13 @@ private:
 	void                        AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size);
 	std::vector<uint64_t>       m_keep_readable;
 	std::vector<uint64_t>       m_make_unreadable;
+	// SynchronizeBda's scratch: the buffer parts to synchronize, their buffers, and the copies
+	// of their CPU-modified pages with the index of the part each belongs to.
+	std::vector<GuestRange>     m_bda_ranges;
+	std::vector<BufferId>       m_bda_owners;
+	std::vector<vk::BufferCopy> m_bda_copies;
+	std::vector<size_t>         m_bda_copy_owners;
+	std::vector<vk::Buffer>     m_bda_sources;
 	void                        NoteGpuWrite(uint64_t vaddr, uint64_t size);
 	void                        DrainPublished();
 	std::map<uint64_t, HotPage> m_hot_pages;
