@@ -760,10 +760,8 @@ bool RenderExecutor::TextureMemoEntryValid(const TextureMemoEntry& entry) {
 	       !image->depth_id;
 }
 
-void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
-                                        const ShaderRecompiler::IR::DescriptorValue& value,
-                                        TextureBinding&                              binding) {
-	auto&          texture_cache = m_context.GetTextureCache();
+static TextureMemoKey MakeTextureMemoKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                         const ShaderRecompiler::IR::DescriptorValue& value) {
 	TextureMemoKey key {};
 	std::copy_n(value.dwords.begin(), key.words.size(), key.words.begin());
 	key.traits = uint64_t {resource.written} | uint64_t {resource.read} << 1u |
@@ -774,6 +772,19 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 	             uint64_t {static_cast<uint8_t>(resource.dimension)} << 24u |
 	             uint64_t {static_cast<uint8_t>(resource.numeric_class)} << 32u |
 	             uint64_t {value.dword_count} << 40u;
+	return key;
+}
+
+void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        TextureBinding&                              binding) {
+	ResolveTextureMemo(resource, value, MakeTextureMemoKey(resource, value), binding);
+}
+
+void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        const TextureMemoKey& key, TextureBinding& binding) {
+	auto& texture_cache = m_context.GetTextureCache();
 	// The binding is written in place: its description is about a kilobyte, and the callers keep
 	// the mip-view vector's capacity.
 	binding.image_view = nullptr;
@@ -914,13 +925,58 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
+	// A stage often binds one T# several times (a GPU-selected table lists a texture once per
+	// key that selects it): a repeated T# with the same resource traits copies the first one's
+	// resolution, and RebindImages and CommitBindings copy its view and layout.
+	const auto image_count = program.info.images.size();
+	size_t     seen_mask   = 0;
+	if (image_count > 1) {
+		const auto capacity = std::bit_ceil(image_count * 2);
+		if (m_seen_textures.size() < capacity) {
+			m_seen_textures.resize(capacity);
+		}
+		seen_mask = capacity - 1;
+		++m_seen_stamp;
+	}
+	for (uint32_t i = 0; i < image_count; i++) {
+		auto&       binding  = prepared.images[i];
+		const auto& resource = program.info.images[i];
+		const auto& value    = snapshot.images[i];
+		if (resource.heap) {
+			binding = {};
 			continue;
 		}
-		auto& binding = prepared.images[i];
-		ResolveTextureMemo(program.info.images[i], snapshot.images[i], binding);
+		binding.same_as = UINT32_MAX;
+		const auto key  = MakeTextureMemoKey(resource, value);
+		if (seen_mask != 0 && !DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
+			const auto hash = TextureMemoKeyHash {}(key);
+			for (auto probe = hash;; probe++) {
+				auto& seen = m_seen_textures[probe & seen_mask];
+				if (seen.stamp != m_seen_stamp) {
+					seen = {m_seen_stamp, hash, i};
+					break;
+				}
+				if (seen.hash == hash && prepared.images[seen.index].memo_key == key) {
+					const auto& first  = prepared.images[seen.index];
+					binding.image_id   = first.image_id;
+					binding.image_view = nullptr;
+					binding.layout     = vk::ImageLayout::eUndefined;
+					binding.mip_views.clear();
+					if (binding.memo_serial != first.memo_serial) {
+						binding.desc        = first.desc;
+						binding.memo_serial = first.memo_serial;
+					}
+					binding.memo_entry = first.memo_entry;
+					binding.memo_key   = first.memo_key;
+					binding.memo_epoch = first.memo_epoch;
+					binding.same_as    = seen.index;
+					break;
+				}
+			}
+		}
+		if (binding.same_as == UINT32_MAX) {
+			ResolveTextureMemo(resource, value, key, binding);
+		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 	}
 	prepared.bindless_heaps.clear();
@@ -1061,6 +1117,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
 		auto& binding = images[i];
+		if (binding.same_as < i) {
+			// The first binding of the T# already acquired the view (and resolved again
+			// above if its image needed it).
+			const auto& first = images[binding.same_as];
+			if (first.image_id == binding.image_id && first.memo_serial == binding.memo_serial) {
+				binding.image_view = first.image_view;
+				binding.mip_views  = first.mip_views;
+				continue;
+			}
+			binding.same_as = UINT32_MAX;
+		}
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
@@ -1511,6 +1578,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = descriptors.images[i];
 			if (!binding.image_id) continue;
+			if (binding.same_as < i) {
+				// The same image and view as an earlier binding (RebindImages kept the copy):
+				// the transition is done.
+				binding.layout = descriptors.images[binding.same_as].layout;
+				continue;
+			}
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,

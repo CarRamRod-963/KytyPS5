@@ -291,6 +291,18 @@ private:
 	void ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
 	                        const ShaderRecompiler::IR::DescriptorValue& value,
 	                        TextureBinding&                              binding);
+	void ResolveTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value,
+	                        const TextureMemoKey& key, TextureBinding& binding);
+	// The T#s PrepareBindings resolved for the current stage (open addressing on the memo key's
+	// hash): a slot is in use while its stamp is the current call's.
+	struct SeenTexture {
+		uint64_t stamp = 0;
+		uint64_t hash  = 0;
+		uint32_t index = 0;
+	};
+	std::vector<SeenTexture> m_seen_textures;
+	uint64_t                 m_seen_stamp = 0;
 	struct TextureMemoKeyHash {
 		size_t operator()(const TextureMemoKey& key) const noexcept {
 			uint64_t hash = key.traits * 0x9E3779B97F4A7C15ull;
