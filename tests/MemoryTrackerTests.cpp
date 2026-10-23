@@ -1295,14 +1295,15 @@ void TestBatchedUploadRanges() {
       region_base, region_size * 2, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
   const auto page = [&](uint64_t index) { return region_base + index * page_size; };
-  const std::array<Libs::Graphics::GuestRange, 5> ranges{{
+  const std::array<Libs::Graphics::GuestRange, 6> ranges{{
       {page(1), page_size},
       {page(5) + 8, 16},
       {page(9), page_size * 2},
       {page(20), page_size},
+      {page(300), page_size},
       {page(1024 + 3), page_size},
   }};
-  for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+  for (const auto index : {1, 5, 9, 10, 300, 1024 + 3}) {
     tracker.MarkRegionAsCpuModified(page(index), page_size);
   }
   Check(IsWritable(reinterpret_cast<void *>(page(5))) &&
@@ -1319,7 +1320,7 @@ void TestBatchedUploadRanges() {
       },
       [&]() noexcept {
         uploaded = true;
-        for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+        for (const auto index : {1, 5, 9, 10, 300, 1024 + 3}) {
           Check(Protection(reinterpret_cast<void *>(page(index))) == PAGE_READONLY,
                 "batched upload copied before protecting a taken page");
         }
@@ -1328,16 +1329,21 @@ void TestBatchedUploadRanges() {
       {0, {page(1), page_size}},
       {1, {page(5), page_size}},
       {2, {page(9), page_size * 2}},
-      {4, {page(1024 + 3), page_size}},
+      {4, {page(300), page_size}},
+      {5, {page(1024 + 3), page_size}},
   };
   Check(uploaded && taken == expected,
         "batched upload did not report each range's CPU-modified pages");
-  Check(g_protection_log.size() == 2 && g_protection_log[0].address == page(1) &&
+  // Pages 1..10 share one request with the clean pages between them; page 300 is too far from
+  // them to stretch that request over.
+  Check(g_protection_log.size() == 3 && g_protection_log[0].address == page(1) &&
             g_protection_log[0].size == page_size * 10 &&
-            g_protection_log[1].address == page(1024 + 3) &&
-            g_protection_log[1].size == page_size,
-        "batched upload did not protect each region's pages with one request");
-  for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+            g_protection_log[1].address == page(300) &&
+            g_protection_log[1].size == page_size &&
+            g_protection_log[2].address == page(1024 + 3) &&
+            g_protection_log[2].size == page_size,
+        "batched upload did not protect each region's nearby pages with one request");
+  for (const auto index : {1, 5, 9, 10, 300, 1024 + 3}) {
     Check(!tracker.IsRegionCpuModified(page(index), page_size),
           "batched upload left a taken page CPU dirty");
   }

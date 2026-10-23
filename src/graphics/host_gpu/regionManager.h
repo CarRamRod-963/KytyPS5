@@ -228,10 +228,32 @@ public:
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
 	}
+	// Write-protects the pages TakeCpuModifiedRanges took. They can lie anywhere in the region:
+	// one request per cluster of them, since a request costs about as much as reaching over
+	// MaxProtectionGap pages whose protection it does not change (Windows: ~1.5 us per request,
+	// ~25 ns per page).
 	void ProtectCpuClean() {
 		const StateChange change(*this);
-		UpdateProtection<true, false>();
+		const auto        mask = m_cpu_dirty ^ m_writable;
+		if (mask.None()) {
+			return;
+		}
+		m_writable = m_cpu_dirty;
+		RegionBits cluster;
+		size_t     cluster_end = 0;
+		bool       open        = false;
+		for (const auto [first, last]: mask) {
+			if (open && first - cluster_end > MaxProtectionGap) {
+				m_page_manager.UpdatePageWatchersForRegion<true, false>(m_cpu_addr, cluster);
+				cluster.Clear();
+			}
+			cluster.SetRange(first, last);
+			cluster_end = last;
+			open        = true;
+		}
+		m_page_manager.UpdatePageWatchersForRegion<true, false>(m_cpu_addr, cluster);
 	}
+	static constexpr size_t MaxProtectionGap = 64;
 
 	TrackingSpinLock lock;
 
