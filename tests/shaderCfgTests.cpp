@@ -10093,9 +10093,11 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
     return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
   });
-  Check(root != buffers.end() && snapshot.flattened_srt[root->indirect_mapping_offset] == 2u &&
-            buffers.size() == plan.info.buffers.size() + 1u,
-        "bounded material range did not select exactly its two writable buffers");
+  Check(
+      root != buffers.end() &&
+          snapshot.flattened_srt[KeyMapOffset(snapshot, *root)] == 2u &&
+          buffers.size() == plan.info.buffers.size() + 1u,
+      "bounded material range did not select exactly its two writable buffers");
   const auto root_index = static_cast<size_t>(root - buffers.begin());
   const auto first_specialization = specialization;
   table[12] += 0x1000u;
@@ -16034,7 +16036,7 @@ void TestBoundedScalarMaterialImageKeys() {
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
       const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
       const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
-      const auto offset = specialization.images[root].indirect_mapping_offset;
+      const auto offset = KeyMapOffset(snapshot, specialization.images[root]);
       Check(snapshot.flattened_srt[offset] == 2u &&
                 snapshot.flattened_srt[offset + 1u] == first &&
                 snapshot.flattened_srt[offset + 3u] == first + 15u,
