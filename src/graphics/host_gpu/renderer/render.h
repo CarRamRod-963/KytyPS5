@@ -329,6 +329,17 @@ private:
 	[[nodiscard]] bool      TextureMemoEntryValid(const TextureMemoEntry& entry);
 	static constexpr size_t TextureMemoFirstSweep = 8192;
 	std::unordered_map<TextureMemoKey, TextureMemoEntry, TextureMemoKeyHash> m_texture_memo;
+	// Recent memo lookups by key hash, direct-mapped, valid within one memo epoch: a binding
+	// slot that changes T# draw after draw (tens of thousands per frame) finds its entry with one
+	// cache line instead of the map's bucket and node.
+	struct TextureMemoFront {
+		TextureMemoKey    key {};
+		TextureMemoEntry* entry = nullptr;
+		uint64_t          epoch = 0;
+	};
+	static constexpr size_t       TextureMemoFrontSize = 4096;
+	std::vector<TextureMemoFront> m_texture_memo_front =
+	    std::vector<TextureMemoFront>(TextureMemoFrontSize);
 	size_t m_texture_memo_sweep_at = TextureMemoFirstSweep;
 	uint64_t m_texture_memo_serial   = 0;
 	// Advances with every erased entry: bindings keep entry pointers only within one epoch.
