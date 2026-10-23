@@ -214,6 +214,8 @@ void ResourceLookahead::RunJob(Job& job) {
 	    .workgroup_counts           = job.inputs.workgroup_counts,
 	    .indirect_args_address      = job.inputs.indirect_args_address,
 	    .read_cache                 = &view,
+	    // Earlier commands may still write the data it reads; Outcome::Failed counts it.
+	    .speculative = true,
 	};
 	const bool done = ShaderRecompiler::IR::MaterializeResources(*plan, runtime, job.snapshot,
 	                                                             job.specialization);
