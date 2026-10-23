@@ -283,6 +283,16 @@ struct ImageHeapTestAccess {
   static bool TailPageDirty(const ImageHeap &heap) {
     return heap.m_memories.back()->dirty_pages.back() != 0u;
   }
+
+  // Whether the table at `base` has the page of `address` marked changed (and unwatched).
+  static bool PageDirty(const ImageHeap &heap, uint64_t base, uint64_t address) {
+    for (const auto &memory : heap.m_memories) {
+      if (memory->base != base) continue;
+      const auto origin = memory->base & ~(TRACKER_PAGE_SIZE - 1u);
+      return memory->dirty_pages.at((address - origin) / TRACKER_PAGE_SIZE) != 0u;
+    }
+    return false;
+  }
 };
 
 struct TextureCacheTestAccess {
@@ -5937,6 +5947,26 @@ public:
                   context.HandleFault(PageFaultAccess::Write, unaligned_table + table_size) &&
                   ImageHeapTestAccess::TailPageDirty(heap),
               "a write fault next to a table left its page watched");
+      draw();
+      // Two tables that share a page: a write to the shared page faults for both, also for the
+      // table whose bytes end before the written ones. One that stays watched there would make
+      // every later write to the page fault again.
+      constexpr uint64_t left_table = idle_table + 0x20100u;
+      constexpr uint64_t right_table = left_table + table_size;
+      Require(name, "adjacent tables",
+              acquire(sampled, left_table) && acquire(sampled, right_table),
+              "adjacent tables were declined");
+      draw();
+      Require(name, "watched shared page",
+              !ImageHeapTestAccess::PageDirty(heap, left_table, right_table) &&
+                  !ImageHeapTestAccess::PageDirty(heap, right_table, right_table),
+              "the tables did not watch their shared page");
+      Require(name, "shared page write", context.InvalidateMemory(right_table + 0x40u, 32u),
+              "the shared page was not mapped");
+      Require(name, "shared page fault",
+              ImageHeapTestAccess::PageDirty(heap, left_table, right_table) &&
+                  ImageHeapTestAccess::PageDirty(heap, right_table, right_table),
+              "a write to a shared page left the other table watching it");
       draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
