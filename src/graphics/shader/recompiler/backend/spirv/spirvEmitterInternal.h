@@ -450,8 +450,11 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
+// The candidate ordinal a GPU-selected key maps to. With `mapping_header`, the flattened-SRT word
+// at `mapping_offset` holds the key map's offset, so the module does not bake where the map is.
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource);
+                                   bool mapping_header, uint32_t search_iterations,
+                                   uint32_t default_resource);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 // The V# stride of a buffer access: a constant, or the binding's shader-data stride word.
