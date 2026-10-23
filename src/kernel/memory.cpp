@@ -231,7 +231,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -262,7 +262,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -292,7 +292,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -306,7 +306,7 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -353,7 +353,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -366,7 +366,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
-		m_generation = NextGeneration();
+		m_generation.store(NextGeneration(), std::memory_order_release);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -428,27 +428,28 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
 
 		// The GPU thread clamps every buffer it binds; most lie in the committed range of one
-		// of the thread's recent clamps, which needs no lookup while the ranges are unchanged.
+		// of the thread's recent clamps, which needs neither a lookup nor the lock while the
+		// ranges are unchanged (a change that starts after the check is ordered after it).
 		auto& last = t_last_committed;
-		if (last.owner == this && last.generation == m_generation &&
+		if (last.owner == this && last.generation == m_generation.load(std::memory_order_acquire) &&
 		    last.Contains(virtual_addr, size)) {
 			return size;
 		}
 
-		auto vma = FindContaining(virtual_addr);
+		Common::LockGuard lock(m_mutex);
+		const auto        generation = m_generation.load(std::memory_order_relaxed);
+		auto              vma        = FindContaining(virtual_addr);
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
-		last.Remember(this, m_generation, vma->second.start, vma_end);
+		last.Remember(this, generation, vma->second.start, vma_end);
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
@@ -650,7 +651,9 @@ private:
 		static std::atomic<uint64_t> generations {0};
 		return generations.fetch_add(1, std::memory_order_relaxed) + 1u;
 	}
-	uint64_t m_generation = NextGeneration();
+	// Changed under m_mutex before every change of the ranges; read without it by
+	// ClampRangeSize's recent-range check.
+	std::atomic<uint64_t> m_generation {NextGeneration()};
 	// The committed ranges a thread's last ClampRangeSize calls started in (vertex, index and
 	// shader buffers of one draw often lie in different ones).
 	struct LastCommitted {
