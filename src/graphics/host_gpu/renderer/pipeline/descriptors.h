@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -42,6 +43,49 @@ struct TextureBinding {
 	uint64_t       memo_epoch = 0;
 };
 
+// A stage's texture bindings. Shrinking keeps the bindings past the new size: a stage that
+// alternates between programs with many and few images (GPU-selected image tables have
+// hundreds of candidates) refills them, with their memo entries and description storage,
+// instead of destroying and value-constructing them again for every draw.
+class TextureBindings {
+public:
+	void resize(size_t size) {
+		if (size > m_storage.size()) {
+			m_storage.resize(size);
+		}
+		m_size = size;
+	}
+	void push_back(TextureBinding binding) {
+		if (m_size < m_storage.size()) {
+			m_storage[m_size] = std::move(binding);
+		} else {
+			m_storage.push_back(std::move(binding));
+		}
+		m_size++;
+	}
+	[[nodiscard]] size_t          size() const noexcept { return m_size; }
+	[[nodiscard]] bool            empty() const noexcept { return m_size == 0; }
+	[[nodiscard]] TextureBinding& operator[](size_t index) noexcept {
+		EXIT_IF(index >= m_size);
+		return m_storage[index];
+	}
+	[[nodiscard]] const TextureBinding& operator[](size_t index) const noexcept {
+		EXIT_IF(index >= m_size);
+		return m_storage[index];
+	}
+	[[nodiscard]] TextureBinding&       back() noexcept { return (*this)[m_size - 1]; }
+	[[nodiscard]] TextureBinding*       data() noexcept { return m_storage.data(); }
+	[[nodiscard]] const TextureBinding* data() const noexcept { return m_storage.data(); }
+	[[nodiscard]] TextureBinding*       begin() noexcept { return m_storage.data(); }
+	[[nodiscard]] TextureBinding*       end() noexcept { return m_storage.data() + m_size; }
+	[[nodiscard]] const TextureBinding* begin() const noexcept { return m_storage.data(); }
+	[[nodiscard]] const TextureBinding* end() const noexcept { return m_storage.data() + m_size; }
+
+private:
+	std::vector<TextureBinding> m_storage;
+	size_t                      m_size = 0;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -55,7 +99,7 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
-	std::vector<TextureBinding>           images;
+	TextureBindings                       images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
