@@ -109,6 +109,10 @@ private:
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// How many specialization failures MaterializeResources has printed: one line per shader per
+// session, none for a speculative walk (SrtRuntime::speculative).
+uint64_t SpecializationFailureReports();
+
 // Whether a module compiled for `compiled` behaves exactly as one compiled for `current`
 // would. Equal layouts do; so does any layout of an unbound direct buffer when both layouts read
 // zero out of bounds, since an unbound buffer is bound so that every access is out of bounds

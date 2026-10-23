@@ -922,6 +922,32 @@ void TestFailedMaterializationRejectsStage() {
         "missing runtime user data did not reject the cached stage");
 }
 
+// A failed walk is reported once per shader; a speculative walk (ahead of the
+// commands that may still write its data) is not reported at all.
+void TestSpecializationFailureReports() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto before = SpecializationFailureReports();
+  plan.shader_hash = 0x5eec0001u;
+  Check(!MaterializeResources(plan, {.speculative = true}, snapshot,
+                              specialization) &&
+            SpecializationFailureReports() == before,
+        "a speculative walk reported its failure");
+  Check(!MaterializeResources(plan, {}, snapshot, specialization) &&
+            SpecializationFailureReports() == before + 1u,
+        "a failed walk was not reported");
+  Check(!MaterializeResources(plan, {}, snapshot, specialization) &&
+            SpecializationFailureReports() == before + 1u,
+        "a shader's repeated failure was reported again");
+  auto other = UserDataBufferPlan();
+  other.shader_hash = 0x5eec0002u;
+  Check(!MaterializeResources(other, {}, snapshot, specialization) &&
+            SpecializationFailureReports() == before + 2u,
+        "another shader's failure was not reported");
+}
+
 void TestSharedControlPredicates() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
@@ -1852,6 +1878,7 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestReaderLoadsThroughCacheView();
   TestResourceLookahead();
+  TestSpecializationFailureReports();
   TestRangeOverlapIndex();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
