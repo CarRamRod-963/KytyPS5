@@ -5765,6 +5765,12 @@ public:
               ImageHeapTestAccess::ElementCount(heap) <= skipped_elements + 2u,
               "elements released by skipped draws were never freed");
       draw();
+      // A table whose probes could exceed the heap is declined instead of exiting later.
+      Require(name, "oversized view", !acquire(sampled, left_table, IR::ImageHeapCapacity / 2u),
+              "a view that could exceed the heap's capacity was kept resident");
+      Require(name, "view after an oversized one", acquire(sampled, left_table),
+              "a declined oversized view declined the table's other views");
+      draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
