@@ -8130,7 +8130,8 @@ void TestRecordTableSpecializationStability() {
   // Rows below `rows` have an object; those from `first_store` on have a
   // distinct byte-buffer V#, the others a null one. Every object has its own T#
   // and the same S#.
-  const auto scene = [&](uint32_t rows, uint32_t first_store, uint32_t base) {
+  const auto scene = [&](uint32_t rows, uint32_t first_store, uint32_t base,
+                         uint32_t sampler_kinds) {
     std::fill(at(records), memory.words.end(), 0u);
     for (uint32_t row = 0; row < rows; ++row) {
       const auto record = records + row * 592u;
@@ -8149,7 +8150,8 @@ void TestRecordTableSpecializationStability() {
           0u,           0u,
           0u,           0u};
       std::copy(texture.begin(), texture.end(), at(object_address + 976u));
-      const std::array<uint32_t, 4> sampler{0u, 0x00fff000u, 0u, 0u};
+      const std::array<uint32_t, 4> sampler{row % sampler_kinds, 0x00fff000u,
+                                            0u, 0u};
       std::copy(sampler.begin(), sampler.end(), at(object_address + 1016u));
     }
     return std::array<uint32_t, 8>{records, 592u << 16u, rows, 0x5204u,
@@ -8157,8 +8159,9 @@ void TestRecordTableSpecializationStability() {
   };
   const auto materialize = [&](uint32_t rows, uint32_t first_store,
                                uint32_t base, ResourceSnapshot &snapshot,
-                               ResourceSpecialization &specialization) {
-    const auto user_data = scene(rows, first_store, base);
+                               ResourceSpecialization &specialization,
+                               uint32_t sampler_kinds = 1u) {
+    const auto user_data = scene(rows, first_store, base, sampler_kinds);
     const SrtRuntime runtime{.user_data = user_data,
                              .read_memory = ReadLinearTestMemory,
                              .userdata = &memory,
@@ -8217,6 +8220,67 @@ void TestRecordTableSpecializationStability() {
   }
   Check(children == 63u && spares == 63u - 45u,
         "store candidates were not padded to a power of two");
+
+  // Objects with two and with three distinct S#s enumerate two and three
+  // sampler candidates (Ghost of Yotei's CS 0x7e9e7b2644d28bbe: 7 -> 6 -> 9).
+  // The union layout of both serves either scene, every key still selecting
+  // its object's S#.
+  ResourceSnapshot two_snapshot, three_snapshot;
+  ResourceSpecialization two, three;
+  Check(materialize(40u, 7u, 0x100000u, two_snapshot, two, 2u) &&
+            materialize(40u, 7u, 0x100000u, three_snapshot, three, 3u) &&
+            two.samplers.size() != three.samplers.size(),
+        "two and three object samplers did not enumerate different candidates");
+  {
+    auto adapted = three_snapshot;
+    auto current = three;
+    Check(!AdaptToSpecialization(plan, two, adapted, current) &&
+              current == three,
+          "a layout with two sampler slots served three sampler candidates");
+  }
+  auto widened_snapshot = three_snapshot;
+  auto widened = three;
+  WidenSpecialization(plan, two, widened_snapshot, widened);
+  const auto selects_samplers = [&](const ResourceSnapshot &adapted,
+                                    const ResourceSpecialization &layout,
+                                    const ResourceSnapshot &original,
+                                    const ResourceSpecialization &own) {
+    if (adapted.samplers.size() != layout.samplers.size())
+      return false;
+    const auto root = 0u;
+    const auto first_child = static_cast<uint32_t>(plan.info.samplers.size());
+    const auto map = KeyMapOffset(adapted, layout.samplers[root]);
+    const auto own_map = KeyMapOffset(original, own.samplers[root]);
+    const auto stride =
+        layout.samplers[root].indirect_search_iterations == 0u ? 1u : 2u;
+    if (adapted.flattened_srt[map] != original.flattened_srt[own_map])
+      return false;
+    for (uint32_t entry = 0; entry < adapted.flattened_srt[map]; ++entry) {
+      const auto ordinal = adapted.flattened_srt[map + stride + entry * stride];
+      const auto own_ordinal =
+          original.flattened_srt[own_map + stride + entry * stride];
+      const auto &value = ordinal == 0u
+                              ? adapted.samplers[root]
+                              : adapted.samplers[first_child + ordinal - 1u];
+      const auto &expected =
+          own_ordinal == 0u ? original.samplers[root]
+                            : original.samplers[first_child + own_ordinal - 1u];
+      if (value != expected)
+        return false;
+    }
+    return true;
+  };
+  Check(widened != three && widened.samplers.size() > three.samplers.size() &&
+            selects_samplers(widened_snapshot, widened, three_snapshot, three),
+        "widening did not move three sampler candidates into the union layout");
+  {
+    auto adapted = two_snapshot;
+    auto current = two;
+    Check(AdaptToSpecialization(plan, widened, adapted, current) &&
+              current == widened &&
+              selects_samplers(adapted, widened, two_snapshot, two),
+          "the union sampler layout did not serve the two-sampler scene");
+  }
 }
 
 void TestStructuredBufferStrideSpecialization() {

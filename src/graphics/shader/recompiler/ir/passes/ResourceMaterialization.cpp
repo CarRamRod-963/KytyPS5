@@ -2027,8 +2027,8 @@ bool EmptyRootServed(const ResourcePlan& program, const ResourceSnapshot& snapsh
 
 // Visits the key map words of a mapped root that hold candidate ordinals: a bounded map holds
 // one ordinal per entry, a searched map a (key, ordinal) pair per entry.
-template <typename Visit>
-bool VisitOrdinals(std::vector<uint32_t>& flat, const SpecImage& root, Visit&& visit) {
+template <typename Root, typename Visit>
+bool VisitOrdinals(std::vector<uint32_t>& flat, const Root& root, Visit&& visit) {
 	const auto offset = KeyMapOffset(flat, root);
 	if (offset >= flat.size()) return false;
 	const size_t count  = flat[offset];
@@ -2147,25 +2147,129 @@ bool AdaptImages(const ResourcePlan& program, const std::vector<SpecImage>& comp
 	return true;
 }
 
+using SpecSampler = ResourceSpecialization::Sampler;
+
+bool MappedSamplerRoot(const std::vector<SpecSampler>& samplers, uint32_t root) {
+	return samplers[root].indirect_root == root;
+}
+
+// A sampler root the draw does not map still names the empty map (see EmptyRootServed).
+bool EmptySamplerRootServed(const ResourceSnapshot& snapshot, const SpecSampler& compiled,
+                            const SpecSampler& current, uint32_t root) {
+	const auto& flat   = snapshot.flattened_srt;
+	const auto  header = compiled.indirect_mapping_offset;
+	return current.indirect_root != root && compiled.indirect_mapping_header &&
+	       header < flat.size() && flat[header] < flat.size() && flat[flat[header]] == 0u;
+}
+
+// Moves the draw's GPU-selected sampler candidates into the slots of `compiled`, as AdaptImages
+// does for images (the sampler candidates of a root share one layout).
+bool AdaptSamplers(const ResourcePlan& program, const std::vector<SpecSampler>& compiled,
+                   ResourceSnapshot& snapshot, const std::vector<SpecSampler>& current,
+                   bool apply) {
+	const auto direct = static_cast<uint32_t>(program.info.samplers.size());
+	if (compiled.size() < direct || current.size() < direct ||
+	    snapshot.samplers.size() != current.size())
+		return false;
+	for (uint32_t root = 0; root < direct; ++root) {
+		if (SameExceptSearch(compiled[root], current[root])) continue;
+		if (!MappedSamplerRoot(compiled, root) ||
+		    !EmptySamplerRootServed(snapshot, compiled[root], current[root], root))
+			return false;
+	}
+	std::vector<std::vector<uint32_t>> slots(direct);
+	std::vector<std::vector<uint32_t>> children(direct);
+	for (uint32_t index = direct; index < compiled.size(); ++index) {
+		const auto root = compiled[index].indirect_root;
+		if (root >= direct || !MappedSamplerRoot(compiled, root)) return false;
+		slots[root].push_back(index);
+	}
+	for (uint32_t index = direct; index < current.size(); ++index) {
+		const auto root = current[index].indirect_root;
+		if (root >= direct || !MappedSamplerRoot(current, root) ||
+		    !MappedSamplerRoot(compiled, root))
+			return false;
+		children[root].push_back(index);
+	}
+	std::vector<std::vector<uint32_t>> renumber(direct);
+	std::vector<uint8_t>               referenced;
+	for (uint32_t root = 0; root < direct; ++root) {
+		if (children[root].empty()) continue;
+		referenced.assign(children[root].size() + 1u, 0u);
+		bool valid_ordinals = true;
+		if (!VisitOrdinals(snapshot.flattened_srt, current[root],
+		                   [&](uint32_t ordinal) {
+			                   if (ordinal < referenced.size()) {
+				                   referenced[ordinal] = 1u;
+			                   } else {
+				                   valid_ordinals = false;
+			                   }
+		                   }) ||
+		    !valid_ordinals)
+			return false;
+		auto& map = renumber[root];
+		map.assign(children[root].size() + 1u, 0u);
+		uint32_t next = 0;
+		for (uint32_t ordinal = 1; ordinal < referenced.size(); ++ordinal) {
+			if (!referenced[ordinal]) continue;
+			while (next < slots[root].size() &&
+			       compiled[slots[root][next]] != current[children[root][ordinal - 1u]])
+				++next;
+			if (next == slots[root].size()) return false;
+			map[ordinal] = ++next;
+		}
+	}
+	if (!apply) return true;
+	std::vector<DescriptorValue> samplers(compiled.size(), DescriptorValue {.dword_count = 4u});
+	std::copy_n(snapshot.samplers.begin(), direct, samplers.begin());
+	for (uint32_t root = 0; root < direct; ++root) {
+		for (uint32_t ordinal = 1; ordinal < renumber[root].size(); ++ordinal) {
+			if (renumber[root][ordinal] != 0u)
+				samplers[slots[root][renumber[root][ordinal] - 1u]] =
+				    snapshot.samplers[children[root][ordinal - 1u]];
+		}
+		if (children[root].empty()) continue;
+		VisitOrdinals(snapshot.flattened_srt, current[root],
+		              [&](uint32_t& ordinal) { ordinal = renumber[root][ordinal]; });
+	}
+	snapshot.samplers = std::move(samplers);
+	return true;
+}
+
+// The slot layouts of a root's children in `layout` plus those `mine` has beyond them: a layout
+// the draw has more of grows to the next power of two (so that a growing table takes few
+// modules), next to the slots of the same layout so that runs stay contiguous.
+template <typename Spec>
+std::vector<Spec> UnionLayout(std::vector<Spec> layout, const std::vector<Spec>& mine) {
+	for (const auto& child: mine) {
+		const auto need = static_cast<size_t>(std::ranges::count(mine, child));
+		const auto have = static_cast<size_t>(std::ranges::count(layout, child));
+		if (need <= have) continue;
+		const auto last = std::find(layout.rbegin(), layout.rend(), child);
+		const auto at   = last == layout.rend() ? layout.end() : last.base();
+		layout.insert(at, std::bit_ceil(need) - have, child);
+	}
+	return layout;
+}
+
 } // namespace
 
 bool AdaptToSpecialization(const ResourcePlan& program, const ResourceSpecialization& compiled,
                            ResourceSnapshot& snapshot, ResourceSpecialization& current) {
-	if (compiled.buffers.size() != current.buffers.size() ||
-	    compiled.samplers.size() != current.samplers.size())
-		return false;
+	if (compiled.buffers.size() != current.buffers.size()) return false;
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		if (!SameExceptSearch(compiled.buffers[i], current.buffers[i]) &&
 		    !ServesBuffer(program, i, compiled.buffers[i], current.buffers[i]))
 			return false;
 	}
-	for (uint32_t i = 0; i < current.samplers.size(); ++i) {
-		if (!SameExceptSearch(compiled.samplers[i], current.samplers[i])) return false;
-	}
-	if (compiled.images != current.images) {
-		if (!AdaptImages(program, compiled.images, snapshot, current.images, false)) return false;
-		AdaptImages(program, compiled.images, snapshot, current.images, true);
-	}
+	const bool samplers = compiled.samplers != current.samplers;
+	const bool images   = compiled.images != current.images;
+	if ((samplers &&
+	     !AdaptSamplers(program, compiled.samplers, snapshot, current.samplers, false)) ||
+	    (images && !AdaptImages(program, compiled.images, snapshot, current.images, false)))
+		return false;
+	if (samplers) AdaptSamplers(program, compiled.samplers, snapshot, current.samplers, true);
+	if (images) AdaptImages(program, compiled.images, snapshot, current.images, true);
 	for (uint32_t i = 0; i < current.buffers.size(); ++i) {
 		current.buffers[i].indirect_search_iterations =
 		    compiled.buffers[i].indirect_search_iterations;
@@ -2189,25 +2293,41 @@ void WidenSpecialization(const ResourcePlan& program, const ResourceSpecializati
 				widened.buffers[i] = DeeperSearch(prior.buffers[i], current.buffers[i]);
 		}
 	}
-	if (prior.samplers.size() == current.samplers.size()) {
-		for (uint32_t i = 0; i < current.samplers.size(); ++i) {
-			if (either_way(prior.samplers[i], current.samplers[i]))
-				widened.samplers[i] = DeeperSearch(prior.samplers[i], current.samplers[i]);
-		}
-	}
-	const auto children_of = [&](const std::vector<SpecImage>& images, uint32_t root) {
-		std::vector<SpecImage> result;
-		for (size_t index = direct; index < images.size(); ++index) {
-			if (images[index].indirect_root == root) result.push_back(images[index]);
+	const auto children_of = [](const auto& entries, size_t first, uint32_t root) {
+		std::remove_cvref_t<decltype(entries)> result;
+		for (size_t index = first; index < entries.size(); ++index) {
+			if (entries[index].indirect_root == root) result.push_back(entries[index]);
 		}
 		return result;
 	};
+	const auto sampler_roots = static_cast<uint32_t>(program.info.samplers.size());
+	if (prior.samplers.size() >= sampler_roots && current.samplers.size() >= sampler_roots) {
+		std::vector<std::vector<SpecSampler>> layouts(sampler_roots);
+		for (uint32_t root = 0; root < sampler_roots; ++root) {
+			const auto& old  = prior.samplers[root];
+			const auto& draw = current.samplers[root];
+			if (either_way(old, draw)) {
+				widened.samplers[root] = DeeperSearch(old, draw);
+				if (MappedSamplerRoot(current.samplers, root))
+					layouts[root] = UnionLayout(children_of(prior.samplers, sampler_roots, root),
+					                            children_of(current.samplers, sampler_roots, root));
+			} else if (MappedSamplerRoot(prior.samplers, root) &&
+			           EmptySamplerRootServed(snapshot, old, draw, root)) {
+				widened.samplers[root] = old;
+				layouts[root]          = children_of(prior.samplers, sampler_roots, root);
+			} else if (MappedSamplerRoot(current.samplers, root)) {
+				layouts[root] = children_of(current.samplers, sampler_roots, root);
+			}
+		}
+		widened.samplers.resize(sampler_roots);
+		for (const auto& layout: layouts)
+			widened.samplers.insert(widened.samplers.end(), layout.begin(), layout.end());
+	}
 	std::vector<uint32_t> snapshot_index(current.images.size(), UINT32_MAX);
 	for (uint32_t index = 0, position = 0; index < current.images.size(); ++index) {
 		if (!current.images[index].fmask) snapshot_index[index] = position++;
 	}
-	// Per root, the children layouts in order: the prior layout's, then the slots the draw has
-	// beyond it, placed after the last slot of the same layout so that runs stay contiguous.
+	// Per root, the children layouts in order (UnionLayout).
 	std::vector<std::vector<SpecImage>> layouts(direct);
 	for (uint32_t root = 0; root < direct; ++root) {
 		const auto& old      = prior.images[root];
@@ -2216,23 +2336,14 @@ void WidenSpecialization(const ResourcePlan& program, const ResourceSpecializati
 		if (either_way(old, draw)) {
 			widened.images[root] = DeeperSearch(old, draw);
 			if (!MappedImageRoot(current.images, root)) continue;
-			auto       layout = children_of(prior.images, root);
-			const auto mine   = children_of(current.images, root);
-			for (const auto& child: mine) {
-				const auto need = std::ranges::count(mine, child);
-				const auto have = std::ranges::count(layout, child);
-				if (need <= have) continue;
-				const auto last = std::find(layout.rbegin(), layout.rend(), child);
-				const auto at   = last == layout.rend() ? layout.end() : last.base();
-				layout.insert(at, static_cast<size_t>(need - have), child);
-			}
-			layouts[root] = std::move(layout);
+			layouts[root] = UnionLayout(children_of(prior.images, direct, root),
+			                            children_of(current.images, direct, root));
 		} else if (MappedImageRoot(prior.images, root) && position < snapshot.images.size() &&
 		           EmptyRootServed(program, snapshot, old, draw, root, snapshot.images[position])) {
 			widened.images[root] = old;
-			layouts[root]        = children_of(prior.images, root);
+			layouts[root]        = children_of(prior.images, direct, root);
 		} else if (MappedImageRoot(current.images, root)) {
-			layouts[root] = children_of(current.images, root);
+			layouts[root] = children_of(current.images, direct, root);
 		}
 	}
 	widened.images.resize(direct);
