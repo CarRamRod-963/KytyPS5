@@ -41,6 +41,9 @@ struct TextureBinding {
 	const void*    memo_entry = nullptr;
 	TextureMemoKey memo_key {};
 	uint64_t       memo_epoch = 0;
+	// The earlier binding of the same stage with the same T# and resource traits, whose
+	// resolution this one copies (PrepareBindings), or UINT32_MAX.
+	uint32_t same_as = UINT32_MAX;
 };
 
 // A stage's texture bindings. Shrinking keeps the bindings past the new size: a stage that
