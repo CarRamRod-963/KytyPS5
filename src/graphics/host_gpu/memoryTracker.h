@@ -102,6 +102,17 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!is_written) {
+				// Most uploads find nothing to copy: answer that without the lock the guest's
+				// write faults take (a concurrent fault is ordered after this check, as it
+				// would be after a locked one).
+				const auto query = [&] {
+					return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+				};
+				if (bool modified = true; manager->TryQueryUnlocked(query, modified) && !modified) {
+					return;
+				}
+			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
 			if (!is_written) {
