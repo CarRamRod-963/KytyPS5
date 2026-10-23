@@ -16,8 +16,8 @@ using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 // Serialized field by field; these trip when a stored struct changes so that the format version
 // is revisited (a new field must be stored, or the version bumped).
 static_assert(sizeof(Specialization::Buffer) == 32);
-static_assert(sizeof(Specialization::Image) == 36);
-static_assert(sizeof(Specialization::Sampler) == 12);
+static_assert(sizeof(Specialization::Image) == 40);
+static_assert(sizeof(Specialization::Sampler) == 16);
 static_assert(sizeof(ShaderComputeInputInfo) == 104);
 
 constexpr std::array<char, 8> FileMagic          = {'K', 'y', 'P', 'r', 'o', 'g', 'M', 'f'};
@@ -157,6 +157,7 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 		w.Put(buffer.indirect_mapping_offset);
 		w.Put(buffer.indirect_search_iterations);
 		w.PutBool(buffer.unbound);
+		w.PutBool(buffer.indirect_mapping_header);
 	}
 	w.Put(static_cast<uint32_t>(specialization.images.size()));
 	for (const auto& image: specialization.images) {
@@ -172,16 +173,25 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 		w.PutBool(image.fmask);
 		w.PutBool(image.bindless);
 		w.PutBool(image.bindless_byte_keys);
+		w.PutBool(image.indirect_mapping_header);
 	}
 	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
 	for (const auto& sampler: specialization.samplers) {
 		w.Put(sampler.indirect_root);
 		w.Put(sampler.indirect_mapping_offset);
 		w.Put(sampler.indirect_search_iterations);
+		w.PutBool(sampler.indirect_mapping_header);
 	}
 }
 
-bool GetSpecialization(Reader& r, Specialization& specialization) {
+// Version 2 stored no mapping-header flags (every key map offset was a module constant).
+constexpr uint32_t FirstHeaderVersion = 3;
+
+bool GetSpecialization(Reader& r, Specialization& specialization, uint32_t version) {
+	const auto get_header = [&](bool& value) {
+		value = false;
+		return version < FirstHeaderVersion || r.GetBool(value);
+	};
 	uint32_t count = 0;
 	if (!r.Get(count) || count > MaxResources) {
 		return false;
@@ -192,7 +202,7 @@ bool GetSpecialization(Reader& r, Specialization& specialization) {
 		    !r.Get(buffer.descriptor_swizzle) || !r.GetBool(buffer.zero_stride_oob) ||
 		    !r.GetBool(buffer.scalar_empty) || !r.Get(buffer.indirect_root) ||
 		    !r.Get(buffer.indirect_mapping_offset) || !r.Get(buffer.indirect_search_iterations) ||
-		    !r.GetBool(buffer.unbound)) {
+		    !r.GetBool(buffer.unbound) || !get_header(buffer.indirect_mapping_header)) {
 			return false;
 		}
 	}
@@ -206,7 +216,7 @@ bool GetSpecialization(Reader& r, Specialization& specialization) {
 		    !r.Get(image.shader_swizzle) || !r.Get(image.indirect_root) ||
 		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
 		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless) ||
-		    !r.GetBool(image.bindless_byte_keys)) {
+		    !r.GetBool(image.bindless_byte_keys) || !get_header(image.indirect_mapping_header)) {
 			return false;
 		}
 	}
@@ -216,18 +226,37 @@ bool GetSpecialization(Reader& r, Specialization& specialization) {
 	specialization.samplers.resize(count);
 	for (auto& sampler: specialization.samplers) {
 		if (!r.Get(sampler.indirect_root) || !r.Get(sampler.indirect_mapping_offset) ||
-		    !r.Get(sampler.indirect_search_iterations)) {
+		    !r.Get(sampler.indirect_search_iterations) ||
+		    !get_header(sampler.indirect_mapping_header)) {
 			return false;
 		}
 	}
 	return true;
 }
 
-std::vector<uint8_t> FileHeader() {
+std::vector<uint8_t> FileHeader(uint32_t version = ProgramManifest::FormatVersion) {
 	std::vector<uint8_t> header(FileMagic.begin(), FileMagic.end());
 	Writer               writer(header);
-	writer.Put(ProgramManifest::FormatVersion);
+	writer.Put(version);
 	return header;
+}
+
+// Whether a specialization reads a key map at an offset baked into the module, which the
+// materialization no longer produces: such a module can never be used again.
+bool HasConstantKeyMap(const Specialization& specialization) {
+	const auto constant = [](const auto& entries) {
+		for (size_t index = 0; index < entries.size(); ++index) {
+			const auto& entry = entries[index];
+			if (entry.indirect_root == index && !entry.indirect_mapping_header) return true;
+		}
+		return false;
+	};
+	for (size_t index = 0; index < specialization.images.size(); ++index) {
+		const auto& image = specialization.images[index];
+		if (image.indirect_root == index && !image.bindless && !image.indirect_mapping_header)
+			return true;
+	}
+	return constant(specialization.buffers) || constant(specialization.samplers);
 }
 
 } // namespace
@@ -279,7 +308,19 @@ std::vector<uint8_t> ProgramManifest::EncodeCode(uint64_t hash, std::span<const 
 	return out;
 }
 
-ProgramManifest::ProgramManifest(std::filesystem::path path): m_path(std::move(path)) {
+std::filesystem::path ProgramManifest::PathFor(const std::filesystem::path& directory,
+                                               const std::string&           title_id) {
+	// The format is part of the name: builds of another format share the directory.
+	return directory / (title_id + ".v3.programs");
+}
+
+std::filesystem::path ProgramManifest::PreviousPathFor(const std::filesystem::path& directory,
+                                                       const std::string&           title_id) {
+	return directory / (title_id + ".programs");
+}
+
+ProgramManifest::ProgramManifest(std::filesystem::path path, std::filesystem::path previous)
+    : m_path(std::move(path)), m_previous(std::move(previous)) {
 	if (!m_path.empty()) {
 		Load();
 	}
@@ -287,7 +328,7 @@ ProgramManifest::ProgramManifest(std::filesystem::path path): m_path(std::move(p
 
 ProgramManifest::~ProgramManifest() = default;
 
-bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload) {
+bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload, uint32_t version) {
 	Reader  r(payload);
 	uint8_t kind = 0;
 	if (!r.Get(kind)) {
@@ -310,9 +351,14 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload) {
 	uint32_t code_words = 0;
 	if (!r.Get(record->shader_hash) || !r.Get(code_words) || !r.Get(record->user_data_count) ||
 	    record->user_data_count > MaxUserData || !GetInput(r, record->input) ||
-	    !r.Get(record->push_data_cursor) || !GetSpecialization(r, record->specialization) ||
-	    !r.Get(record->spirv_hash) || !r.AtEnd()) {
+	    !r.Get(record->push_data_cursor) ||
+	    !GetSpecialization(r, record->specialization, version) || !r.Get(record->spirv_hash) ||
+	    !r.AtEnd()) {
 		return false;
+	}
+	// An older record keeps its program only while the module it names can still be needed.
+	if (version < FirstHeaderVersion && HasConstantKeyMap(record->specialization)) {
+		return true;
 	}
 	// A program whose code entry was lost cannot be translated; skip it, the entry is intact.
 	const auto code = m_code.find({record->shader_hash, code_words});
@@ -328,8 +374,8 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload) {
 
 void ProgramManifest::Load() {
 	std::vector<uint8_t> data;
-	{
-		std::ifstream file(m_path, std::ios::binary | std::ios::ate);
+	const auto           read = [&data](const std::filesystem::path& path) {
+		std::ifstream file(path, std::ios::binary | std::ios::ate);
 		if (file) {
 			const auto size = static_cast<std::streamoff>(file.tellg());
 			if (size > 0) {
@@ -340,11 +386,24 @@ void ProgramManifest::Load() {
 				}
 			}
 		}
+	};
+	read(m_path);
+	std::error_code error;
+	if (data.empty() && !m_previous.empty() && !std::filesystem::exists(m_path, error)) {
+		read(m_previous);
 	}
-	const auto header = FileHeader();
-	size_t     offset = 0;
+	const auto header  = FileHeader();
+	const auto older   = FileHeader(FirstHeaderVersion - 1u);
+	size_t     offset  = 0;
+	uint32_t   version = ProgramManifest::FormatVersion;
 	bool       valid =
 	    data.size() >= header.size() && std::equal(header.begin(), header.end(), data.begin());
+	// The previous version's records are still readable; the file is rewritten in this one.
+	if (!valid && data.size() >= older.size() &&
+	    std::equal(older.begin(), older.end(), data.begin())) {
+		valid   = true;
+		version = FirstHeaderVersion - 1u;
+	}
 	if (valid) {
 		offset = header.size();
 		while (offset < data.size()) {
@@ -360,7 +419,8 @@ void ProgramManifest::Load() {
 				break;
 			}
 			const auto payload = std::span(data).subspan(offset + EntryHeaderSize, size);
-			if (XXH3_64bits(payload.data(), payload.size()) != hash || !ParseEntry(payload)) {
+			if (XXH3_64bits(payload.data(), payload.size()) != hash ||
+			    !ParseEntry(payload, version)) {
 				break;
 			}
 			offset += EntryHeaderSize + size;
@@ -368,7 +428,7 @@ void ProgramManifest::Load() {
 	}
 	m_loaded.records      = m_records.size();
 	m_loaded.code_entries = m_code.size();
-	if (!valid || offset != data.size()) {
+	if (!valid || offset != data.size() || version != ProgramManifest::FormatVersion) {
 		m_loaded.dropped_bytes = valid ? data.size() - offset : data.size();
 		m_loaded.rewritten     = !data.empty();
 		// A file that cannot be rewritten is not appended to: new entries would follow the
