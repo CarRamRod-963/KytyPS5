@@ -1230,6 +1230,58 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+void TestCleanUploadDoesNotWaitForRegionLock() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto second = address + page_size;
+  tracker.ForEachUploadRange(second, page_size, false, [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+
+  std::binary_semaphore upload_entered{0};
+  std::binary_semaphore finish_upload{0};
+  std::binary_semaphore clean_finished{0};
+  std::atomic_uint32_t clean_ranges{0};
+  std::jthread uploader([&] {
+    tracker.ForEachUploadRange(
+        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          upload_entered.release();
+          (void)finish_upload.try_acquire_for(std::chrono::seconds(5));
+        });
+  });
+  upload_entered.acquire();
+  std::jthread clean([&] {
+    tracker.ForEachUploadRange(
+        second, page_size, false,
+        [&](uint64_t, uint64_t) noexcept { clean_ranges.fetch_add(1); },
+        []() noexcept {});
+    clean_finished.release();
+  });
+  const bool finished_while_locked =
+      clean_finished.try_acquire_for(std::chrono::seconds(4));
+  finish_upload.release();
+  uploader.join();
+  clean.join();
+  Check(finished_while_locked && clean_ranges.load() == 0,
+        "an upload of clean pages waited for the region lock");
+
+  // A dirty page still takes the lock and is uploaded.
+  tracker.MarkRegionAsCpuModified(second, 1);
+  uint32_t dirty_ranges = 0;
+  tracker.ForEachUploadRange(
+      second, page_size, false, [&](uint64_t, uint64_t) noexcept { dirty_ranges++; },
+      []() noexcept {});
+  Check(dirty_ranges == 1 && Protection(reinterpret_cast<void *>(second)) == PAGE_READONLY,
+        "an upload of a dirty page after a clean one was not taken");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestBatchedUploadRanges() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1491,6 +1543,7 @@ int main(int argc, char **argv) {
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
   TestBatchedUploadRanges();
+  TestCleanUploadDoesNotWaitForRegionLock();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
