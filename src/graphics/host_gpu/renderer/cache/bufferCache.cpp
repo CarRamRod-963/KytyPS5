@@ -859,6 +859,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		RecordUpload(buffer, source, copies);
+	}
+	if (is_texel_buffer && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
+void BufferCache::RecordUpload(Buffer& buffer, vk::Buffer source,
+                               std::span<const vk::BufferCopy> copies) {
+	{
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -884,10 +895,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
-	}
-	return false;
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -1245,19 +1252,72 @@ RangeSet BufferCache::TakeBdaSync() {
 	return std::exchange(m_bda_sync, {});
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	// Take before walking: writes queued during synchronization remain pending.
+	const auto pending = TakeBdaSync();
+	auto&      ranges  = m_bda_ranges;
+	auto&      owners  = m_bda_owners;
+	ranges.clear();
+	owners.clear();
+	pending.ForEach([&](uint64_t begin, uint64_t end) {
+		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+			auto it = m_buffers.upper_bound(start);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < finish; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				const auto  first  = std::max(buffer.CpuAddress(), start);
+				const auto  last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
+				if (first < last) {
+					ranges.push_back({first, last - first});
+					owners.push_back(it->second);
+				}
+			}
+		});
+	});
+	if (ranges.empty()) {
+		return;
 	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+	// One protection change per tracking region for all the written pages (they are typically
+	// many small ranges: the guest's writes since the last synchronization), then one upload
+	// per buffer.
+	auto& copies      = m_bda_copies;
+	auto& copy_owners = m_bda_copy_owners;
+	auto& sources     = m_bda_sources;
+	copies.clear();
+	copy_owners.clear();
+	sources.clear();
+	m_memory_tracker.ForEachUploadRanges(
+	    ranges,
+	    [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
+		    copies.emplace_back(0, m_slot_buffers[owners[index]].Offset(address), bytes);
+		    copy_owners.push_back(index);
+	    },
+	    [&]() noexcept {
+		    for (size_t first = 0; first < copies.size();) {
+			    const auto id    = owners[copy_owners[first]];
+			    size_t     last  = first;
+			    uint64_t   total = 0;
+			    for (; last < copies.size() && owners[copy_owners[last]] == id; last++) {
+				    copies[last].srcOffset = total;
+				    total += copies[last].size;
+			    }
+			    sources.push_back(UploadCopies(
+			        m_slot_buffers[id], std::span {copies}.subspan(first, last - first), total));
+			    first = last;
+		    }
+	    });
+	size_t group = 0;
+	for (size_t first = 0; first < copies.size(); group++) {
+		const auto id   = owners[copy_owners[first]];
+		size_t     last = first;
+		while (last < copies.size() && owners[copy_owners[last]] == id) {
+			last++;
 		}
+		RecordUpload(m_slot_buffers[id], sources[group],
+		             std::span {copies}.subspan(first, last - first));
+		first = last;
 	}
 }
 
