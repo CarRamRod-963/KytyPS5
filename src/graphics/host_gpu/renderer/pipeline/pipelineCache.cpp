@@ -706,34 +706,46 @@ struct PipelineCache::ProgramCache {
 		// taken as it is when it serves the draw, and is the one widened before any module.
 		const ShaderRecompiler::IR::ResourceSpecialization* prior    = nullptr;
 		bool                                                recorded = false;
-		for (auto it = entry->second.permutations.rbegin(); it != entry->second.permutations.rend();
-		     ++it) {
-			if (std::ranges::equal(it->function_code, entry->second.FunctionCode())) {
-				prior = &it->specialization;
-				break;
-			}
+		// The widest module: a draw that a narrower module served (another candidate count) must
+		// not restart the growth from its layout.
+		const auto width = [](const ShaderRecompiler::IR::ResourceSpecialization& layout) {
+			return layout.images.size() + layout.samplers.size();
+		};
+		for (const auto& permutation: entry->second.permutations) {
+			if (std::ranges::equal(permutation.function_code, entry->second.FunctionCode()) &&
+			    (prior == nullptr || width(permutation.specialization) >= width(*prior)))
+				prior = &permutation.specialization;
 		}
 		std::vector<std::shared_ptr<const ComputeProgramRecord>> records;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			if (manifest != nullptr && !entry->second.call_source) {
 				records = manifest->Records();
-				std::vector<uint32_t> state;
-				for (auto it = records.rbegin(); it != records.rend() && !recorded; ++it) {
-					const auto& record = **it;
-					if (record.shader_hash != params.hash ||
-					    record.user_data_count != params.user_data_count ||
-					    record.code == nullptr || record.code->size() != params.code.size() ||
-					    record.push_data_cursor != push_data_cursor)
-						continue;
-					auto input               = record.input;
-					input.host_subgroup_size = input_info.host_subgroup_size;
-					BuildStageStaticKey(input, state);
-					if (state != lookup_key.static_state) continue;
+				// This program's records, the widest first: the module of the widest one that
+				// serves the draw also serves the most later draws.
+				std::erase_if(
+				    records, [&, state = std::vector<uint32_t> {}](const auto& record) mutable {
+					    if (record->shader_hash != params.hash ||
+					        record->user_data_count != params.user_data_count ||
+					        record->code == nullptr || record->code->size() != params.code.size() ||
+					        record->push_data_cursor != push_data_cursor)
+						    return true;
+					    auto input               = record->input;
+					    input.host_subgroup_size = input_info.host_subgroup_size;
+					    BuildStageStaticKey(input, state);
+					    return state != lookup_key.static_state;
+				    });
+				std::ranges::stable_sort(records, std::greater {}, [&](const auto& record) {
+					return width(record->specialization);
+				});
+				for (const auto& record: records) {
 					recorded = ShaderRecompiler::IR::AdaptToSpecialization(
-					    entry->second.resource_plan, record.specialization, entry->second.resources,
-					    entry->second.specialization);
-					if (prior == nullptr) prior = &record.specialization;
+					    entry->second.resource_plan, record->specialization,
+					    entry->second.resources, entry->second.specialization);
+					if (recorded) break;
 				}
+				if (!records.empty() &&
+				    (prior == nullptr || width(records.front()->specialization) > width(*prior)))
+					prior = &records.front()->specialization;
 			}
 		}
 		const auto images_before = entry->second.specialization.images.size();
