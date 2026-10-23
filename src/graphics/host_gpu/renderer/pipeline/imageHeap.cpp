@@ -152,6 +152,15 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		       candidate->count == request.count && candidate->profile == profile;
 	});
 	if (view == views.end()) {
+		// A view interns at most one element per probe, and a table rewritten within a tick keeps
+		// the elements it released until the tick is done: each view may need twice its probes.
+		// A table that could exceed the heap stays with the caller (materialized), not an exit.
+		uint64_t reserved = 2u * request.count;
+		for (const auto& other: m_memories) {
+			for (const auto& existing: other->views)
+				reserved += 2u * existing->count;
+		}
+		if (reserved >= IR::ImageHeapCapacity) return false;
 		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
 		auto       created = std::make_unique<View>(View {.memory        = **memory,
 		                                                  .step          = request.step,
