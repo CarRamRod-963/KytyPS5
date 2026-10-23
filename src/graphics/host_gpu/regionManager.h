@@ -210,6 +210,29 @@ public:
 		}
 	}
 
+	// ForEachModifiedRange<DirtySource::Cpu, true> without the protection update: the caller
+	// takes the CPU-modified pages of several ranges of this region under one hold of `lock`, then
+	// write-protects them all with ProtectCpuClean before it releases the lock and copies them.
+	template <typename Func>
+	void TakeCpuModifiedRanges(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_cpu_dirty.FirstRangeFrom(start).first >= end) {
+			return;
+		}
+		RegionBits mask(m_cpu_dirty, start, end);
+		{
+			const StateChange change(*this);
+			m_cpu_dirty.UnsetRange(start, end);
+		}
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+	void ProtectCpuClean() {
+		const StateChange change(*this);
+		UpdateProtection<true, false>();
+	}
+
 	TrackingSpinLock lock;
 
 private:
