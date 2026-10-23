@@ -1415,9 +1415,6 @@ ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) con
 }
 
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
-	NoteLayoutChange(stencil.address, stencil.size);
-	NoteLayoutChange(m_slot_images[depth_id].info.data.address,
-	                 m_slot_images[depth_id].info.data.size);
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
 	}
@@ -1458,6 +1455,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.Upload(copies, linear.buffer, linear.offset, linear.size);
 		}
+		// Associating changes how both ranges resolve; associating them again as they are (every
+		// draw that targets the depth image does) changes nothing.
+		NoteLayoutChange(stencil.address, stencil.size);
+		NoteLayoutChange(depth.info.data.address, depth.info.data.size);
 		ImageInfo plane {};
 		plane.data         = stencil;
 		plane.pixel_format = vk::Format::eS8Uint;
@@ -1816,7 +1817,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             static_cast<uint32_t>(offset / slice_size),
 		                             desc.info.resources.layers};
 	}
-	if (desc.info.pixel_format == image.info.pixel_format) {
+	const bool same_format = desc.info.pixel_format == image.info.pixel_format;
+	if (desc.info.HasStencil() && ((same_format && image.info.stencil != desc.info.stencil) ||
+	                               !(image.info.metadata == desc.info.metadata))) {
+		// A depth image's stencil plane and metadata decide how its stencil association resolves.
+		NoteLayoutChange(image.info.data.address, image.info.data.size);
+	}
+	if (same_format) {
 		image.info.stencil = desc.info.stencil;
 	}
 	image.info.metadata = desc.info.metadata;
