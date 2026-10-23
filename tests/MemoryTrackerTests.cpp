@@ -1308,6 +1308,76 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+void TestBatchedUploadRanges() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(harness.page_manager, region_size * 3 / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  tracker.ForEachUploadRange(
+      region_base, region_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto page = [&](uint64_t index) { return region_base + index * page_size; };
+  const std::array<Libs::Graphics::GuestRange, 5> ranges{{
+      {page(1), page_size},
+      {page(5) + 8, 16},
+      {page(9), page_size * 2},
+      {page(20), page_size},
+      {page(1024 + 3), page_size},
+  }};
+  for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+    tracker.MarkRegionAsCpuModified(page(index), page_size);
+  }
+  Check(IsWritable(reinterpret_cast<void *>(page(5))) &&
+            !IsWritable(reinterpret_cast<void *>(page(20))),
+        "batched upload setup did not dirty its pages");
+
+  ResetProtectionLog();
+  std::vector<std::pair<size_t, Libs::Graphics::GuestRange>> taken;
+  bool uploaded = false;
+  tracker.ForEachUploadRanges(
+      ranges,
+      [&](size_t index, uint64_t address, uint64_t size) noexcept {
+        taken.push_back({index, {address, size}});
+      },
+      [&]() noexcept {
+        uploaded = true;
+        for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+          Check(Protection(reinterpret_cast<void *>(page(index))) == PAGE_READONLY,
+                "batched upload copied before protecting a taken page");
+        }
+      });
+  const std::vector<std::pair<size_t, Libs::Graphics::GuestRange>> expected{
+      {0, {page(1), page_size}},
+      {1, {page(5), page_size}},
+      {2, {page(9), page_size * 2}},
+      {4, {page(1024 + 3), page_size}},
+  };
+  Check(uploaded && taken == expected,
+        "batched upload did not report each range's CPU-modified pages");
+  Check(g_protection_log.size() == 2 && g_protection_log[0].address == page(1) &&
+            g_protection_log[0].size == page_size * 10 &&
+            g_protection_log[1].address == page(1024 + 3) &&
+            g_protection_log[1].size == page_size,
+        "batched upload did not protect each region's pages with one request");
+  for (const auto index : {1, 5, 9, 10, 1024 + 3}) {
+    Check(!tracker.IsRegionCpuModified(page(index), page_size),
+          "batched upload left a taken page CPU dirty");
+  }
+  Check(IsWritable(reinterpret_cast<void *>(page(1024 + 4))) == false &&
+            tracker.TakeBdaSync().Contains(page(1), page_size),
+        "batched upload changed untaken state");
+
+  tracker.MarkRegionAsCpuModified(page(5) + 3, 1);
+  Check(IsWritable(reinterpret_cast<void *>(page(5))),
+        "a write after a batched upload was not tracked again");
+  tracker.UntrackMemory(allocation_base, region_size * 3);
+  Release(memory);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1501,6 +1571,7 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestBatchedUploadRanges();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
