@@ -347,6 +347,23 @@ struct PipelineCache::ProgramCache {
 				}
 				return &candidate;
 			}
+			// A module whose candidate slots hold this draw's candidates serves it once they are
+			// moved there; the latest module has the widest layout.
+			for (auto it = permutations.rbegin(); it != permutations.rend(); ++it) {
+				const auto& layout = it->program.bindings;
+				if (layout.push_data_start_dword !=
+				    ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                             layout.ShaderDataDwords())) {
+					continue;
+				}
+				if constexpr (HasCalls) {
+					if (!std::ranges::equal(it->function_code, FunctionCode())) continue;
+				}
+				if (ShaderRecompiler::IR::AdaptToSpecialization(resource_plan, it->specialization,
+				                                                resources, specialization)) {
+					return &*it;
+				}
+			}
 			return nullptr;
 		}
 
@@ -693,6 +710,53 @@ struct PipelineCache::ProgramCache {
 			LogPermutationDifference(stage_name, params.hash,
 			                         entry->second.permutations.back().specialization,
 			                         entry->second.specialization);
+		}
+		// A shader whose GPU-selected tables change with the scene gets the union of this draw's
+		// candidate layout and the last module's, so that the draws both serve need no module. A
+		// layout an earlier session recorded (whose module the precompile already built) is
+		// taken as it is when it serves the draw, and is the one widened before any module.
+		const ShaderRecompiler::IR::ResourceSpecialization* prior    = nullptr;
+		bool                                                recorded = false;
+		for (auto it = entry->second.permutations.rbegin(); it != entry->second.permutations.rend();
+		     ++it) {
+			if (std::ranges::equal(it->function_code, entry->second.FunctionCode())) {
+				prior = &it->specialization;
+				break;
+			}
+		}
+		std::vector<std::shared_ptr<const ComputeProgramRecord>> records;
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (manifest != nullptr && !entry->second.call_source) {
+				records = manifest->Records();
+				std::vector<uint32_t> state;
+				for (auto it = records.rbegin(); it != records.rend() && !recorded; ++it) {
+					const auto& record = **it;
+					if (record.shader_hash != params.hash ||
+					    record.user_data_count != params.user_data_count ||
+					    record.code == nullptr || record.code->size() != params.code.size() ||
+					    record.push_data_cursor != push_data_cursor)
+						continue;
+					auto input               = record.input;
+					input.host_subgroup_size = input_info.host_subgroup_size;
+					BuildStageStaticKey(input, state);
+					if (state != lookup_key.static_state) continue;
+					recorded = ShaderRecompiler::IR::AdaptToSpecialization(
+					    entry->second.resource_plan, record.specialization, entry->second.resources,
+					    entry->second.specialization);
+					if (prior == nullptr) prior = &record.specialization;
+				}
+			}
+		}
+		const auto images_before = entry->second.specialization.images.size();
+		if (!recorded && prior != nullptr) {
+			ShaderRecompiler::IR::WidenSpecialization(entry->second.resource_plan, *prior,
+			                                          entry->second.resources,
+			                                          entry->second.specialization);
+		}
+		if (recorded || entry->second.specialization.images.size() != images_before) {
+			LOGF("Permutation: %s %016" PRIx64 " %s images %zu->%zu\n", stage_name, params.hash,
+			     recorded ? "recorded layout" : "widened", images_before,
+			     entry->second.specialization.images.size());
 		}
 		// Unbound buffers take the typed layouts already compiled for them, so this module also
 		// serves those bound cases.
