@@ -127,6 +127,22 @@ size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecializati
 size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Image& root);
 size_t KeyMapOffset(const ResourceSnapshot& snapshot, const ResourceSpecialization::Sampler& root);
 
+// Whether a module compiled for `compiled` serves the draw `snapshot` and `current` describe once
+// its GPU-selected image candidates are moved into the module's candidate slots: every candidate
+// a key selects needs a slot of its own layout (a null one any free slot), a key search needs at
+// most the module's depth, and a root the draw does not map is served by a module that maps it
+// (the draw's key map header names the empty map). Rewrites the snapshot's images and key map
+// ordinals and `current` to the module's layout when it does; leaves both unchanged otherwise.
+bool AdaptToSpecialization(const ResourcePlan& program, const ResourceSpecialization& compiled,
+                           ResourceSnapshot& snapshot, ResourceSpecialization& current);
+
+// Widens `current` to a layout that also serves the draws `prior` serves - per image root, the
+// prior candidate slots plus the ones the draw has beyond them, the deeper key searches - and
+// moves the draw into it. A shader whose tables change with the scene thereby compiles modules
+// whose layouts only grow. Leaves both unchanged when the layouts do not combine.
+void WidenSpecialization(const ResourcePlan& program, const ResourceSpecialization& prior,
+                         ResourceSnapshot& snapshot, ResourceSpecialization& current);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
