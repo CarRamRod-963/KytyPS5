@@ -11364,6 +11364,62 @@ public:
                     other_binding.desc == sampled.desc &&
                     other_binding.memo_serial == memo_binding.memo_serial,
                 "a memo hit kept the description of a binding it did not fill");
+        // A stage binding the T# twice (with a null candidate between) resolves it once and
+        // gives the copy the first binding's image, view and layout; a stage that first
+        // shrinks to one image and grows back refills its bindings.
+        {
+          const auto make_program = [&](uint32_t count) {
+            ShaderRecompiler::IR::CompiledShaderInfo program{};
+            program.stage = ShaderType::Compute;
+            for (uint32_t i = 0; i < count; ++i) {
+              auto image = resource;
+              const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+              const auto index = static_cast<size_t>(kind);
+              image.descriptor_index = program.bindings.descriptor_counts[index];
+              program.bindings.descriptor_counts[index] += image.mip_count;
+              program.bindings.descriptor_mask |= uint64_t{1} << index;
+              program.info.images.push_back(image);
+            }
+            return program;
+          };
+          const auto three = make_program(3);
+          const auto one = make_program(1);
+          ShaderRecompiler::IR::ResourceSnapshot three_snapshot{};
+          three_snapshot.images = {value, ShaderRecompiler::IR::DescriptorValue{}, value};
+          three_snapshot.images[1].dword_count = 8;
+          ShaderRecompiler::IR::ResourceSnapshot one_snapshot{};
+          one_snapshot.images = {value};
+          const ShaderStageRuntime three_runtime{&three, &three_snapshot};
+          const ShaderStageRuntime one_runtime{&one, &one_snapshot};
+          PreparedBindings repeated_bindings;
+          std::vector<PipelineCache::Pipeline> repeated_pipelines;
+          for (const auto *runtime : {&three_runtime, &one_runtime, &three_runtime}) {
+            RenderExecutorTestAccess::ResetBindings(executor);
+            executor.PrepareBindings(*runtime, repeated_bindings);
+            executor.RebindImages(repeated_bindings);
+            repeated_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+                executor, scheduler.Current(), repeated_bindings));
+            const auto &images = repeated_bindings.images;
+            const auto &first = images[0];
+            Require(name, "repeated T# first binding",
+                    images.size() == runtime->program->info.images.size() &&
+                        first.image_id == sampled.image_id &&
+                        first.same_as == UINT32_MAX && first.image_view != nullptr &&
+                        first.layout != vk::ImageLayout::eUndefined,
+                    "the first binding of a T# was not resolved");
+            if (runtime == &three_runtime) {
+              const auto &copy = images[2];
+              Require(name, "repeated T# binding",
+                      !images[1].image_id && images[1].same_as == UINT32_MAX &&
+                          copy.same_as == 0 && copy.image_id == first.image_id &&
+                          copy.desc == first.desc && copy.image_view == first.image_view &&
+                          copy.layout == first.layout,
+                      "a repeated T# did not take the first binding's resolution");
+            }
+          }
+          RenderExecutorTestAccess::ResetBindings(executor);
+          RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, repeated_pipelines);
+        }
         const auto expected = target.float16
                                   ? std::vector<u32>{0x00003c00u, 0x3c003c00u}
                                   : std::vector<u32>{0xffff00ffu};
