@@ -55,7 +55,7 @@ class ProgramManifest {
 public:
 	// Bump when the stored fields change; the static_asserts in programManifest.cpp trip when
 	// a serialized struct changes size.
-	static constexpr uint32_t FormatVersion = 3;
+	static constexpr uint32_t FormatVersion = 4;
 
 	// Loads the manifest at `path`, creating it when missing. An empty path keeps the manifest
 	// in memory only. While `path` is missing, the manifest of the previous format at
