@@ -597,6 +597,14 @@ void TestResidentImageHeap() {
             snapshot.images.size() == 2u && !specialization.images[0].heap &&
             snapshot.images[1].dwords == descriptor,
         "a declined heap was not materialized entry by entry");
+  // A lookahead walk has no heap and must leave heap tables to the GPU thread.
+  auto speculative = runtime;
+  speculative.image_heap = nullptr;
+  speculative.speculative = true;
+  const auto watched_reads = memory.watched_reads;
+  Check(!MaterializeResources(plan, speculative, snapshot, specialization) &&
+            memory.watched_reads == watched_reads,
+        "a lookahead walk materialized a resident image heap entry by entry");
 }
 
 void TestImageHeapKinds() {
