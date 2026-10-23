@@ -130,6 +130,51 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	// ForEachUploadRange (not written) of several ranges: range_func(index, address, size) gets
+	// the CPU-modified parts of ranges[index], and upload_func runs once every such part is
+	// write-protected again. Ranges that share a tracking region are taken under one hold of its
+	// lock and protected with one update, so the pages of many small ranges (and the clean pages
+	// between them) need one protection change per region instead of one per range. Ascending
+	// ranges visit each region once.
+	template <typename RangeFunc, typename UploadFunc>
+	void ForEachUploadRanges(std::span<const GuestRange> ranges, RangeFunc&& range_func,
+	                         UploadFunc&& upload_func) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		CheckNotInUploadCallback();
+		const auto*    previous_upload_owner = std::exchange(s_upload_owner, this);
+		RegionManager* held                  = nullptr;
+		bool           taken                 = false;
+		const auto     release               = [&] {
+			if (held != nullptr) {
+				if (taken) {
+					held->ProtectCpuClean();
+				}
+				held->lock.unlock();
+				held  = nullptr;
+				taken = false;
+			}
+		};
+		for (size_t index = 0; index < ranges.size(); index++) {
+			Iterate<true>(ranges[index].address, ranges[index].size,
+			              [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				              if (manager != held) {
+					              release();
+					              manager->lock.lock();
+					              held = manager;
+				              }
+				              manager->TakeCpuModifiedRanges(manager->GetCpuAddr() + offset, bytes,
+				                                             [&](uint64_t address, uint64_t size) {
+					                                             taken = true;
+					                                             range_func(index, address, size);
+				                                             });
+			              });
+		}
+		release();
+		upload_func();
+		s_upload_owner = previous_upload_owner;
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
