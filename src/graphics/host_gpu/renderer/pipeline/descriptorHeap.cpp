@@ -5,15 +5,20 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+// Heap sets are the stages with more descriptors than a push descriptor set takes: GPU-selected
+// image tables of hundreds of candidates, a thousand sets a frame. A pool holds a few frames of
+// them; each exhaustion drops every layout's preallocated batch.
+constexpr uint32_t   DescriptorHeapCount = 4096;
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 32768},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 131072},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace
@@ -38,6 +43,9 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	auto& batch = m_sets[layout];
 	if (batch.size != 0) {
 		return batch.sets[--batch.size];
+	}
+	if (batch.sets[0]) {
+		batch.allocation = std::min(batch.allocation * 2, DescriptorSetBatch);
 	}
 	if (Allocate(layout, batch)) {
 		return batch.sets[--batch.size];
