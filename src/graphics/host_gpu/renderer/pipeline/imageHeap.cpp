@@ -175,6 +175,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		// Empty after the first acquire in a draw, since the table refreshes once per draw.
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
 		(*view)->changed_begin = (*view)->changed_end = 0;
+		// Elements the changes released are free once the work submitted so far is done, also
+		// when no commit follows (a draw skipped while its pipeline builds).
+		Retire(**view);
 	}
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;

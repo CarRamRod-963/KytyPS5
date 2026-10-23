@@ -5760,6 +5760,23 @@ public:
                   ImageHeapTestAccess::PageDirty(heap, right_table, right_table),
               "a write to a shared page left the other table watching it");
       draw();
+      // Draws skipped after their programs acquired a changing table (their pipeline is still
+      // being built) commit nothing; the elements their changes released are freed anyway.
+      const auto skipped_elements = ImageHeapTestAccess::ElementCount(heap);
+      for (uint32_t pass = 0; pass < 8u; ++pass) {
+        const auto words = descriptor(30u + pass, Format::k8_8_8_8UNorm);
+        Libs::LibKernel::Memory::WriteBacking(left_table, words.data(), sizeof(words));
+        Require(name, "skipped draw write", context.InvalidateMemory(left_table, sizeof(words)),
+                "the table was not mapped");
+        Require(name, "skipped draw acquire", acquire(sampled, left_table),
+                "the view was declined");
+        scheduler.Finish();
+        heap.BeginDraw();
+      }
+      Require(name, "skipped draw elements",
+              ImageHeapTestAccess::ElementCount(heap) <= skipped_elements + 2u,
+              "elements released by skipped draws were never freed");
+      draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
