@@ -174,6 +174,7 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 		w.PutBool(image.bindless);
 		w.PutBool(image.bindless_byte_keys);
 		w.PutBool(image.indirect_mapping_header);
+		w.PutBool(image.heap);
 	}
 	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
 	for (const auto& sampler: specialization.samplers) {
@@ -184,13 +185,19 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 	}
 }
 
-// Version 2 stored no mapping-header flags (every key map offset was a module constant).
+// Version 2 stored no mapping-header flags (every key map offset was a module constant),
+// version 3 no resident image heap flags (there were no heaps).
 constexpr uint32_t FirstHeaderVersion = 3;
+constexpr uint32_t FirstHeapVersion   = 4;
 
 bool GetSpecialization(Reader& r, Specialization& specialization, uint32_t version) {
 	const auto get_header = [&](bool& value) {
 		value = false;
 		return version < FirstHeaderVersion || r.GetBool(value);
+	};
+	const auto get_heap = [&](bool& value) {
+		value = false;
+		return version < FirstHeapVersion || r.GetBool(value);
 	};
 	uint32_t count = 0;
 	if (!r.Get(count) || count > MaxResources) {
@@ -216,7 +223,8 @@ bool GetSpecialization(Reader& r, Specialization& specialization, uint32_t versi
 		    !r.Get(image.shader_swizzle) || !r.Get(image.indirect_root) ||
 		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
 		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless) ||
-		    !r.GetBool(image.bindless_byte_keys) || !get_header(image.indirect_mapping_header)) {
+		    !r.GetBool(image.bindless_byte_keys) || !get_header(image.indirect_mapping_header) ||
+		    !get_heap(image.heap)) {
 			return false;
 		}
 	}
@@ -311,12 +319,12 @@ std::vector<uint8_t> ProgramManifest::EncodeCode(uint64_t hash, std::span<const 
 std::filesystem::path ProgramManifest::PathFor(const std::filesystem::path& directory,
                                                const std::string&           title_id) {
 	// The format is part of the name: builds of another format share the directory.
-	return directory / (title_id + ".v3.programs");
+	return directory / (title_id + ".v4.programs");
 }
 
 std::filesystem::path ProgramManifest::PreviousPathFor(const std::filesystem::path& directory,
                                                        const std::string&           title_id) {
-	return directory / (title_id + ".programs");
+	return directory / (title_id + ".v3.programs");
 }
 
 ProgramManifest::ProgramManifest(std::filesystem::path path, std::filesystem::path previous)
@@ -393,16 +401,18 @@ void ProgramManifest::Load() {
 		read(m_previous);
 	}
 	const auto header  = FileHeader();
-	const auto older   = FileHeader(FirstHeaderVersion - 1u);
 	size_t     offset  = 0;
 	uint32_t   version = ProgramManifest::FormatVersion;
-	bool       valid =
-	    data.size() >= header.size() && std::equal(header.begin(), header.end(), data.begin());
-	// The previous version's records are still readable; the file is rewritten in this one.
-	if (!valid && data.size() >= older.size() &&
-	    std::equal(older.begin(), older.end(), data.begin())) {
-		valid   = true;
-		version = FirstHeaderVersion - 1u;
+	bool       valid   = false;
+	// Older versions' records are still readable; the file is rewritten in this one.
+	for (uint32_t candidate = FirstHeaderVersion - 1u; candidate <= ProgramManifest::FormatVersion;
+	     candidate++) {
+		const auto expected = FileHeader(candidate);
+		if (data.size() >= expected.size() &&
+		    std::equal(expected.begin(), expected.end(), data.begin())) {
+			valid   = true;
+			version = candidate;
+		}
 	}
 	if (valid) {
 		offset = header.size();
