@@ -4272,6 +4272,134 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuCommandLane");
   }
 
+  // A RELEASE_MEM timestamp (data_sel 3) stores the reference clock when the
+  // GPU finished the work before it, not when the command processor read the
+  // packet: two of them around GPU work of a known duration differ by that
+  // duration.
+  void CheckEopTimestamps() {
+    constexpr const char *name = "EopTimestamps";
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    auto processor = std::make_unique<CommandProcessor>(context, 0);
+    const auto make_timestamp = [](uint64_t *destination) {
+      std::array<uint32_t, 8> packet{};
+      const auto address = reinterpret_cast<uint64_t>(destination);
+      packet[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+      packet[1] = 0x28u | (5u << 8u); // BOTTOM_OF_PIPE_TS
+      packet[2] = 3u << 29u;          // data_sel 3: the reference clock
+      packet[3] = static_cast<uint32_t>(address);
+      packet[4] = static_cast<uint32_t>(address >> 32u);
+      return packet;
+    };
+    const auto process = [&](const std::array<uint32_t, 8> &packet) {
+      Pm4Execution execution;
+      return processor->Process(execution, packet) ==
+             Pm4ProcessResult::Complete;
+    };
+
+    // GPU work of a measured duration: buffer fills between two timestamp
+    // queries.
+    constexpr vk::DeviceSize fill_size = vk::DeviceSize{256} << 20u;
+    constexpr uint32_t fills = 64;
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = fill_size;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo allocation_info{};
+    allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkBuffer fill_buffer = VK_NULL_HANDLE;
+    VmaAllocation fill_allocation = nullptr;
+    RequireVk(name, "fill buffer",
+              static_cast<vk::Result>(vmaCreateBuffer(
+                  m_runtime_context.allocator, &buffer_info, &allocation_info,
+                  &fill_buffer, &fill_allocation, nullptr)),
+              "vmaCreateBuffer");
+    vk::QueryPoolCreateInfo pool_info{};
+    pool_info.queryType = vk::QueryType::eTimestamp;
+    pool_info.queryCount = 2;
+    vk::QueryPool pool = nullptr;
+    RequireVk(name, "query pool",
+              m_device.createQueryPool(&pool_info, nullptr, &pool),
+              "vkCreateQueryPool");
+
+    alignas(uint64_t) std::array<uint64_t, 3> labels{};
+    std::array<uint64_t, 3> processed{};
+    bool complete = true;
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      // Earlier work, then the first timestamp: it ends that submission.
+      scheduler.Current().Handle().fillBuffer(fill_buffer, 0, 4096, 0);
+      complete &= process(make_timestamp(&labels[0]));
+      processed[0] = Sync::ReadReferenceClock();
+      auto handle = scheduler.Current().Handle();
+      handle.resetQueryPool(pool, 0, 2);
+      handle.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, 0);
+      for (uint32_t i = 0; i < fills; i++) {
+        handle.fillBuffer(fill_buffer, 0, VK_WHOLE_SIZE, i);
+      }
+      handle.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, 1);
+      complete &= process(make_timestamp(&labels[1]));
+      processed[1] = Sync::ReadReferenceClock();
+      // Nothing recorded since: completes with the same submission, and cannot
+      // be earlier than the packet.
+      complete &= process(make_timestamp(&labels[2]));
+      processed[2] = Sync::ReadReferenceClock();
+    });
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    // Labels outside guest memory are written by GPU-thread commands queued
+    // behind this one.
+    gpu.SendCommandSync([] {});
+    const auto finished = Sync::ReadReferenceClock();
+
+    std::array<uint64_t, 2> queries{};
+    RequireVk(name, "query results",
+              m_device.getQueryPoolResults(pool, 0, 2, sizeof(queries),
+                                           queries.data(), sizeof(uint64_t),
+                                           vk::QueryResultFlagBits::e64 |
+                                               vk::QueryResultFlagBits::eWait),
+              "vkGetQueryPoolResults");
+    vk::PhysicalDeviceProperties properties{};
+    m_physical_device.getProperties(&properties);
+    // Reference-clock ticks are 10 ns.
+    const double gpu_ticks =
+        static_cast<double>(queries[1] - queries[0]) *
+        static_cast<double>(properties.limits.timestampPeriod) / 10.0;
+    const double label_ticks = static_cast<double>(labels[1] - labels[0]);
+    const double parse_ticks = static_cast<double>(processed[1] - processed[0]);
+    std::printf("[host]    %-32s GPU %.3f ms, timestamps %.3f ms apart, "
+                "packets %.3f ms apart\n",
+                name, gpu_ticks / 1e5, label_ticks / 1e5, parse_ticks / 1e5);
+    Require(name, "packets", complete, "a timestamp release did not complete");
+    Require(name, "measurable work", gpu_ticks >= 100000.0 * 0.5,
+            "the GPU work took less than 0.5 ms; the comparison would be "
+            "meaningless");
+    // The second timestamp waits for the fills; the first ends work that was
+    // submitted before they were recorded. 1 ms covers submission latency and
+    // the clock calibration.
+    Require(name, "GPU duration",
+            label_ticks >= gpu_ticks * 0.98 - 2000.0 &&
+                label_ticks <= gpu_ticks * 1.02 + 100000.0,
+            "the timestamps do not span the GPU execution of the work between "
+            "them");
+    Require(name, "monotonic",
+            labels[0] != 0 && labels[0] < labels[1] && labels[1] <= labels[2] &&
+                labels[2] <= finished,
+            "timestamps went backwards or lie in the future");
+    Require(name, "not before the packet", labels[2] >= processed[1],
+            "a timestamp is earlier than the packet that requested it");
+
+    m_device.destroyQueryPool(pool, nullptr);
+    vmaDestroyBuffer(m_runtime_context.allocator, fill_buffer, fill_allocation);
+    context.ShutdownGpu();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
@@ -24520,6 +24648,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_pipeline_cache_control = false;
+  bool m_calibrated_timestamps = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -24557,6 +24686,7 @@ private:
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.native_indirect_draws_enabled = m_native_indirect_draws;
+    m_runtime_context.calibrated_timestamps_enabled = m_calibrated_timestamps;
     m_runtime_context.pipeline_creation_cache_control_enabled =
         m_pipeline_cache_control;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
@@ -24898,6 +25028,16 @@ private:
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
         VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+    // As the emulator does: GPU timestamps mapped onto the host clock.
+    for (const auto &extension :
+         m_physical_device.enumerateDeviceExtensionProperties().value) {
+      if (std::strcmp(extension.extensionName,
+                      VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0) {
+        device_extensions.push_back(
+            VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        m_calibrated_timestamps = true;
+      }
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -54189,6 +54329,42 @@ void CheckReferenceClockScale() {
           !Sync::ScaleReferenceClock(1, 0, value) &&
               !Sync::ScaleReferenceClock(UINT64_MAX, 1, value),
           "invalid frequency or overflow was accepted");
+  // Moving a host tick count back by a steady-clock distance (3 GHz host
+  // clock).
+  Require("ReferenceClockScale", "ticks before",
+          Sync::HostTicksBefore(3000000000ull, 3000000000ull, 500000000ull) ==
+                  1500000000ull &&
+              Sync::HostTicksBefore(7500000000ull, 3000000000ull,
+                                    1250000000ull) == 3750000000ull,
+          "a steady-clock distance did not move the host ticks back exactly");
+  Require("ReferenceClockScale", "ticks before rounding",
+          Sync::HostTicksBefore(1000ull, 2500000000ull, 1ull) == 997ull,
+          "a partial host tick was not rounded to the earlier tick");
+  Require("ReferenceClockScale", "ticks before start",
+          Sync::HostTicksBefore(1000ull, 3000000000ull, 1000000000ull) == 0 &&
+              Sync::HostTicksBefore(1000ull, 3000000000ull, UINT64_MAX) == 0,
+          "a distance before the first host tick did not clamp to zero");
+  {
+    const auto before = Sync::ReadReferenceClock();
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const auto past = Sync::ReferenceClockAt(now_ns - 10000000);
+    const auto present = Sync::ReferenceClockAt(now_ns + 1000000000);
+    const auto after = Sync::ReadReferenceClock();
+    // 10 ms is 1,000,000 reference ticks; allow 0.2 ms for the reads
+    // themselves.
+    Require(
+        "ReferenceClockScale", "clock at a steady time",
+        past + 1000000 + 20000 >= before && past + 1000000 <= after + 20000 &&
+            present >= before && present <= after,
+        "the reference clock at a past steady-clock time is not that far back");
+    Require("ReferenceClockScale", "monotonic timestamps",
+            Sync::MonotonicReferenceClock(after) == after &&
+                Sync::MonotonicReferenceClock(after - 5) == after &&
+                Sync::MonotonicReferenceClock(after + 5) == after + 5,
+            "an earlier timestamp went back in time");
+  }
   std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
 }
 
@@ -56866,6 +57042,11 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckEopTimestamps();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {

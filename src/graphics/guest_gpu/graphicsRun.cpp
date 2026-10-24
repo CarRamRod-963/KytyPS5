@@ -1418,10 +1418,11 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			WriteLabelAtEndOfPipe(static_cast<uint32_t*>(address), static_cast<uint32_t>(data),
 			                      interrupt, interrupt_context_id);
 			return;
-		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2:
-			WriteLabelAtEndOfPipe(static_cast<uint64_t*>(address), data, interrupt,
-			                      interrupt_context_id);
+		case 3:
+			WriteLabelAtEndOfPipe(static_cast<uint64_t*>(address),
+			                      data_sel == 3 ? Sync::ReadReferenceClock() : data, interrupt,
+			                      interrupt_context_id, data_sel == 3);
 			return;
 		case 5: {
 			SynchronizeGpu();
@@ -1444,9 +1445,22 @@ void CommandProcessor::EmitGlobalBarrier() {
 	CurrentBuffer().GuestFlush();
 }
 
+// The reference clock when the GPU finished submission `tick`: its end-of-pipe timestamp, or the
+// time the packet was processed when that submission ended before it (nothing was recorded in
+// between). Without a GPU timestamp the completion bounds it.
+static uint64_t EndOfPipeTimestamp(CommandScheduler& scheduler, uint64_t tick, int64_t issued_ns,
+                                   uint64_t issued_clock) {
+	const auto end_ns = scheduler.GetTimestamps().CompletedEndNs(tick);
+	const auto at_ns  = end_ns ? std::max(*end_ns, issued_ns)
+	                           : std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count();
+	return Sync::MonotonicReferenceClock(std::max(Sync::ReferenceClockAt(at_ns), issued_clock));
+}
+
 template <typename T>
 void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
-                                             uint32_t interrupt_context_id) {
+                                             uint32_t interrupt_context_id, bool timestamp) {
 	// An end-of-pipe label means every command before it finished. Writing it when the
 	// submission completes makes the guest's wait cover the GPU, so the results it reads next
 	// are already published instead of faulting into a synchronous readback of unsubmitted
@@ -1462,16 +1476,21 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	}
 	// Pending until stored, so a WAIT_REG_MEM on it can continue behind a barrier.
 	auto&      labels = m_renderer.GetPendingLabels();
-	const auto label_id =
-	    labels.Add(reinterpret_cast<uint64_t>(dst), sizeof(T), static_cast<uint64_t>(value));
+	const auto label_id = labels.Add(reinterpret_cast<uint64_t>(dst), sizeof(T),
+	                                 static_cast<uint64_t>(value), !timestamp);
 	// Queued after the flush: the submission queued the publication of its asynchronous
 	// downloads, which then runs before the label on the completion thread.
 	const auto label_tick = scheduler.DeferPriorityOperationAfterRecorded(
 	    [&renderer = m_renderer, &scheduler, dst, value, with_interrupt, issued_ns, label_id,
-	     event_id  = m_interrupt_event_id, interrupt_context_id] {
-		    const auto tick = scheduler.ActivePriorityTick();
+	     event_id  = m_interrupt_event_id, interrupt_context_id, timestamp] {
+		    const auto tick   = scheduler.ActivePriorityTick();
+		    auto       stored = static_cast<uint64_t>(value);
+		    if (timestamp) {
+			    stored = EndOfPipeTimestamp(scheduler, tick, issued_ns, stored);
+			    renderer.GetPendingLabels().SetValue(label_id, stored);
+		    }
 		    renderer.DeliverLabel(
-		        dst, static_cast<uint64_t>(value), sizeof(T),
+		        dst, stored, sizeof(T),
 		        [&renderer, &scheduler, tick, issued_ns, with_interrupt, event_id,
 		         interrupt_context_id] {
 			        scheduler.GetTimestamps().RecordLabel(tick, issued_ns);
