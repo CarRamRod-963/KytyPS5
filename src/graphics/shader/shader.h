@@ -39,9 +39,12 @@ namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
+struct ShaderProgram;
+
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	const ShaderProgram*                            handle    = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
 		return program != nullptr && resources != nullptr;

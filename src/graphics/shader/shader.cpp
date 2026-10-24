@@ -402,7 +402,6 @@ static void ShaderGetStaticInputInfoPS(
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
-                                       const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
@@ -448,8 +447,7 @@ bool ShaderGetCreatedComputeInput(std::span<const ShaderRegister> sh_registers,
 	info                     = {};
 	info.dispatch_thread_dimensions =
 	    (dispatch_modifier & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0u;
-	static const HW::ShaderRegisters unused_sh {};
-	ShaderGetStaticInputInfoCS(regs, unused_sh, data, info);
+	ShaderGetStaticInputInfoCS(regs, data, info);
 	user_data_count = regs.cs_regs.user_sgpr;
 	return program && regs.cs_regs.num_thread_x != 0u;
 }
@@ -736,10 +734,9 @@ ShaderParams PrepareProgram(
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
-ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                            ShaderComputeInputInfo& info) {
+ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
-	ShaderGetStaticInputInfoCS(regs, sh, data, info);
+	ShaderGetStaticInputInfoCS(regs, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
