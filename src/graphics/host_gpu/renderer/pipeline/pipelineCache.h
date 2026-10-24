@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
@@ -27,17 +29,8 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
-struct RenderColorInfo;
-struct RenderDepthInfo;
 class CommandBuffer;
 class CommandScheduler;
-
-namespace HW {
-class Context;
-class Shader;
-class UserConfig;
-struct ComputeShaderInfo;
-} // namespace HW
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -126,6 +119,30 @@ enum class PipelineBuildMode : uint8_t {
 	Precompile,
 };
 
+// A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
+struct DrawRenderState {
+	RenderDepthInfo                      depth_info;
+	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t                             color_count                              = 0;
+	// Color targets the pixel program writes.
+	uint32_t                             mrt_mask                                 = 0;
+	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
+	bool                                 primitive_restart_enable                 = false;
+	bool                                 ps_active                                = false;
+	// A stage's resources could not be specialized for this draw's guest data; the draw must be
+	// skipped (see ResourceSnapshot::unavailable).
+	bool                                 unavailable                              = false;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 ps_input_info;
+	// Input: the user-data slots a GPU-read indirect draw patches.
+	ShaderIndirectOffsets                indirect_offsets;
+	bool                                 indirect_draw = false;
+
+	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
+		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
+	}
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -158,48 +175,21 @@ public:
 		bool                    uses_image_heap       = false;
 	};
 
-	struct GraphicsPrograms {
-		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
-		// A stage's resources could not be specialized for this draw's guest data; the draw
-		// must be skipped (see ResourceSnapshot::unavailable).
-		bool unavailable = false;
-
-		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
-	};
-
-	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo&        pixel_info,
-	                    const ShaderIndirectOffsets* indirect_offsets = nullptr);
+	// Reads the shaders and registers bound in `command` into the state's shader stages.
+	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// An empty program skips the dispatch.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
-	                              const RenderDepthInfo&                 depth,
-	                              std::span<const ShaderVertexInputInfo> vertex_info,
-	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
-	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	// With --skip-pending-draws: like GetGraphicsPipeline, but returns null when the draw is to
 	// be skipped, which only happens when `blocker` is None. A missing pipeline is then built on
 	// the background queue, and the draws using it are skipped until it is ready, for at most
 	// PendingDrawSkipWindow; afterwards, and for any blocked draw, the lookup waits for it.
-	Pipeline* FindGraphicsPipeline(std::span<const RenderColorInfo>       colors,
-	                               const RenderDepthInfo&                 depth,
-	                               std::span<const ShaderVertexInputInfo> vertex_info,
-	                               CommandBuffer&                         command,
-	                               const ShaderPixelInputInfo*            ps_input_info,
-	                               vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                               const GraphicsPrograms& programs, PendingDrawBlocker blocker);
+	Pipeline* FindGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                               PendingDrawBlocker blocker);
 	[[nodiscard]] bool SkipPendingDrawsEnabled() const { return m_skip_pending_draws; }
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                             const ShaderProgram&          compute_program);
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 	// Resource walks of compute dispatches the GPU thread has not reached (ResourceLookahead).
 	// A command stream (one per command processor) plans the dispatches of a run of commands
@@ -330,12 +320,12 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
 // the pipeline may be unoptimized or (Background) still null; the returned job then builds the
 // optimized one (see PipelineCache::DeferOptimization).
-PipelineCompileQueue::Job CreatePipelineInternal(
-    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
-    std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
-    const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
-    vk::PipelineCache driver_cache, PipelineBuildMode mode);
+PipelineCompileQueue::Job
+CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                       const PipelineRenderingState&   rendering,
+                       const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
+                       const PipelineStaticParameters& static_params,
+                       vk::PipelineCache driver_cache, PipelineBuildMode mode);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,

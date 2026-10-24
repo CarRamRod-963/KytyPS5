@@ -11548,11 +11548,10 @@ void TestGraphicsComputeGetreg() {
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
-  HW::ShaderRegisters sh{};
   ShaderComputeInputInfo graphics{}, async{};
   async.async_compute = true;
-  (void)PrepareProgram(regs, sh, graphics);
-  (void)PrepareProgram(regs, sh, async);
+  (void)PrepareProgram(regs, graphics);
+  (void)PrepareProgram(regs, async);
   Check(!graphics.async_compute && async.async_compute &&
             MakeStageStaticKey(graphics) != MakeStageStaticKey(async) &&
             MakeStageStaticKey(graphics).size() == MakeStageStaticKey(async).size(),
@@ -17186,13 +17185,12 @@ void TestComputeLdsAllocationIdentity() {
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
-  HW::ShaderRegisters sh{};
 
   const auto compile = [&](uint16_t encoded_lds_size,
                            uint32_t expected_dwords) {
     regs.cs_regs.lds_size = encoded_lds_size;
     ShaderComputeInputInfo input_info{};
-    const auto params = PrepareProgram(regs, sh, input_info);
+    const auto params = PrepareProgram(regs, input_info);
     Check(input_info.lds_size_dwords == expected_dwords,
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
     auto options = MakeCompileOptions(ShaderType::Compute);
@@ -17258,7 +17256,7 @@ void TestComputeLdsAllocationIdentity() {
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
   regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
   ShaderComputeInputInfo scratch_info{};
-  const auto scratch_params = PrepareProgram(regs, sh, scratch_info);
+  const auto scratch_params = PrepareProgram(regs, scratch_info);
   Check(scratch_info.scratch_size_dwords == 7,
         "AGC per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
