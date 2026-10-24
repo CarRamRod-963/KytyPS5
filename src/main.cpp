@@ -161,15 +161,16 @@ static void PrintUsage() {
 	    "                                       2 s per pipeline).\n");
 	::printf(
 	    "  --precompile-pipelines               Build the compute pipelines recorded in earlier\n"
-	    "                                       sessions into the driver cache on background\n"
-	    "                                       threads while the game runs.\n");
+	    "                                       sessions, and those of compute shaders the game\n"
+	    "                                       created but never dispatched, into the driver\n"
+	    "                                       cache on background threads while it runs.\n");
 	::printf(
 	    "  --lookahead-threads <n>              Threads that evaluate the resources of upcoming\n"
 	    "                                       draws and dispatches ahead of the GPU thread\n"
 	    "                                       (0 = off, at most 8). Default: 2.\n");
 	::printf(
-	    "  --precompile-only                    Build the recorded compute pipelines into the\n"
-	    "                                       driver cache, save it and exit.\n");
+	    "  --precompile-only                    Build the recorded and created compute pipelines\n"
+	    "                                       into the driver cache, save it and exit.\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");

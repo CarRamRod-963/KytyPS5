@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -345,7 +346,28 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
-void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Returns the shader's hash (of its code).
+uint64_t ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+
+// The static compute input that dispatching a compute shader binary sets up, from its AGC header:
+// the SH registers, the dispatch modifier the SDK merges into DISPATCH_INITIATOR, and the scratch
+// size. Queue-dependent fields (async_compute) stay false. Returns false for registers that do
+// not describe a compute program.
+bool ShaderGetCreatedComputeInput(std::span<const ShaderRegister> sh_registers,
+                                  uint32_t dispatch_modifier, uint32_t scratch_size_dwords,
+                                  ShaderComputeInputInfo& info, uint32_t& user_data_count);
+
+// A compute shader the guest created (sceAgcCreateShader), before any dispatch uses it.
+struct ShaderCreatedCompute {
+	uint64_t                  hash = 0;
+	std::span<const uint32_t> code;
+	ShaderComputeInputInfo    input;
+	uint32_t                  user_data_count = 0;
+};
+// Receives every created compute shader on the creating guest thread; an empty function stops
+// the notifications. Set by the renderer, which can build pipelines ahead of their first use.
+void     ShaderSetCreatedComputeSink(std::function<void(const ShaderCreatedCompute&)> sink);
+void     ShaderNoteCreatedCompute(const ShaderCreatedCompute& shader);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

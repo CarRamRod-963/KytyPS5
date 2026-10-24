@@ -465,6 +465,66 @@ void TestPrecompileProgress() {
 }
 } // namespace
 
+void TestCreatedShaders() {
+  const auto directory = TempPath("created").parent_path();
+  const auto created = ProgramManifest::CreatedPathFor(directory, "TITLE00001");
+  Check(created != ProgramManifest::PathFor(directory, "TITLE00001") &&
+            created !=
+                ProgramManifest::PreviousPathFor(directory, "TITLE00001"),
+        "created shaders live in their own file, which no format reads");
+  std::filesystem::remove(created);
+  // A created shader has its static input and no specialization; the same
+  // shader created again (a level reloaded) is not recorded twice.
+  auto shader = MakeRecord(9, Code(9, 96));
+  shader.specialization = {};
+  shader.spirv_hash = 0;
+  {
+    ProgramManifest manifest(created);
+    Check(manifest.Add(shader) && !manifest.Add(shader),
+          "a created shader is recorded once");
+  }
+  ProgramManifest manifest(created);
+  const auto records = manifest.Records();
+  Check(records.size() == 1 && SameRecord(*records[0], shader) &&
+            records[0]->specialization.buffers.empty() &&
+            records[0]->specialization.images.empty() &&
+            records[0]->specialization.samplers.empty(),
+        "a created shader survives a reload without a specialization");
+}
+
+void TestPrecompileAttempts() {
+  using Libs::Graphics::PrecompileAttempts;
+  const auto path = TempPath("precompile.attempts");
+  {
+    PrecompileAttempts attempts(path);
+    Check(attempts.FailedCount() == 0, "a new attempts file has no failures");
+    attempts.Begin(0x1234u);
+    attempts.End(0x1234u);
+    // The process ends in this build.
+    attempts.Begin(0xabcdef0123456789u);
+  }
+  {
+    // A torn last event is ignored.
+    std::ofstream file(path, std::ios::app);
+    file << "B";
+  }
+  {
+    PrecompileAttempts attempts(path);
+    Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x1234u) &&
+              attempts.FailedCount() == 1,
+          "an unfinished build is a failure, a finished one is not");
+    attempts.Begin(0x55u);
+    attempts.End(0x55u);
+  }
+  PrecompileAttempts attempts(path);
+  Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x55u) &&
+            attempts.FailedCount() == 1,
+        "failures survive the rewrite of the file");
+  PrecompileAttempts memory;
+  memory.Begin(1u);
+  Check(!memory.Failed(1u), "attempts without a file record nothing");
+}
+
 int main() {
   TestRoundTrip();
   TestKey();
@@ -476,6 +536,8 @@ int main() {
   TestMemoryOnly();
   TestPrecompileQueue();
   TestPrecompileProgress();
+  TestCreatedShaders();
+  TestPrecompileAttempts();
   std::printf("ProgramManifestTests: all tests passed\n");
   return 0;
 }

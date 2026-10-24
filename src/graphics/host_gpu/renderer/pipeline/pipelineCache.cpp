@@ -34,6 +34,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -941,8 +942,8 @@ struct PipelineCache::ProgramCache {
 };
 
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
-                                           const ComputeProgramRecord& record,
-                                           uint64_t*                   spirv_hash) {
+                                           const ComputeProgramRecord& record, uint64_t* spirv_hash,
+                                           bool code_only) {
 	EXIT_IF(record.code == nullptr || record.code->empty());
 	// The inputs GetComputeProgram derives from the device.
 	auto input               = record.input;
@@ -965,29 +966,50 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	options.input_info.compute = &input;
 	options.wave_size          = input.wave_size;
 
-	auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
-	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
-		return PrecompileOutcome::Skipped;
+	const auto compile = [&]() -> std::optional<ShaderRecompiler::CompileResult> {
+		auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+			return std::nullopt;
+		}
+		auto       translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		const auto specialization =
+		    code_only ? ShaderRecompiler::IR::CodeOnlySpecialization(translated.program)
+		              : std::optional(record.specialization);
+		// A recompiler change may give the shader other resources than the record was made for.
+		if (!specialization.has_value() ||
+		    !ShaderRecompiler::IR::SpecializationApplies(translated.program, *specialization)) {
+			return std::nullopt;
+		}
+		return ShaderRecompiler::CompileProgram(std::move(translated), options, *specialization,
+		                                        record.push_data_cursor);
+	};
+	std::optional<ShaderRecompiler::CompileResult> result;
+	if (code_only) {
+		// No dispatch has used a created shader: the recompiler may not handle its code, which
+		// skips the shader instead of ending the process.
+		try {
+			const Common::RecoverableFatalScope recoverable;
+			result = compile();
+		} catch (const Common::RecoverableFatal& fatal) {
+			PipelineCacheLog("Precompile: created CS {:016x} cannot be translated: {}",
+			                 record.shader_hash, fatal.message);
+			return PrecompileOutcome::Skipped;
+		}
+	} else {
+		result = compile();
 	}
-	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-	// A recompiler change may give the shader other resources than the record was made for.
-	if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, record.specialization)) {
-		return PrecompileOutcome::Skipped;
-	}
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               record.specialization, record.push_data_cursor);
-	if (!ValidateShaderSpirv(options.dump_label, record.shader_hash, result.spirv,
-	                         profile.maintenance8)) {
+	if (!result.has_value() || !ValidateShaderSpirv(options.dump_label, record.shader_hash,
+	                                                result->spirv, profile.maintenance8)) {
 		return PrecompileOutcome::Skipped;
 	}
 	if (spirv_hash != nullptr) {
-		*spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+		*spirv_hash = XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
 	}
-	const auto module = CompileSPV(result.spirv, graphics.device);
+	const auto module = CompileSPV(result->spirv, graphics.device);
 	if (module == nullptr) {
 		return PrecompileOutcome::Skipped;
 	}
-	const auto                             program = std::move(result.program).TakeCompiledInfo();
+	const auto                             program = std::move(result->program).TakeCompiledInfo();
 	ShaderRecompiler::IR::ResourceSnapshot resources;
 	input.stage = {.program = &program, .resources = &resources};
 
@@ -1030,6 +1052,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_created != nullptr) {
+		ShaderSetCreatedComputeSink({});
+	}
 	StopBackgroundCompiles();
 	(void)Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1216,11 +1241,75 @@ void PipelineCache::InitializeDriverCache() {
 	                 loaded.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
 	                                                loaded.dropped_bytes)
 	                                  : std::string {});
+	SetCreatedShaders(
+	    std::make_unique<ProgramManifest>(ProgramManifest::CreatedPathFor(directory, title_id)));
+	m_precompile_attempts =
+	    std::make_unique<PrecompileAttempts>(PrecompileAttempts::PathFor(directory, title_id));
+	const auto created = m_created->Loaded();
+	PipelineCacheLog("Created compute shaders: {} in {}{}", created.records,
+	                 Common::PathToString(m_created->Path()),
+	                 created.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
+	                                                 created.dropped_bytes)
+	                                   : std::string {});
 }
 
 void PipelineCache::SetManifest(std::unique_ptr<ProgramManifest> manifest) {
 	m_manifest                = std::move(manifest);
 	m_program_cache->manifest = m_manifest.get();
+}
+
+void PipelineCache::SetCreatedShaders(std::unique_ptr<ProgramManifest> created) {
+	ShaderSetCreatedComputeSink({});
+	m_created = std::move(created);
+	if (m_created == nullptr) {
+		return;
+	}
+	// Runs on the creating guest thread; the manifest serializes its own state.
+	ShaderSetCreatedComputeSink([created = m_created.get()](const ShaderCreatedCompute& shader) {
+		ComputeProgramRecord record;
+		record.shader_hash = shader.hash;
+		record.code =
+		    std::make_shared<const std::vector<uint32_t>>(shader.code.begin(), shader.code.end());
+		record.user_data_count = shader.user_data_count;
+		record.input           = ComputeProgramRecord::StaticInput(shader.input);
+		(void)created->Add(record);
+	});
+}
+
+void PipelineCache::EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record,
+                                      bool                                        code_only) {
+	auto& progress = m_precompile_progress;
+	// Counted before the job can run; a key the queue rejects is uncounted again below.
+	progress.Queued();
+	const auto key = record->Key();
+	const bool queued =
+	    m_precompile_queue->Enqueue(key, [this, record = std::move(record), code_only, key] {
+		    // A created shader no dispatch has used may be one the recompiler cannot translate,
+		    // which ends the process: its unfinished attempt keeps later runs from retrying it.
+		    auto* attempts = code_only ? m_precompile_attempts.get() : nullptr;
+		    if (attempts != nullptr) {
+			    attempts->Begin(key);
+		    }
+		    const auto start = std::chrono::steady_clock::now();
+		    const auto outcome =
+		        PrecompileComputeProgram(m_graphics, m_driver_cache, *record, nullptr, code_only);
+		    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                        std::chrono::steady_clock::now() - start)
+		                        .count();
+		    if (attempts != nullptr) {
+			    attempts->End(key);
+		    }
+		    if (outcome == PrecompileOutcome::Compiled) {
+			    m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+			    m_precompile_dirty.store(true, std::memory_order_relaxed);
+		    }
+		    if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms))) {
+			    LogPrecompileStats("done");
+		    }
+	    });
+	if (!queued) {
+		progress.Rejected();
+	}
 }
 
 void PipelineCache::QueuePrecompile(uint32_t thread_count) {
@@ -1231,29 +1320,28 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	auto& progress = m_precompile_progress;
 	progress.BeginQueueing();
 	for (const auto& record: m_manifest->Records()) {
-		// Counted before the job can run; a key the queue rejects is uncounted again below.
-		progress.Queued();
-		const bool queued = m_precompile_queue->Enqueue(record->Key(), [this, record] {
-			const auto start   = std::chrono::steady_clock::now();
-			const auto outcome = PrecompileComputeProgram(m_graphics, m_driver_cache, *record);
-			const auto ms      = std::chrono::duration_cast<std::chrono::milliseconds>(
-			                         std::chrono::steady_clock::now() - start)
-			                         .count();
-			if (outcome == PrecompileOutcome::Compiled) {
-				m_driver_cache_dirty.store(true, std::memory_order_relaxed);
-				m_precompile_dirty.store(true, std::memory_order_relaxed);
+		EnqueuePrecompile(record, false);
+	}
+	const auto recorded = progress.Get().queued;
+	// A created shader no session has dispatched gets the module of its code-only
+	// specialization, which the first dispatches of most such shaders use.
+	size_t failed = 0;
+	if (m_created != nullptr) {
+		for (const auto& record: m_created->Records()) {
+			if (m_manifest->HasShader(record->shader_hash)) {
+				continue;
 			}
-			if (m_precompile_progress.Finish(outcome, static_cast<uint64_t>(ms))) {
-				LogPrecompileStats("done");
+			if (m_precompile_attempts != nullptr && m_precompile_attempts->Failed(record->Key())) {
+				failed++;
+				continue;
 			}
-		});
-		if (!queued) {
-			progress.Rejected();
+			EnqueuePrecompile(record, true);
 		}
 	}
-	const auto queued = progress.Get().queued;
-	PipelineCacheLog("Precompile: {} recorded compute programs queued on {} threads", queued,
-	                 thread_count);
+	PipelineCacheLog("Precompile: {} recorded compute programs and {} created compute shaders "
+	                 "queued on {} threads ({} created shaders skipped after an unfinished "
+	                 "attempt)",
+	                 recorded, progress.Get().queued - recorded, thread_count, failed);
 	if (progress.EndQueueing()) {
 		LogPrecompileStats("done");
 	}
