@@ -1243,6 +1243,12 @@ bool MaterializeIndirectDescriptor(
 					return true;
 				}
 			}
+			// A key neither bounded nor counted by the program reaches every probe of the table,
+			// and most probes hold other record fields or stale data: a probe that is no
+			// descriptor of this access is not one the shader selects, so it reads as null (as an
+			// image table candidate of an unusable format does). A bounded or counted key names a
+			// record the shader may use, and a malformed one still fails the specialization.
+			const bool unbounded_probes = !indirect.table_maximum && indirect.key_count.IsEmpty();
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
 			// A DWORD start whose candidate normalizes to null interns as the null root (ordinal
@@ -1281,9 +1287,13 @@ bool MaterializeIndirectDescriptor(
 					} else {
 						candidate = heap_candidate(table_offset);
 					}
-					if (!normalize(candidate))
-						return normalization_failed(table_offset, word, step,
-						                            indirect.table_maximum ? "key" : "probe");
+					if (const auto mark = t_failure_reasons.text.size(); !normalize(candidate)) {
+						if (!unbounded_probes)
+							return normalization_failed(table_offset, word, step,
+							                            indirect.table_maximum ? "key" : "probe");
+						t_failure_reasons.text.resize(mark);
+						candidate = {.dword_count = dword_count};
+					}
 					const auto ordinal = intern_candidate(candidate);
 					if (ordinal == 0u) continue;
 					const auto mapping_word = image_heap ? table_offset / 4u : word * child_count + child;

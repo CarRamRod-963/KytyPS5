@@ -6912,6 +6912,38 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
               "unproved loop did not use the bounded descriptor table");
     }
   }
+  // Without a proven count the key reaches every 64-byte probe of the table
+  // (the 192-byte stride's power-of-two part), and most probes hold other
+  // record fields. A probe that is no descriptor of the access (Ghost of
+  // Yotei's CS 8b26ed4422b71476: a 56-byte record table probed every 8 bytes, a
+  // misaligned stride-1 field among its V#s) reads as null; a usable probe
+  // stays a candidate.
+  const auto unbounded = MakeBufferRecordFixture(1u, true, false, 0u, false,
+                                                 false, d32_components);
+  const auto unbounded_plan = ExtractResourcePlan(unbounded->program);
+  memory.words[0] = 4u;
+  const auto probe =
+      (table_offset + 192u + 64u + 160u) / 4u; // row 1, inside its fields
+  std::array<uint32_t, 4> misaligned{0x200001u, 8u << 16u, 16u,
+                                     (format << 12u) | DstSel(4, 5, 6, 1)};
+  std::copy(misaligned.begin(), misaligned.end(), memory.words.begin() + probe);
+  const auto has = [&](const std::array<uint32_t, 4> &words) {
+    return std::ranges::any_of(snapshot.buffers, [&](const auto &buffer) {
+      return std::equal(words.begin(), words.end(), buffer.dwords.begin());
+    });
+  };
+  Check(
+      MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
+          !has(misaligned),
+      "an unbounded key's probe that is no descriptor failed the walk or "
+      "became a candidate");
+  auto usable = misaligned;
+  usable[0] = 0x200000u;
+  std::copy(usable.begin(), usable.end(), memory.words.begin() + probe);
+  Check(
+      MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
+          has(usable),
+      "an unbounded key's usable probe was not a candidate");
 }
 
 void TestGuardedWaterfallBufferRecords() {
@@ -7053,7 +7085,27 @@ void TestGuardedWaterfallBufferRecords() {
           "waterfall bound mixed different lanes, values or resource uses");
     const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
     if (!proven) {
-      Check(!materialize(), "unproved waterfall bypassed conservative descriptor rejection");
+      // The unproved domain reaches the wrapped slot. Its poison is no
+      // descriptor of the access, so it reads as null; a usable descriptor in
+      // its place is a candidate.
+      const auto has = [&](const std::array<uint32_t, 4> &words) {
+        return std::ranges::any_of(snapshot.buffers, [&](const auto &buffer) {
+          return std::equal(words.begin(), words.end(), buffer.dwords.begin());
+        });
+      };
+      Check(materialize() && !has(poison),
+            "unproved waterfall failed on, or kept, a wrapped slot's "
+            "non-descriptor");
+      const std::array usable{
+          0x30000u, 12u << 16u, 32u,
+          (uint32_t(Prospero::BufferFormat::k32_32_32Float) << 12u) |
+              DstSel(4, 5, 6, 1)};
+      std::copy(usable.begin(), usable.end(),
+                memory.words.begin() + (table_offset + 480u) / 4u);
+      Check(materialize() && has(usable),
+            "unproved waterfall domain lost its wrapped slot");
+      std::copy(poison.begin(), poison.end(),
+                memory.words.begin() + (table_offset + 480u) / 4u);
       continue;
     }
     for (const uint32_t count : {2u, 0u, 1u, 2u}) {
