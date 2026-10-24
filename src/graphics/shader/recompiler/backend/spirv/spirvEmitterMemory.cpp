@@ -485,7 +485,11 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto selected = ctx.Arg(handle, 0);
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	// Candidates grouped by layout: a switch over the layouts, each one indexed access.
+	const auto runs =
+	    shared ? std::vector<IndirectBufferRun> {} : IndirectBufferLayoutRuns(state, root_resource);
+	const auto indexed         = shared || !runs.empty();
+	const auto empty_root      = indexed && buffer.packed_stride == 0u;
 	const auto selected_access = [&]() {
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
@@ -499,12 +503,36 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 			mem.resource = representative;
 			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
 		}
+		if (!runs.empty()) {
+			// The run of the selected ordinal is the number of later runs starting at or below it.
+			auto run = ConstantU32(state, 0u);
+			for (size_t index = 1; index < runs.size(); ++index) {
+				run = EmitAddU32(
+				    state, run,
+				    Select(state, TypeU32(state),
+				           Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selected,
+				                  ConstantU32(state, runs[index].first_ordinal)),
+				           ConstantU32(state, 1u), ConstantU32(state, 0u)));
+			}
+			return EmitIndexSwitch(
+			    state, run, static_cast<uint32_t>(runs.size()),
+			    has_result ? TypeU32Composite(state, components) : 0u, [&](uint32_t item) {
+				    const auto& entry = runs[item];
+				    if (state.program.info.buffers[entry.representative].packed_stride == 0u)
+					    return access(entry.representative);
+				    const auto slot =
+				        EmitAddU32(state, selected,
+				                   ConstantU32(state, entry.first_slot - entry.first_ordinal));
+				    mem.resource = entry.representative;
+				    return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+			    });
+		}
 		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
 		                       has_result ? TypeU32Composite(state, components) : 0u,
 		                       [&](uint32_t item) { return access(buffer.indirect_resources[item]); });
 	};
 	if constexpr (!has_result) {
-		if (!shared) return selected_access();
+		if (!indexed) return selected_access();
 	}
 	auto valid = Binary(state, spv::OpULessThan, TypeBool(state), selected,
 	                          ConstantU32(state, buffer.indirect_resources.size()));
