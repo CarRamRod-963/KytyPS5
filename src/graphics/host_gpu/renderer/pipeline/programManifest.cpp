@@ -20,7 +20,7 @@ using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 static_assert(sizeof(Specialization::Buffer) == 32);
 static_assert(sizeof(Specialization::Image) == 40);
 static_assert(sizeof(Specialization::Sampler) == 16);
-static_assert(sizeof(ShaderComputeInputInfo) == 104);
+static_assert(sizeof(ShaderComputeInputInfo) == 112);
 
 constexpr std::array<char, 8> FileMagic          = {'K', 'y', 'P', 'r', 'o', 'g', 'M', 'f'};
 constexpr uint8_t             KindCode           = 1;
