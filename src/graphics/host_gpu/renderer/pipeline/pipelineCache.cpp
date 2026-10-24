@@ -876,7 +876,7 @@ struct PipelineCache::ProgramCache {
 			    LookaheadMemory {.read      = Libs::LibKernel::Memory::TryReadBacking,
 			                     .gpu_dirty = Libs::LibKernel::Memory::HasGpuDirtyBytes,
 			                     .same      = SameBacking},
-			    lookahead_threads);
+			    lookahead_threads, image_heap);
 		}
 	}
 	~ProgramCache() {
@@ -1596,11 +1596,11 @@ void PipelineCache::KickLookahead() {
 			return static_cast<unsigned long long>(stats.outcomes[static_cast<size_t>(outcome)]);
 		};
 		LOGF("Lookahead: %u helpers, %llu planned, adopted %llu, not planned %llu, changed %llu, "
-		     "late %llu, failed %llu, dirty %llu, moved %llu (10 s)\n",
+		     "late %llu, failed %llu, dirty %llu, moved %llu, heap %llu (10 s)\n",
 		     programs.lookahead->HelperCount(), static_cast<unsigned long long>(stats.planned),
 		     count(Outcome::Adopted), count(Outcome::NotPlanned), count(Outcome::Changed),
 		     count(Outcome::Late), count(Outcome::Failed), count(Outcome::Dirty),
-		     count(Outcome::Moved));
+		     count(Outcome::Moved), count(Outcome::Heap));
 	} else {
 		(void)programs.lookahead->TakeStats();
 	}
