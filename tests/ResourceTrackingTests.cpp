@@ -6899,6 +6899,23 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(!materialize(), "formatted record accepted unproved alignment or addressing");
+    // Work that must run binds the root it cannot serve as null; the other root
+    // keeps its candidates, and the key map of the nulled root is the empty
+    // one.
+    auto degraded = runtime;
+    degraded.null_failed_roots = true;
+    Check(MaterializeResources(plan, degraded, snapshot, specialization) &&
+              snapshot.nulled_roots == 1u &&
+              std::ranges::all_of(snapshot.buffers[0].dwords,
+                                  [](uint32_t w) { return w == 0u; }) &&
+              std::ranges::none_of(
+                  specialization.buffers,
+                  [](const auto &b) { return b.indirect_root == 0u; }) &&
+              std::ranges::count_if(
+                  specialization.buffers,
+                  [](const auto &b) { return b.indirect_root == 1u; }) >= 4,
+          "an unservable record root was not bound as null beside its served "
+          "sibling");
     memory.words[word] = saved;
   }
   memory.words[0] = MaxIndirectDescriptorProbes + 1u;

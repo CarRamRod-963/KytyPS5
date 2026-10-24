@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -107,6 +108,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // How many specialization failures MaterializeResources has printed: one line per shader per
 // session, none for a speculative walk (SrtRuntime::speculative).
 uint64_t SpecializationFailureReports();
+// The failure line this thread's last reporting MaterializeResources call printed, empty when
+// none printed one since the last take.
+std::string TakeSpecializationFailureReport();
 
 // Whether a module compiled for `compiled` behaves exactly as one compiled for `current`
 // would. Equal layouts do; so does any layout of an unbound direct buffer when both layouts read

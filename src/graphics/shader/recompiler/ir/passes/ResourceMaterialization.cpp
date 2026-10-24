@@ -80,6 +80,8 @@ struct FailureReasons {
 thread_local FailureReasons t_failure_reasons;
 
 std::atomic<uint64_t> g_failure_reports {0};
+// The line this thread's last MaterializeResources call printed (TakeSpecializationFailureReport).
+thread_local std::string t_last_report;
 
 bool SpecializationFail(std::string_view message) {
 	auto& reasons = t_failure_reasons;
@@ -91,17 +93,22 @@ bool SpecializationFail(std::string_view message) {
 }
 
 // A shader that cannot be specialized usually fails the same way for every draw; its first
-// failure names the reasons and later ones are not printed.
-void ReportSpecializationFailure(uint64_t shader_hash, const std::string& reasons) {
+// failure names the reasons and later ones are not printed. A walk that bound unsupported roots
+// as null (SrtRuntime::null_failed_roots) is reported once more, with that outcome. The caller
+// can log the line too (TakeSpecializationFailureReport).
+void ReportSpecializationFailure(uint64_t shader_hash, const std::string& reasons, bool nulled) {
 	static std::mutex                   mutex;
-	static std::unordered_set<uint64_t> reported;
+	static std::unordered_set<uint64_t> reported[2];
 	{
 		std::scoped_lock lock(mutex);
-		if (!reported.insert(shader_hash).second) return;
+		if (!reported[nulled ? 1 : 0].insert(shader_hash).second) return;
 	}
 	g_failure_reports.fetch_add(1u, std::memory_order_relaxed);
-	std::fprintf(stderr, "shader resource specialization failed: hash=%016llx %s\n",
-	             static_cast<unsigned long long>(shader_hash), reasons.c_str());
+	t_last_report =
+	    fmt::format("shader resource specialization {}: hash={:016x} {}",
+	                nulled ? "failed, unsupported GPU-selected roots bound as null" : "failed",
+	                shader_hash, reasons);
+	std::fprintf(stderr, "%s\n", t_last_report.c_str());
 }
 
 // The draw's guest data cannot be enumerated (see ResourceSnapshot::unavailable). The data can
@@ -2701,6 +2708,10 @@ uint64_t SpecializationFailureReports() {
 	return g_failure_reports.load(std::memory_order_relaxed);
 }
 
+std::string TakeSpecializationFailureReport() {
+	return std::exchange(t_last_report, {});
+}
+
 static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                                      ResourceSnapshot&       snapshot,
                                      ResourceSpecialization& specialization) {
@@ -2709,7 +2720,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 	auto& scratch = *program.materialization_scratch;
 	for (auto& keys: program.selector_keys) keys.resolved = false;
-	snapshot.unavailable = false;
+	snapshot.unavailable  = false;
+	snapshot.nulled_roots = 0u;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -2839,6 +2851,44 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	auto& class_spares = scratch.class_spares;
 	padding.clear();
 	class_spares.clear();
+	// What a GPU-selected root's enumeration may have added before it failed, so that the root
+	// can be bound as null instead (SrtRuntime::null_failed_roots). Its reads are kept: they are
+	// still the data the draw's specialization depends on.
+	struct RootMark {
+		size_t descriptors   = 0;
+		size_t flattened_srt = 0;
+		size_t bindless_uses = 0;
+		size_t padding       = 0;
+		size_t class_spares  = 0;
+	};
+	const auto mark_root = [&](size_t descriptors) {
+		return RootMark {descriptors, snapshot.flattened_srt.size(), snapshot.bindless_uses.size(),
+		                 padding.size(), class_spares.size()};
+	};
+	// Records why a root cannot be served; true when it is bound as null (no candidates, its
+	// header naming the empty map: every key selects the null root) and the walk goes on.
+	const auto root_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
+	                             const RootMark& mark, auto& descriptors, auto& specializations,
+	                             const auto& root, uint32_t header, uint32_t bindless) {
+		resource_failed(kind, resource, source, descriptors.size());
+		if (!runtime.null_failed_roots || snapshot.unavailable) return false;
+		const auto dword_count = descriptors[resource].dword_count;
+		descriptors.resize(mark.descriptors);
+		specializations.resize(mark.descriptors);
+		descriptors[resource]     = {.dword_count = dword_count};
+		specializations[resource] = root;
+		snapshot.flattened_srt.resize(mark.flattened_srt);
+		if (header != UINT32_MAX) snapshot.flattened_srt[header] = empty_map;
+		if (bindless != UINT32_MAX) {
+			snapshot.flattened_srt[bindless]      = 0u;
+			snapshot.flattened_srt[bindless + 1u] = 0u;
+		}
+		snapshot.bindless_uses.resize(mark.bindless_uses);
+		padding.resize(mark.padding);
+		class_spares.resize(mark.class_spares);
+		++snapshot.nulled_roots;
+		return true;
+	};
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -2852,6 +2902,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					const auto mark = mark_root(snapshot.buffers.size());
+					const auto root = specialization.buffers[i];
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, UINT32_MAX,
@@ -2859,8 +2911,11 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
-					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+					        }) &&
+					    !root_failed("buffer", i, base.source, mark, snapshot.buffers,
+					                 specialization.buffers, root, scratch.buffer_headers[i],
+					                 UINT32_MAX))
+						return false;
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
@@ -2945,10 +3000,13 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			// Candidates read from guest tables (rather than enumerated by the program) may
 			// belong to other image operations.
 			const bool table_candidates = bounded_table || indirect.sources.empty();
+			const auto mark             = mark_root(snapshot.images.size());
+			const auto root             = specialization.images[i];
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot,
 			        snapshot.images, specialization.images, bindless_mapping[i],
-			        scratch.image_headers[i], padding, class_spares, [&](DescriptorValue& value) {
+			        scratch.image_headers[i], padding, class_spares,
+			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations;
 				        // a selector names exactly the records the shader uses, so a malformed one
 				        // still fails the specialization. Another dimension is only nulled in a
@@ -2963,8 +3021,10 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				             !ImageDescriptorFormatUsable(image, value)))
 					        value.dwords.fill(0u);
 				        return true;
-			        })) {
-				return resource_failed("image", i, image.source, snapshot.images.size());
+			        }) &&
+			    !root_failed("image", i, image.source, mark, snapshot.images, specialization.images,
+			                 root, scratch.image_headers[i], bindless_mapping[i])) {
+				return false;
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
@@ -2988,12 +3048,17 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
+				const auto mark      = mark_root(snapshot.samplers.size());
+				const auto root      = specialization.samplers[i];
 				if ((active.empty() || active[source]) &&
 				    !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
 				        specialization.samplers, UINT32_MAX, scratch.sampler_headers[i], padding,
-				        class_spares, [](DescriptorValue&) { return true; }))
-					return resource_failed("sampler", i, source, snapshot.samplers.size());
+				        class_spares, [](DescriptorValue&) { return true; }) &&
+				    !root_failed("sampler", i, source, mark, snapshot.samplers,
+				                 specialization.samplers, root, scratch.sampler_headers[i],
+				                 UINT32_MAX))
+					return false;
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];
 				if (!evaluate(source, snapshot.samplers[i])) return false;
@@ -3048,7 +3113,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const bool done = MaterializeResourcesImpl(program, runtime, snapshot, specialization);
 	// An unavailable draw has already named its reason.
 	if (!done && !snapshot.unavailable && !reasons.text.empty())
-		ReportSpecializationFailure(program.shader_hash, reasons.text);
+		ReportSpecializationFailure(program.shader_hash, reasons.text, false);
+	if (done && snapshot.nulled_roots != 0u && !reasons.speculative)
+		ReportSpecializationFailure(program.shader_hash, reasons.text, true);
 	reasons.text.clear();
 	return done;
 }

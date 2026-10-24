@@ -82,6 +82,9 @@ struct ResourceSnapshot {
 	// set reads memory that is not mapped or needs more probes than the host enumerates. The
 	// shader is supported; the draw that supplied the data cannot be specialized.
 	bool unavailable = false;
+	// GPU-selected roots bound as null because their candidates cannot be served (only with
+	// SrtRuntime::null_failed_roots).
+	uint32_t nulled_roots = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

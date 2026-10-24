@@ -310,16 +310,35 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
-		// Refreshes resources and specialization for a draw. False only when the draw's guest
-		// data cannot be specialized (an unsupported shader still exits).
-		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
-			if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                               specialization)) {
-				NoteUserDataReads();
-				return true;
+		// Refreshes resources and specialization for a draw. False when the draw cannot be
+		// specialized: its guest data is unavailable, or the plan cannot serve one of its
+		// descriptors (reported once per shader); the caller skips the draw. A dispatch is run
+		// instead with the GPU-selected roots that cannot be served bound as null: its writes
+		// through its other resources may be what the host or later work reads, and a skipped
+		// dispatch would leave all of them stale. Once a dispatch needed that, its later walks
+		// bind failed roots as null directly (a walk where every root is served is unchanged).
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime, ShaderType stage) {
+			auto       walk        = runtime;
+			const auto materialize = [&] {
+				const bool done = ShaderRecompiler::IR::MaterializeResources(
+				    resource_plan, walk, resources, specialization);
+				// The first report of each shader also goes to the log.
+				if (const auto report = ShaderRecompiler::IR::TakeSpecializationFailureReport();
+				    !report.empty()) {
+					PipelineCacheLog("{}", report);
+				}
+				return done;
+			};
+			walk.null_failed_roots = null_failed_roots;
+			if (!materialize()) {
+				if (resources.unavailable || stage != ShaderType::Compute || null_failed_roots)
+					return false;
+				null_failed_roots      = true;
+				walk.null_failed_roots = true;
+				if (!materialize()) return false;
 			}
-			EXIT_IF(!resources.unavailable);
-			return false;
+			NoteUserDataReads();
+			return true;
 		}
 
 		// After a refresh (Materialize, or a lookahead snapshot taken in its place).
@@ -381,6 +400,8 @@ struct PipelineCache::ProgramCache {
 		// command streams do not plan).
 		std::shared_ptr<LookaheadPlan>             lookahead;
 		bool                                       skip_dispatch = false;
+		// A dispatch of this shader had a GPU-selected root the plan cannot serve (Materialize).
+		bool null_failed_roots = false;
 	};
 
 	struct ProgramKeyHash {
@@ -402,16 +423,18 @@ struct PipelineCache::ProgramCache {
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
 	// A draw whose GPU-selected resources cannot be enumerated (unmapped guest memory, more
-	// probes than the host reads) is skipped rather than run with descriptors that may name
-	// the wrong memory; the shader's next draw is specialized afresh.
+	// probes than the host reads) or served (a descriptor the plan does not support) is skipped
+	// rather than run with descriptors that may name the wrong memory; the shader's next draw is
+	// specialized afresh.
 	template <typename InputInfo>
 	static ShaderProgram SkipUnavailableDraw(ShaderType stage, uint64_t hash,
 	                                         InputInfo& input_info) {
 		input_info.stage = {};
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1u, std::memory_order_relaxed) < 64u) {
-			std::printf("Shader %u %016" PRIx64 ": resources unavailable for this draw, skipped\n",
-			            static_cast<uint32_t>(stage), hash);
+			PipelineCacheLog("Shader {} {:016x}: resources cannot be specialized for this draw, "
+			                 "skipped",
+			                 static_cast<uint32_t>(stage), hash);
 		}
 		return {};
 	}
@@ -593,7 +616,7 @@ struct PipelineCache::ProgramCache {
 				bool materialized = adopted;
 				if (!adopted) {
 					read_cache.Prefetch(cached.walk_read_backs);
-					materialized = cached.Materialize(runtime);
+					materialized = cached.Materialize(runtime, stage);
 					read_cache.Prefetch({});
 					if (const auto read_backs = read_cache.ReadBacks(); !read_backs.empty()) {
 						cached.walk_read_backs.assign(read_backs.begin(), read_backs.end());
@@ -694,11 +717,11 @@ struct PipelineCache::ProgramCache {
 				    next_lookahead_helper++);
 				PublishLookahead(stage, params, entry->second);
 			}
-			if (!entry->second.Materialize(runtime))
+			if (!entry->second.Materialize(runtime, stage))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 		} else if (source_changed) {
 			entry->second.resource_plan = ExtractPlan(translated.program, entry->second.walker_job);
-			if (!entry->second.Materialize(runtime))
+			if (!entry->second.Materialize(runtime, stage))
 				return SkipUnavailableDraw(stage, params.hash, input_info);
 			if (const auto* permutation = entry->second.FindPermutation<true>(push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};

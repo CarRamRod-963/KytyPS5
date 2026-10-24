@@ -101,6 +101,10 @@ struct SrtRuntime {
 	// A walk ahead of the commands that may still write its guest data (ResourceLookahead):
 	// MaterializeResources reports none of its failures, the caller counts them.
 	bool speculative = false;
+	// A GPU-selected root whose candidates cannot be served (a descriptor the plan does not
+	// support) is bound as null instead of failing the walk; ResourceSnapshot::nulled_roots
+	// counts them. For work that must run even when one of its resources cannot.
+	bool null_failed_roots = false;
 };
 
 class SrtReadCapture {
