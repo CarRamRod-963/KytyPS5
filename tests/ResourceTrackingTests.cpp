@@ -6989,10 +6989,14 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
   memory.words[first] = first_address;
   memory.words[first + 2u] = 16u;
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
-           {{first + 1u, 4u << 16u}, {first + 1u, 9u << 16u},
-            {first, memory.words[first] + 1u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)},
-            {first + 1u, (8u << 16u) | (1u << 31u)}}}) {
+  for (const auto [word, replacement] :
+       std::array<std::pair<uint32_t, uint32_t>, 6>{
+           {{first + 1u, 4u << 16u},
+            {first + 1u, 9u << 16u},
+            {first, memory.words[first] + 1u},
+            {first + 3u, memory.words[first + 3u] | (1u << 28u)},
+            {first + 1u, (8u << 16u) | (1u << 31u)},
+            {first + 3u, (format << 12u) | DstSel(2, 5, 6, 1)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(!materialize(), "formatted record accepted unproved alignment or addressing");
@@ -7058,6 +7062,121 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
       MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
           has(usable),
       "an unbounded key's usable probe was not a candidate");
+  // A probe whose memory is not mapped is not one the shader reads either.
+  auto mapped_runtime = runtime;
+  mapped_runtime.mapped_range_size = [](uint64_t address,
+                                        uint64_t size) -> uint64_t {
+    constexpr uint64_t begin = 0x200000u, end = 0x400000u;
+    return address >= begin && address < end ? std::min(size, end - address)
+                                             : 0u;
+  };
+  Check(MaterializeResources(unbounded_plan, mapped_runtime, snapshot,
+                             specialization) &&
+            has(usable),
+        "an unbounded key's mapped probe was not a candidate");
+  auto unmapped = usable;
+  unmapped[0] = 0x900000u;
+  std::copy(unmapped.begin(), unmapped.end(), memory.words.begin() + probe);
+  Check(MaterializeResources(unbounded_plan, mapped_runtime, snapshot,
+                             specialization) &&
+            !has(unmapped),
+        "an unbounded key's unmapped probe became a candidate");
+  // A reserved selector for a component the load reads has no defined value.
+  auto reserved = usable;
+  reserved[3] = (format << 12u) | DstSel(3, 5, 6, 1);
+  std::copy(reserved.begin(), reserved.end(), memory.words.begin() + probe);
+  Check(
+      MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
+          !has(reserved),
+      "an unbounded key's probe with a reserved dst_sel became a candidate");
+  // Past MaxMixedLayoutBufferCandidates, candidates of several layouts are
+  // grouped by layout, each group padded to a power of two with spares of its
+  // layout, and the key map follows them; more layouts than the module
+  // switches over cannot be served, and work that must run binds the root as
+  // null. Candidates of one layout share an access at any count.
+  memory.words.resize(0x8000u / 4u);
+  std::fill(memory.words.begin() + table_offset / 4u, memory.words.end(), 0u);
+  constexpr uint32_t many = 80u;
+  user_data[2] = (160u + 64u * many) / 8u + 2u;
+  const auto many_record = [&](uint32_t k, uint32_t layouts) {
+    // Layout k % layouts: a swizzle permutation per layout.
+    constexpr std::array swizzles{
+        DstSel(4, 5, 6, 1), DstSel(5, 4, 6, 1), DstSel(6, 5, 4, 1),
+        DstSel(4, 6, 5, 1), DstSel(5, 6, 4, 1), DstSel(6, 4, 5, 1),
+        DstSel(4, 4, 6, 1), DstSel(5, 5, 6, 1), DstSel(6, 6, 6, 1)};
+    return std::array<uint32_t, 4>{0x200000u + k * 0x100u, 8u << 16u, 16u,
+                                   (format << 12u) | swizzles[k % layouts]};
+  };
+  const auto fill_many = [&](uint32_t layouts) {
+    for (uint32_t k = 0; k < many; ++k) {
+      const auto record = many_record(k, layouts);
+      std::copy(record.begin(), record.end(),
+                memory.words.begin() + (table_offset + 160u + 64u * k) / 4u);
+    }
+  };
+  // The root-0 candidates in ordinal order, and whether each probe's key maps
+  // to the candidate holding its record.
+  const auto root_candidates = [&] {
+    std::vector<uint32_t> children;
+    for (uint32_t index =
+             static_cast<uint32_t>(unbounded_plan.info.buffers.size());
+         index < specialization.buffers.size(); ++index)
+      if (specialization.buffers[index].indirect_root == 0u)
+        children.push_back(index);
+    return children;
+  };
+  const auto maps_records = [&](uint32_t layouts) {
+    const auto children = root_candidates();
+    const auto mapping = KeyMapOffset(snapshot, specialization.buffers[0]);
+    for (uint32_t k = 0; k < many; ++k) {
+      const auto ordinal = snapshot.flattened_srt[mapping + 1u + k];
+      if (ordinal == 0u || ordinal > children.size())
+        return false;
+      const auto record = many_record(k, layouts);
+      if (!std::equal(record.begin(), record.end(),
+                      snapshot.buffers[children[ordinal - 1u]].dwords.begin()))
+        return false;
+    }
+    return true;
+  };
+  fill_many(2u);
+  Check(
+      MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
+          root_candidates().size() == 128u && maps_records(2u),
+      "two layouts of many candidates were not grouped and mapped");
+  {
+    // Each group is contiguous, of one layout, and padded with its layout.
+    const auto children = root_candidates();
+    bool grouped = true;
+    for (uint32_t ordinal = 0; ordinal < children.size(); ++ordinal) {
+      const auto &candidate = specialization.buffers[children[ordinal]];
+      const auto &lead =
+          specialization.buffers[children[ordinal < 64u ? 0u : 64u]];
+      grouped = grouped &&
+                candidate.descriptor_swizzle == lead.descriptor_swizzle &&
+                candidate.packed_stride == lead.packed_stride;
+    }
+    Check(grouped &&
+              specialization.buffers[children[0]].descriptor_swizzle !=
+                  specialization.buffers[children[64]].descriptor_swizzle,
+          "grouped candidates or their spares mixed layouts");
+  }
+  fill_many(MaxIndirectBufferLayouts + 1u);
+  Check(
+      !MaterializeResources(unbounded_plan, runtime, snapshot, specialization),
+      "a root with many candidates in too many layouts was served");
+  auto many_degraded = runtime;
+  many_degraded.null_failed_roots = true;
+  Check(
+      MaterializeResources(unbounded_plan, many_degraded, snapshot,
+                           specialization) &&
+          snapshot.nulled_roots == 1u,
+      "a root with many candidates in too many layouts was not bound as null");
+  fill_many(1u);
+  Check(
+      MaterializeResources(unbounded_plan, runtime, snapshot, specialization) &&
+          root_candidates().size() == 127u && maps_records(1u),
+      "a root with many candidates of one layout was not served");
 }
 
 void TestGuardedWaterfallBufferRecords() {

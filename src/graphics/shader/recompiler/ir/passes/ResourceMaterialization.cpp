@@ -24,6 +24,17 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// The layout a buffer descriptor gives the module (see ResourceSpecialization::Buffer): the V#
+// stride bits with any nonzero stride as 1 (the stride itself is a shader-data word), and the
+// format and swizzle of a formatted resource.
+struct BufferLayout {
+	uint32_t               packed_stride = 0;
+	Prospero::BufferFormat format        = Prospero::BufferFormat::kInvalid;
+	uint32_t               swizzle       = DstSel(4, 5, 6, 7);
+
+	bool operator==(const BufferLayout&) const = default;
+};
+
 // Vectors MaterializeResources fills and empties again within one refresh. They keep their
 // capacity in the plan, so a refresh of a known shape allocates nothing; every user clears or
 // assigns its vector before reading it.
@@ -38,6 +49,8 @@ struct MaterializationScratch {
 	std::vector<uint32_t>                                     class_list;
 	std::vector<uint32_t>                                     class_starts;
 	std::vector<uint32_t>                                     class_order;
+	std::vector<BufferLayout>                                 buffer_layouts;
+	std::vector<ResourceSpecialization::Buffer>               grouped_buffers;
 	std::vector<DescriptorValue>                              grouped;
 	std::vector<ResourceSpecialization::Image>                grouped_images;
 	std::vector<uint32_t>                                     renumber;
@@ -367,7 +380,10 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+// `components` are the output components the resource's formatted reads use (see
+// ResourcePlan::formatted_components).
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             uint32_t components) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
@@ -398,6 +414,12 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		const auto format = Format::GetFormatInfo(descriptor.Format());
 		if (!indexed || format.type == Format::ComponentType::Unknown)
 			return rejected("indirect formatted buffers require a supported indexed format");
+		// A reserved selector (2 or 3) for a component the shader reads has no defined value.
+		for (uint32_t component = 0; component < 4u; ++component) {
+			const auto selector = GetDstSel(descriptor.DstSelXYZW(), component);
+			if (((components >> component) & 1u) != 0u && (selector == 2u || selector == 3u))
+				return rejected("indirect formatted buffers require defined dst_sel selectors");
+		}
 		if (!formatted_read) {
 			const bool scalar = resource.max_byte_extent == 4u &&
 			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
@@ -426,6 +448,69 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		return rejected("indirect buffer stores require exact linear DWORD or byte bounds");
 	}
 	return true;
+}
+
+BufferLayout DescriptorBufferLayout(const ShaderBufferResource& descriptor, bool formatted) {
+	auto       packed_stride = descriptor.PackedStride();
+	const auto stride        = packed_stride & 0x3fffu;
+	const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed_stride &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed_stride &= ~(3u << 16u);
+	}
+	if (stride != 0u) packed_stride = (packed_stride & ~0x3fffu) | 1u;
+	return {.packed_stride = packed_stride,
+	        .format        = formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid,
+	        .swizzle       = formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7)};
+}
+
+// The renderer accesses GPU-selected buffer candidates of one layout through one dynamically
+// indexed binding, and a few candidates of several layouts through a switch with an arm per
+// candidate. More candidates than this in several layouts are grouped by layout, and the module
+// switches over the layouts (at most MaxIndirectBufferLayouts) instead: a switch arm per
+// candidate for Ghost of Yotei's CS 8b26ed4422b71476 (2047 vertex-stream V#s of two formats in
+// 56-byte records) was a module of five million words that the driver did not build in minutes.
+constexpr size_t MaxMixedLayoutBufferCandidates = 64u;
+
+bool NullDescriptorWords(const DescriptorValue& value) {
+	return std::ranges::all_of(value.dwords, [](uint32_t word) { return word == 0u; });
+}
+
+// The layout of a normalized GPU-selected buffer candidate (zero DWORDs: none).
+std::optional<BufferLayout> CandidateBufferLayout(const DescriptorValue& candidate,
+                                                  bool                   formatted) {
+	ShaderBufferResource descriptor;
+	if (NullDescriptorWords(candidate) || !DecodeBufferDescriptor(candidate, descriptor) ||
+	    descriptor.Type() != 0u)
+		return std::nullopt;
+	return DescriptorBufferLayout(descriptor, formatted);
+}
+
+// Whether the renderer can bind a GPU-selected buffer candidate's memory: all of it is mapped
+// guest memory, or the start of a V# without a record bound (NumRecords ~0, a sentinel the
+// renderer clamps). A candidate without memory is bound as null anyway.
+bool CandidateMemoryMapped(const DescriptorValue& candidate, const SrtRuntime& runtime) {
+	ShaderBufferResource descriptor;
+	if (runtime.mapped_range_size == nullptr || !DecodeBufferDescriptor(candidate, descriptor) ||
+	    descriptor.Base48() == 0u || descriptor.GetSize() == 0u)
+		return true;
+	const uint64_t needed = descriptor.NumRecords() == UINT32_MAX ? 1u : descriptor.GetSize();
+	return runtime.mapped_range_size(descriptor.Base48(), needed) >= needed;
+}
+
+// Whether the candidates of a GPU-selected buffer root are more than a switch arm each allows, in
+// more layouts than the module switches over.
+bool TooManyMixedLayoutCandidates(std::span<const DescriptorValue> candidates, bool formatted) {
+	if (candidates.size() <= MaxMixedLayoutBufferCandidates) return false;
+	std::vector<BufferLayout> layouts;
+	for (const auto& candidate: candidates) {
+		const auto layout = CandidateBufferLayout(candidate, formatted);
+		if (!layout || std::ranges::find(layouts, *layout) != layouts.end()) continue;
+		layouts.push_back(*layout);
+		if (layouts.size() > MaxIndirectBufferLayouts) return true;
+	}
+	return false;
 }
 
 bool IsBoundedDescriptorTable(const ResourcePlan& program,
@@ -880,6 +965,83 @@ bool MaterializeIndirectDescriptor(
 		}
 		return true;
 	};
+	// Buffer candidates of several layouts are accessed through a switch arm each, which only a
+	// few candidates afford. Past MaxMixedLayoutBufferCandidates behind a null root (a table
+	// enumeration) the children are grouped by layout in order of first appearance, each group
+	// padded to a power of two with null spares that take the group's layout (class_spares:
+	// spare, donor), and the keys in the map renumbered: each group is then one dynamically
+	// indexed access of a switch over the layouts. False when the candidates are not grouped.
+	const auto group_buffer_candidates = [&](size_t map_first, size_t map_entries,
+	                                         size_t entry_stride) {
+		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
+			const auto count = descriptors.size() - children_begin;
+			if (count <= MaxMixedLayoutBufferCandidates ||
+			    !NullDescriptorWords(descriptors[resource_index]))
+				return false;
+			const bool formatted = program.info.buffers[resource_index].formatted;
+			auto&      scratch   = *program.materialization_scratch;
+			auto&      layouts   = scratch.buffer_layouts;
+			auto&      ranks     = scratch.class_ranks;
+			auto&      starts    = scratch.class_starts;
+			auto&      order     = scratch.class_order;
+			layouts.clear();
+			ranks.resize(count);
+			for (uint32_t child = 0; child < count; ++child) {
+				const auto layout =
+				    CandidateBufferLayout(descriptors[children_begin + child], formatted);
+				// Children are distinct from the null root, so each has a layout.
+				if (!layout) return false;
+				auto found = std::ranges::find(layouts, *layout);
+				if (found == layouts.end()) found = layouts.insert(layouts.end(), *layout);
+				ranks[child] = static_cast<uint32_t>(found - layouts.begin());
+			}
+			if (layouts.size() < 2u || layouts.size() > MaxIndirectBufferLayouts) return false;
+			starts.assign(layouts.size() + 1u, 0u);
+			for (const auto rank: ranks)
+				++starts[rank + 1u];
+			for (size_t rank = 1; rank < starts.size(); ++rank)
+				starts[rank] += starts[rank - 1u];
+			order.resize(count);
+			for (uint32_t child = 0; child < count; ++child)
+				order[starts[ranks[child]]++] = child;
+			auto& grouped                 = scratch.grouped;
+			auto& grouped_specializations = scratch.grouped_buffers;
+			auto& renumber                = scratch.renumber;
+			grouped.clear();
+			grouped_specializations.clear();
+			renumber.assign(count + 1u, 0u);
+			auto child_template          = root_resource;
+			child_template.indirect_root = resource_index;
+			for (size_t rank = 0, first = 0; rank < layouts.size(); ++rank) {
+				const size_t last  = starts[rank];
+				const auto   donor = static_cast<uint32_t>(children_begin + grouped.size());
+				for (auto member = first; member < last; ++member) {
+					renumber[order[member] + 1u] = static_cast<uint32_t>(grouped.size() + 1u);
+					grouped.push_back(descriptors[children_begin + order[member]]);
+					grouped_specializations.push_back(
+					    specializations[children_begin + order[member]]);
+				}
+				for (auto slots = std::bit_ceil(last - first); slots > last - first; --slots) {
+					class_spares.emplace_back(
+					    static_cast<uint32_t>(children_begin + grouped.size()), donor);
+					grouped.push_back({.dword_count = dword_count});
+					grouped_specializations.push_back(child_template);
+				}
+				first = last;
+			}
+			descriptors.resize(children_begin);
+			specializations.resize(children_begin);
+			descriptors.insert(descriptors.end(), grouped.begin(), grouped.end());
+			specializations.insert(specializations.end(), grouped_specializations.begin(),
+			                       grouped_specializations.end());
+			for (size_t entry = 0; entry < map_entries; ++entry) {
+				auto& ordinal = snapshot.flattened_srt[map_first + entry * entry_stride];
+				if (ordinal != 0u) ordinal = renumber[ordinal];
+			}
+			return true;
+		}
+		return false;
+	};
 	// A heap's two words live at a place fixed by the plan, so the mapping offsets the program
 	// bakes do not move with the length of other tables' key maps.
 	// A key map's offset depends on the lengths of the maps before it, which change with the
@@ -1253,8 +1415,9 @@ bool MaterializeIndirectDescriptor(
 			// A key neither bounded nor counted by the program reaches every probe of the table,
 			// and most probes hold other record fields or stale data: a probe that is no
 			// descriptor of this access is not one the shader selects, so it reads as null (as an
-			// image table candidate of an unusable format does). A bounded or counted key names a
-			// record the shader may use, and a malformed one still fails the specialization.
+			// image table candidate of an unusable format does), and so does a buffer probe whose
+			// memory is not mapped. A bounded or counted key names a record the shader may use,
+			// and a malformed one still fails the specialization.
 			const bool unbounded_probes = !indirect.table_maximum && indirect.key_count.IsEmpty();
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
@@ -1301,6 +1464,10 @@ bool MaterializeIndirectDescriptor(
 						t_failure_reasons.text.resize(mark);
 						candidate = {.dword_count = dword_count};
 					}
+					if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
+						if (unbounded_probes && !CandidateMemoryMapped(candidate, runtime))
+							candidate = {.dword_count = dword_count};
+					}
 					const auto ordinal = intern_candidate(candidate);
 					if (ordinal == 0u) continue;
 					const auto mapping_word = image_heap ? table_offset / 4u : word * child_count + child;
@@ -1319,8 +1486,10 @@ bool MaterializeIndirectDescriptor(
 				snapshot.flattened_srt.resize(mapping_offset + 1u + std::bit_ceil(entries), 0u);
 				// Store candidates are bound buffers; tables of them are as large as the scene's
 				// object list (Ghost of Yotei CS 0x8457901d80b91921: about 60 per scene).
-				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>)
-					pad_candidates();
+				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
+					if (!group_buffer_candidates(mapping_offset + 1u, entries, 1u))
+						pad_candidates();
+				}
 				if (!group_image_candidates(mapping_offset + 1u, entries, 1u)) return false;
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
@@ -1463,7 +1632,7 @@ bool MaterializeIndirectDescriptor(
 		const auto unique = descriptors.size() - children_begin + 1u;
 		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
 			if (!group_image_candidates(mapping_offset + 2u, key_count, 2u)) return false;
-		} else {
+		} else if (!group_buffer_candidates(mapping_offset + 2u, key_count, 2u)) {
 			pad_candidates();
 		}
 		auto& root                      = specializations[resource_index];
@@ -2894,19 +3063,29 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
-					const auto mark = mark_root(snapshot.buffers.size());
-					const auto root = specialization.buffers[i];
-					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers, UINT32_MAX,
-					        scratch.buffer_headers[i], padding, class_spares,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
-					        }) &&
-					    !root_failed("buffer", i, base.source, mark, snapshot.buffers,
-					                 specialization.buffers, root, scratch.buffer_headers[i],
-					                 UINT32_MAX))
+					const auto mark   = mark_root(snapshot.buffers.size());
+					const auto root   = specialization.buffers[i];
+					bool       served = MaterializeIndirectDescriptor(
+					    program, base.source, i, 4u, 4u, observed, snapshot,
+					    snapshot.buffers, specialization.buffers, UINT32_MAX,
+					    scratch.buffer_headers[i], padding, class_spares,
+					    [&](DescriptorValue& value) {
+						    return NormalizeIndirectBuffer(
+						        value, source->indirect_descriptor->indexed, base,
+						        i < program.formatted_components.size()
+						            ? program.formatted_components[i]
+						            : 0xfu);
+					    });
+					const auto candidates = std::span<const DescriptorValue>(snapshot.buffers)
+					                            .subspan(mark.descriptors);
+					if (served && TooManyMixedLayoutCandidates(candidates, base.formatted)) {
+						served = SpecializationFail(fmt::format(
+						    "indirect buffer resource={} has {} candidates in more than {} layouts",
+						    i, candidates.size(), MaxIndirectBufferLayouts));
+					}
+					if (!served && !root_failed("buffer", i, base.source, mark, snapshot.buffers,
+					                            specialization.buffers, root,
+					                            scratch.buffer_headers[i], UINT32_MAX))
 						return false;
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i])) {
@@ -2922,21 +3101,13 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			descriptor_value.dwords.fill(0);
 			descriptor = {};
 		}
-		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
-			packed_stride &= ~((1u << 14u) | (3u << 16u));
-		} else if (!swizzle) {
-			packed_stride &= ~(3u << 16u);
-		}
 		// Only whether the stride is zero changes the module; the value is a shader-data word.
-		if (stride != 0u) packed_stride = (packed_stride & ~0x3fffu) | 1u;
-		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
-		buffer.descriptor_format =
-		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
-		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
+		const auto stride         = descriptor.PackedStride() & 0x3fffu;
+		const auto layout         = DescriptorBufferLayout(descriptor, base.formatted);
+		auto&      buffer         = specialization.buffers[i];
+		buffer.packed_stride      = layout.packed_stride;
+		buffer.descriptor_format  = layout.format;
+		buffer.descriptor_swizzle = layout.swizzle;
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 		// The renderer binds a direct V# without base or records as the null buffer, which every
@@ -2960,6 +3131,11 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			break;
 		}
 	}
+	// A spare of a layout group takes the group's layout; the image roots below use the list
+	// for their own class spares.
+	for (const auto& [spare, donor]: class_spares)
+		specialization.buffers[spare] = specialization.buffers[donor];
+	class_spares.clear();
 	// A snapshot is evaluated repeatedly; the heaps found this time replace the previous ones,
 	// whose mapping offsets belong to the flattened SRT just rebuilt.
 	snapshot.bindless_uses.clear();
