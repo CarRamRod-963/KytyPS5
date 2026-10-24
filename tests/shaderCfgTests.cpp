@@ -5853,6 +5853,33 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   CheckSpirvBinaryValidates(buffer.spirv);
 }
 
+void TestRecoverableFatalScope() {
+  const auto thrown = [](auto function, const char *text) {
+    try {
+      const Common::RecoverableFatalScope recoverable;
+      function();
+    } catch (const Common::RecoverableFatal &fatal) {
+      return fatal.message.find(text) != std::string::npos;
+    }
+    return false;
+  };
+  Check(thrown([] { EXIT("speculative failure %d", 7); },
+               "speculative failure 7"),
+        "EXIT inside a recoverable scope must throw its message");
+  Check(thrown([] { EXIT_IF(std::getenv("PATH") != nullptr); }, "PATH"),
+        "EXIT_IF inside a recoverable scope must throw its condition");
+  // Scopes nest and end: the outer one still recovers after an inner one ended.
+  Check(thrown(
+            [] {
+              {
+                const Common::RecoverableFatalScope inner;
+              }
+              EXIT("after inner");
+            },
+            "after inner"),
+        "an ended inner scope must keep the outer one recoverable");
+}
+
 void TestNewShaderRecompilerImageQueryTranslation() {
   const uint32_t shader[] = {
       EncodeMimg0(0x60, 0x3),
@@ -17809,6 +17836,7 @@ int main() {
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
+  TestRecoverableFatalScope();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
