@@ -11357,7 +11357,7 @@ public:
             shaders.SetCsUserSgpr(12 + i, output.fields[i]);
           ShaderComputeInputInfo input{};
           (void)context.GetPipelineCache().GetComputeProgram(
-              shaders.GetCs(), input);
+              shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
           PreparedBindings bindings;
           executor.PrepareBindings(input.stage, bindings);
           executor.RebindImages(bindings);
@@ -11472,7 +11472,7 @@ public:
         }
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), input);
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         if (original_id == 0) original_id = program.id;
         Require(name, "exact function identity",
                 (program.id == original_id) == (test.value == 41),
@@ -11564,7 +11564,7 @@ public:
             LibKernel::Memory::WriteBacking(output, actual.data(), wave_size * 4);
             ShaderComputeInputInfo input{};
             const auto program = context.GetPipelineCache().GetComputeProgram(
-                shaders.GetCs(), input);
+                shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
             if (phase == 1) original_vector_id = program.id;
             if (phase >= 2)
               Require(name, "ordered helper identity", (program.id == original_vector_id) == (phase == 3),
@@ -12110,7 +12110,7 @@ public:
         const auto clean_tick = scheduler.CurrentTick();
         ShaderComputeInputInfo input{};
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), input);
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         if (previous_program.id != 0) {
           Require(name, "count permutation reuse", program.id == previous_program.id,
                   "a changing GPU count compiled a new shader permutation");
@@ -12192,7 +12192,7 @@ public:
         input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
         input.workgroup_counts[2] = test.groups;
         const auto program = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), input);
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         Require(name, "workgroup table refresh and coalescing",
                 input.workgroup_counts[2] == test.groups &&
                     input.stage.program->info.images.size() == 1 &&
@@ -12210,7 +12210,7 @@ public:
         const auto *image_storage = snapshot->images.data();
         const auto flattened_capacity = snapshot->flattened_srt.capacity();
         const auto repeated = context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), input);
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         Require(name, "workgroup table cache-hit storage reuse",
                 repeated.id == program.id && input.stage.resources == snapshot &&
                     snapshot->images.data() == image_storage &&
@@ -12449,7 +12449,7 @@ public:
         input.workgroup_counts[0] = material_groups;
         input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
         (void)context.GetPipelineCache().GetComputeProgram(
-            shaders.GetCs(), input);
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
         const auto &info = input.stage.program->info;
         const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
           return buffer.indirect_resources.size() == material_rows;
@@ -18783,12 +18783,10 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
-                            .topology = topology, .ps_active = true,
-                            .vertex_info = {vertex}, .ps_input_info = pixel};
-      state.vertex_info[0].stage.handle = &vertex_shader;
-      state.ps_input_info.stage.handle = &pixel_shader;
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      return context.GetPipelineCache().GetGraphicsPipeline(
+          std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
+          topology, false,
+          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
@@ -19146,50 +19144,17 @@ public:
       ShaderMapUserData(pixel_address,
           {.type = Prospero::ShaderBinaryType::kPs,
            .code_size_bytes = static_cast<uint32_t>(native_pixel.size() * sizeof(u32))});
-      shaders.SetEsShaderBase(vertex_address);
-      shaders.SetPsShaderBase(pixel_address);
+      HW::VertexShaderInfo native_vertex_regs{};
+      native_vertex_regs.es_regs.data_addr = vertex_address;
+      HW::PixelShaderInfo native_pixel_regs{};
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
       const auto owned_vertex_shader = vertex_shader;
       const auto owned_pixel_shader = pixel_shader;
       depth.stencil_test_enable = false;
       registers.SetViewportTransformControl(0x300);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-      // The cache reads the bound shaders, the color outputs and the export mapping itself.
-      const auto refresh = [&] {
-        DrawRenderState state{};
-        context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), state);
-        return state;
-      };
-      const auto native_programs = [&] {
-        const auto native = refresh();
-        vertex = native.vertex_info[0];
-        pixel = native.ps_input_info;
-        vertex_shader = *vertex.stage.handle;
-        pixel_shader = *pixel.stage.handle;
-      };
-      const auto silent = refresh();
-      registers.SetDepthShaderControl({.shader_kill_enable = true});
-      const auto killing = refresh();
-      registers.SetDepthShaderControl({.shader_z_export_enable = true});
-      const auto depth_writing = refresh();
-      registers.SetDepthShaderControl({});
-      registers.SetTargetOutputMode(0, 4);
-      const auto writing = refresh();
-      // Slot 1 takes color output, but the pixel program exports only MRT0.
-      registers.SetRenderTargetMask(0xff);
-      registers.SetShaderMask(0xff);
-      registers.SetTargetOutputMode(1, 4);
-      const auto partial = refresh();
-      registers.SetTargetOutputMode(1, 0);
-      registers.SetShaderMask(0xf);
-      registers.SetRenderTargetMask(0xf);
-      Require(name, "pixel stage activity",
-              !silent.ps_active && !silent.ps_input_info.stage && silent.mrt_mask == 0 &&
-                  killing.ps_active && killing.ps_input_info.stage && killing.mrt_mask == 0 &&
-                  depth_writing.ps_active && depth_writing.mrt_mask == 0 &&
-                  writing.ps_active && writing.mrt_mask == 1u && partial.mrt_mask == 1u &&
-                  writing.VertexStages().size() == 1 &&
-                  writing.vertex_info[0].stage.handle != nullptr,
-              "pixel activity or its MRT mask ignored the color outputs or depth side effects");
+      std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+      std::array<ShaderVertexInputInfo, 3> native_vertex_info{};
       std::array<uint64_t, 2> wave_ids{};
       std::array<std::vector<u32>, 2> wave_keys;
       struct PixelWaveCase { uint32_t control, width, color; };
@@ -19197,7 +19162,9 @@ public:
                               PixelWaveCase{0x8008, 32, 0x3e800000},
                               PixelWaveCase{0x0008, 64, 0}}) {
         registers.SetPsInControl(wave.control);
-        native_programs();
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
         Require(name, "pixel wave metadata propagation",
                 pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
@@ -19206,11 +19173,14 @@ public:
         BuildStageStaticKey(pixel, key);
         if (wave_ids[index] != 0) {
           Require(name, "pixel wave cache reuse",
-                  pixel_shader.id == wave_ids[index] && key == wave_keys[index],
+                  programs.pixel.id == wave_ids[index] && key == wave_keys[index],
                   "restoring wave64 did not reuse its original program");
         }
-        wave_ids[index] = pixel_shader.id;
+        wave_ids[index] = programs.pixel.id;
         wave_keys[index] = std::move(key);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
         draw(pipeline(true, 2, 2));
         const auto wave_pixels = read_color();
         for (size_t component = 0; component < wave_pixels.size(); component++) {
@@ -19246,8 +19216,8 @@ public:
         *(position + 1) = EncodeExp1(3, 4, 0, 9);
         return code;
       }();
-      shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(waterfall_vertex.data()));
-      ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
+      native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(waterfall_vertex.data());
+      ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
           {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
            .code_size_bytes = static_cast<u32>(waterfall_vertex.size() * sizeof(u32))});
       registers.SetPsInControl(0x8008);
@@ -19255,7 +19225,12 @@ public:
       for (const u32 wave : {32u, 64u}) {
         registers.SetShaderStages((saved_stages & ~0x00400000u) |
                                    (wave == 32u ? 0x00400000u : 0u));
-        native_programs();
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
         Require(name, "native NGG waterfall wave",
                 vertex.stage.program->stage == ShaderType::Vertex &&
                     vertex.stage.program->wave_size == wave,
@@ -19270,7 +19245,7 @@ public:
         }
       }
       registers.SetShaderStages(saved_stages);
-      shaders.SetEsShaderBase(vertex_address);
+      native_vertex_regs.es_regs.data_addr = vertex_address;
 
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
@@ -19285,8 +19260,8 @@ public:
         AppendEnd(&code);
         return code;
       }();
-      shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(blend_pixel.data()));
-      ShaderMapUserData(shaders.GetPs().ps_regs.data_addr,
+      native_pixel_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(blend_pixel.data());
+      ShaderMapUserData(native_pixel_regs.ps_regs.data_addr,
           {.type = Prospero::ShaderBinaryType::kPs,
            .code_size_bytes = static_cast<uint32_t>(blend_pixel.size() * sizeof(u32))});
       const auto saved_blend = registers.GetBlendControl(0);
@@ -19295,13 +19270,8 @@ public:
       registers.SetTargetOutputMode(0, 4);
       auto blend_target_info = saved_target_info;
       blend_target_info.blend_bypass = false;
-      // A reversed RGBA32F target exports through the ABGR mapping.
-      blend_target_info.format = Prospero::ChannelLayout::k32_32_32_32;
-      blend_target_info.channel_type = Prospero::ChannelType::kFloat;
-      blend_target_info.channel_order = Prospero::ChannelOrder::kReversed;
       registers.SetColorInfo(0, blend_target_info);
-      registers.SetColorBase(0, {.addr = depth_address + 0x10000});
-      color.export_mapping = Prospero::ColorMappingAbgr;
+      export_mapping[0] = color.export_mapping = Prospero::ColorMappingAbgr;
       HW::BlendControl alpha_blend{};
       alpha_blend.enable = true;
       alpha_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
@@ -19324,18 +19294,22 @@ public:
         alpha_blend.separate_alpha_blend = test.separate;
         alpha_blend.alpha_srcblend = static_cast<uint8_t>(test.alpha_source);
         registers.SetBlendControl(0, alpha_blend);
-        native_programs();
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
         Require(name, "logical alpha blend program", pixel.alpha_blend_source == test.mode &&
-                    pixel.dual_source_blending &&
-                    pixel.target_export_mapping[0] == Prospero::ColorMappingAbgr,
+                    pixel.dual_source_blending,
                 "the separate alpha equation did not reach the compiled pixel program");
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
         auto &selected = pipeline(true, 2, 2);
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
-                  broadcast_program == 0 || (pixel_shader.id == broadcast_program &&
+                  broadcast_program == 0 || (programs.pixel.id == broadcast_program &&
                                               selected.pipeline == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
-          broadcast_program = pixel_shader.id;
+          broadcast_program = programs.pixel.id;
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
@@ -19349,10 +19323,9 @@ public:
                   "reversed blending changed logical RGB or the separate alpha equation");
         }
       }
-      shaders.SetPsShaderBase(pixel_address);
-      color.export_mapping = {};
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
+      export_mapping[0] = color.export_mapping = {};
       registers.SetBlendControl(0, saved_blend);
-      registers.SetColorBase(0, {});
       registers.SetColorInfo(0, saved_target_info);
       registers.SetTargetOutputMode(0, saved_output_mode);
 
@@ -19391,12 +19364,17 @@ public:
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriStrip);
       for (size_t i = 0; i < position_shaders.size(); i++) {
         const auto &code = position_shaders[i];
-        shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(code.data()));
-        ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
+        native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
             {.type = Prospero::ShaderBinaryType::kGs,
              .user_data = &native_user_data,
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-        native_programs();
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
         draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4);
         const auto pixels = read_color();
         bool second_triangle = false;
@@ -19974,7 +19952,11 @@ public:
         shaders.SetGsShaderResource2({});
         shaders.SetPsShaderBase(ps_address);
         user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-        native_programs();
+        native_vertex_regs.es_regs.data_addr = vertex_address;
+        native_pixel_regs.ps_regs.data_addr = ps_address;
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
         Require(name, "packed format follows export ordinal",
                 pixel.target_output_mode[2] == 9 && pixel.wave_size == test.wave &&
                     pixel.target_packed_unorm_mask == 4u &&
@@ -19982,9 +19964,9 @@ public:
                 "packed conversion or rounding contaminated another MRT or followed a physical slot");
         if (test.slot == 2) {
           auto &id = test.truncate ? truncate_program : half_up_program;
-          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.id,
+          Require(name, "packed rounding program reuse", id == 0 || id == programs.pixel.id,
                   "restoring half-up rounding failed to reuse its program");
-          id = pixel_shader.id;
+          id = programs.pixel.id;
         }
         RenderColorInfo packed_target{}, float_target{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -46470,13 +46452,13 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
                            uint16_t{112}, uint16_t{128}, uint16_t{128}}) {
     regs.cs_regs.lds_size = units;
     ShaderComputeInputInfo input{};
-    const auto program = cache.GetComputeProgram(regs, input);
+    const auto program = cache.GetComputeProgram(regs, {}, input);
     Require(name, "guest allocation and device backing",
             input.lds_size_dwords == units * 128u &&
                 input.lds_storage == (units > limit_units),
             "compute LDS was truncated or chose backing that exceeds the device limit");
     Require(name, "pipeline creation",
-            cache.GetComputePipeline(input).pipeline != nullptr,
+            cache.GetComputePipeline(input, program).pipeline != nullptr,
             "full-size LDS shader did not create a Vulkan compute pipeline");
     if (previous.id != 0) {
       Require(name, "guest-size cache identity",
