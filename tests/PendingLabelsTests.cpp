@@ -126,6 +126,23 @@ void TestPatchElided() {
   Check(byte == 0x22, "a read inside a label got the wrong byte");
 }
 
+void TestUnknownValue() {
+  PendingLabels labels;
+  // A timestamp: its value is known only when its submission ends.
+  const auto id = labels.Add(0x1000, 8, 5, false);
+  labels.SetTick(id, 2);
+  Check(!labels.Elide(0x1000, 8, Equals(5)) && !labels.HasElided(),
+        "a wait was elided on a label whose value is not known yet");
+  labels.SetValue(id, 9);
+  Check(labels.Elide(0x1000, 8, Equals(9)),
+        "a wait on a label with its final value was not elided");
+  uint64_t stored = 0;
+  labels.StoreCompleted(
+      0x1000, 8, 2,
+      [&stored](const PendingLabels::Label &label) { stored = label.value; });
+  Check(stored == 9, "a settling access stored the provisional value");
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +150,7 @@ int main() {
   TestPartialAndNewest();
   TestStoreCompleted();
   TestPatchElided();
+  TestUnknownValue();
   std::printf("PendingLabelsTests: ok\n");
   return 0;
 }

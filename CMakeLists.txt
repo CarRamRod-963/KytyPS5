@@ -905,6 +905,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wait-until-safe-for-rendering-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME eop_timestamps
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
 	add_test(NAME depth_bits
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME msaa_storage
