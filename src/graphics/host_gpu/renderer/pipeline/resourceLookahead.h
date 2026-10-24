@@ -61,6 +61,8 @@ struct LookaheadMemory {
 	// Owner thread: whether `read` would return exactly `data` (true) or fail exactly when
 	// `mapped` is false; null to compare through `read`.
 	bool (*same)(uint64_t address, const void* data, uint64_t size, bool mapped) = nullptr;
+	// Any thread: SrtRuntime::mapped_range_size (null: every candidate counts as mapped).
+	uint64_t (*mapped_size)(uint64_t address, uint64_t size) = nullptr;
 };
 
 // Materializes the resources of commands the GPU thread has not reached yet on helper threads.
