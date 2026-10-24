@@ -13579,6 +13579,83 @@ public:
                       " expected " + Hex(expected) + ", got " + Hex(actual[i]));
         }
       }
+      // Thread dimensions become workgroup counts on the host, so the command
+      // processor reads those arguments itself. A page read back once stays
+      // hot: a later GPU write, recorded while the page is clean, keeps its old
+      // bytes readable for CPU threads, yet the packet runs after that write
+      // and must see the new dimensions.
+      {
+        constexpr auto hot_args = base + 0xe0000;
+        constexpr auto hot_output = base + 0xe8000;
+        // One descriptor for all three DWORDs: a single recorded write to the
+        // page.
+        std::vector<u32> hot_writer;
+        for (u32 i = 0; i < 3; i++) {
+          hot_writer.push_back(EncodeVop1(0x01u, 1, 4u + i));
+          hot_writer.push_back(EncodeMubuf0(0x1cu, i * 4u, false, false));
+          hot_writer.push_back(EncodeMubuf1(1, 0, 0));
+        }
+        AppendEnd(&hot_writer);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(hot_writer.data()),
+                          {.type = Prospero::ShaderBinaryType::kCs,
+                           .code_size_bytes = static_cast<u32>(
+                               hot_writer.size() * sizeof(u32))});
+        const auto write_threads = [&](std::array<u32, 3> threads) {
+          shaders.SetCsShader(
+              {.data_addr = reinterpret_cast<uint64_t>(hot_writer.data()),
+               .num_thread_x = 1,
+               .num_thread_y = 1,
+               .num_thread_z = 1,
+               .wave_size = 64,
+               .user_sgpr = 7});
+          set_buffer(0, hot_args, 3u * sizeof(u32));
+          for (u32 i = 0; i < 3; i++) {
+            shaders.SetCsUserSgpr(4u + i, threads[i]);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        };
+        write_threads({4, 1, 1});
+        cache.ReadMemory(hot_args, 3u * sizeof(u32));
+        write_threads({8, 1, 1});
+        std::array<u32, 3> visible{};
+        Require(name, "hot argument page fixture",
+                cache.HasGpuDirtyBytes(hot_args, sizeof(visible)) &&
+                    LibKernel::Memory::TryReadBacking(hot_args, visible.data(),
+                                                      sizeof(visible)) &&
+                    visible == std::array<u32, 3>{4, 1, 1},
+                "the second write was not pending over the first write's "
+                "published bytes");
+        shaders.SetCsShader(
+            {.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+             .num_thread_x = 4,
+             .num_thread_y = 1,
+             .num_thread_z = 1,
+             .wave_size = 64,
+             .user_sgpr = 4,
+             .tgid_x_en = true});
+        set_buffer(0, hot_output, 16u * sizeof(u32));
+        const std::array<u32, 3> packet{static_cast<u32>(hot_args),
+                                        static_cast<u32>(hot_args >> 32u),
+                                        0x61u};
+        Require(name, "hot thread-dimension packet",
+                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0,
+                                     0) == 3,
+                "the thread-dimension indirect packet was not consumed");
+        cache.ReadMemory(hot_output, 16u * sizeof(u32));
+        std::array<u32, 16> actual{};
+        Require(name, "hot thread-dimension output readback",
+                LibKernel::Memory::TryReadBacking(hot_output, actual.data(),
+                                                  sizeof(actual)),
+                "the thread-dimension consumer output could not be read back");
+        for (u32 i = 0; i < actual.size(); i++) {
+          const auto expected = i < 8u ? i + 1u : sentinel;
+          Require(name, "thread dimensions after a pending GPU write",
+                  actual[i] == expected,
+                  "word " + std::to_string(i) + " expected " + Hex(expected) +
+                      ", got " + Hex(actual[i]) +
+                      ": the packet read stale thread dimensions");
+        }
+      }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
       constexpr auto image_address = base + cases.size() * case_size;
