@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <xxhash.h>
@@ -327,6 +329,11 @@ std::filesystem::path ProgramManifest::PreviousPathFor(const std::filesystem::pa
 	return directory / (title_id + ".v3.programs");
 }
 
+std::filesystem::path ProgramManifest::CreatedPathFor(const std::filesystem::path& directory,
+                                                      const std::string&           title_id) {
+	return directory / (title_id + ".v4.created");
+}
+
 ProgramManifest::ProgramManifest(std::filesystem::path path, std::filesystem::path previous)
     : m_path(std::move(path)), m_previous(std::move(previous)) {
 	if (!m_path.empty()) {
@@ -375,6 +382,7 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload, uint32_t vers
 	}
 	record->code = code->second;
 	if (m_keys.insert(record->Key()).second) {
+		m_shaders.insert(record->shader_hash);
 		m_records.push_back(std::move(record));
 	}
 	return true;
@@ -530,8 +538,14 @@ bool ProgramManifest::Add(const ComputeProgramRecord& record) {
 	}
 	Writer(body).Put(record.spirv_hash);
 	AppendEntry(body);
+	m_shaders.insert(record.shader_hash);
 	m_records.push_back(std::move(stored));
 	return true;
+}
+
+bool ProgramManifest::HasShader(uint64_t shader_hash) const {
+	std::lock_guard lock(m_mutex);
+	return m_shaders.contains(shader_hash);
 }
 
 std::vector<std::shared_ptr<const ComputeProgramRecord>> ProgramManifest::Records() const {
@@ -542,6 +556,74 @@ std::vector<std::shared_ptr<const ComputeProgramRecord>> ProgramManifest::Record
 size_t ProgramManifest::Size() const {
 	std::lock_guard lock(m_mutex);
 	return m_records.size();
+}
+
+PrecompileAttempts::PrecompileAttempts(std::filesystem::path path): m_path(std::move(path)) {
+	if (m_path.empty()) {
+		return;
+	}
+	std::unordered_set<uint64_t> begun;
+	{
+		std::ifstream file(m_path);
+		std::string   line;
+		while (std::getline(file, line)) {
+			// A torn last line is ignored.
+			if (line.size() < 3 || line[1] != ' ' || (line[0] != 'B' && line[0] != 'E')) {
+				continue;
+			}
+			char*      end = nullptr;
+			const auto key = std::strtoull(line.c_str() + 2, &end, 16);
+			if (end == line.c_str() + 2 || *end != '\0') {
+				continue;
+			}
+			if (line[0] == 'B') {
+				begun.insert(key);
+			} else {
+				begun.erase(key);
+			}
+		}
+	}
+	m_failed = std::move(begun);
+	m_file.open(m_path, std::ios::trunc);
+	for (const auto key: m_failed) {
+		m_file << "B " << std::hex << key << '\n';
+	}
+	m_file.flush();
+}
+
+PrecompileAttempts::~PrecompileAttempts() = default;
+
+std::filesystem::path PrecompileAttempts::PathFor(const std::filesystem::path& directory,
+                                                  const std::string&           title_id) {
+	return directory / (title_id + ".v4.attempts");
+}
+
+bool PrecompileAttempts::Failed(uint64_t key) const {
+	std::lock_guard lock(m_mutex);
+	return m_failed.contains(key);
+}
+
+size_t PrecompileAttempts::FailedCount() const {
+	std::lock_guard lock(m_mutex);
+	return m_failed.size();
+}
+
+void PrecompileAttempts::Begin(uint64_t key) {
+	Append('B', key);
+}
+
+void PrecompileAttempts::End(uint64_t key) {
+	Append('E', key);
+}
+
+void PrecompileAttempts::Append(char event, uint64_t key) {
+	std::lock_guard lock(m_mutex);
+	if (!m_file.is_open()) {
+		return;
+	}
+	// Flushed per event: the process may end in the build that follows.
+	m_file << event << ' ' << std::hex << key << '\n';
+	m_file.flush();
 }
 
 } // namespace Libs::Graphics
