@@ -287,6 +287,19 @@ void GpuTimestamps::RecordLabel(uint64_t tick, int64_t issued_ns) {
 	RecordEndLatency(tick, true, issued_ns);
 }
 
+std::optional<int64_t> GpuTimestamps::CompletedEndNs(uint64_t tick) {
+	if (m_pool == nullptr || !m_calibrated) {
+		return std::nullopt;
+	}
+	std::scoped_lock lock(m_mutex);
+	Collect();
+	const auto& slot = SlotOf(tick);
+	if (slot.tick != tick || tick > m_collected) {
+		return std::nullopt;
+	}
+	return slot.host_end_ns;
+}
+
 void GpuTimestamps::MaybeRotate(int64_t now_ns) {
 	if (now_ns - m_window_start_ns < WINDOW_NS) {
 		return;

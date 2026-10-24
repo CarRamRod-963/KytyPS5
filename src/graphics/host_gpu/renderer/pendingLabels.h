@@ -31,15 +31,25 @@ public:
 		uint32_t size    = 0; // 4 or 8 bytes.
 		bool     elided  = false;
 		bool     stored  = false; // Stored early by a settling access.
+		bool     known   = true;  // A timestamp's value is known only once its submission ends.
 	};
 
 	// Returns the id that Stored() takes once the label is in guest memory. The submission it
-	// completes with follows with SetTick().
-	uint64_t Add(uint64_t address, uint32_t size, uint64_t value) {
+	// completes with follows with SetTick(). A label whose value is not `known` yet gets it with
+	// SetValue() before it is stored; no wait is elided on it until then.
+	uint64_t Add(uint64_t address, uint32_t size, uint64_t value, bool known = true) {
 		std::lock_guard lock(m_mutex);
 		const auto      id = ++m_last_id;
-		m_labels.push_back({id, address, value, 0, size, false, false});
+		m_labels.push_back({id, address, value, 0, size, false, false, known});
 		return id;
+	}
+
+	void SetValue(uint64_t id, uint64_t value) {
+		std::lock_guard lock(m_mutex);
+		if (const auto it = std::ranges::find(m_labels, id, &Label::id); it != m_labels.end()) {
+			it->value = value;
+			it->known = true;
+		}
 	}
 
 	void SetTick(uint64_t id, uint64_t tick) {
@@ -71,7 +81,7 @@ public:
 			if (!Overlaps(*it, address, size)) {
 				continue;
 			}
-			if (address < it->address || address + size > it->address + it->size) {
+			if (!it->known || address < it->address || address + size > it->address + it->size) {
 				return false;
 			}
 			uint64_t value = 0;

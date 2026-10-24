@@ -39,6 +39,9 @@ public:
 	// issued after its tick already ended (nothing recorded since the previous submission)
 	// counts from `issued_ns` (steady clock), not from the GPU end.
 	void RecordLabel(uint64_t tick, int64_t issued_ns);
+	// When the GPU finished submission `tick` (steady clock), once that submission completed;
+	// nothing for untimed submissions or without calibrated timestamps.
+	[[nodiscard]] std::optional<int64_t> CompletedEndNs(uint64_t tick);
 	// The renderer's scheduler: its windows carry the per-reason submission and wait counts and
 	// are the ones the performance overlay shows. Other schedulers (presentation) only log.
 	void SetPrimary(bool primary) noexcept { m_primary = primary; }
