@@ -9,6 +9,9 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -38,15 +41,54 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 	return true;
 }
 
-uint64_t ReadReferenceClock() {
-	const auto host_frequency = LibKernel::KernelGetTscFrequency();
-	const auto host_ticks     = LibKernel::KernelReadTsc();
-	uint64_t   value          = 0;
+static uint64_t ReferenceClockOfTicks(uint64_t host_ticks, uint64_t host_frequency) {
+	uint64_t value = 0;
 	if (!ScaleReferenceClock(host_ticks, host_frequency, value)) {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
 	return value;
+}
+
+uint64_t ReadReferenceClock() {
+	return ReferenceClockOfTicks(LibKernel::KernelReadTsc(), LibKernel::KernelGetTscFrequency());
+}
+
+uint64_t HostTicksBefore(uint64_t host_ticks, uint64_t host_frequency, uint64_t elapsed_ns) {
+	constexpr uint64_t NS_PER_SECOND = 1000000000;
+	const auto         whole_seconds = elapsed_ns / NS_PER_SECOND;
+	const auto         remainder_ns  = elapsed_ns % NS_PER_SECOND;
+	if (host_frequency != 0 && whole_seconds > host_ticks / host_frequency) {
+		return 0;
+	}
+	const auto whole_ticks = whole_seconds * host_frequency;
+	// remainder_ns < 10^9, so the product fits for host frequencies below 18 GHz.
+	const auto fractional_ticks =
+	    (remainder_ns * host_frequency + NS_PER_SECOND - 1) / NS_PER_SECOND;
+	const auto ticks = whole_ticks + fractional_ticks;
+	return ticks >= host_ticks ? 0 : host_ticks - ticks;
+}
+
+uint64_t ReferenceClockAt(int64_t steady_ns) {
+	// Read the two clocks back to back; the steady clock's distance to `steady_ns` then moves the
+	// host tick counter back, so the result is in the same domain as ReadReferenceClock().
+	const auto host_frequency = LibKernel::KernelGetTscFrequency();
+	const auto host_ticks     = LibKernel::KernelReadTsc();
+	const auto now_ns         = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                std::chrono::steady_clock::now().time_since_epoch())
+	                                .count();
+	const auto elapsed_ns     = now_ns > steady_ns ? static_cast<uint64_t>(now_ns - steady_ns) : 0;
+	return ReferenceClockOfTicks(HostTicksBefore(host_ticks, host_frequency, elapsed_ns),
+	                             host_frequency);
+}
+
+uint64_t MonotonicReferenceClock(uint64_t value) {
+	static std::atomic<uint64_t> last {0};
+	auto                         previous = last.load(std::memory_order_relaxed);
+	while (previous < value &&
+	       !last.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {
+	}
+	return std::max(previous, value);
 }
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
