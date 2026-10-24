@@ -67,6 +67,10 @@ public:
 	                                     const std::string&           title_id);
 	static std::filesystem::path PreviousPathFor(const std::filesystem::path& directory,
 	                                             const std::string&           title_id);
+	// Where a title's created compute shaders live: records with the static input a shader's
+	// header describes and no specialization, for shaders no dispatch may have used yet.
+	static std::filesystem::path CreatedPathFor(const std::filesystem::path& directory,
+	                                            const std::string&           title_id);
 	~ProgramManifest();
 	KYTY_CLASS_NO_COPY(ProgramManifest);
 
@@ -84,6 +88,8 @@ public:
 	// The records in the order they were first added.
 	[[nodiscard]] std::vector<std::shared_ptr<const ComputeProgramRecord>> Records() const;
 	[[nodiscard]] size_t                                                   Size() const;
+	// Whether a record of the shader is known.
+	[[nodiscard]] bool                         HasShader(uint64_t shader_hash) const;
 	[[nodiscard]] const std::filesystem::path& Path() const { return m_path; }
 
 	// The serialized body of a record (everything but the SPIR-V hash), exposed for tests.
@@ -114,7 +120,41 @@ private:
 	LoadStats                                                m_loaded;
 	std::vector<std::shared_ptr<const ComputeProgramRecord>> m_records;
 	std::unordered_set<uint64_t>                             m_keys;
+	std::unordered_set<uint64_t>                             m_shaders;
 	std::unordered_map<CodeKey, std::shared_ptr<const std::vector<uint32_t>>, CodeKeyHash> m_code;
+};
+
+// Precompile builds of created shaders that started but never finished: the recompiler ends the
+// process on code it cannot translate, and a created shader may be one no dispatch ever uses.
+// Such a shader is skipped from then on, so that it does not end every later precompile run.
+// The file (_PipelineCache/<title>.v4.attempts) holds one line per event, "B <key>" before a
+// build and "E <key>" after it, appended and flushed; loading keeps the unfinished keys and
+// rewrites the file with only those.
+//
+// Thread-safe.
+class PrecompileAttempts {
+public:
+	// An empty path keeps the attempts in memory only.
+	explicit PrecompileAttempts(std::filesystem::path path = {});
+	~PrecompileAttempts();
+	KYTY_CLASS_NO_COPY(PrecompileAttempts);
+
+	static std::filesystem::path PathFor(const std::filesystem::path& directory,
+	                                     const std::string&           title_id);
+
+	// Whether an earlier process began the key's build and did not finish it.
+	[[nodiscard]] bool   Failed(uint64_t key) const;
+	[[nodiscard]] size_t FailedCount() const;
+	void                 Begin(uint64_t key);
+	void                 End(uint64_t key);
+
+private:
+	void Append(char event, uint64_t key);
+
+	std::filesystem::path        m_path;
+	mutable std::mutex           m_mutex;
+	std::ofstream                m_file;
+	std::unordered_set<uint64_t> m_failed;
 };
 
 } // namespace Libs::Graphics
