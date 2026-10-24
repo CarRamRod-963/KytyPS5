@@ -92,8 +92,11 @@ public:
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	// A `timestamp` label stores the reference clock at the GPU end of the work before it;
+	// `value` is then the clock when the packet was processed, its lower bound.
 	template <typename T>
-	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id);
+	void WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt, uint32_t interrupt_context_id,
+	                           bool timestamp = false);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
