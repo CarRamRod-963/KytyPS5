@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -386,15 +387,17 @@ Speculation Classify(const Module& m, const Inst& inst) {
 		           : Speculation::No;
 	}
 	if (inst.op == spv::OpLoad) {
-		if (inst.words.size() > 4 &&
-		    (inst.words[4] & ~static_cast<uint32_t>(spv::MemoryAccessAlignedMask |
-		                                            spv::MemoryAccessNontemporalMask)) != 0) {
-			return Speculation::No;
-		}
 		const auto  pointer = inst.words[3];
 		const auto* source  = m.Def(pointer);
 		const auto  root    = RootVariable(m, pointer);
 		const auto  storage = StorageClassOfVariable(m, root);
+		// A volatile (coherent) load only promises to observe other invocations' writes; reading
+		// a robust buffer once more under a false guard observes nothing that a select keeps.
+		const auto allowed = spv::MemoryAccessAlignedMask | spv::MemoryAccessNontemporalMask |
+		                     (IsRobustClass(storage) ? spv::MemoryAccessVolatileMask : 0u);
+		if (inst.words.size() > 4 && (inst.words[4] & ~static_cast<uint32_t>(allowed)) != 0) {
+			return Speculation::No;
+		}
 		if (source == nullptr || (!IsRobustClass(storage) && !IsPrivateClass(storage))) {
 			return Speculation::No;
 		}
@@ -418,6 +421,56 @@ bool IsScalarType(const Module& m, uint32_t type) {
 	const auto* inst = m.Def(type);
 	return inst != nullptr && (inst->op == spv::OpTypeInt || inst->op == spv::OpTypeFloat ||
 	                           inst->op == spv::OpTypeBool);
+}
+
+// The component count of a vector of scalars, 0 for anything else.
+uint32_t ScalarVectorSize(const Module& m, uint32_t type) {
+	const auto* inst = m.Def(type);
+	return inst != nullptr && inst->op == spv::OpTypeVector && IsScalarType(m, inst->words[2])
+	           ? inst->words[3]
+	           : 0u;
+}
+
+// Appends `result = condition ? if_true : if_false` for a scalar or vector type. Before SPIR-V
+// 1.4 a vector select needs a vector condition, so vectors are selected per component.
+void AppendSelect(Module& m, std::vector<uint32_t>& out, uint32_t type, uint32_t result,
+                  uint32_t condition, uint32_t if_true, uint32_t if_false) {
+	const auto size = ScalarVectorSize(m, type);
+	if (size == 0u || m.header[1] >= 0x10400u) {
+		out.push_back(m.Add(MakeSelect(type, result, condition, if_true, if_false)));
+		return;
+	}
+	const auto            component = m.Def(type)->words[2];
+	std::vector<uint32_t> parts;
+	for (uint32_t index = 0; index < size; index++) {
+		std::array<uint32_t, 2> values {};
+		for (size_t side = 0; side < 2; side++) {
+			Inst extract;
+			extract.op     = spv::OpCompositeExtract;
+			extract.type   = component;
+			extract.result = m.AllocateId();
+			extract.words  = {(5u << spv::WordCountShift) | spv::OpCompositeExtract, component,
+			                  extract.result, side == 0 ? if_true : if_false, index};
+			extract.ids    = {1, 3};
+			values[side]   = extract.result;
+			out.push_back(m.Add(std::move(extract)));
+		}
+		const auto part = m.AllocateId();
+		out.push_back(m.Add(MakeSelect(component, part, condition, values[0], values[1])));
+		parts.push_back(part);
+	}
+	Inst construct;
+	construct.op     = spv::OpCompositeConstruct;
+	construct.type   = type;
+	construct.result = result;
+	construct.words  = {((3u + size) << spv::WordCountShift) | spv::OpCompositeConstruct, type,
+	                    result};
+	construct.ids    = {1};
+	for (const auto part: parts) {
+		construct.ids.push_back(static_cast<uint16_t>(construct.words.size()));
+		construct.words.push_back(part);
+	}
+	out.push_back(m.Add(std::move(construct)));
 }
 
 std::vector<uint32_t> Successors(const Module& m, const Inst& terminator,
@@ -533,7 +586,8 @@ uint32_t SpeculateRegions(Module& m, Function& function, DriverSimplifyStats& st
 			if (phi.op != spv::OpPhi) {
 				break;
 			}
-			ok = phi.words.size() == 7 && IsScalarType(m, phi.type) &&
+			ok = phi.words.size() == 7 &&
+			     (IsScalarType(m, phi.type) || ScalarVectorSize(m, phi.type) != 0u) &&
 			     ((phi.words[4] == exit_label && phi.words[6] == header.label) ||
 			      (phi.words[4] == header.label && phi.words[6] == exit_label));
 		}
@@ -567,15 +621,20 @@ uint32_t SpeculateRegions(Module& m, Function& function, DriverSimplifyStats& st
 		body.push_back(m.Add(std::move(jump)));
 		header.insts = std::move(body);
 
-		auto& merge_insts = function.blocks[labels[merge_label]].insts;
+		auto&                 merge_insts = function.blocks[labels[merge_label]].insts;
+		std::vector<uint32_t> selects;
 		for (size_t i = 0; i < phi_count; i++) {
-			auto&      phi         = m.At(merge_insts[i]);
+			const auto phi         = m.At(merge_insts[i]);
 			const auto from_exit   = phi.words[4] == exit_label ? phi.words[3] : phi.words[5];
 			const auto from_header = phi.words[4] == exit_label ? phi.words[5] : phi.words[3];
-			phi = region.inverted
-			          ? MakeSelect(phi.type, phi.result, region.condition, from_header, from_exit)
-			          : MakeSelect(phi.type, phi.result, region.condition, from_exit, from_header);
+			m.def[phi.result]      = 0;
+			AppendSelect(m, selects, phi.type, phi.result, region.condition,
+			             region.inverted ? from_header : from_exit,
+			             region.inverted ? from_exit : from_header);
 		}
+		merge_insts.erase(merge_insts.begin(),
+		                  merge_insts.begin() + static_cast<ptrdiff_t>(phi_count));
+		merge_insts.insert(merge_insts.begin(), selects.begin(), selects.end());
 		preds[merge_label]      = 1;
 		structural[merge_label] = false;
 		speculated++;

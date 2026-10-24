@@ -12752,9 +12752,10 @@ void TestTypedSpirvSerialization() {
                       0x80000000u);
 }
 
-// A guarded storage-buffer load and a guarded LDS load run unconditionally (the LDS index clamped
-// to element 0 when the guard is false), the exec-style select chain reads through, and a guarded
-// store and a guarded volatile load keep their branches.
+// A guarded storage-buffer load, a guarded volatile one and a guarded LDS load
+// run unconditionally (the LDS index clamped to element 0 when the guard is
+// false), the exec-style select chain reads through, and a guarded store keeps
+// its branch.
 void TestDriverSimplifySpeculatesGuardedLoads() {
   const char *text = R"(
                OpCapability Shader
@@ -12842,8 +12843,8 @@ void TestDriverSimplifySpeculatesGuardedLoads() {
   Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary, &stats),
         "driver simplify refused a module it emitted the shape of");
   CheckSpirvBinaryValidates(binary);
-  Check(stats.speculated_branches == 2,
-        "driver simplify: the two guarded loads were not both speculated");
+  Check(stats.speculated_branches == 3,
+        "driver simplify: the three guarded loads were not all speculated");
   Check(
       stats.clamped_loads == 1,
       "driver simplify: the LDS load was not clamped, or the buffer load was");
@@ -12859,9 +12860,11 @@ void TestDriverSimplifySpeculatesGuardedLoads() {
     }
     return n;
   };
-  Check(count("OpSelectionMerge") == 2,
-        "driver simplify: the volatile load or the store lost its branch");
-  Check(count("OpPhi") == 1,
+  // A volatile read of a robust buffer is speculated too: an extra read under a
+  // false guard observes nothing the select keeps.
+  Check(count("OpSelectionMerge") == 1,
+        "driver simplify: the store lost its branch");
+  Check(count("OpPhi") == 0,
         "driver simplify: a speculated merge kept its phi");
   Check(count("Volatile") == 1, "driver simplify: the volatile load changed");
   Check(count("OpStore") == 1, "driver simplify: the store changed");
@@ -12871,6 +12874,84 @@ void TestDriverSimplifySpeculatesGuardedLoads() {
   Check(ShaderRecompiler::Spirv::SimplifyForDriver(again, &stats) &&
             stats.speculated_branches == 0 && again == binary,
         "driver simplify is not idempotent");
+}
+
+// A guarded load of two DWORDs merges a vector: before SPIR-V 1.4 a vector
+// select needs a vector condition, so the merge becomes per-component selects
+// of the speculated vector.
+void TestDriverSimplifySpeculatesVectorMerges() {
+  const char *text = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+       %bool = OpTypeBool
+         %v2 = OpTypeVector %u32 2
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+      %zero2 = OpConstantComposite %v2 %c0 %c0
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+         %x1 = OpIAdd %u32 %x %c1
+        %len = OpArrayLength %u32 %buf 0
+        %inb = OpULessThan %bool %x1 %len
+               OpSelectionMerge %m1 None
+               OpBranchConditional %inb %t1 %m1
+         %t1 = OpLabel
+         %p0 = OpAccessChain %pu32 %buf %c0 %x
+         %a0 = OpLoad %u32 %p0
+         %p1 = OpAccessChain %pu32 %buf %c0 %x1
+         %a1 = OpLoad %u32 %p1
+         %v1 = OpCompositeConstruct %v2 %a0 %a1
+               OpBranch %m1
+         %m1 = OpLabel
+          %r = OpPhi %v2 %v1 %t1 %zero2 %entry
+         %e0 = OpCompositeExtract %u32 %r 0
+         %e1 = OpCompositeExtract %u32 %r 1
+          %s = OpIAdd %u32 %e0 %e1
+         %ps = OpAccessChain %pu32 %buf %c0 %x
+               OpStore %ps %s
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "vector merge fixture did not assemble");
+  Check(binary[1] < 0x10400u,
+        "vector merge fixture is not a SPIR-V 1.3 module");
+  CheckSpirvBinaryValidates(binary);
+  ShaderRecompiler::Spirv::DriverSimplifyStats stats;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary, &stats),
+        "driver simplify refused the vector merge fixture");
+  CheckSpirvBinaryValidates(binary);
+  Check(stats.speculated_branches == 1,
+        "driver simplify: the vector merge was not speculated");
+  const auto source = DisassembleSpirvBinary(binary);
+  Check(source.find("OpPhi") == std::string::npos &&
+            source.find("OpSelectionMerge") == std::string::npos,
+        "driver simplify: the speculated vector merge kept its branch or phi");
+  Check(source.find("OpSelect %v2uint") == std::string::npos,
+        "driver simplify: a SPIR-V 1.3 module got a vector select with a "
+        "scalar condition");
 }
 
 // Bit-exact value replacements: a bitcast round trip, a mask that clears
@@ -17692,6 +17773,7 @@ int main() {
   TestDeferredSpirvPhiPatching();
   TestDriverSimplifySpeculatesGuardedLoads();
   TestDriverSimplifyFoldsValues();
+  TestDriverSimplifySpeculatesVectorMerges();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
