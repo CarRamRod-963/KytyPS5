@@ -39,6 +39,10 @@ public:
 	void BeginDraw() { ++m_draw; }
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
+	ShaderRecompiler::IR::ImageHeapPeek
+	Peek(const ShaderRecompiler::IR::ImageHeapRequest&       request,
+	     ShaderRecompiler::IR::ImageHeapView&                result,
+	     std::vector<ShaderRecompiler::IR::DescriptorValue>& kinds) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots, moves resident images to their read layout and binds the array.
@@ -95,6 +99,29 @@ private:
 		size_t                       dirty_end     = 0;
 		size_t                       changed_begin = 0; // Table bytes changed since it was probed.
 		size_t                       changed_end   = 0;
+		size_t                       published     = SIZE_MAX; // Kinds Peek returns.
+	};
+
+	// A view as Peek returns it, or a table declined for capacity (no slots). The profile is the
+	// view's root ImageResource and first is normalized as Acquire normalizes it.
+	struct Published {
+		uint64_t                            base  = 0;
+		uint64_t                            size  = 0;
+		uint64_t                            step  = 0;
+		uint64_t                            first = 0;
+		uint64_t                            limit = 0;
+		ShaderRecompiler::IR::ImageResource profile;
+		uint64_t                            slots      = 0;
+		uint32_t                            slot_count = 0;
+		std::vector<DescriptorValue>        kinds;
+		bool                                declined = false;
+
+		[[nodiscard]] bool Matches(uint64_t table_base, uint64_t table_size, uint64_t table_step,
+		                           uint64_t table_first, uint64_t table_limit,
+		                           const ShaderRecompiler::IR::ImageResource& table_profile) const {
+			return base == table_base && size == table_size && step == table_step &&
+			       first == table_first && limit == table_limit && profile == table_profile;
+		}
 	};
 
 	struct Memory {
@@ -129,6 +156,9 @@ private:
 	uint32_t Allocate();
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
+	void     Publish(View& view);
+	void PublishDecline(uint64_t base, uint64_t size, uint64_t step, uint64_t first, uint64_t limit,
+	                    const ShaderRecompiler::IR::ImageResource& profile);
 
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
@@ -154,6 +184,9 @@ private:
 	vk::DescriptorSetLayout                           m_layout = nullptr;
 	vk::DescriptorPool                                m_pool   = nullptr;
 	vk::DescriptorSet                                 m_set    = nullptr;
+
+	std::mutex             m_published_mutex; // m_published, read by any thread.
+	std::vector<Published> m_published;
 
 	friend struct ImageHeapTestAccess;
 };

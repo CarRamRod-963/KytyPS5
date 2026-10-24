@@ -41,6 +41,12 @@ void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
 	}
 }
 
+// The requests Acquire may keep resident: whole DWORDs.
+bool Eligible(const IR::ImageHeapRequest& request) {
+	return request.count != 0u && request.step != 0u &&
+	       ((request.base | request.first | request.step) & 3u) == 0u;
+}
+
 // Grows [begin, end) to cover [first, last).
 void Widen(size_t& begin, size_t& end, size_t first, size_t last) {
 	const bool empty = begin == end;
@@ -141,10 +147,7 @@ ImageHeap::~ImageHeap() {
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
-	if (request.count == 0u || request.step == 0u ||
-	    ((request.base | request.first | request.step) & 3u) != 0u) {
-		return false;
-	}
+	if (!Eligible(request)) return false;
 	auto memory = std::ranges::find_if(
 	    m_memories, [&](const auto& candidate) { return candidate->base == request.base; });
 	// A table follows its descriptor's size, as the first program of a draw acquires it.
@@ -192,7 +195,10 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 			for (const auto& existing: other->views)
 				reserved += 2u * existing->count;
 		}
-		if (reserved >= IR::ImageHeapCapacity) return false;
+		if (reserved >= IR::ImageHeapCapacity) {
+			PublishDecline(request.base, size, request.step, first, limit, root);
+			return false;
+		}
 		const auto count   = std::min(limit, Probes(bytes, first, request.step));
 		auto       created = std::make_unique<View>(View {.memory  = **memory,
 		                                                  .step    = request.step,
@@ -216,11 +222,78 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		Retire();
 	}
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
+	if ((*view)->published != (*view)->kinds.size()) Publish(**view);
 	const auto& selected = **view;
 	result = {.slots      = selected.buffer->BufferDeviceAddress(),
 	          .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
 	          .kinds      = selected.kinds};
 	return true;
+}
+
+IR::ImageHeapPeek ImageHeap::Peek(const IR::ImageHeapRequest& request, IR::ImageHeapView& result,
+                                  std::vector<DescriptorValue>& kinds) {
+	const auto size = request.size & ~uint64_t {3};
+	if (!Eligible(request)) return IR::ImageHeapPeek::Declined;
+	const auto profile = IR::ImageHeapResource(*request.root, 0u);
+	const auto probes  = Probes(size, request.first, request.step);
+	const auto limit   = request.count < probes ? request.count : UINT64_MAX;
+	// As Acquire: unbounded requests share the view of their lattice.
+	const auto       first = limit == UINT64_MAX ? request.first % request.step : request.first;
+	std::scoped_lock lock {m_published_mutex};
+	const auto       found = std::ranges::find_if(m_published, [&](const Published& view) {
+		return view.Matches(request.base, size, request.step, first, limit, profile);
+	});
+	// A table the heap has not taken yet may still be taken by the GPU thread's acquire.
+	if (found == m_published.end()) return IR::ImageHeapPeek::Unknown;
+	if (found->declined) return IR::ImageHeapPeek::Declined;
+	kinds  = found->kinds;
+	result = {.slots = found->slots, .slot_count = found->slot_count, .kinds = kinds};
+	return IR::ImageHeapPeek::Resident;
+}
+
+// Tables declined for capacity stay declined until a table leaves the heap (Drop).
+void ImageHeap::PublishDecline(uint64_t base, uint64_t size, uint64_t step, uint64_t first,
+                               uint64_t limit, const IR::ImageResource& profile) {
+	std::scoped_lock lock {m_published_mutex};
+	if (std::ranges::any_of(m_published, [&](const Published& view) {
+		    return view.Matches(base, size, step, first, limit, profile);
+	    })) {
+		return;
+	}
+	m_published.push_back({.base     = base,
+	                       .size     = size,
+	                       .step     = step,
+	                       .first    = first,
+	                       .limit    = limit,
+	                       .profile  = profile,
+	                       .declined = true});
+}
+
+// Kinds only grow, so a view publishes when it is created and when it gains a kind.
+void ImageHeap::Publish(View& view) {
+	view.published           = view.kinds.size();
+	const auto&      profile = view.root;
+	std::scoped_lock lock {m_published_mutex};
+	auto             found = std::ranges::find_if(m_published, [&](const Published& published) {
+		return published.Matches(view.memory.base, view.memory.size, view.step, view.first,
+		                         view.limit, profile);
+	});
+	if (found != m_published.end() && found->declined) {
+		m_published.erase(found);
+		found = m_published.end();
+	}
+	if (found == m_published.end()) {
+		found = m_published.insert(m_published.end(),
+		                           {.base       = view.memory.base,
+		                            .size       = view.memory.size,
+		                            .step       = view.step,
+		                            .first      = view.first,
+		                            .limit      = view.limit,
+		                            .profile    = profile,
+		                            .slots      = view.buffer->BufferDeviceAddress(),
+		                            .slot_count = static_cast<uint32_t>(view.slots.size() - 1u)});
+	}
+	found->kinds = view.kinds;
 }
 
 bool ImageHeap::Refresh(Memory& memory) {
@@ -477,6 +550,14 @@ uint32_t ImageHeap::Allocate() {
 
 void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	{
+		// Slot buffers and sizes change: the views publish again at their next acquire.
+		std::scoped_lock published {m_published_mutex};
+		std::erase_if(m_published, [&](const Published& view) {
+			return !view.declined && view.base == memory.base;
+		});
+	}
+	for (auto& view: memory.views) view->published = SIZE_MAX;
+	{
 		std::scoped_lock lock {m_mutex};
 		Unwatch(memory);
 		memory.base = base;
@@ -690,6 +771,13 @@ void ImageHeap::RunGarbageCollector() {
 void ImageHeap::Drop(Memory& memory) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	Unwatch(memory);
+	{
+		std::scoped_lock published {m_published_mutex};
+		// Its capacity frees: tables declined so far may be taken now.
+		std::erase_if(m_published, [&](const Published& view) {
+			return view.declined || view.base == memory.base;
+		});
+	}
 	for (auto& view: memory.views) {
 		std::erase(m_active, view.get());
 		for (uint64_t probe = 0; probe < view->count; ++probe) {

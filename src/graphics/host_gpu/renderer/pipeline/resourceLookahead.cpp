@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <span>
 
 namespace Libs::Graphics {
@@ -72,7 +73,45 @@ private:
 	Job&                   m_job;
 };
 
-ResourceLookahead::ResourceLookahead(LookaheadMemory memory, uint32_t helpers): m_memory(memory) {
+// A helper's view of the resident image heap: what the owner's last acquire of each table did,
+// recorded so that the owner can check it at the command.
+class ResourceLookahead::HelperHeap final: public ShaderRecompiler::IR::ImageHeapSource {
+public:
+	HelperHeap(ShaderRecompiler::IR::ImageHeapSource& heap, Job& job): m_heap(heap), m_job(job) {}
+
+	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& /*request*/,
+	             ShaderRecompiler::IR::ImageHeapView& /*view*/) override {
+		return false;
+	}
+	ShaderRecompiler::IR::ImageHeapPeek
+	Peek(const ShaderRecompiler::IR::ImageHeapRequest&       request,
+	     ShaderRecompiler::IR::ImageHeapView&                view,
+	     std::vector<ShaderRecompiler::IR::DescriptorValue>& kinds) override {
+		const auto peeked = m_heap.Peek(request, view, kinds);
+		if (peeked == ShaderRecompiler::IR::ImageHeapPeek::Unknown) return peeked;
+		const bool resident = peeked == ShaderRecompiler::IR::ImageHeapPeek::Resident;
+		m_job.heap_uses.push_back(
+		    {.base       = request.base,
+		     .size       = request.size,
+		     .step       = request.step,
+		     .first      = request.first,
+		     .count      = request.count,
+		     .root       = *request.root,
+		     .slots      = resident ? view.slots : 0u,
+		     .slot_count = resident ? view.slot_count : 0u,
+		     .kinds      = resident ? kinds : std::vector<ShaderRecompiler::IR::DescriptorValue> {},
+		     .resident   = resident});
+		return peeked;
+	}
+
+private:
+	ShaderRecompiler::IR::ImageHeapSource& m_heap;
+	Job&                                   m_job;
+};
+
+ResourceLookahead::ResourceLookahead(LookaheadMemory memory, uint32_t helpers,
+                                     ShaderRecompiler::IR::ImageHeapSource* heap)
+    : m_memory(memory), m_heap(heap) {
 	m_helpers.reserve(helpers);
 	for (uint32_t i = 0; i < helpers; ++i) {
 		m_helpers.push_back(std::make_unique<Helper>());
@@ -115,6 +154,7 @@ ResourceLookahead::Job* ResourceLookahead::NewJob() {
 	job->cancelled.store(false, std::memory_order_relaxed);
 	job->reads.clear();
 	job->bytes.clear();
+	job->heap_uses.clear();
 	return job;
 }
 
@@ -205,6 +245,8 @@ void ResourceLookahead::RunJob(Job& job) {
 		job.state.store(State::Failed, std::memory_order_release);
 		return;
 	}
+	std::optional<HelperHeap> heap;
+	if (m_heap != nullptr) heap.emplace(*m_heap, job);
 	HelperReader                  reader(m_memory, job);
 	ScalarReadCache<HelperReader> cache(reader);
 	HelperReader::Context         context {.reader = reader, .cache = cache};
@@ -225,6 +267,7 @@ void ResourceLookahead::RunJob(Job& job) {
 	    .read_specialization_memory = HelperReader::ReadSpecialization,
 	    .workgroup_counts           = job.inputs.workgroup_counts,
 	    .indirect_args_address      = job.inputs.indirect_args_address,
+	    .image_heap                 = heap ? &*heap : nullptr,
 	    .read_cache                 = &view,
 	    // Earlier commands may still write the data it reads; Outcome::Failed counts it.
 	    .speculative = true,
@@ -262,6 +305,23 @@ bool ResourceLookahead::Unchanged(const Job& job, Outcome& outcome) {
 	return true;
 }
 
+// Acquires the heap tables the walk met, as the owner's own walk would: the walk holds when every
+// acquire does what the helper saw (the same view, or a decline). The owner's own walk acquires
+// the same tables, so a mismatch costs nothing extra.
+bool ResourceLookahead::SameHeapViews(const Job& job) {
+	for (const auto& use: job.heap_uses) {
+		ShaderRecompiler::IR::ImageHeapView view;
+		const bool                          resident =
+		    m_heap->Acquire({use.base, use.size, use.step, use.first, use.count, &use.root}, view);
+		if (resident != use.resident ||
+		    (resident && (view.slots != use.slots || view.slot_count != use.slot_count ||
+		                  !std::ranges::equal(view.kinds, use.kinds)))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 ResourceLookahead::Outcome
 ResourceLookahead::TryAdopt(const void* stream_key, const void* command, const LookaheadPlan* plan,
                             const LookaheadInputs&                        inputs,
@@ -291,6 +351,7 @@ ResourceLookahead::TryAdopt(const void* stream_key, const void* command, const L
 		if (state != State::Done) return Outcome::Failed;
 		Outcome result = Outcome::Adopted;
 		if (!Unchanged(*job, result)) return result;
+		if (!job->heap_uses.empty() && !SameHeapViews(*job)) return Outcome::Heap;
 		std::swap(snapshot, job->snapshot);
 		std::swap(specialization, job->specialization);
 		return Outcome::Adopted;
