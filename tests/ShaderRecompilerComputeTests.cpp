@@ -43180,8 +43180,9 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         u32 pagetable = 0, conversion_function = 0, geometry_function = 0,
             function = 0;
         u32 bda_reads = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
-        bool geometry_pure = true, geometry_cases = true;
+        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0,
+            geometry_loads = 0;
+        bool geometry_pure = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -43200,19 +43201,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             conversion_definitions += function == conversion_function;
             geometry_definitions += function == geometry_function;
           }
+          // The geometry is one read of a constant table, without branches.
           if (function == geometry_function && function != 0u) {
-            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
-                             opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
-              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
-            }
+            geometry_pure &=
+                opcode != spv::OpStore && opcode != spv::OpFunctionCall;
+            geometry_switches +=
+                opcode == spv::OpSwitch || opcode == spv::OpBranchConditional;
+            geometry_loads += opcode == spv::OpLoad;
           }
           if (opcode == spv::OpAccessChain && words[3] == pagetable)
             ++bda_reads;
@@ -43227,10 +43222,12 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 conversion_definitions == 1u &&
                     conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
                 "formatted loads must call one conversion function across virtual halves");
-        Require(test.name, "one shared pure format geometry",
-                geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
-                "format geometry duplicated, lost a format/default or acquired memory accesses");
+        Require(
+            test.name, "one shared pure format geometry",
+            geometry_definitions == 1u && geometry_calls == conversion_calls &&
+                geometry_switches == 0u && geometry_loads == 1u &&
+                geometry_pure,
+            "format geometry duplicated, branched or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
