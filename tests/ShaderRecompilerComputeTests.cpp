@@ -44468,7 +44468,14 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
               Prospero::BufferFormat::k16_16_16_16SNorm, Prospero::BufferFormat::k10_10_10_2SNorm};
           const std::array swizzles{DstSel(4, 5, 0, 1), DstSel(7, 4, 1, 0), DstSel(5, 4, 7, 6)};
           record[3] = (u32(formats[row % 3u]) << 12u) | swizzles[row % 3u];
-          if (row == 3u) std::fill_n(record.begin(), 4u, 0u);
+          // The key is unbounded, so every 64-byte probe of the table is a
+          // candidate. Row 3 holds a field that is no descriptor of the access
+          // (Ghost of Yotei's CS 8b26ed4422b71476: a misaligned stride-1 record
+          // of an unsupported format); it reads as null instead of failing the
+          // specialization.
+          if (row == 3u)
+            record = {0x00001081u, 0x0001d22cu, 0xcb550000u, 0x00020050u,
+                      record[4],   record[5],   record[6],   record[7]};
         }
         std::copy(record.begin(), record.end(), test.initial.begin() + (table + 192u + row * 64u) / 4u);
         // BDA loads use a separate tuple, as the captured shader's record members do.
