@@ -414,7 +414,6 @@ static void ShaderGetStaticInputInfoPS(
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
-                                       const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	info.threads_num[0]      = regs.cs_regs.num_thread_x;
 	info.threads_num[1]      = regs.cs_regs.num_thread_y;
@@ -431,24 +430,6 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
-
-// The part of each raw buffer format a vertex module depends on: its channel count and, for
-// integer formats, its component type (Float otherwise).
-constexpr auto kVertexFetchFormats = [] {
-	std::array<uint8_t, 128> formats {};
-	for (uint32_t raw = 0; raw < formats.size(); raw++) {
-		const auto format =
-		    ShaderRecompiler::Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(raw));
-		auto type = ShaderRecompiler::Format::ComponentType::Float;
-		if (format.type == ShaderRecompiler::Format::ComponentType::Uint ||
-		    format.type == ShaderRecompiler::Format::ComponentType::Sint) {
-			type = format.type;
-		}
-		formats[raw] =
-		    static_cast<uint8_t>(format.component_count | static_cast<uint32_t>(type) << 3u);
-	}
-	return formats;
-}();
 
 bool ShaderGetCreatedComputeInput(std::span<const ShaderRegister> sh_registers,
                                   uint32_t dispatch_modifier, uint32_t scratch_size_dwords,
@@ -467,8 +448,7 @@ bool ShaderGetCreatedComputeInput(std::span<const ShaderRegister> sh_registers,
 	info                     = {};
 	info.dispatch_thread_dimensions =
 	    (dispatch_modifier & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0u;
-	static const HW::ShaderRegisters unused_sh {};
-	ShaderGetStaticInputInfoCS(regs, unused_sh, data, info);
+	ShaderGetStaticInputInfoCS(regs, data, info);
 	user_data_count = regs.cs_regs.user_sgpr;
 	return program && regs.cs_regs.num_thread_x != 0u;
 }
@@ -531,9 +511,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		// Swizzle, channel count and type class; the pipeline key holds the format itself.
-		key.push_back(resource.DstSelXYZW() |
-		              static_cast<uint32_t>(kVertexFetchFormats[resource.RawFormat()]) << 12u);
+		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
 	}
 }
 
@@ -771,10 +749,9 @@ ShaderParams PrepareProgram(
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
-ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                            ShaderComputeInputInfo& info) {
+ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
-	ShaderGetStaticInputInfoCS(regs, sh, data, info);
+	ShaderGetStaticInputInfoCS(regs, data, info);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
