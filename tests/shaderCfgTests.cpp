@@ -5807,7 +5807,8 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
-  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
+  // One page lookup per DWORD, each with its fault record (OpAtomicOr).
+  Check(SpirvInstructionOpcodeCount(raw.spirv, 241) == 2u,
         "aligned scalar DWORDs must each use one BDA lookup");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
