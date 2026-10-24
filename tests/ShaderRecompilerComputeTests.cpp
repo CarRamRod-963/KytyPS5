@@ -43816,6 +43816,148 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "GpuSelectedRecordBufferAccess");
 }
 
+// A GPU-selected table of more mixed-layout candidates than a switch arm each
+// affords (Ghost of Yotei's CS 8b26ed4422b71476: 2047 vertex-stream V#s of two
+// formats) is grouped by layout: the module switches over the two layouts and
+// indexes the candidates of each, and every key still reads its own record.
+void CheckGroupedLayoutRecordBuffers(VulkanHarness &vulkan) {
+  const u32 alignment = vulkan.RuntimeContext()
+                            .GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  constexpr u32 selectors = 256u, table = 2048u, rows = 80u;
+  // An integer below 2048 as a half and as a float.
+  const auto half_of = [](u32 n) {
+    const u32 e = 31u - static_cast<u32>(std::countl_zero(n));
+    return ((e + 15u) << 10u) | ((n - (1u << e)) << (10u - e));
+  };
+  const auto float_of = [](u32 n) {
+    return std::bit_cast<u32>(static_cast<float>(n));
+  };
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32u ? "GroupedLayoutRecordBuffers32"
+                            : "GroupedLayoutRecordBuffers64";
+    const u32 output = slot * (rows + 2u);
+    test.initial.assign((output + rows * wave * 16u) / 4u, 0xdeadbeefu);
+    test.has_user_data = test.has_compute_info = true;
+    const std::array<u32, 8> descriptors{
+        selectors, 12u << 16u, rows, 0x5204u, table, 0u, rows * 64u, 0x5204u};
+    std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
+    const std::array<u32, 4> out_descriptor{output, 16u << 16u, rows * wave,
+                                            0x5204u};
+    std::copy(out_descriptor.begin(), out_descriptor.end(),
+              test.user_data.begin() + 16u);
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 24u;
+    test.compute_info.lds_size_dwords = 0;
+    test.dispatch_x = rows;
+    auto &code = test.code;
+    // A vector-loaded key keeps the table on the unbounded probe path.
+    code.insert(code.end(),
+                {EncodeVop1(0x01, 2, 24), EncodeMubuf0(0x0c, 0, true, false),
+                 EncodeMubuf1(3, 0, 2), EncodeSopp(0x0c, 0),
+                 EncodeVop1(0x02, 32, Vgpr(3)), EncodeSop2(0x26, 33, 32, 255),
+                 64u, EncodeSmem0(0x0a, 8, 2), EncodeSmem1(0u, 33),
+                 EncodeSopp(0x0c, 0)});
+    for (u32 component = 2u; component < 4u; ++component)
+      AppendVMovLiteral(&code, 4u + component, 0x13579bdfu);
+    code.insert(code.end(),
+                {EncodeMubuf0(1u, 0, true, false, true), EncodeMubuf1(4, 2, 0),
+                 EncodeSopp(0x0c, 0),
+                 EncodeSop2(0x1e, 34, 24, InlineU32(std::countr_zero(wave))),
+                 EncodeVop2(0x25, 20, 34, 0),
+                 EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
+    AppendEnd(&code);
+    // Even rows hold RG32Float records, odd rows RG16Float ones, each in its
+    // own slot.
+    for (u32 row = 0; row < rows; ++row) {
+      const bool half = (row & 1u) != 0u;
+      const auto format = half ? Prospero::BufferFormat::k16_16Float
+                               : Prospero::BufferFormat::k32_32Float;
+      const std::array<u32, 4> record{
+          slot * (row + 2u), (half ? 4u : 8u) << 16u, 1u,
+          (u32(format) << 12u) | DstSel(4, 5, 6, 7)};
+      std::copy(record.begin(), record.end(),
+                test.initial.begin() + (table + row * 64u) / 4u);
+      const auto word = slot * (row + 2u) / 4u;
+      if (half) {
+        test.initial[word] = (half_of(row + 101u) << 16u) | half_of(row + 1u);
+      } else {
+        test.initial[word] = float_of(row + 1u);
+        test.initial[word + 1u] = float_of(row + 101u);
+      }
+    }
+    // Compile against poison selectors. A separate GPU dispatch writes the
+    // actual keys.
+    auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    // No switch has an arm per candidate: the widest switches over the layouts.
+    u32 widest_switch = 0;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = std::span(compiled.spirv)
+                             .subspan(offset, compiled.spirv[offset] >> 16u);
+      if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpSwitch)
+        widest_switch =
+            std::max(widest_switch, static_cast<u32>((words.size() - 3u) / 2u));
+      offset += words.size();
+    }
+    Require(test.name, "layout groups",
+            compiled.resources.buffers.size() >= 128u &&
+                widest_switch <= ShaderRecompiler::IR::MaxIndirectBufferLayouts,
+            "mixed-layout candidates were not grouped into indexed layout "
+            "accesses");
+    for (const auto &descriptor : compiled.resources.buffers) {
+      ShaderBufferResource resource{};
+      std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
+      test.storage_buffer_ranges.emplace_back(
+          resource.Base48(), std::max(4u, u32(resource.GetSize())));
+    }
+    TestCase producer;
+    producer.name = "GroupedLayoutSelectorProducer";
+    producer.initial = test.initial;
+    producer.has_compute_info = true;
+    producer.compute_info.threads_num[0] =
+        producer.compute_info.threads_num[1] =
+            producer.compute_info.threads_num[2] = 1u;
+    producer.compute_info.wave_size = 32u;
+    producer.compute_info.lds_size_dwords = 0;
+    // Group g reads row (g * 37) % rows, so the keys visit both layouts out of
+    // order.
+    const auto key_of = [](u32 group) { return group * 37u % rows; };
+    for (u32 group = 0; group < rows; ++group) {
+      AppendVMovLiteral(&producer.code, 1, key_of(group));
+      AppendVMovLiteral(&producer.code, 2, selectors + group * 12u);
+      AppendBufferStoreDword(&producer.code, 1, 2);
+    }
+    AppendEnd(&producer.code);
+    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+    test.expected = test.initial;
+    for (u32 group = 0; group < rows; ++group) {
+      test.expected[selectors / 4u + group * 3u] = key_of(group);
+      const u32 row = key_of(group);
+      for (u32 lane = 0; lane < wave; ++lane) {
+        const u32 out = output / 4u + (group * wave + lane) * 4u;
+        test.expected[out] = lane == 0u ? float_of(row + 1u) : 0u;
+        test.expected[out + 1u] = lane == 0u ? float_of(row + 101u) : 0u;
+        test.expected[out + 2u] = test.expected[out + 3u] = 0x13579bdfu;
+      }
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial,
+                                             test.initial.size(), true);
+    vulkan.Dispatch(producer, producer_shader, buffer);
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "grouped layouts, out-of-order keys and per-row formats",
+                 test.expected,
+                 vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", "GroupedLayoutRecordBuffers");
+}
+
 void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
@@ -54726,6 +54868,7 @@ int main(int argc, char **argv) {
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
     CheckGpuSelectedRecordBufferAccess(vulkan);
+    CheckGroupedLayoutRecordBuffers(vulkan);
     CheckGuardedWaterfallBufferRecords(vulkan);
     CheckGpuSelectedFormattedRecordStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
@@ -55534,6 +55677,7 @@ int main(int argc, char **argv) {
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
   CheckGpuSelectedRecordBufferAccess(vulkan);
+  CheckGroupedLayoutRecordBuffers(vulkan);
   CheckGuardedWaterfallBufferRecords(vulkan);
   CheckGpuSelectedFormattedRecordStore(vulkan);
   CheckFiniteBufferSelection(vulkan);

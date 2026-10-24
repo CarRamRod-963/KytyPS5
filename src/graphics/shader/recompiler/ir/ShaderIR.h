@@ -34,6 +34,10 @@ struct MaterializationScratch;
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
+// The layouts (format, swizzle, stride class) a GPU-selected buffer root's candidates are grouped
+// into when a switch arm per candidate would be too large: the module switches over the layouts
+// and indexes the candidates of each (MaterializeResources, EmitBufferAccess).
+constexpr uint32_t MaxIndirectBufferLayouts = 8u;
 
 enum class ResourceKind {
 	None,

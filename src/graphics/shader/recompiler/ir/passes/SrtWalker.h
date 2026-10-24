@@ -98,6 +98,9 @@ struct SrtRuntime {
 	// Optional: the cache read_memory reads through, and where reads served from it are logged.
 	const SrtReadCacheView* read_cache = nullptr;
 	SrtReadLog*             read_log   = nullptr;
+	// Optional: how many bytes from an address on are mapped guest memory (at most `size`).
+	// Without it every GPU-selected candidate counts as mapped.
+	uint64_t (*mapped_range_size)(uint64_t address, uint64_t size) = nullptr;
 	// A walk ahead of the commands that may still write its guest data (ResourceLookahead):
 	// MaterializeResources reports none of its failures, the caller counts them.
 	bool speculative = false;

@@ -437,6 +437,19 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
+// A run of a GPU-selected buffer root's candidates in one layout with consecutive bindings: the
+// ordinals from first_ordinal to the next run's are bindings first_slot onwards.
+struct IndirectBufferRun {
+	uint32_t first_ordinal  = 0;
+	uint32_t first_slot     = 0;
+	uint32_t representative = 0;
+};
+
+// The runs of a root with a null root descriptor whose candidates are grouped by layout (2 to
+// IR::MaxIndirectBufferLayouts runs); empty for any other root.
+std::vector<IndirectBufferRun> IndirectBufferLayoutRuns(const EmitterState& state,
+                                                        uint32_t            resource);
+
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);

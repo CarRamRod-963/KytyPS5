@@ -169,6 +169,38 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	return representative;
 }
 
+std::vector<IndirectBufferRun> IndirectBufferLayoutRuns(const EmitterState& state,
+                                                        uint32_t            resource) {
+	const auto& buffers = state.program.info.buffers;
+	const auto& root    = buffers[resource];
+	if (root.indirect_root != resource || root.descriptor_index == UINT32_MAX ||
+	    root.packed_stride != 0u || root.indirect_resources.size() < 3u) {
+		return {};
+	}
+	const auto same_layout = [](const IR::BufferResource& a, const IR::BufferResource& b) {
+		return a.packed_stride == b.packed_stride && a.descriptor_format == b.descriptor_format &&
+		       a.descriptor_swizzle == b.descriptor_swizzle;
+	};
+	// A zero-stride layout (an empty formatted record: every index out of bounds) needs no
+	// binding, only its format and swizzle constants.
+	std::vector<IndirectBufferRun> runs;
+	for (uint32_t ordinal = 1; ordinal < root.indirect_resources.size(); ++ordinal) {
+		const auto  index     = root.indirect_resources[ordinal];
+		const auto& candidate = buffers[index];
+		const bool  empty     = candidate.packed_stride == 0u;
+		if (!empty && candidate.descriptor_index == UINT32_MAX) return {};
+		if (!runs.empty() && same_layout(candidate, buffers[runs.back().representative]) &&
+		    (empty || candidate.descriptor_index ==
+		                  runs.back().first_slot + (ordinal - runs.back().first_ordinal))) {
+			continue;
+		}
+		runs.push_back({ordinal, candidate.descriptor_index, index});
+		if (runs.size() > IR::MaxIndirectBufferLayouts) return {};
+	}
+	if (runs.size() < 2u) return {};
+	return runs;
+}
+
 namespace {
 
 // Loads the 16-bit stride word of a buffer binding (a SPIR-V id) from the shader data.
@@ -212,9 +244,12 @@ void EmitMemoryOffsets(EmitterState& state) {
 	state.memory_byte_offsets.resize(count);
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
-		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
+		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX &&
+		    IndirectBufferLayoutRuns(state, resource).empty())
+			continue;
 		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
-			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+			const auto slot = state.program.info.buffers[candidate].descriptor_index;
+			if (slot != UINT32_MAX) dynamic_offsets[slot] = true;
 		}
 	}
 	for (uint32_t i = 0; i < count; i += 4u) {
