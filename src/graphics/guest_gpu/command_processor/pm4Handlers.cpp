@@ -951,8 +951,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetViewportZ) {
 	return reg_num;
 }
 
-static void HwShIgnoreComputeRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
 static void HwShIgnoreShaderRegister([[maybe_unused]] uint32_t cmd_offset,
                                      [[maybe_unused]] uint32_t value) {}
 
@@ -969,9 +967,9 @@ KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	return reg_num;
 }
 
-static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
-	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
+namespace HW {
 
+bool ApplyComputeShaderRegister(CsStageRegisters& cs_regs, uint32_t cmd_offset, uint32_t value) {
 	switch (cmd_offset) {
 		case Pm4::COMPUTE_PGM_LO:
 			cs_regs.data_addr &= 0xFFFFFF00000000FFull;
@@ -1033,12 +1031,20 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_START_Z:
 		case Pm4::COMPUTE_RESOURCE_LIMITS:
 		case Pm4::COMPUTE_TMPRING_SIZE:
-		case Pm4::COMPUTE_PACE_ID: HwShIgnoreComputeRegister(cmd_offset, value); break;
-		default:
-			EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
-			     value);
+		case Pm4::COMPUTE_PACE_ID: break;
+		default: return false;
 	}
+	return true;
+}
 
+} // namespace HW
+
+static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
+	if (!HW::ApplyComputeShaderRegister(cs_regs, cmd_offset, value)) {
+		EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
+		     value);
+	}
 	cp.GetShCtx().SetCsShader(cs_regs);
 }
 

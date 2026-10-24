@@ -5873,6 +5873,47 @@ void TestRecoverableFatalScope() {
         "an ended inner scope must keep the outer one recoverable");
 }
 
+void TestCreatedComputeShaderInput() {
+  // SH registers as an AGC header lists them: the program address, a checksum
+  // the compute stage does not read, RSRC1 with FLOAT_MODE 0xc0, RSRC2 with two
+  // user SGPRs, TGID X/Y, two thread-ID components and 4 x 128 LDS DWORDs, and
+  // the workgroup size.
+  const ShaderRegister registers[] = {
+      {Pm4::COMPUTE_PGM_LO, 0x1000u},
+      {Pm4::COMPUTE_PGM_HI, 0u},
+      {0x22au, 0x12345678u},
+      {Pm4::COMPUTE_PGM_RSRC1, 0xc0u << 12u},
+      {Pm4::COMPUTE_PGM_RSRC2,
+       (2u << 1u) | (1u << 7u) | (1u << 8u) | (1u << 11u) | (4u << 15u)},
+      {Pm4::COMPUTE_NUM_THREAD_X, 8u},
+      {Pm4::COMPUTE_NUM_THREAD_Y, 8u},
+      {Pm4::COMPUTE_NUM_THREAD_Z, 1u},
+  };
+  ShaderComputeInputInfo info;
+  uint32_t user_data_count = 0;
+  // The SDK's dispatch modifier sets CS_W32_EN for wave32 programs.
+  Check(ShaderGetCreatedComputeInput(registers, 0x8001u, 12u, info,
+                                     user_data_count),
+        "created compute registers were not accepted");
+  Check(info.threads_num[0] == 8u && info.threads_num[1] == 8u &&
+            info.threads_num[2] == 1u && info.wave_size == 32u &&
+            user_data_count == 2u && info.workgroup_register == 2 &&
+            info.lds_size_dwords == 512u && info.float_mode == 0xc0u &&
+            info.group_id[0] && info.group_id[1] && !info.group_id[2] &&
+            info.thread_ids_num == 2 && !info.tg_size_en &&
+            info.scratch_size_dwords == 12u && !info.async_compute &&
+            !info.dispatch_thread_dimensions,
+        "created compute input does not match its registers");
+  Check(ShaderGetCreatedComputeInput(registers, 0x1u, 0u, info,
+                                     user_data_count) &&
+            info.wave_size == 64u && info.scratch_size_dwords == 0u,
+        "a dispatch modifier without CS_W32_EN must give wave64");
+  // Without RSRC2 the registers do not describe a compute program.
+  Check(!ShaderGetCreatedComputeInput(std::span(registers).first(4), 0x1u, 0u,
+                                      info, user_data_count),
+        "registers without RSRC2 must not give a compute input");
+}
+
 void TestCodeOnlySpecializationMatchesPlainDescriptors() {
   const auto code_only_module =
       [](std::span<const uint32_t> shader,
@@ -17870,6 +17911,7 @@ int main() {
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   TestRecoverableFatalScope();
+  TestCreatedComputeShaderInput();
   TestCodeOnlySpecializationMatchesPlainDescriptors();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks

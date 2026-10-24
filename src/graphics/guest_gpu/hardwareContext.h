@@ -622,6 +622,10 @@ struct ComputeShaderInfo {
 	UserSgprInfo     cs_user_sgpr;
 };
 
+// Applies one compute SH register write (offset relative to the SH register base). Returns false
+// for a register the compute stage does not know.
+bool ApplyComputeShaderRegister(CsStageRegisters& cs_regs, uint32_t offset, uint32_t value);
+
 struct GeControl {
 	uint16_t primitive_group_size = 0;
 	uint16_t vertex_group_size    = 0;
