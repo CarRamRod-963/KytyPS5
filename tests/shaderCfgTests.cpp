@@ -5968,6 +5968,79 @@ void TestRecoverableFatalScope() {
         "an ended inner scope must keep the outer one recoverable");
 }
 
+void TestCodeOnlySpecializationMatchesPlainDescriptors() {
+  const auto code_only_module =
+      [](std::span<const uint32_t> shader,
+         const ShaderRecompiler::CompileOptions &options) {
+        auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+        const auto specialization =
+            ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
+        Check(specialization.has_value() &&
+                  ShaderRecompiler::IR::SpecializationApplies(
+                      translated.program, *specialization),
+              "code-only specialization does not apply to its program");
+        return ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                *specialization)
+            .spirv;
+      };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+
+  // buffer_load_dword v1 through the V# in s[0:3], buffer_store_dword v1
+  // through the V# in s[4:7]: plain V#s have a 4-byte stride, identity DST_SEL
+  // and raw out-of-bounds checks.
+  const uint32_t buffers[] = {
+      EncodeMubuf0(0x0c, 0), EncodeMubuf1(1, 0, 0), EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(1, 1, 0), 0xbf810000u,
+  };
+  std::array<uint32_t, 8> buffer_data{};
+  for (uint32_t buffer = 0; buffer < 2u; buffer++) {
+    buffer_data[buffer * 4u] = 0x10000u * (buffer + 1u);
+    buffer_data[buffer * 4u + 1u] = 4u << 16u;
+    buffer_data[buffer * 4u + 2u] = 0x100u;
+    buffer_data[buffer * 4u + 3u] = 0xfacu | (3u << 28u);
+  }
+  options.user_data = buffer_data;
+  const auto buffer_module = code_only_module(buffers, options);
+  Check(RecompileForTest(buffers, options).spirv == buffer_module,
+        "plain V#s must give the code-only module");
+  CheckSpirvBinaryValidates(buffer_module);
+  // A zero stride makes every access out of bounds: another module.
+  buffer_data[1] = 0u;
+  Check(RecompileForTest(buffers, options).spirv != buffer_module,
+        "a zero-stride V# must not give the code-only module");
+  buffer_data[1] = 4u << 16u;
+
+  // image_load v[4:7] from the T# in s[0:7], buffer_store_dword v4 through the
+  // V# in s[8:11]: a plain T# is a single-level 2D RGBA8 UNORM image with
+  // identity DST_SEL.
+  const uint32_t image[] = {
+      EncodeMimg0(0x00, 0xf),
+      EncodeMimg1(4, 0, 0, 1),
+      EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(4, 2, 0),
+      0xbf810000u,
+  };
+  auto image_data = ImageTestUserData();
+  image_data[2] = 0x003f003fu; // 64x64
+  image_data[3] |= 0xfacu;
+  std::fill_n(image_data.begin() + 4, 4, 0u);
+  SetImageTestFormat(&image_data, 0, Prospero::BufferFormat::k8_8_8_8UNorm);
+  std::copy_n(buffer_data.begin(), 4, image_data.begin() + 8);
+  options.user_data = image_data;
+  const auto image_module = code_only_module(image, options);
+  FakeGuestMemory zero_memory;
+  Check(RecompileForTest(image, options).spirv ==
+            image_module,
+        "a plain T# must give the code-only module");
+  CheckSpirvBinaryValidates(image_module);
+  // A 3D T# gives another module: the code-only one is a prediction.
+  SetImageTestType(&image_data, 0, Prospero::ImageType::kColor3D);
+  image_data[3] |= 0xfacu;
+  Check(RecompileForTest(image, options).spirv !=
+            image_module,
+        "a 3D T# must not give the 2D code-only module");
+}
+
 void TestNewShaderRecompilerImageQueryTranslation() {
   const uint32_t shader[] = {
       EncodeMimg0(0x60, 0x3),
@@ -18198,6 +18271,7 @@ int main() {
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   TestRecoverableFatalScope();
+  TestCodeOnlySpecializationMatchesPlainDescriptors();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
