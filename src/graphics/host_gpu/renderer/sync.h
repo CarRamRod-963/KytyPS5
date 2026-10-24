@@ -16,6 +16,14 @@ namespace Sync {
 [[nodiscard]] bool     ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
                                            uint64_t& value);
 [[nodiscard]] uint64_t ReadReferenceClock();
+// The host clock `elapsed_ns` before `host_ticks`, in host ticks; 0 if that is before tick 0.
+[[nodiscard]] uint64_t HostTicksBefore(uint64_t host_ticks, uint64_t host_frequency,
+                                       uint64_t elapsed_ns);
+// What ReadReferenceClock() returned at the std::chrono::steady_clock time `steady_ns`; a time
+// after now reads now.
+[[nodiscard]] uint64_t ReferenceClockAt(int64_t steady_ns);
+// `value`, or the largest value an earlier call returned: GPU timestamps never go backwards.
+[[nodiscard]] uint64_t MonotonicReferenceClock(uint64_t value);
 
 [[nodiscard]] uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index,
                                            int flip_mode, int64_t flip_arg);
