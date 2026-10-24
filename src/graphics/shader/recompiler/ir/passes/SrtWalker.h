@@ -33,10 +33,25 @@ struct ImageHeapView {
 	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
 };
 
+// What the last Acquire of a table did, as ImageHeapSource::Peek reports it.
+enum class ImageHeapPeek {
+	Unknown,  // Not acquired yet, or no longer known.
+	Resident, // The table is resident: the view of the last Acquire.
+	Declined, // Acquire returned false: the table is materialized entry by entry.
+};
+
 class ImageHeapSource {
 public:
 	// False when the host does not keep the table resident.
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+	// Any thread: what the last Acquire of this table did; for a resident table, the view it
+	// returned, with its kinds copied to `kinds` (view.kinds refers to them). A walk ahead of the
+	// commands follows it, and the caller keeps the walk only when Acquire does the same at the
+	// command.
+	virtual ImageHeapPeek Peek(const ImageHeapRequest& /*request*/, ImageHeapView& /*view*/,
+	                           std::vector<DescriptorValue>& /*kinds*/) {
+		return ImageHeapPeek::Unknown;
+	}
 
 protected:
 	~ImageHeapSource() = default;

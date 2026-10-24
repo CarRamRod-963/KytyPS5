@@ -82,10 +82,14 @@ public:
 		Failed,     // the helper's walk failed
 		Dirty,      // read bytes with GPU writes not in the backing
 		Moved,      // read bytes changed
+		Heap,       // a resident image heap gave the command another view
 		Count
 	};
 
-	ResourceLookahead(LookaheadMemory memory, uint32_t helpers);
+	// With a resident image heap, walks take the views of its tables that the owner acquired
+	// last (ImageHeapSource::Peek), and the owner acquires them again at the command.
+	ResourceLookahead(LookaheadMemory memory, uint32_t helpers,
+	                  ShaderRecompiler::IR::ImageHeapSource* heap = nullptr);
 	~ResourceLookahead();
 	ResourceLookahead(const ResourceLookahead&)            = delete;
 	ResourceLookahead& operator=(const ResourceLookahead&) = delete;
@@ -123,6 +127,19 @@ private:
 		bool     mapped  = false;
 	};
 	enum class State : uint32_t { Queued, Running, Done, Failed, Skipped };
+	// What a walk took the resident image heap to do with a table.
+	struct HeapUse {
+		uint64_t                                           base  = 0;
+		uint64_t                                           size  = 0;
+		uint64_t                                           step  = 0;
+		uint64_t                                           first = 0;
+		uint64_t                                           count = 0;
+		ShaderRecompiler::IR::ImageResource                root;
+		uint64_t                                           slots      = 0;
+		uint32_t                                           slot_count = 0;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> kinds;
+		bool                                               resident = false;
+	};
 	struct Job {
 		std::atomic<State>                           state {State::Queued};
 		std::atomic<bool>                            cancelled {false};
@@ -133,6 +150,7 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Read>                            reads;
 		std::vector<uint8_t>                         bytes;
+		std::vector<HeapUse>                         heap_uses;
 	};
 	struct Stream {
 		const void*       key = nullptr;
@@ -151,16 +169,19 @@ private:
 	};
 
 	class HelperReader;
+	class HelperHeap;
 
 	void    RunHelper(Helper& helper);
 	void    RunJob(Job& job);
 	bool    Unchanged(const Job& job, Outcome& outcome);
+	bool    SameHeapViews(const Job& job);
 	Job*    NewJob();
 	void    Retire(Job* job);
 	void    Reclaim();
 	Stream& FindStream(const void* key);
 
 	LookaheadMemory                      m_memory;
+	ShaderRecompiler::IR::ImageHeapSource* m_heap = nullptr;
 	std::vector<std::unique_ptr<Helper>> m_helpers;
 	std::vector<std::unique_ptr<Job>>    m_storage;
 	std::vector<Job*>                    m_free;
