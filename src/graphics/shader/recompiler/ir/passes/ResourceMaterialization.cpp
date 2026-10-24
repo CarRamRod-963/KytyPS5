@@ -186,6 +186,35 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
+void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
+                    const DescriptorSource* source, Value extra = {}) {
+	if (source == nullptr && extra.IsEmpty()) {
+		return;
+	}
+	std::vector<Value> pending;
+	if (source != nullptr) {
+		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
+	}
+	if (!extra.IsEmpty()) pending.push_back(extra);
+	std::vector<const Inst*> visited;
+	while (!pending.empty()) {
+		auto* inst = pending.back().Resolve().TryInstruction();
+		pending.pop_back();
+		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+			continue;
+		}
+		visited.push_back(inst);
+		if (planned_reads.contains(inst)) {
+			auto flags = inst->Flags<SrtReadFlags>();
+			flags.clean = 1u;
+			inst->SetFlags(flags);
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
 bool ReadTable(uint64_t base, uint64_t size, uint64_t offset,
                const SrtRuntime& runtime, std::span<uint32_t> words) {
 	const auto count = std::min<uint64_t>(words.size(), offset < size ? (size - offset) / 4u : 0u);
@@ -280,22 +309,22 @@ bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offse
 	           uint64_t {UINT32_MAX} + 1u;
 }
 
-bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
-                           const SrtRuntime& runtime, uint32_t& count) {
+bool EvaluateIndirectCount(const DescriptorSource::IndirectDescriptor& indirect,
+                           const SrtRuntime& runtime, SrtWalker& clean, uint32_t& count) {
 	if (indirect.workgroup_axis != UINT32_MAX) {
 		if (runtime.workgroup_counts.size() != 3u || indirect.workgroup_axis >= 3u) return false;
 		count = std::ranges::find(runtime.workgroup_counts, 0u) != runtime.workgroup_counts.end()
 		    ? 0u : runtime.workgroup_counts[indirect.workgroup_axis];
 		return true;
 	}
-	if (!WalkedValue(program, indirect.key_count, count)) return false;
+	if (!clean.Evaluate(indirect.key_count, count)) return false;
 	if (indirect.signed_count && std::bit_cast<int32_t>(count) < 0) count = 0;
 	return true;
 }
 
-bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
+bool ResolveSelectorKeys(const DescriptorSource::IndirectDescriptor& indirect,
                          const DescriptorValue& material_value, const SrtRuntime& runtime,
-                         std::vector<uint32_t>& keys) {
+                         SrtWalker& clean, std::vector<uint32_t>& keys) {
 	const auto* selector = &*indirect.selector;
 	keys.clear();
 	const auto read_selector = [&](uint64_t base, uint64_t size, uint64_t offset,
@@ -334,7 +363,7 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		const auto& rows = *selector->rows;
 		DescriptorValue count_value;
 		ShaderBufferResource counts, material;
-		if (!WalkedDescriptor(program, rows.source, count_value) ||
+		if (!clean.EvaluateDescriptor(rows.source, count_value) ||
 		    !DecodeBufferDescriptor(count_value, counts) ||
 		    !DecodeBufferDescriptor(material_value, material) || selector->stride != 4u ||
 		    selector->offset != 0u || rows.stride == 0u || (rows.stride & 3u) != 0u ||
@@ -363,7 +392,7 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 				if (candidate_end - first > MaxIndirectDescriptorProbes) break;
 				end = candidate_end;
 			}
-			// Coalesce small gaps, but interpret only selected prefixes. The specialization
+			// Coalesce small gaps, but interpret only selected prefixes. The strict
 			// reader captures the entire fetched span for writable-alias rejection.
 			batch.resize(end - first);
 			if (!ReadScalarTable(material.Base48(), material.GetSize(), first * 4u, runtime, batch))
@@ -379,8 +408,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		std::array<uint32_t, 4> masks {};
 		uint32_t first = 0, count = 0;
 		if (!DecodeBufferDescriptor(material_value, material) ||
-		    !WalkedValue(program, indirect.selector_first, first) ||
-		    !EvaluateIndirectCount(program, indirect, runtime, count) || count != masks.size() * 32u ||
+		    !clean.Evaluate(indirect.selector_first, first) ||
+		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count != masks.size() * 32u ||
 		    selector->stride != sizeof(masks) || selector->offset != 0u ||
 		    material.Type() != 0u || material.Stride() != sizeof(masks) ||
 		    material.SwizzleEnabled() || material.AddTid() || material.OutOfBounds() != 0u ||
@@ -433,8 +462,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 			base = material.Base48();
 			size = material.GetSize();
 		}
-		if (!WalkedValue(program, indirect.selector_first, first) ||
-		    !EvaluateIndirectCount(program, indirect, runtime, count) || count > MaxIndirectDescriptorProbes)
+		if (!clean.Evaluate(indirect.selector_first, first) ||
+		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count > MaxIndirectDescriptorProbes)
 			return false;
 		// SMEM uses its instruction's byte stride; V# stride only supplies its bounds.
 		const auto step = selector->stride != 0u ? selector->stride : material.Stride();
@@ -454,8 +483,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		uint32_t mask = 0;
 		uint32_t count = 0;
 		if (material_value.dword_count != 2u ||
-		    !WalkedValue(program, indirect.selector_mask, mask) ||
-		    !EvaluateIndirectCount(program, indirect, runtime, count) || count == 0u || count > 32u) {
+		    !clean.Evaluate(indirect.selector_mask, mask) ||
+		    !EvaluateIndirectCount(indirect, runtime, clean, count) || count == 0u || count > 32u) {
 			return false;
 		}
 		if (count < 32u) mask &= (1u << count) - 1u;
@@ -512,7 +541,8 @@ template <typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    uint32_t source_index,
                                    uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                                   const SrtRuntime& runtime, SrtWalker& clean,
+                                   ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
                                    Normalize&& normalize) {
@@ -575,8 +605,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) keys.clear();
 		DescriptorValue material_value;
 		if ((selector != nullptr && (byte_keys || !selector_keys->resolved) &&
-		     !WalkedDescriptor(program, selector->source, material_value)) ||
-		    !WalkedDescriptor(program, indirect.table_source, table_value)) {
+		     !clean.EvaluateDescriptor(selector->source, material_value)) ||
+		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
 			return false;
 		}
 		if (table_value.dword_count == 2u) {
@@ -629,7 +659,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                                       : uint64_t {1} << 32u;
 			if (!indirect.key_count.IsEmpty()) {
 				uint32_t key_count = 0u;
-				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
+				if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
 				domain = std::min(domain, uint64_t {key_count});
 			}
 			if (indexed_pointer &&
@@ -741,8 +771,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
-			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
-			if (!indirect.selector_first.IsEmpty() && !WalkedValue(program, indirect.selector_first, first_key))
+			if (!EvaluateIndirectCount(indirect, runtime, clean, key_count)) return false;
+			if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first_key))
 				return false;
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
 			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
@@ -758,7 +788,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
 			if (!selector_keys->resolved) {
-				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys)) return false;
+				if (!ResolveSelectorKeys(indirect, material_value, runtime, clean, keys)) return false;
 				selector_keys->resolved = true;
 			}
 		}
@@ -797,7 +827,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                     std::span(candidate.dwords).first(read_dwords))) {
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
 			}
-		} else if (!WalkedDescriptor(program, sources[entry], candidate)) {
+		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return false;
 		}
 		if (!normalize(candidate))
@@ -1350,13 +1380,16 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
 		}
-		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) plan.capture_specialization_reads = true;
+		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+			plan.requires_specialization_memory = true;
+			plan.capture_specialization_reads   = true;
+		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
 		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
 		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
 		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			target.SetFlags(MemoryFlags {.index = source->Flags<MemoryFlags>().index});
+			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
 		}
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
@@ -1378,6 +1411,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
 		if (target.indirect_descriptor.has_value()) {
+			plan.requires_specialization_memory = true;
 			capture_indirect_reads = true;
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =
@@ -1489,16 +1523,57 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
+	if (plan.capture_specialization_reads) {
+		// Every former flat alias now targets its retained raw read. Mark those reads
+		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.
+		std::unordered_set<const Inst*> planned_reads;
+		for (const auto& read: plan.srt_reads) {
+			auto* inst = read.value.ResolveInstruction();
+			EXIT_IF(inst == nullptr || (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			                           inst->GetOpcode() != ValueOpcode::ReadConstBuffer));
+			planned_reads.insert(inst);
+		}
+		for (const auto& source: plan.descriptor_sources) {
+			if (!source.indirect_descriptor.has_value()) continue;
+			const auto& indirect = *source.indirect_descriptor;
+			if (indirect.selector) {
+				MarkCleanReads(planned_reads, Source(plan, indirect.selector->source));
+				if (indirect.selector->rows)
+					MarkCleanReads(planned_reads, Source(plan, indirect.selector->rows->source));
+			}
+			MarkCleanReads(planned_reads, nullptr, indirect.selector_mask);
+			MarkCleanReads(planned_reads, nullptr, indirect.selector_first);
+			MarkCleanReads(planned_reads, nullptr, indirect.key_count);
+			if (indirect.sources.empty()) {
+				MarkCleanReads(planned_reads, Source(plan, indirect.table_source));
+			} else {
+				for (const auto candidate: indirect.sources) {
+					MarkCleanReads(planned_reads, Source(plan, candidate));
+				}
+			}
+		}
+		// Clean writable addresses prove that shader writes cannot overlap captured reads.
+		for (const auto& buffer: plan.info.buffers) {
+			if (buffer.written) MarkCleanReads(planned_reads, Source(plan, buffer.source));
+		}
+		for (const auto& image: plan.info.images) {
+			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
+		}
+	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
-	if (plan.srt_plan_complete && plan.resource_tracking_complete) CompileSrtWalker(plan);
+	CompileSrtWalker(plan);
 	return plan;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
-	if (!program.resource_tracking_complete) return false;
+	if (!program.resource_tracking_complete ||
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
+		return false;
+	}
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
 	};
@@ -1507,16 +1582,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+	SrtReadCapture capture {runtime, reads};
+	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker walker(program, observed,
+	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
-	SrtReadCapture capture {runtime, reads};
-	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	const auto active = std::span<const uint8_t>(program.active_sources);
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
-			if (!WalkedActive(program, source) ||
+			if ((!active.empty() && !active[source]) ||
 			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
@@ -1531,24 +1610,24 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	if (uniform_fill && !fill.pattern_size.IsEmpty())
-		uniform_fill = WalkedValue(program, fill.pattern_size, words) && words >= 1 && words <= 4;
+		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
 	uint32_t elements = 0;
 	if (uniform_fill && !fill.element_count.IsEmpty())
-		uniform_fill = WalkedValue(program, fill.element_count, elements) && elements != 0;
+		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = WalkedValue(program, fill.values[i], stored[i]) && stored[i] == stored[0];
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.bounded_elements = elements;
 	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
+	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
 		}
-		if (WalkedActive(program, source)) {
-			return WalkedDescriptor(program, source, value) ||
+		if (active.empty() || active[source]) {
+			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
 			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
 		}
 		value = {};
@@ -1572,9 +1651,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source == nullptr) return false;
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, base.source)) {
+				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
+					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
@@ -1582,7 +1661,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i])) {
+			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
 			}
 		}
@@ -1632,13 +1711,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
-			if (!WalkedActive(program, image.source)) {
+			if (!active.empty() && !active[image.source]) {
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
+			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
@@ -1649,7 +1728,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				return resource_failed("image", i, image.source, snapshot.images.size());
 			}
 		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
+			if (!evaluate(image.source, snapshot.images[i], image.written)) {
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
@@ -1670,8 +1749,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
-				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
+				if ((active.empty() || active[source]) && !MaterializeIndirectDescriptor(
+				        program, source, i, 4u, 4u, observed, clean, snapshot, snapshot.samplers,
 				        specialization.samplers,
 				        [](DescriptorValue&) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());

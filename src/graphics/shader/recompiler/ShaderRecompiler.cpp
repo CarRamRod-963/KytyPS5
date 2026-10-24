@@ -584,13 +584,10 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
 		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 || inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
-			inst.SetFlags(MemoryFlags {.index = inst.Flags<MemoryFlags>().index});
+			inst.SetFlags(SrtReadFlags {.index = inst.Flags<MemoryFlags>().index});
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
-	std::vector<Value> targets;
-	for (const auto& site: source.calls) targets.insert(targets.end(), site.target.begin(), site.target.end());
-	CompileSrtWalker(source.call_targets, targets);
 }
 
 } // namespace
@@ -620,18 +617,12 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();
-	std::vector<uint32_t> flat;
-	const bool walked = IR::WalkSrt(source.call_targets, runtime, flat, &reads);
-	const auto read_code = [&](uint64_t address, std::span<uint32_t> words) {
-		if (runtime.read_specialization_memory == nullptr ||
-		    !runtime.read_specialization_memory(runtime.userdata, address, words)) return false;
-		reads.emplace_back(address, words.size_bytes());
-		return true;
-	};
+	IR::SrtReadCapture capture(runtime, reads);
+	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
+	IR::SrtWalker walker(source.call_targets, clean);
 	for (auto& site: source.calls) {
 		uint32_t low = 0, high = 0;
-		if (!walked || !IR::WalkedValue(source.call_targets, site.target[0], low) ||
-		    !IR::WalkedValue(source.call_targets, site.target[1], high))
+		if (!walker.Evaluate(site.target[0], low) || !walker.Evaluate(site.target[1], high))
 			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
 			     source.decoded.instructions[site.instruction].pc);
 		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
@@ -655,7 +646,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				break;
 			}
 			linked.observed_function.resize(function.size);
-			if (!read_code(source.calls[i].address, linked.observed_function) ||
+			if (!clean.read_memory(clean.userdata, source.calls[i].address, linked.observed_function) ||
 			    !std::ranges::equal(expected, linked.observed_function)) {
 				unchanged = false;
 				break;
@@ -685,7 +676,8 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				uint32_t count = 1;
 				Decoder::Instruction inst;
 				for (;;) {
-					if (!read_code(address + uint64_t {index} * sizeof(uint32_t), std::span(words).first(count)))
+					if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
+					                       std::span(words).first(count)))
 						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
 					inst = {};
 					Decoder::DecodeInstruction(words, 0u, inst);
