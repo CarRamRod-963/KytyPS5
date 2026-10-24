@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/shader/recompiler/ir/DescriptorInterner.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -20,6 +21,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -520,18 +522,36 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
         "malformed image table tracking was not transactional");
 }
 
-void TestResidentImageHeap() {
-  struct FakeImageHeap final : ImageHeapSource {
-    bool accept = true;
-    std::vector<DescriptorValue> kinds;
-    std::vector<ImageHeapRequest> requests;
-    bool Acquire(const ImageHeapRequest &request, ImageHeapView &view) override {
-      requests.push_back(request);
-      if (!accept) return false;
-      view = {.slots = 0x123456789abcull, .slot_count = 36u, .kinds = kinds};
-      return true;
+// An image heap that holds the fixture table of MakeIndirectImageFixture(false, 48u, 0u, 16u)
+// (base 0x2000, 144 bytes) resident.
+struct FakeImageHeap final : ImageHeapSource {
+  bool accept = true;
+  std::vector<DescriptorValue> kinds;
+  std::vector<ImageHeapRequest> requests;
+  ImageHeapPeek peek = ImageHeapPeek::Unknown;
+  uint32_t peeks = 0;
+  uint32_t slot_count = 36u;
+  bool Acquire(const ImageHeapRequest &request, ImageHeapView &view) override {
+    requests.push_back(request);
+    if (!accept) return false;
+    view = {.slots = 0x123456789abcull, .slot_count = slot_count, .kinds = kinds};
+    return true;
+  }
+  ImageHeapPeek Peek(const ImageHeapRequest &request, ImageHeapView &view,
+                     std::vector<DescriptorValue> &copy) override {
+    ++peeks;
+    if (request.base != 0x2000u || request.size != 144u || request.step != 16u ||
+        request.count != 9u)
+      return ImageHeapPeek::Unknown;
+    if (peek == ImageHeapPeek::Resident) {
+      copy = kinds;
+      view = {.slots = 0x123456789abcull, .slot_count = 36u, .kinds = copy};
     }
-  };
+    return peek;
+  }
+};
+
+void TestResidentImageHeap() {
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
   fixture->PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture->program);
@@ -605,6 +625,136 @@ void TestResidentImageHeap() {
   Check(!MaterializeResources(plan, speculative, snapshot, specialization) &&
             memory.watched_reads == watched_reads,
         "a lookahead walk materialized a resident image heap entry by entry");
+  // With the heap, it takes the view the last acquire published and gives the GPU thread's result
+  // without acquiring; with no published view it still fails without entry reads.
+  heap.accept = true;
+  heap.kinds = {{descriptor, 8u}, {cube, 8u}};
+  ResourceSnapshot owner_snapshot;
+  ResourceSpecialization owner_specialization;
+  Check(MaterializeResources(plan, runtime, owner_snapshot, owner_specialization),
+        "the GPU thread's heap walk failed");
+  speculative.image_heap = &heap;
+  const auto acquires = heap.requests.size();
+  Check(!MaterializeResources(plan, speculative, snapshot, specialization) && heap.peeks == 1u &&
+            heap.requests.size() == acquires && memory.watched_reads == watched_reads,
+        "a lookahead walk without a published heap view did not fail");
+  heap.peek = ImageHeapPeek::Resident;
+  Check(MaterializeResources(plan, speculative, snapshot, specialization) && heap.peeks == 2u &&
+            heap.requests.size() == acquires && memory.watched_reads == watched_reads &&
+            snapshot.flattened_srt == owner_snapshot.flattened_srt &&
+            snapshot.images.size() == owner_snapshot.images.size() &&
+            std::ranges::equal(snapshot.images, owner_snapshot.images,
+                               [](const auto &a, const auto &b) { return a.dwords == b.dwords; }) &&
+            specialization.images == owner_specialization.images &&
+            snapshot.specialization_reads == owner_snapshot.specialization_reads,
+        "a lookahead walk of a published heap view differs from the GPU thread's walk");
+  // A table the heap declined is materialized entry by entry, as the GPU thread does.
+  heap.accept = false;
+  Check(MaterializeResources(plan, runtime, owner_snapshot, owner_specialization) &&
+            !owner_specialization.images[0].heap,
+        "the GPU thread's walk of a declined heap failed");
+  heap.peek = ImageHeapPeek::Declined;
+  const auto declined_acquires = heap.requests.size();
+  Check(MaterializeResources(plan, speculative, snapshot, specialization) && heap.peeks == 3u &&
+            heap.requests.size() == declined_acquires &&
+            snapshot.flattened_srt == owner_snapshot.flattened_srt &&
+            snapshot.images == owner_snapshot.images &&
+            specialization.images == owner_specialization.images,
+        "a lookahead walk of a declined heap differs from the GPU thread's walk");
+}
+
+LinearTestMemory *g_lookahead_memory = nullptr;
+
+bool LookaheadLinearRead(uint64_t address, void *data, uint64_t size) {
+  if (size % 4u != 0u) return false;
+  std::vector<uint32_t> words(size / 4u);
+  if (!ReadLinearTestMemory(g_lookahead_memory, address, words)) return false;
+  std::memcpy(data, words.data(), size);
+  return true;
+}
+
+// A lookahead walk of a resident heap table is adopted when the owner's acquire at the command
+// returns the view the helper peeked, and not when the view changed.
+void TestLookaheadResidentImageHeap() {
+  using Libs::Graphics::LookaheadInputs;
+  using Libs::Graphics::LookaheadPlan;
+  using Libs::Graphics::ResourceLookahead;
+  using Libs::Graphics::SrtWalkerCompileQueue;
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  fixture->PlanAndTrack();
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  std::array<uint32_t, 16> data{0x3000u, 4u << 16u, 0x100000u, 0u,
+                                0x2000u, 48u << 16u, 3u, 0u};
+  std::copy_n(data.begin(), 4u, data.begin() + 12u);
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x1010u / 4u);
+  g_lookahead_memory = &memory;
+  FakeImageHeap heap;
+  heap.kinds = {{descriptor, 8u}};
+  heap.peek = ImageHeapPeek::Resident;
+
+  const auto owner_plan = ExtractResourcePlan(fixture->program);
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+  ResourceSnapshot owner_snapshot;
+  ResourceSpecialization owner_specialization;
+  Check(MaterializeResources(owner_plan, runtime, owner_snapshot, owner_specialization) &&
+            owner_specialization.images[0].heap,
+        "the owner's heap walk failed");
+
+  SrtWalkerCompileQueue queue;
+  auto job = queue.Submit(std::make_unique<ResourcePlan>(
+      ExtractResourcePlan(fixture->program, SrtWalkerCompilation::SimpleOnly)));
+  for (uint32_t wait = 0; wait < 10000u && !job->Ready(); ++wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  Check(job->Ready(), "the lookahead plan was not compiled");
+  auto plan = std::make_shared<LookaheadPlan>(job, 0u);
+  ResourceLookahead lookahead({.read = LookaheadLinearRead,
+                               .gpu_dirty = [](uint64_t, uint64_t) { return false; }},
+                              1u, &heap);
+  LookaheadInputs inputs;
+  inputs.user_data_count = static_cast<uint32_t>(data.size());
+  std::copy(data.begin(), data.end(), inputs.user_data.begin());
+  const int stream = 0;
+  const int command = 0;
+  using Outcome = ResourceLookahead::Outcome;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto run = [&] {
+    lookahead.BeginRun(&stream);
+    lookahead.Plan(&stream, &command, plan, inputs);
+    lookahead.Kick();
+    lookahead.WaitIdle();
+    snapshot = {};
+    specialization = {};
+    return lookahead.TryAdopt(&stream, &command, plan.get(), inputs, snapshot, specialization);
+  };
+  heap.requests.clear();
+  Check(run() == Outcome::Adopted && heap.requests.size() == 1u &&
+            heap.requests[0].base == 0x2000u && heap.requests[0].count == 9u &&
+            snapshot.flattened_srt == owner_snapshot.flattened_srt &&
+            snapshot.images.size() == owner_snapshot.images.size() &&
+            specialization.images == owner_specialization.images,
+        "a lookahead walk of a resident heap table was not adopted as the owner's walk");
+  heap.slot_count = 40u;
+  Check(run() == Outcome::Heap, "a lookahead walk was adopted although its heap view changed");
+  heap.slot_count = 36u;
+  // A walk that followed a decline holds while the owner's acquire still declines.
+  heap.peek = ImageHeapPeek::Declined;
+  heap.accept = false;
+  Check(run() == Outcome::Adopted && !specialization.images[0].heap,
+        "a lookahead walk of a declined heap table was not adopted");
+  heap.accept = true;
+  Check(run() == Outcome::Heap, "a lookahead walk was adopted although the heap took its table");
+  heap.peek = ImageHeapPeek::Unknown;
+  Check(run() == Outcome::Failed, "a lookahead walk without a heap view did not fail");
+  g_lookahead_memory = nullptr;
 }
 
 void TestImageHeapKinds() {
@@ -10320,6 +10470,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
+    Run("lookahead resident image heap", TestLookaheadResidentImageHeap);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);

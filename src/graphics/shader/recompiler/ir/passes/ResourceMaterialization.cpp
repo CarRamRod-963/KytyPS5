@@ -1050,14 +1050,24 @@ bool MaterializeIndirectDescriptor(
 				const bool heap_root = image_heap &&
 				                       image.resource_class == ImageResourceClass::Sampled &&
 				                       image.mip_mode != ImageMipMode::Dynamic;
-				// Heaps are acquired on the GPU thread only: a lookahead walk that enumerated the
-				// table instead would give the draw another specialization than the GPU thread's.
-				if (heap_root && runtime.speculative)
+				// Heaps are acquired on the GPU thread only. A lookahead walk follows what the last
+				// acquire of the table did (the GPU thread keeps the walk only when its own acquire
+				// does the same) and fails when that is unknown: enumerating a table the heap takes
+				// would give the draw another specialization than the GPU thread's.
+				ImageHeapView                view;
+				std::vector<DescriptorValue> peeked_kinds;
+				const ImageHeapRequest request {table_base, table_size, step, first, count, &image};
+				const auto             peeked =
+				    heap_root && runtime.speculative && runtime.image_heap != nullptr
+				        ? runtime.image_heap->Peek(request, view, peeked_kinds)
+				        : ImageHeapPeek::Unknown;
+				if (heap_root && runtime.speculative && peeked == ImageHeapPeek::Unknown)
 					return failed("image heap on a lookahead walk");
-				ImageHeapView view;
-				if (heap_root && runtime.image_heap != nullptr &&
-				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
-				                                view)) {
+				const bool resident =
+				    heap_root && runtime.image_heap != nullptr &&
+				    (runtime.speculative ? peeked == ImageHeapPeek::Resident
+				                         : runtime.image_heap->Acquire(request, view));
+				if (resident) {
 					snapshot.specialization_reads.emplace_back(table_base, table_size);
 					if (view.kinds.empty()) return true;
 					auto root = root_resource;
