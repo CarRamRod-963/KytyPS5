@@ -36669,6 +36669,73 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(4u);
 }
 
+// A GPU-selected DWORDX4 whose last two DWORDs lie past the only mapped page:
+// the mapped half reads its data, the other half zero, and only the absent page
+// records a fault. The DWORDs of one load share their page table reads, so this
+// checks the split between them.
+TestCase BufferLoadDwordx4GpuSelectedPageSplit(u32 wave) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 PageBytes = BufferCache::CACHING_PAGESIZE;
+  static_assert((GuestBase & (PageBytes - 1u)) == 0u);
+  TestCase test;
+  test.name = wave == 32u ? "BufferLoadDwordx4GpuSelectedPageSplit32"
+                          : "BufferLoadDwordx4GpuSelectedPageSplit64";
+  // The backing is exactly one page, so the page after it has no mapping.
+  test.initial.resize(PageBytes / 4u);
+  for (u32 i = 0; i < test.initial.size(); ++i)
+    test.initial[i] = 0x70000000u | i;
+  const std::array<u32, 4> descriptor{u32(GuestBase + PageBytes - 8u), 1u,
+                                      0x100u, 0x5204u | (3u << 28u)};
+  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130);
+  test.initial[64] = 0;
+  test.compute_info.threads_num[0] = wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 126, 1u);
+  AppendSMovLiteral(&code, 127, 0u);
+  AppendVMovU32(&code, 30, 64u * 4u);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+  code.push_back(EncodeSmem0(0x0a, 8, 0));
+  code.push_back(EncodeSmem1(520, 20));
+  AppendSMovLiteral(&code, 22, 0u);
+  AppendVMovU32(&code, 21, 0u);
+  code.push_back(EncodeMubuf0(0x0e, 0, false, true));
+  code.push_back(EncodeMubuf1(4, 2, 21, 22));
+  for (u32 component = 0; component < 4u; ++component)
+    AppendStoreVgpr(&code, 4u + component, component);
+  AppendEnd(&code);
+  test.expected = test.initial;
+  test.expected[0] = test.initial[PageBytes / 4u - 2u];
+  test.expected[1] = test.initial[PageBytes / 4u - 1u];
+  test.expected[2] = test.expected[3] = 0u;
+  test.bda_mappings = {{GuestBase, 0}};
+  test.fault_words_address = GuestBase + PageBytes;
+  test.expected_fault_words = {
+      1u << (BufferCache::PageIndex(GuestBase + PageBytes) & 31u)};
+  test.opcodes = {O::S_MOV_B32,
+                  O::V_MOV_B32,
+                  O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32,
+                  O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadDwordx4GpuSelectedPageSplit32() {
+  return BufferLoadDwordx4GpuSelectedPageSplit(32u);
+}
+
+TestCase BufferLoadDwordx4GpuSelectedPageSplit64() {
+  return BufferLoadDwordx4GpuSelectedPageSplit(64u);
+}
+
 TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(3u);
 }
@@ -36898,35 +36965,45 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
-      u32 function = 0, bda = 0, inline_reads = 0;
+      u32 function = 0, pagetable = 0, inline_reads = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
-          if (name == "get_bda_pointer") bda = words[1];
+          if (name == "bda_pagetable")
+            pagetable = words[1];
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
           if (functions.contains(function)) ++profiles[functions.at(function)].definitions;
         }
-        if (opcode == spv::OpFunctionCall) {
-          if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
-          if (words[3] == bda) {
-            if (functions.contains(function)) ++profiles[functions.at(function)].reads;
-            else ++inline_reads;
-          }
+        if (opcode == spv::OpFunctionCall && functions.contains(words[3]))
+          ++profiles[functions.at(words[3])].calls;
+        // Page table reads: the DWORDs of one load share the entries of its
+        // first and last page.
+        if (opcode == spv::OpAccessChain && words[3] == pagetable) {
+          if (functions.contains(function))
+            ++profiles[functions.at(function)].reads;
+          else
+            ++inline_reads;
         }
         offset += words.size();
       }
       Require(test.name, "raw load function scope", functions.size() == profiles.size() && inline_reads == 0u,
               "a raw load profile was unused, missing or still emitted inline");
       for (const auto &[name, profile] : profiles)
-        Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
-                    profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
-                    profile.reads == profile.components,
-                "raw load helpers duplicated definitions, calls or component reads");
+        Require(test.name, name.c_str(),
+                profile.uses != 0u && profile.definitions == 1u &&
+                    profile.calls ==
+                        profile.uses *
+                            (wave == 64u && vulkan.SubgroupSize() == 32u
+                                 ? 2u
+                                 : 1u) &&
+                    profile.reads == std::min(profile.components, 2u),
+                "raw load helpers duplicated definitions, calls or component "
+                "reads");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, buffer);
       CompareWords(test, "shared raw loads, lane addressing, EXEC and bounds", test.expected,
@@ -38955,7 +39032,7 @@ TestCase FlatStoreSlcCaptured() {
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.decoded_counts = {{"slc=1", 2}};
-  test.forbidden_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"bda_pagetable"};
   return test;
 }
 
@@ -39362,7 +39439,7 @@ TestCase ScalarLoadAlignsDynamicBase() {
     test.expected[group * 2 + 1] = test.initial[19];
   }
   test.bda_mappings = {{GuestBase, 64}};
-  test.required_spirv = {"get_bda_pointer"};
+  test.required_spirv = {"bda_pagetable"};
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX2, O::V_MOV_B32,
                   O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -39436,7 +39513,8 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
                    0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
                    0, 0, 0, 0};
   test.bda_mappings = {{GuestBase, 512}};
-  test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle"};
+  test.required_spirv = {"bda_pagetable", "OpLoopMerge",
+                         "OpGroupNonUniformShuffle"};
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
                   O::S_MOV_B64, O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4,
@@ -43774,7 +43852,8 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   test.compute_info.dispatch_thread_dimensions = true;
   test.compute_info.dispatch_threads_num[0] = 2;
   test.compute_info.dispatch_threads_num[1] = test.compute_info.dispatch_threads_num[2] = 1;
-  test.forbidden_spirv = {"get_bda_pointer", "flattened_srt", "OpFDiv", "OpUMulExtended"};
+  test.forbidden_spirv = {"bda_pagetable", "flattened_srt", "OpFDiv",
+                          "OpUMulExtended"};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
   Require(test.name, "runtime record count",
           compiled.program.info.buffers.size() == 3 &&
@@ -44050,8 +44129,9 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
-        u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
-        u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
+        u32 pagetable = 0, conversion_function = 0, geometry_function = 0,
+            function = 0;
+        u32 bda_reads = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
         bool geometry_pure = true, geometry_cases = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
@@ -44059,7 +44139,8 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
           if (opcode == spv::OpName) {
             const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
-            if (name == "get_bda_pointer") bda_function = words[1];
+            if (name == "bda_pagetable")
+              pagetable = words[1];
             if (name == "convert_indirect_buffer_format") conversion_function = words[1];
             if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
           }
@@ -44085,8 +44166,9 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
               }
             }
           }
+          if (opcode == spv::OpAccessChain && words[3] == pagetable)
+            ++bda_reads;
           if (opcode == spv::OpFunctionCall) {
-            if (words[3] == bda_function) ++bda_calls;
             if (words[3] == conversion_function) ++conversion_calls;
             if (words[3] == geometry_function) ++geometry_calls;
           }
@@ -44105,10 +44187,12 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
                 "formatted identity lowering duplicated the store per descriptor");
-        Require(test.name, "shared formatted payload read", bda_calls <= 12u,
-                "formatted source load duplicated BDA reads per format or component");
-        std::printf("[compute] BoundedFormattedBufferCopy%u: %zu SPIR-V words, %u BDA calls\n",
-                    wave, compiled.spirv.size(), bda_calls);
+        Require(test.name, "shared formatted payload read", bda_reads <= 12u,
+                "formatted source load duplicated BDA reads per format or "
+                "component");
+        std::printf("[compute] BoundedFormattedBufferCopy%u: %zu SPIR-V words, "
+                    "%u BDA reads\n",
+                    wave, compiled.spirv.size(), bda_reads);
       }
       auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, output);
@@ -44346,16 +44430,19 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
         test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_",
                                "indirect_buffer_format_geometry"};
       else
-        test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+        test.required_spirv = {"bda_pagetable",
+                               "convert_indirect_buffer_format"};
       CheckSpirvEmission(test, compiled.spirv);
-      u32 bda_function = 0, bda_calls = 0;
+      u32 pagetable = 0, bda_calls = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName &&
-            std::string_view(reinterpret_cast<const char *>(words.data() + 2)) == "get_bda_pointer")
-          bda_function = words[1];
-        if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
+            std::string_view(reinterpret_cast<const char *>(
+                words.data() + 2)) == "bda_pagetable")
+          pagetable = words[1];
+        if (opcode == spv::OpAccessChain && words[3] == pagetable)
+          ++bda_calls;
         offset += words.size();
       }
       Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u || components != 0u),
@@ -44654,7 +44741,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     AppendEnd(&code);
     test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
         {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
-    test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+    test.required_spirv = {"bda_pagetable", "convert_indirect_buffer_format"};
     if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
     test.forbidden_spirv = {"OpAtomicCompareExchange"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -49529,6 +49616,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
+  AddCase(BufferLoadDwordx4GpuSelectedPageSplit32);
+  AddCase(BufferLoadDwordx4GpuSelectedPageSplit64);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
