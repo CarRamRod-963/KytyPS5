@@ -6319,6 +6319,32 @@ public:
               acquire(unfiltered) && views.size() == 2u &&
                   ImageHeapTestAccess::ElementCount(heap) == 5u,
               "a second root profile did not get its own view");
+      // Lookahead helpers peek at what the GPU thread's acquire returned. An
+      // unbounded request that starts one step later shares the view of its
+      // lattice, as Acquire normalizes it; a table no acquire took is unknown.
+      {
+        IR::ImageHeapView peeked{};
+        std::vector<IR::DescriptorValue> kinds;
+        const IR::ImageHeapRequest later{table, table_size,       32u,
+                                         32u,   table_size / 32u, &sampled};
+        const IR::ImageHeapRequest untaken{
+            idle_table, table_size, 32u, 0u, table_size / 32u, &sampled};
+        IR::ImageHeapView acquired{};
+        Require(name, "acquired lattice",
+                heap.Acquire(later, acquired) && views.size() == 2u,
+                "an unbounded request a step later did not share its lattice's "
+                "view");
+        Require(name, "peeked view",
+                heap.Peek(later, peeked, kinds) ==
+                        IR::ImageHeapPeek::Resident &&
+                    peeked.slots == acquired.slots &&
+                    peeked.slot_count == acquired.slot_count &&
+                    peeked.kinds.size() == acquired.kinds.size(),
+                "a peek did not return the view the acquire returned");
+        Require(name, "untaken table",
+                heap.Peek(untaken, peeked, kinds) == IR::ImageHeapPeek::Unknown,
+                "a peek of a table no acquire took was not unknown");
+      }
       const auto &idle = *views[1];
       draw();
       const auto resident = ImageHeapTestAccess::ImageOf(heap, filtered.slots[0]);
