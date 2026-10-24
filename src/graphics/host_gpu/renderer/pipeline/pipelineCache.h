@@ -142,7 +142,8 @@ public:
 	// false when a write failed.
 	bool Save();
 	// Queues a driver-cache build of every compute program the title's manifest recorded in
-	// earlier sessions (--precompile-pipelines). Needs the renderer's bindless set layout.
+	// earlier sessions, and of every created compute shader without a recorded program
+	// (--precompile-pipelines). Needs the renderer's bindless set layout.
 	void StartPrecompile(uint32_t thread_count);
 	// --precompile-only: builds every recorded program's pipeline on `thread_count` threads,
 	// waits for all of them, logs the outcome counts and saves the driver cache. Returns false
@@ -285,6 +286,12 @@ private:
 	// Compute programs of this title (_PipelineCache/<title>.programs); null without a driver
 	// cache file.
 	std::unique_ptr<ProgramManifest>        m_manifest;
+	// Compute shaders the guest created (_PipelineCache/<title>.v4.created): code and static
+	// input without a specialization. Precompile builds those the manifest has no program for
+	// with their code-only specialization. Null without a driver cache file.
+	std::unique_ptr<ProgramManifest> m_created;
+	// Created shaders whose precompile never finished; null without a driver cache file.
+	std::unique_ptr<PrecompileAttempts>     m_precompile_attempts;
 	std::unique_ptr<ProgramPrecompileQueue> m_precompile_queue;
 	PrecompileProgress                      m_precompile_progress;
 	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
@@ -301,8 +308,13 @@ private:
 	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
 	void InstallOptimizedPipelines();
 	void SetManifest(std::unique_ptr<ProgramManifest> manifest);
-	// Queues the manifest's programs, on a new queue unless one exists.
+	// Records every compute shader the guest creates from now on in `created`.
+	void SetCreatedShaders(std::unique_ptr<ProgramManifest> created);
+	// Queues the manifest's programs and the created shaders without one, on a new queue unless
+	// one exists.
 	void QueuePrecompile(uint32_t thread_count);
+	void EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record, bool code_only);
+
 	void LogPrecompileStats(const char* when);
 	// Returns the pipeline of a pending first build, or null when the draw may skip it.
 	Pipeline* ResolvePendingBuild(Pipeline& pipeline, PendingDrawBlocker blocker);
@@ -335,9 +347,12 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
 // Thread-safe; touches no guest state. `spirv_hash` receives the hash of the module.
+// With `code_only`, the record's specialization is ignored and the module is built for
+// ShaderRecompiler::IR::CodeOnlySpecialization of the translated program (a created shader that
+// no dispatch has specialized yet).
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record,
-                                           uint64_t*                   spirv_hash = nullptr);
+                                           uint64_t* spirv_hash = nullptr, bool code_only = false);
 
 } // namespace Libs::Graphics
 

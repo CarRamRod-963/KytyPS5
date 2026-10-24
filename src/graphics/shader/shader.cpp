@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -62,7 +63,7 @@ void ShaderInit() {
 	g_shader_map = std::make_unique<std::unordered_map<uint64_t, ShaderMapEntry>>();
 }
 
-void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
+uint64_t ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 
 	if (addr == 0 || data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
@@ -75,6 +76,22 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	return hash;
+}
+
+static std::function<void(const ShaderCreatedCompute&)> g_created_compute_sink;
+static std::mutex                                       g_created_compute_mutex;
+
+void ShaderSetCreatedComputeSink(std::function<void(const ShaderCreatedCompute&)> sink) {
+	std::scoped_lock lock(g_created_compute_mutex);
+	g_created_compute_sink = std::move(sink);
+}
+
+void ShaderNoteCreatedCompute(const ShaderCreatedCompute& shader) {
+	std::scoped_lock lock(g_created_compute_mutex);
+	if (g_created_compute_sink) {
+		g_created_compute_sink(shader);
+	}
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -412,6 +429,29 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
+}
+
+bool ShaderGetCreatedComputeInput(std::span<const ShaderRegister> sh_registers,
+                                  uint32_t dispatch_modifier, uint32_t scratch_size_dwords,
+                                  ShaderComputeInputInfo& info, uint32_t& user_data_count) {
+	HW::ComputeShaderInfo regs;
+	bool                  program = false;
+	for (const auto& reg: sh_registers) {
+		// Registers of other stages (checksums, user-accumulator setup) do not apply.
+		if (HW::ApplyComputeShaderRegister(regs.cs_regs, reg.offset, reg.value)) {
+			program = program || reg.offset == Pm4::COMPUTE_PGM_RSRC2;
+		}
+	}
+	regs.cs_regs.wave_size = Pm4::ComputeWaveSize(dispatch_modifier);
+	ShaderMappedData data;
+	data.scratch_size_dwords = scratch_size_dwords;
+	info                     = {};
+	info.dispatch_thread_dimensions =
+	    (dispatch_modifier & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0u;
+	static const HW::ShaderRegisters unused_sh {};
+	ShaderGetStaticInputInfoCS(regs, unused_sh, data, info);
+	user_data_count = regs.cs_regs.user_sgpr;
+	return program && regs.cs_regs.num_thread_x != 0u;
 }
 
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {

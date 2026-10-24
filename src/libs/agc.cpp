@@ -653,7 +653,20 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	map.code_size_bytes     = h->shader_size;
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
 
-	ShaderMapUserData(base, map);
+	const auto hash = ShaderMapUserData(base, map);
+
+	if (map.type == Prospero::ShaderBinaryType::kCs && h->sh_registers != nullptr &&
+	    h->specials != nullptr) {
+		ShaderCreatedCompute created;
+		created.hash = hash;
+		created.code = std::span(reinterpret_cast<const uint32_t*>(base),
+		                         map.code_size_bytes / sizeof(uint32_t));
+		if (ShaderGetCreatedComputeInput(std::span(h->sh_registers, h->num_sh_registers),
+		                                 h->specials->dispatch_modifier, map.scratch_size_dwords,
+		                                 created.input, created.user_data_count)) {
+			ShaderNoteCreatedCompute(created);
+		}
+	}
 
 	EXIT_NOT_IMPLEMENTED((base & 0xFFFF0000000000FFull) != 0);
 
