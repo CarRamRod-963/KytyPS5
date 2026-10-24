@@ -269,6 +269,7 @@ void ResourceLookahead::RunJob(Job& job) {
 	    .indirect_args_address      = job.inputs.indirect_args_address,
 	    .image_heap                 = heap ? &*heap : nullptr,
 	    .read_cache                 = &view,
+	    .mapped_range_size          = m_memory.mapped_size,
 	    // Earlier commands may still write the data it reads; Outcome::Failed counts it.
 	    .speculative = true,
 	};

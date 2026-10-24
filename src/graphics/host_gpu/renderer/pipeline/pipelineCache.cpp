@@ -581,6 +581,7 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .image_heap                 = image_heap,
 		    .read_cache                 = &read_cache_view,
+		    .mapped_range_size          = Libs::LibKernel::Memory::MappedRangeSize,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -896,9 +897,10 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		if (lookahead_threads != 0) {
 			lookahead = std::make_unique<ResourceLookahead>(
-			    LookaheadMemory {.read      = Libs::LibKernel::Memory::TryReadBacking,
-			                     .gpu_dirty = Libs::LibKernel::Memory::HasGpuDirtyBytes,
-			                     .same      = SameBacking},
+			    LookaheadMemory {.read        = Libs::LibKernel::Memory::TryReadBacking,
+			                     .gpu_dirty   = Libs::LibKernel::Memory::HasGpuDirtyBytes,
+			                     .same        = SameBacking,
+			                     .mapped_size = Libs::LibKernel::Memory::MappedRangeSize},
 			    lookahead_threads, image_heap);
 		}
 	}
