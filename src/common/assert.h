@@ -5,9 +5,27 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Common {
+
+// Thrown instead of ending the process by EXIT, EXIT_COLOR, EXIT_IF and EXIT_NOT_IMPLEMENTED on a
+// thread that is inside a RecoverableFatalScope.
+struct RecoverableFatal {
+	std::string message;
+};
+
+// Makes the fatal checks of speculative work on this thread recoverable: a speculative shader
+// translation may meet code the recompiler cannot handle, which no guest ever runs. Only for
+// self-contained work whose partial state the unwinding discards; nests.
+class RecoverableFatalScope {
+public:
+	RecoverableFatalScope();
+	~RecoverableFatalScope();
+	RecoverableFatalScope(const RecoverableFatalScope&)            = delete;
+	RecoverableFatalScope& operator=(const RecoverableFatalScope&) = delete;
+};
 
 #ifdef __clang__
 int DbgExitHandler(char const* file, int line, std::string_view text)
