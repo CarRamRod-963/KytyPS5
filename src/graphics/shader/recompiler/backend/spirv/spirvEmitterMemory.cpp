@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <optional>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -1716,17 +1717,33 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 }
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
-	auto& state = ctx.state;
+	auto&      state = ctx.state;
+	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 3>> {
+		const auto components = IR::BufferComponentCount(inst.GetOpcode());
+		if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
+			return std::nullopt;
+		}
+		const auto& memory = ctx.Memory(inst);
+		if (memory.kind != IR::ResourceKind::IndirectBuffer || memory.formatted ||
+		    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+			return std::nullopt;
+		}
+		return std::array {memory.data_bits, components, uint32_t(memory.coherent)};
+	};
+	std::map<std::array<uint32_t, 3>, uint32_t> calls;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
-			const auto components = IR::BufferComponentCount(inst.GetOpcode());
-			if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) continue;
-			const auto& memory = ctx.Memory(inst);
-			if (memory.kind != IR::ResourceKind::IndirectBuffer || memory.formatted ||
-			    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) continue;
-			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(
-			    std::array {memory.data_bits, components, uint32_t(memory.coherent)}, 0u);
+			if (const auto found = key(inst)) calls[*found] += state.lane_count;
+		}
+	}
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto found = key(inst);
+			if (!found) continue;
+			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(*found, 0u);
 			if (!inserted) continue;
+			const auto& memory     = ctx.Memory(inst);
+			const auto  components = (*found)[1];
 			const auto function = entry->second = state.builder.AllocateId();
 			const auto type = TypeU32(state);
 			const auto result_type = TypeU32Composite(state, components);
@@ -1736,8 +1753,13 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "");
 			state.builder.AddName(function, name.c_str());
-			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			// NVIDIA inlines every call, and its compile time grows faster than the program: a
+			// shader with hundreds of GPU-selected loads took minutes. From OutlinedLoadCalls call
+			// sites the function stays a call.
+			const auto control = calls[*found] >= OutlinedLoadCalls
+			                         ? spv::FunctionControlDontInlineMask
+			                         : spv::FunctionControlMaskNone;
+			state.builder.AddFunction(spv::OpFunction, result_type, function, control, signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();

@@ -293,6 +293,9 @@ enum class VertexInputScalarKind { Float, Sint, Uint };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
+// A GPU-selected load function called from this many sites is not inlined (DontInline).
+constexpr uint32_t OutlinedLoadCalls = 64;
+
 struct DppTargetLane {
 	uint32_t lane  = 0;
 	uint32_t valid = 0;

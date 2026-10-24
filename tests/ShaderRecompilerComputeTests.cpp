@@ -36736,6 +36736,68 @@ TestCase BufferLoadDwordx4GpuSelectedPageSplit64() {
   return BufferLoadDwordx4GpuSelectedPageSplit(64u);
 }
 
+// A program with more GPU-selected loads of one shape than OutlinedLoadCalls
+// keeps their function a call (DontInline), with the results of the inlined
+// form: every lane sums the first DWORD of 72 consecutive records, half of them
+// past NUM_RECORDS.
+TestCase BufferLoadsGpuSelectedOutlined() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Loads = 72, Records = 36;
+  TestCase test;
+  test.name = "BufferLoadsGpuSelectedOutlined";
+  test.initial.resize(4096);
+  const std::array<u32, 4> descriptor{u32(GuestBase + 4096u), 1u, Records * 16u,
+                                      0x5204u | (3u << 28u)};
+  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130);
+  test.initial[64] = 0;
+  u32 sum = 0;
+  for (u32 record = 0; record < Loads * 4u; ++record) {
+    test.initial[1024 + record] = record * 3u + 1u;
+  }
+  for (u32 load = 0; load < Loads; ++load) {
+    if (load < Records)
+      sum += test.initial[1024 + load * 4u];
+  }
+  test.compute_info.threads_num[0] = 32u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32u;
+  test.has_compute_info = true;
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 126, 1u);
+  AppendSMovLiteral(&code, 127, 0u);
+  AppendVMovU32(&code, 30, 64u * 4u);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+  code.push_back(EncodeSmem0(0x0a, 8, 0));
+  code.push_back(EncodeSmem1(520, 20));
+  AppendSMovLiteral(&code, 22, 0u);
+  AppendVMovU32(&code, 10, 0u);
+  for (u32 load = 0; load < Loads; ++load) {
+    AppendVMovU32(&code, 21, load * 16u);
+    code.push_back(EncodeMubuf0(0x0e, 0, false, true));
+    code.push_back(EncodeMubuf1(4, 2, 21, 22));
+    code.push_back(EncodeVop2(0x25, 10, Vgpr(4), 10));
+  }
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+  test.expected = test.initial;
+  test.expected[0] = sum;
+  test.bda_mappings = {{GuestBase, 0}};
+  test.required_spirv = {"DontInline", "load_indirect_buffer_32x4"};
+  test.opcodes = {O::S_MOV_B32,
+                  O::V_MOV_B32,
+                  O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32,
+                  O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_DWORDX4,
+                  O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(3u);
 }
@@ -49615,6 +49677,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx4GpuSelectedPageSplit32);
   AddCase(BufferLoadDwordx4GpuSelectedPageSplit64);
+  AddCase(BufferLoadsGpuSelectedOutlined);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
