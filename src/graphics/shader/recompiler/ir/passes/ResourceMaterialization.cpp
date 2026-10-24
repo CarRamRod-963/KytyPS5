@@ -3294,6 +3294,44 @@ bool SpecializationApplies(const Program& program, const ResourceSpecialization&
 	                 SamplerResource::NoIndirectSampler);
 }
 
+std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& program) {
+	ResourceSpecialization specialization;
+	specialization.buffers.reserve(program.info.buffers.size());
+	for (const auto& buffer: program.info.buffers) {
+		// A nonzero stride whose value the module reads from the shader data, without swizzle,
+		// index stride or ADD_TID.
+		specialization.buffers.push_back({
+		    .packed_stride      = 1u,
+		    .descriptor_format  = buffer.formatted ? Prospero::BufferFormat::k32_32_32_32Float
+		                                           : Prospero::BufferFormat::kInvalid,
+		    .descriptor_swizzle = DstSel(4, 5, 6, 7),
+		});
+	}
+	specialization.images.reserve(program.info.images.size());
+	for (const auto& image: program.info.images) {
+		// A single-level, identity-swizzled T# of the dimension the instructions name, with a
+		// float format (an integer one for atomics), as BuildResourceSpecialization reads it.
+		auto& entry = specialization.images.emplace_back(ResourceSpecialization::Image {
+		    .numeric_class = image.atomic ? Prospero::TextureNumericClass::Uint
+		                                  : Prospero::TextureNumericClass::Float,
+		    .dimension     = image.dimension == Decoder::ImageDimension::Unknown
+		                         ? Decoder::ImageDimension::Dim2D
+		                         : image.dimension,
+		});
+		// Like the materialization, refuse what no descriptor can give the image (an unused
+		// image without a class, an atomic sampled image).
+		auto specialized          = image;
+		specialized.numeric_class = entry.numeric_class;
+		specialized.dimension     = entry.dimension;
+		specialized.mip_count     = entry.mip_count;
+		if (!DescriptorBindingForImage(specialized).has_value()) {
+			return std::nullopt;
+		}
+	}
+	specialization.samplers.resize(program.info.samplers.size());
+	return specialization;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||

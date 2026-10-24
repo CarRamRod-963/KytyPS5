@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -164,6 +165,13 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
 // resource counts and indirect roots fit the program's resources. A specialization recorded for
 // another recompiler version may not.
 bool SpecializationApplies(const Program& program, const ResourceSpecialization& specialization);
+// The specialization a translated program gets from descriptors that are as plain as its code
+// allows: direct buffers with a nonzero stride (formatted ones 32_32_32_32_FLOAT), direct images
+// of a float 2D format unless the code says otherwise, no candidates. It needs no guest memory,
+// so a pipeline can be built before the first dispatch; the many shaders whose resources are
+// plain get the module their dispatches use. Empty when no descriptors can specialize the
+// program's resources.
+std::optional<ResourceSpecialization> CodeOnlySpecialization(const Program& program);
 
 // Writes the V# stride of every buffer binding with a runtime stride into the shader data.
 void FillBufferStrides(const ShaderInfo& info, const Bindings& bindings,
