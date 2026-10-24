@@ -9,8 +9,21 @@
 
 namespace Common {
 
+static thread_local uint32_t g_recoverable_fatal_depth = 0;
+
+RecoverableFatalScope::RecoverableFatalScope() {
+	g_recoverable_fatal_depth++;
+}
+
+RecoverableFatalScope::~RecoverableFatalScope() {
+	g_recoverable_fatal_depth--;
+}
+
 [[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
                                    int line) {
+	if (g_recoverable_fatal_depth != 0) {
+		throw RecoverableFatal {fmt::format("{} in {}:{}", text, file, line)};
+	}
 	Log::WriteToConsoleAndLog(fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL,
 	                                      title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
