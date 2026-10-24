@@ -954,8 +954,15 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	}
 }
 
+void CommandProcessor::SettleMemoryRead(const volatile void* address, uint64_t size) {
+	SettleLabelAccess(address, size);
+	const std::pair<uint64_t, uint64_t> range {reinterpret_cast<uint64_t>(address), size};
+	LibKernel::Memory::ReadGpuDirtyBytes(std::span {&range, 1u});
+}
+
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
+		SettleMemoryRead(reinterpret_cast<const void*>(m_num_instances_addr), sizeof(uint32_t));
 		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
 		m_num_instances_addr = 0;
 	}
@@ -1090,6 +1097,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		SettleMemoryRead(count_addr, sizeof(uint32_t));
 		draw_count = std::min(uint32_t {*count_addr}, max_count_or_count);
 	}
 	if (draw_count == 0) {
@@ -1117,6 +1125,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		return;
 	}
 
+	SettleMemoryRead(
+	    reinterpret_cast<const void*>(args_addr),
+	    static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes +
+	        (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)));
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
@@ -1243,7 +1255,7 @@ void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instance
 		// and a packet that drew nothing left it as it was.
 		uint32_t count = value.max_count;
 		if (value.count_addr != nullptr) {
-			SettleLabelAccess(value.count_addr, sizeof(uint32_t));
+			SettleMemoryRead(value.count_addr, sizeof(uint32_t));
 			const uint32_t selected = *value.count_addr;
 			count                   = std::min(selected, value.max_count);
 		}
@@ -1268,7 +1280,9 @@ void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instance
 				                     : offsetof(vk::DrawIndirectCommand, instanceCount) / 4u;
 				break;
 		}
-		const auto argument = reinterpret_cast<const uint32_t*>(args_addr)[word];
+		const auto* argument_addr = reinterpret_cast<const uint32_t*>(args_addr) + word;
+		SettleMemoryRead(argument_addr, sizeof(uint32_t));
+		const auto argument = *argument_addr;
 		if (value.field == Field::InstanceCount) {
 			m_num_instances      = argument;
 			m_num_instances_addr = 0;
@@ -1313,7 +1327,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		// Thread dimensions are converted to workgroups on the host, so the arguments are read
+		// here, after the work recorded before this packet.
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+		SettleMemoryRead(args, sizeof(*args));
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;
 	}
