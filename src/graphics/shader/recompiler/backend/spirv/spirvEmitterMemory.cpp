@@ -1781,15 +1781,35 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                          spv::FunctionControlMaskNone, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
-		const auto result = EmitIndexSwitch(
-		    state, format, format_count, result_type, [&](uint32_t format) {
-			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    return state.builder.Constant(
-			        spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
-			        ConstantU32(state, std::max(1u, info.component_count)),
-			        ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
-			        ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
-		    });
+		// A Private table rather than a switch: inlined at every formatted load, a switch over
+		// every format gave the driver dozens of blocks per load. Formats past the table read
+		// the first entry, as the switch's default did.
+		std::vector<uint32_t> entries;
+		entries.reserve(format_count);
+		for (uint32_t item = 0; item < format_count; item++) {
+			const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(item));
+			entries.push_back(state.builder.Constant(
+			    spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
+			    ConstantU32(state, std::max(1u, info.component_count)),
+			    ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
+			    ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u)));
+		}
+		const auto array =
+		    state.builder.Type(spv::OpTypeArray, result_type, ConstantU32(state, format_count));
+		const auto table = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, array), spv::StorageClassPrivate,
+		    state.builder.Constant(spv::OpConstantComposite, array,
+		                           std::span<const uint32_t>(entries)));
+		const auto index   = Select(state, type,
+		                            Binary(state, spv::OpULessThan, TypeBool(state), format,
+		                                   ConstantU32(state, format_count)),
+		                            format, ConstantU32(state, 0));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassPrivate, result_type),
+		                          pointer, table, index);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, result_type, result, pointer);
 		state.builder.AddFunction(spv::OpReturnValue, result);
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}
@@ -1815,23 +1835,29 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		        state, TypeU32(state),
 		        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
 		        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
-		    return EmitValueOrDefaultIfCondition(
-		        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
-		                      ConstantU32(state, 4)),
-		        TypeU32(state), constant, [&]() {
-			        const auto emit_component = [&](uint32_t component) {
-				        return LoadFormattedComponent(
-				            ctx, info, {FormattedSourceKind::Memory, component},
-				            [&](uint32_t) { return raw; },
-				            [&](uint32_t, uint32_t bits) {
-					            return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
-					                          ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
-				            });
-			        };
-			        if (!info.packed_bitfield) return emit_component(0u);
-			        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-			                               emit_component);
-		        });
+		    // The conversions are arithmetic on `raw`: selects keep each format one block.
+		    const auto emit_component = [&](uint32_t component) {
+			    return LoadFormattedComponent(
+			        ctx, info, {FormattedSourceKind::Memory, component},
+			        [&](uint32_t) { return raw; },
+			        [&](uint32_t, uint32_t bits) {
+				        return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+				                      ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+			        });
+		    };
+		    // A component past the format's count converts as the first, as the switch's
+		    // default did.
+		    auto converted = emit_component(0u);
+		    for (uint32_t item = 1; info.packed_bitfield && item < info.component_count; item++) {
+			    converted = Select(state, TypeU32(state),
+			                       Binary(state, spv::OpIEqual, TypeBool(state), component,
+			                              ConstantU32(state, item)),
+			                       emit_component(item), converted);
+		    }
+		    return Select(state, TypeU32(state),
+		                  Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+		                         ConstantU32(state, 4)),
+		                  converted, constant);
 	    });
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
