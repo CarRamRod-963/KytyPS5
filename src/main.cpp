@@ -160,17 +160,25 @@ static void PrintUsage() {
 	    "                                       their pipelines build in the background (at most\n"
 	    "                                       2 s per pipeline).\n");
 	::printf(
-	    "  --precompile-pipelines               Build the compute pipelines recorded in earlier\n"
-	    "                                       sessions, and those of compute shaders the game\n"
-	    "                                       created but never dispatched, into the driver\n"
-	    "                                       cache on background threads while it runs.\n");
+	    "  --precompile-pipelines               Build the compute and graphics pipelines recorded\n"
+	    "                                       in earlier sessions, and those of compute shaders\n"
+	    "                                       the game created but never dispatched, into the\n"
+	    "                                       driver cache in the background while it runs.\n");
 	::printf(
 	    "  --lookahead-threads <n>              Threads that evaluate the resources of upcoming\n"
 	    "                                       draws and dispatches ahead of the GPU thread\n"
 	    "                                       (0 = off, at most 8). Default: 2.\n");
 	::printf(
-	    "  --precompile-only                    Build the recorded and created compute pipelines\n"
-	    "                                       into the driver cache, save it and exit.\n");
+	    "  --precompile-only                    Build the recorded compute and graphics pipelines\n"
+	    "                                       and the created compute shaders into the driver\n"
+	    "                                       cache, save it and exit (code 0 when done).\n");
+	::printf(
+	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
+	    "                                       shareable list without shader code, and exit.\n");
+	::printf(
+	    "  --import-pipeline-list <file>        Precompile the pipelines of a shared list whose\n"
+	    "                                       shaders this game has (with --precompile-only or\n"
+	    "                                       --precompile-pipelines).\n");
 	::printf("  --serialize-dispatches               Order every guest compute dispatch after the\n"
 	         "                                       previous one, also where the guest sends no\n"
 	         "                                       flush between them.\n");
@@ -493,6 +501,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-log-folder") {
 			options.config.shader_log_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--export-pipeline-list") {
+			options.config.export_pipeline_list = Common::PathFromUtf8(value);
+		} else if (arg == "--import-pipeline-list") {
+			options.config.import_pipeline_list = Common::PathFromUtf8(value);
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--printf-direction") {

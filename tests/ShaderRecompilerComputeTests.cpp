@@ -50579,7 +50579,8 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
             "the manifest did not take the live and the stale record");
     PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
                                                new_driver_cache());
-    Require(name, "precompile-all result", cache.PrecompileAll(2),
+    Require(name, "precompile-all result",
+            cache.PrecompileAll(2, {}) == PipelineCache::PrecompileResult::Done,
             "precompiling every record reported a failed save");
     const auto counts = PipelineCacheTestAccess::PrecompileCounts(cache);
     Require(name, "precompile-all counts",

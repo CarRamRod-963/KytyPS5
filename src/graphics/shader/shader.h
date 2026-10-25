@@ -371,6 +371,17 @@ struct ShaderCreatedCompute {
 // the notifications. Set by the renderer, which can build pipelines ahead of their first use.
 void     ShaderSetCreatedComputeSink(std::function<void(const ShaderCreatedCompute&)> sink);
 void     ShaderNoteCreatedCompute(const ShaderCreatedCompute& shader);
+
+// The code of any shader the guest created (sceAgcCreateShader), of every binary type
+// (Prospero::ShaderBinaryType); the hash is that of ShaderMapUserData.
+struct ShaderCreatedCode {
+	uint8_t                   binary_type = 0;
+	uint64_t                  hash        = 0;
+	std::span<const uint32_t> code;
+};
+// Receives every created shader on the creating guest thread, like the compute sink.
+void     ShaderSetCreatedCodeSink(std::function<void(const ShaderCreatedCode&)> sink);
+void     ShaderNoteCreatedCode(const ShaderCreatedCode& shader);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

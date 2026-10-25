@@ -51,13 +51,21 @@ void PipelineCompileQueue::WaitIdle() {
 }
 
 void PipelineCompileQueue::Expedite(uint64_t ticket) {
+	(void)Expedite(ticket, std::chrono::milliseconds::max());
+}
+
+bool PipelineCompileQueue::Expedite(uint64_t ticket, std::chrono::milliseconds max_wait) {
 	std::unique_lock lock(m_mutex);
 	const auto       queued = std::ranges::find(m_jobs, ticket, &Entry::ticket);
 	if (queued == m_jobs.end()) {
-		m_job_finished.wait(lock, [&] {
+		const auto finished = [&] {
 			return std::ranges::find(m_running_tickets, ticket) == m_running_tickets.end();
-		});
-		return;
+		};
+		if (max_wait == std::chrono::milliseconds::max()) {
+			m_job_finished.wait(lock, finished);
+			return true;
+		}
+		return m_job_finished.wait_for(lock, max_wait, finished);
 	}
 	auto job = std::move(queued->job);
 	m_jobs.erase(queued);
@@ -69,6 +77,7 @@ void PipelineCompileQueue::Expedite(uint64_t ticket) {
 	Finish(ticket, handle);
 	lock.unlock();
 	m_job_finished.notify_all();
+	return true;
 }
 
 void PipelineCompileQueue::Finish(uint64_t ticket, uint64_t handle) {
