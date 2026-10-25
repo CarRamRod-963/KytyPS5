@@ -702,6 +702,22 @@ struct PipelineCacheTestAccess {
   static uint64_t PrecompilesFinished(PipelineCache &cache) {
     return cache.m_precompile_progress.Get().finished;
   }
+
+  // Records the cache's graphics stages and pipelines in `manifest` from now
+  // on.
+  static PipelineManifest *
+  AttachPipelineManifest(PipelineCache &cache,
+                         std::unique_ptr<PipelineManifest> manifest) {
+    cache.SetPipelineManifest(std::move(manifest));
+    return cache.m_pipeline_manifest.get();
+  }
+
+  static PrecompileOutcome PrecompileGraphics(
+      PipelineCache &cache, const GraphicsPipelineRecord &record,
+      const std::vector<std::shared_ptr<const GraphicsStageRecord>> &stages) {
+    return cache.PrecompileGraphicsPipeline(record, stages,
+                                            PipelineBuildMode::Precompile);
+  }
 };
 
 namespace {
@@ -21129,6 +21145,10 @@ public:
     constexpr uint64_t fetch_table_address = fetch_instance_address + 0x1000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
+    // Graphics stages and pipelines are recorded as a title's would be (in
+    // memory), for the graphics precompile case below.
+    auto *pipeline_manifest = PipelineCacheTestAccess::AttachPipelineManifest(
+        context.GetPipelineCache(), std::make_unique<PipelineManifest>());
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -22275,6 +22295,88 @@ public:
                 "a draw past the skip window did not wait for its pipeline");
         (void)PipelineCacheTestAccess::SetSkipPendingDraws(
             pipelines, false, PendingDrawSkipWindow);
+
+        // Graphics precompile: the pipeline of the last draw, rebuilt from its
+        // records alone in a fresh driver cache, which then holds it: the
+        // FAIL_ON_PIPELINE_COMPILE_REQUIRED probe of the next build hits.
+        {
+          const auto recorded = pipeline_manifest->Pipelines();
+          Require(name, "recorded graphics pipelines", !recorded.empty(),
+                  "the draws recorded no graphics pipeline");
+          const auto record = recorded.back();
+          std::vector<std::shared_ptr<const GraphicsStageRecord>> stages;
+          for (const auto key : record->VertexStages())
+            stages.push_back(pipeline_manifest->FindStage(key));
+          if (record->pixel_stage != 0)
+            stages.push_back(pipeline_manifest->FindStage(record->pixel_stage));
+          Require(name, "recorded graphics stages",
+                  std::ranges::all_of(stages,
+                                      [](const auto &stage) {
+                                        return stage != nullptr &&
+                                               stage->code != nullptr;
+                                      }) &&
+                      record->pixel_stage != 0 &&
+                      stages.back()->stage == ShaderType::Pixel &&
+                      *stages.back()->code == skip_pixels[2],
+                  "the last draw's stages were not recorded with their code");
+          const bool probes =
+              m_runtime_context.pipeline_creation_cache_control_enabled;
+          const auto fresh_driver_cache = [&] {
+            vk::PipelineCacheCreateInfo create{};
+            vk::PipelineCache driver_cache = nullptr;
+            RequireVk(name, "graphics precompile driver cache",
+                      m_runtime_context.device.createPipelineCache(
+                          &create, nullptr, &driver_cache),
+                      "vkCreatePipelineCache");
+            return driver_cache;
+          };
+          // The records alone, in a cache without the context's modules.
+          auto replay = std::make_unique<PipelineManifest>();
+          for (const auto &stage : stages)
+            (void)replay->AddStage(*stage);
+          (void)replay->AddPipeline(*record);
+          PipelineCache fresh(m_runtime_context, nullptr);
+          PipelineCacheTestAccess::AttachPersistence(
+              fresh, std::make_unique<ProgramManifest>(), fresh_driver_cache());
+          (void)PipelineCacheTestAccess::AttachPipelineManifest(
+              fresh, std::move(replay));
+          Require(name, "graphics precompile-all",
+                  fresh.PrecompileAll(2, {}) ==
+                      PipelineCache::PrecompileResult::Done,
+                  "precompiling the recorded pipeline reported a failed save");
+          const auto counts = PipelineCacheTestAccess::PrecompileCounts(fresh);
+          // The driver may keep pipelines in its own cache across processes
+          // (NVIDIA does), so the fresh cache may already report it cached.
+          Require(name, "graphics precompile counts",
+                  counts.queued == 1 && counts.finished == 1 &&
+                      counts.skipped == 0 && counts.timed_out == 0 &&
+                      counts.cached + counts.compiled == 1,
+                  "the recorded pipeline was not built from its records");
+          if (probes) {
+            Require(name, "graphics precompile probe",
+                    PipelineCacheTestAccess::PrecompileGraphics(
+                        fresh, *record, stages) == PrecompileOutcome::Cached,
+                    "the driver cache does not hold the precompiled graphics "
+                    "pipeline");
+          }
+          // A stage this recompiler no longer derives is skipped, not built.
+          auto stale = *stages.back();
+          stale.specialization.images.resize(
+              stale.specialization.images.size() + 1);
+          auto stale_stages = stages;
+          stale_stages.back() =
+              std::make_shared<const GraphicsStageRecord>(stale);
+          PipelineCache other(m_runtime_context, nullptr);
+          PipelineCacheTestAccess::AttachPersistence(
+              other, std::make_unique<ProgramManifest>(), fresh_driver_cache());
+          Require(name, "stale graphics stage",
+                  PipelineCacheTestAccess::PrecompileGraphics(other, *record,
+                                                              stale_stages) ==
+                      PrecompileOutcome::Skipped,
+                  "a stage whose specialization does not fit was built");
+          std::printf("[gpu]     %-32s ok%s\n", "GraphicsPrecompile",
+                      probes ? "" : " (no driver-cache probes)");
+        }
 
         registers.SetColorBase(0, {.addr = depth_address + 0x38000});
         registers.SetColorAttrib2(
@@ -56369,6 +56471,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--program-precompile-only") == 0) {
     VulkanHarness vulkan;
     CheckComputePrecompile(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graphics-precompile-only") == 0) {
+    // The rasterization case records its draws' pipelines and precompiles
+    // the last one from its records.
+    VulkanHarness vulkan;
+    vulkan.CheckRasterization(false);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
