@@ -94,6 +94,21 @@ void ShaderNoteCreatedCompute(const ShaderCreatedCompute& shader) {
 	}
 }
 
+static std::function<void(const ShaderCreatedCode&)> g_created_code_sink;
+static std::mutex                                    g_created_code_mutex;
+
+void ShaderSetCreatedCodeSink(std::function<void(const ShaderCreatedCode&)> sink) {
+	std::scoped_lock lock(g_created_code_mutex);
+	g_created_code_sink = std::move(sink);
+}
+
+void ShaderNoteCreatedCode(const ShaderCreatedCode& shader) {
+	std::scoped_lock lock(g_created_code_mutex);
+	if (g_created_code_sink) {
+		g_created_code_sink(shader);
+	}
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

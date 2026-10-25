@@ -868,11 +868,31 @@ void WindowRun() {
 	g_window->render_context->GetPipelineCache().Save();
 }
 
-bool WindowPrecompilePipelines() {
+int WindowPrecompilePipelines() {
 	EXIT_IF(g_window == nullptr);
 	// About half the host threads: nothing else runs, and each driver compile is mostly serial.
 	const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
-	return g_window->render_context->GetPipelineCache().PrecompileAll(threads);
+	SDL_SetWindowTitle(g_window->window, "Kyty: precompiling pipelines");
+	// The window keeps answering messages, so that Windows does not end the process as hung.
+	const auto pump = [] {
+		SDL_Event event;
+		while (SDL_PollEvent(&event)) {
+			if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+				return false;
+			}
+		}
+		return true;
+	};
+	using Result      = PipelineCache::PrecompileResult;
+	const auto result = g_window->render_context->GetPipelineCache().PrecompileAll(threads, pump);
+	const int  code   = result == Result::Done ? 0 : result == Result::SaveFailed ? 1 : 2;
+	Log::WriteToConsoleAndLog(fmt::format("Precompile exit: code {}\n", code));
+	return code;
+}
+
+bool WindowExportPipelineList(const std::filesystem::path& path) {
+	EXIT_IF(g_window == nullptr);
+	return g_window->render_context->GetPipelineCache().ExportPipelineList(path);
 }
 
 void WindowShutdown() {

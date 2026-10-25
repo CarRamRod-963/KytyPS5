@@ -217,6 +217,14 @@ bool PrecompileOnlyEnabled() {
 	return g_config->precompile_only;
 }
 
+std::filesystem::path ExportPipelineListPath() {
+	return g_config->export_pipeline_list;
+}
+
+std::filesystem::path ImportPipelineListPath() {
+	return g_config->import_pipeline_list;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

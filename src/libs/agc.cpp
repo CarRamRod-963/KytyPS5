@@ -655,6 +655,10 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 
 	const auto hash = ShaderMapUserData(base, map);
 
+	ShaderNoteCreatedCode({.binary_type = static_cast<uint8_t>(h->type),
+	                       .hash        = hash,
+	                       .code        = std::span(reinterpret_cast<const uint32_t*>(base),
+	                                                map.code_size_bytes / sizeof(uint32_t))});
 	if (map.type == Prospero::ShaderBinaryType::kCs && h->sh_registers != nullptr &&
 	    h->specials != nullptr) {
 		ShaderCreatedCompute created;

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,9 @@ public:
 	// Returns once the ticket's result is available to TakeCompleted (or was taken): a job that
 	// has not started runs on the calling thread, a running one is waited for.
 	void Expedite(uint64_t ticket);
+	// Like Expedite, but waits at most `max_wait` for a running job. Returns whether the result
+	// is available.
+	bool Expedite(uint64_t ticket, std::chrono::milliseconds max_wait);
 	// Drops the queued jobs, waits for the running ones, joins the threads and discards every
 	// uncollected handle. Idempotent.
 	void Stop();
