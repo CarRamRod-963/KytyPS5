@@ -107,10 +107,18 @@ public:
 	// Waits for a running background save, then writes the driver cache if it changed. Returns
 	// false when a write failed.
 	bool Save();
-	// Queues a driver-cache build of every compute program the title's manifest recorded in
-	// earlier sessions, and of every created compute shader without a recorded program
-	// (--precompile-pipelines). Needs the renderer's bindless set layout.
-	void StartPrecompile(uint32_t thread_count);
+	// Queues a driver-cache build of every compute program and graphics pipeline the title's
+	// manifests recorded in earlier sessions or the imported list names, and of every created
+	// compute shader without a recorded program (--precompile-pipelines). Needs the renderer's
+	// bindless set layout. Recorded and listed builds come first, in first-seen order; the
+	// builds run on `thread_count` low-priority threads while the session boots and on
+	// `steady_thread_count` once the game renders or no recorded build is left (see
+	// UpdatePrecompileThreads); zero keeps `thread_count`.
+	void StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count = 0);
+	// The process is about to end on purpose: running precompile builds are recorded as
+	// interrupted (PrecompileAttempts::Interrupt), not as builds that ended the process, and
+	// builds that have not reached their driver call stop there.
+	void EndPrecompileForExit();
 	enum class PrecompileResult : uint8_t {
 		Done,
 		// The driver cache could not be written.
@@ -263,19 +271,40 @@ private:
 	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
 	std::atomic<bool> m_precompile_dirty {false};
 	// A precompile build that runs: when it started, and whether it has finished or timed out
-	// (whichever comes first settles it).
-	using PrecompileBuild = std::function<PrecompileOutcome(PipelineBuildMode)>;
+	// (whichever comes first settles it). A build stops before its next driver call once
+	// `cancel` is set (it timed out, or the cache stops); a driver call itself cannot be
+	// interrupted.
+	using PrecompileBuild =
+	    std::function<PrecompileOutcome(PipelineBuildMode, const std::atomic<bool>& cancel)>;
 	struct RunningPrecompile {
 		std::chrono::steady_clock::time_point start;
 		std::shared_ptr<std::atomic<bool>>    settled;
+		std::shared_ptr<std::atomic<bool>>    cancel;
 		std::string                           label;
 		PrecompileBuild                       build;
-		PipelineBuildMode                     mode = PipelineBuildMode::Precompile;
+		PipelineBuildMode                     mode  = PipelineBuildMode::Precompile;
+		uint64_t                              order = 0;
 	};
-	std::mutex                                      m_precompile_running_mutex;
-	std::unordered_map<uint64_t, RunningPrecompile> m_precompile_running;
-	std::atomic<uint64_t>                           m_precompile_abandoned {0};
-	std::chrono::steady_clock::time_point           m_next_timeout_check {};
+	// Shared with the precompile jobs: an abandoned job may return after the cache is gone.
+	struct PrecompileRuns {
+		std::mutex                                      mutex;
+		std::unordered_map<uint64_t, RunningPrecompile> running;
+		// Abandoned builds still in their driver call.
+		std::atomic<uint64_t> abandoned {0};
+	};
+	std::shared_ptr<PrecompileRuns>       m_precompile_runs = std::make_shared<PrecompileRuns>();
+	std::chrono::steady_clock::time_point m_next_timeout_check {};
+	// Precompile threads after the boot (StartPrecompile); 0 without a precompile.
+	uint32_t m_precompile_steady_threads = 0;
+	// When a recorded or listed build was last queued (steady clock ticks; queued from guest
+	// threads too).
+	std::atomic<int64_t> m_last_recorded_enqueue {0};
+	// Guest flips seen by UpdatePrecompileThreads: the window it counts, and how many windows
+	// in a row had the game rendering.
+	uint64_t                                        m_flip_window_start_count = 0;
+	std::chrono::steady_clock::time_point           m_flip_window_start {};
+	uint32_t                                        m_rendering_windows = 0;
+	bool                                            m_game_rendering    = false;
 	std::chrono::steady_clock::time_point           m_next_coverage_report {};
 	// --precompile-only logs its outcome itself.
 	bool m_precompile_only = false;
@@ -302,21 +331,31 @@ private:
 	void DeferOptimization(Pipeline& pipeline, PipelineCompileQueue::Job job);
 	void InstallOptimizedPipelines();
 	void SetManifest(std::unique_ptr<ProgramManifest> manifest);
+	// Records every graphics stage permutation and pipeline from now on in `manifest`.
+	void SetPipelineManifest(std::unique_ptr<PipelineManifest> manifest);
 	// Records every compute shader the guest creates from now on in `created`.
 	void SetCreatedShaders(std::unique_ptr<ProgramManifest> created);
 	// Queues the manifest's programs and the created shaders without one, on a new queue unless
 	// one exists.
 	void QueuePrecompile(uint32_t thread_count);
-	void EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record, bool code_only);
+	// `position` is the record's FirstSeenPosition: recorded and listed builds run in that order,
+	// before the created shaders (code_only).
+	void EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record, bool code_only,
+	                       uint64_t position);
 	void EnqueuePrecompile(std::shared_ptr<const GraphicsPipelineRecord>           record,
-	                       std::vector<std::shared_ptr<const GraphicsStageRecord>> stages);
+	                       std::vector<std::shared_ptr<const GraphicsStageRecord>> stages,
+	                       uint64_t                                                position);
 	// Queues a build under the attempts rules: quarantined keys are skipped, and a key whose
 	// optimized build timed out is built unoptimized instead. Returns whether it was queued.
-	bool EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build);
+	bool EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
+	                          uint64_t order);
 	void EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
-	                          PipelineBuildMode mode);
+	                          PipelineBuildMode mode, uint64_t order);
 	// Abandons the precompile builds that ran past the time budget.
-	void        CheckPrecompileTimeouts();
+	void CheckPrecompileTimeouts();
+	// Boot threads while recorded or listed builds are left (or were queued less than a while
+	// ago) and the game is not rendering steadily, else the steady thread count.
+	void        UpdatePrecompileThreads();
 	void        QueueResolved(PipelineListResolver::Resolved resolved);
 	void        ImportPipelineList();
 	void        SetCreatedCode(std::unique_ptr<ShaderCodeStore> store);
@@ -326,7 +365,7 @@ private:
 	PrecompileOutcome
 	PrecompileGraphicsPipeline(const GraphicsPipelineRecord&                               record,
 	                           std::span<const std::shared_ptr<const GraphicsStageRecord>> stages,
-	                           PipelineBuildMode                                           mode);
+	                           PipelineBuildMode mode, const std::atomic<bool>* cancel = nullptr);
 	void LogCoverage();
 	// Adds a pipeline the cache is about to create to the pipeline manifest.
 	void RecordGraphicsPipeline(const GraphicsPipelineKey& key, const DrawRenderState& state);
@@ -348,18 +387,18 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
 // the pipeline may be unoptimized or (Background) still null; the returned job then builds the
 // optimized one (see PipelineCache::DeferOptimization).
-PipelineCompileQueue::Job
-CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                       const PipelineRenderingState&   rendering,
-                       const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
-                       const PipelineStaticParameters& static_params,
-                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool* from_driver_cache = nullptr);
+PipelineCompileQueue::Job CreatePipelineInternal(
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
+    const DrawRenderState& state, const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache = nullptr,
+    const std::atomic<bool>* cancel = nullptr);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool* from_driver_cache = nullptr);
+                       bool*                    from_driver_cache = nullptr,
+                       const std::atomic<bool>* cancel            = nullptr);
 
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
@@ -367,11 +406,13 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 // With `code_only`, the record's specialization is ignored and the module is built for
 // ShaderRecompiler::IR::CodeOnlySpecialization of the translated program (a created shader that
 // no dispatch has specialized yet).
-// `mode` is Precompile, or Unoptimized for a program whose optimized build timed out.
+// `mode` is Precompile, or Unoptimized for a program whose optimized build timed out. Once
+// `cancel` is set, the build stops before its next driver call (and reports TimedOut).
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record,
                                            uint64_t* spirv_hash = nullptr, bool code_only = false,
-                                           PipelineBuildMode mode = PipelineBuildMode::Precompile);
+                                           PipelineBuildMode mode = PipelineBuildMode::Precompile,
+                                           const std::atomic<bool>* cancel = nullptr);
 
 } // namespace Libs::Graphics
 
