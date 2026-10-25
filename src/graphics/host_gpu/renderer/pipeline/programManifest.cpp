@@ -418,7 +418,7 @@ PrecompileAttempts::PrecompileAttempts(std::filesystem::path path, std::filesyst
 		while (std::getline(file, line)) {
 			// A torn last line is ignored.
 			if (line.size() < 3 || line[1] != ' ' ||
-			    (line[0] != 'B' && line[0] != 'E' && line[0] != 'T')) {
+			    (line[0] != 'B' && line[0] != 'E' && line[0] != 'T' && line[0] != 'I')) {
 				continue;
 			}
 			char*      end = nullptr;
@@ -430,6 +430,14 @@ PrecompileAttempts::PrecompileAttempts(std::filesystem::path path, std::filesyst
 				// One unfinished begin per process: a process builds a key once.
 				case 'B': m_loaded[key].unfinished++; break;
 				case 'T': m_loaded[key].timed_out = true; break;
+				case 'I':
+					if (const auto state = m_loaded.find(key);
+					    state != m_loaded.end() && state->second.unfinished != 0) {
+						if (--state->second.unfinished == 0 && !state->second.timed_out) {
+							m_loaded.erase(state);
+						}
+					}
+					break;
 				default: m_loaded.erase(key); break;
 			}
 		}
@@ -496,6 +504,10 @@ void PrecompileAttempts::Begin(uint64_t key) {
 
 void PrecompileAttempts::End(uint64_t key) {
 	Append('E', key);
+}
+
+void PrecompileAttempts::Interrupt(uint64_t key) {
+	Append('I', key);
 }
 
 void PrecompileAttempts::TimeOut(uint64_t key) {

@@ -135,9 +135,10 @@ private:
 // runs skip it, so that it cannot end or block every later precompile run. A build that ended
 // one process only is retried once, since that process may have ended for another reason.
 // The file (_PipelineCache/<title>.v5.attempts) holds one line per event, "B <key>" before a
-// build, "E <key>" after it and "T <key>" when it timed out, appended and flushed; loading keeps
-// the keys of unfinished builds and rewrites the file with only those. While the file is missing,
-// the attempts of the previous format (B and E only) are read.
+// build, "E <key>" after it, "T <key>" when it timed out and "I <key>" when the process ended on
+// purpose while the build ran (it takes back that process's begin), appended and flushed; loading
+// keeps the keys of unfinished builds and rewrites the file with only those. While the file is
+// missing, the attempts of the previous format (B and E only) are read.
 //
 // Thread-safe.
 class PrecompileAttempts {
@@ -164,6 +165,9 @@ public:
 	[[nodiscard]] size_t RetriedCount() const;
 	void                 Begin(uint64_t key);
 	void                 End(uint64_t key);
+	// The process ends while the build runs (it did not end the process): this process's begin
+	// does not count, earlier ones still do.
+	void Interrupt(uint64_t key);
 	// The build has run past the time budget; it is quarantined in later processes.
 	void TimeOut(uint64_t key);
 
