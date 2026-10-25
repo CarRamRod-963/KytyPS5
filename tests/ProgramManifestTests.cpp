@@ -392,6 +392,45 @@ void TestPrecompileQueue() {
   stopped.Expedite(2);
   Check(dropped_ran == 0, "a stopped queue runs nothing");
   Check(!stopped.Enqueue(5, [] {}), "a stopped queue takes no jobs");
+
+  // Programs start by order; an abandoned program counts as finished and its
+  // worker is replaced, so the others still run.
+  auto stuck_gate = std::make_shared<Gate>();
+  auto stuck_started = std::make_shared<std::atomic<bool>>(false);
+  {
+    ProgramPrecompileQueue ordered(1, true);
+    std::vector<int> ran;
+    std::mutex ran_mutex;
+    (void)ordered.Enqueue(10, [stuck_gate, stuck_started] {
+      *stuck_started = true;
+      stuck_gate->Wait();
+    });
+    while (!*stuck_started) {
+      std::this_thread::yield();
+    }
+    const auto record = [&](int id) {
+      return [&, id] {
+        std::lock_guard lock(ran_mutex);
+        ran.push_back(id);
+      };
+    };
+    (void)ordered.Enqueue(11, record(1), 7);
+    (void)ordered.Enqueue(12, record(2), 3);
+    (void)ordered.Enqueue(13, record(3), 7);
+    Check(ordered.QueuedBelow(7) == 1, "one program is queued before order 7");
+    Check(!ordered.Abandon(11), "a queued program is not abandoned");
+    Check(ordered.Abandon(10), "the running program is abandoned");
+    ordered.WaitIdle();
+    Check(ran == std::vector<int>{2, 1, 3} && ordered.Remaining() == 0,
+          "the programs ran by order after the abandoned one's worker was "
+          "replaced");
+    ordered.Expedite(10);
+    ordered.SetActiveThreads(1);
+    Check(ordered.ActiveThreads() == 1 && ordered.ThreadCount() == 1,
+          "the thread counts are reported");
+  }
+  // The queue is gone; the abandoned job returns later on its own thread.
+  stuck_gate->Release();
 }
 
 void TestPrecompileProgress() {
@@ -519,10 +558,29 @@ void TestPrecompileAttempts() {
     attempts.Begin(0x55u);
     attempts.End(0x55u);
   }
+  {
+    PrecompileAttempts attempts(path);
+    Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x55u) &&
+              attempts.FailedCount() == 1,
+          "a build that ended two processes is a failure");
+    // Builds that run while the process ends on purpose.
+    attempts.Begin(0x77u);
+    attempts.Interrupt(0x77u);
+    attempts.Begin(0x88u);
+  }
+  {
+    PrecompileAttempts attempts(path);
+    Check(!attempts.Retried(0x77u) && !attempts.Failed(0x77u) &&
+              attempts.Retried(0x88u),
+          "an interrupted build is not counted as one that ended the process");
+    // Retried, and interrupted this time: the earlier unfinished begin stays.
+    attempts.Begin(0x88u);
+    attempts.Interrupt(0x88u);
+  }
   PrecompileAttempts attempts(path);
-  Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x55u) &&
-            attempts.FailedCount() == 1,
-        "a build that ended two processes is a failure");
+  Check(attempts.Retried(0x88u) && !attempts.Failed(0x88u) &&
+            attempts.Failed(0xabcdef0123456789u),
+        "an interrupt takes back only its own process's begin");
   PrecompileAttempts memory;
   memory.Begin(1u);
   Check(!memory.Failed(1u), "attempts without a file record nothing");
