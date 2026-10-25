@@ -198,12 +198,6 @@
              </widget>
             </item>
             <item row="11" column="1">
-             <widget class="QCheckBox" name="checkBox_shader_cache">
-              <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
-              <property name="text"><string>Cache shaders</string></property>
-             </widget>
-            </item>
-            <item row="12" column="1">
              <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
               <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
               <property name="text"><string>Relaxed shader float math</string></property>
