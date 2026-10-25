@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -61,6 +62,13 @@ public:
 	                                          const PipelineManifest* pipelines);
 };
 
+// The position of the `index`th of `count` entries, scaled to [0, 2^32): entries of lists of
+// different lengths that a session first needed at about the same time get about the same
+// position (lists and manifests keep first-seen order).
+constexpr uint64_t FirstSeenPosition(size_t index, size_t count) {
+	return count == 0 ? 0 : (static_cast<uint64_t>(index) << 32u) / count;
+}
+
 // Resolves a list's shader names to code: up front from what the emulator has, then as the
 // guest creates shaders. A compute entry is complete when its code is known; a pipeline when the
 // code of all of its stages is. Each entry is returned complete exactly once.
@@ -73,10 +81,15 @@ public:
 	struct Resolved {
 		std::vector<std::shared_ptr<const ComputeProgramRecord>> compute;
 		std::vector<bool>                                        compute_code_only;
+		// FirstSeenPosition among the list's compute entries of the same kind (recorded or
+		// code-only).
+		std::vector<uint64_t> compute_position;
 		struct Pipeline {
 			std::shared_ptr<const GraphicsPipelineRecord>           record;
 			std::vector<std::shared_ptr<const GraphicsStageRecord>> vertex_stages;
 			std::shared_ptr<const GraphicsStageRecord>              pixel_stage;
+			// FirstSeenPosition among the list's pipelines.
+			uint64_t position = 0;
 		};
 		std::vector<Pipeline> pipelines;
 		[[nodiscard]] bool    Empty() const { return compute.empty() && pipelines.empty(); }
@@ -102,6 +115,8 @@ public:
 	Resolved             OnCode(std::span<const uint32_t> code);
 	[[nodiscard]] Counts GetCounts() const;
 	[[nodiscard]] bool   Pending() const;
+	// The program hashes of the compute entries and stages that still miss code.
+	[[nodiscard]] std::unordered_set<uint64_t> PendingShaderHashes() const;
 
 private:
 	struct StageState {
@@ -115,12 +130,14 @@ private:
 	struct PipelineState {
 		std::shared_ptr<const GraphicsPipelineRecord> record;
 		std::vector<size_t>                           stages; // vertex stages, then pixel
-		uint32_t                                      missing = 0;
-		bool                                          done    = false;
+		uint32_t                                      missing  = 0;
+		bool                                          done     = false;
+		uint64_t                                      position = 0;
 	};
 	struct ComputeState {
 		PipelineListContents::Compute entry;
-		bool                          done = false;
+		bool                          done     = false;
+		uint64_t                      position = 0;
 	};
 	struct Waiters {
 		std::vector<size_t> compute;
