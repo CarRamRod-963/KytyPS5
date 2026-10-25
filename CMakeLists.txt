@@ -740,6 +740,16 @@ add_executable(program_manifest_tests EXCLUDE_FROM_ALL
 target_link_libraries(program_manifest_tests common fmt::fmt xxhash)
 target_include_directories(program_manifest_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_list_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineListTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/manifestFormat.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programManifest.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineManifest.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineList.cpp"
+)
+target_link_libraries(pipeline_list_tests common fmt::fmt xxhash Vulkan::Headers)
+target_include_directories(pipeline_list_tests PRIVATE ${inc_headers})
+
 add_executable(memory_budget_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryBudgetTests.cpp"
 )
@@ -845,6 +855,7 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_timing COMMAND $<TARGET_FILE:gpu_timing_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
+	add_test(NAME pipeline_list COMMAND $<TARGET_FILE:pipeline_list_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
@@ -962,6 +973,7 @@ if(BUILD_TESTING)
 		dcc_retile_tests
 		gpu_timing_tests
 		pipeline_compile_queue_tests
+		pipeline_list_tests
 		pipeline_cache_writer_tests
 		pending_draw_policy_tests
 		memory_priority_tests
