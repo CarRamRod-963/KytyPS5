@@ -124,37 +124,56 @@ private:
 	std::unordered_map<CodeKey, std::shared_ptr<const std::vector<uint32_t>>, CodeKeyHash> m_code;
 };
 
-// Precompile builds of created shaders that started but never finished: the recompiler ends the
-// process on code it cannot translate, and a created shader may be one no dispatch ever uses.
-// Such a shader is skipped from then on, so that it does not end every later precompile run.
-// The file (_PipelineCache/<title>.v4.attempts) holds one line per event, "B <key>" before a
-// build and "E <key>" after it, appended and flushed; loading keeps the unfinished keys and
-// rewrites the file with only those.
+// Precompile builds that started and never finished. The recompiler may end the process on code
+// it cannot translate (a created shader no dispatch has used), a driver may never finish a
+// compile, and Windows or a user may end the process during any build. A build that ended two
+// processes, or that ran past the precompile time budget once (TimeOut), is quarantined: later
+// runs skip it, so that it cannot end or block every later precompile run. A build that ended
+// one process only is retried once, since that process may have ended for another reason.
+// The file (_PipelineCache/<title>.v5.attempts) holds one line per event, "B <key>" before a
+// build, "E <key>" after it and "T <key>" when it timed out, appended and flushed; loading keeps
+// the keys of unfinished builds and rewrites the file with only those. While the file is missing,
+// the attempts of the previous format (B and E only) are read.
 //
 // Thread-safe.
 class PrecompileAttempts {
 public:
 	// An empty path keeps the attempts in memory only.
-	explicit PrecompileAttempts(std::filesystem::path path = {});
+	explicit PrecompileAttempts(std::filesystem::path path     = {},
+	                            std::filesystem::path previous = {});
 	~PrecompileAttempts();
 	KYTY_CLASS_NO_COPY(PrecompileAttempts);
 
 	static std::filesystem::path PathFor(const std::filesystem::path& directory,
 	                                     const std::string&           title_id);
+	static std::filesystem::path PreviousPathFor(const std::filesystem::path& directory,
+	                                             const std::string&           title_id);
 
-	// Whether an earlier process began the key's build and did not finish it.
+	// Whether the key's build is quarantined: it timed out, or it began and did not finish in
+	// two earlier processes.
 	[[nodiscard]] bool   Failed(uint64_t key) const;
+	// Whether the key's build timed out in an earlier process.
+	[[nodiscard]] bool TimedOut(uint64_t key) const;
+	// Whether the key's build did not finish in exactly one earlier process (it is retried).
+	[[nodiscard]] bool   Retried(uint64_t key) const;
 	[[nodiscard]] size_t FailedCount() const;
+	[[nodiscard]] size_t RetriedCount() const;
 	void                 Begin(uint64_t key);
 	void                 End(uint64_t key);
+	// The build has run past the time budget; it is quarantined in later processes.
+	void TimeOut(uint64_t key);
 
 private:
+	struct State {
+		uint32_t unfinished = 0;
+		bool     timed_out  = false;
+	};
 	void Append(char event, uint64_t key);
 
-	std::filesystem::path        m_path;
-	mutable std::mutex           m_mutex;
-	std::ofstream                m_file;
-	std::unordered_set<uint64_t> m_failed;
+	std::filesystem::path               m_path;
+	mutable std::mutex                  m_mutex;
+	std::ofstream                       m_file;
+	std::unordered_map<uint64_t, State> m_loaded;
 };
 
 } // namespace Libs::Graphics
