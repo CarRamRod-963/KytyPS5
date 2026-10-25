@@ -510,16 +510,19 @@ void TestPrecompileAttempts() {
   }
   {
     PrecompileAttempts attempts(path);
-    Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x1234u) &&
-              attempts.FailedCount() == 1,
-          "an unfinished build is a failure, a finished one is not");
+    Check(attempts.Retried(0xabcdef0123456789u) &&
+              !attempts.Failed(0xabcdef0123456789u) &&
+              !attempts.Retried(0x1234u) && attempts.RetriedCount() == 1,
+          "an unfinished build is retried once, a finished one is not");
+    // The retry ends the process again.
+    attempts.Begin(0xabcdef0123456789u);
     attempts.Begin(0x55u);
     attempts.End(0x55u);
   }
   PrecompileAttempts attempts(path);
   Check(attempts.Failed(0xabcdef0123456789u) && !attempts.Failed(0x55u) &&
             attempts.FailedCount() == 1,
-        "failures survive the rewrite of the file");
+        "a build that ended two processes is a failure");
   PrecompileAttempts memory;
   memory.Begin(1u);
   Check(!memory.Failed(1u), "attempts without a file record nothing");
