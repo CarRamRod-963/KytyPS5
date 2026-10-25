@@ -1226,8 +1226,9 @@ void PipelineCache::InitializeDriverCache() {
 	                                  : std::string {});
 	SetCreatedShaders(
 	    std::make_unique<ProgramManifest>(ProgramManifest::CreatedPathFor(directory, title_id)));
-	m_precompile_attempts =
-	    std::make_unique<PrecompileAttempts>(PrecompileAttempts::PathFor(directory, title_id));
+	m_precompile_attempts = std::make_unique<PrecompileAttempts>(
+	    PrecompileAttempts::PathFor(directory, title_id),
+	    PrecompileAttempts::PreviousPathFor(directory, title_id));
 	const auto created = m_created->Loaded();
 	PipelineCacheLog("Created compute shaders: {} in {}{}", created.records,
 	                 Common::PathToString(m_created->Path()),
