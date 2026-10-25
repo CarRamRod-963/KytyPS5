@@ -10845,6 +10845,124 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A bindless slot names its image by texture cache id. The cache gives a
+  // deleted image's id to the next image it inserts (Ghost of Yotei recreates
+  // its hi-Z pair every frame), so a slot validated by id alone kept the view
+  // of the deleted image in the bindless table; once the cache's recycled
+  // backing of that image was destroyed, a shader sampling the slot read freed
+  // memory and the device was lost. The slot must go back to the placeholder
+  // when its id holds another image.
+  void CheckBindlessSlotImageReuse() {
+    constexpr const char *name = "BindlessSlotImageReuse";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    EnsureRuntimeContext();
+    // The harness device enables the update-after-bind features the bindless
+    // table needs; the renderer turns the table on from the device features.
+    struct RestoreFlag {
+      bool &flag;
+      bool value;
+      ~RestoreFlag() { flag = value; }
+    } restore_bindless{m_runtime_context.bindless_enabled,
+                       m_runtime_context.bindless_enabled};
+    m_runtime_context.bindless_enabled = true;
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "bindless test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed bindless test direct-memory mapping failed");
+    std::memset(mapped, 0, 0x10000);
+    bool skipped = false;
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      resources.MapMemory(base, allocation_size);
+      auto &table = resources.GetBindlessTable();
+      if (!table.Enabled()) {
+        skipped = true;
+      } else {
+        auto &texture_cache = resources.GetTextureCache();
+        auto &executor = resources.GetRenderExecutor();
+        auto &translation = table.Translation();
+        auto desc =
+            MakeLinearDesc(base, 16u * 16u * 4u, vk::Format::eR8G8B8A8Unorm,
+                           Prospero::BufferFormat::k8_8_8_8UNorm,
+                           Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 4, 1);
+        const auto deleted = texture_cache.FindImage(desc);
+        const auto view = texture_cache.FindTexture(deleted, desc);
+        const auto serial = texture_cache.GetImage(deleted).serial;
+        const auto handle =
+            reinterpret_cast<uint64_t>(static_cast<VkImageView>(view));
+        const auto slot = translation.AllocateSlot(deleted, serial, handle);
+        Require(name, "slot allocation",
+                deleted && view != nullptr &&
+                    slot != BindlessTranslation::NoSlot,
+                "the bindless slot of a sampled image was not allocated");
+        table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
+        // A frame with no deletion keeps the slot.
+        executor.ResolveBindlessImages(scheduler.Current());
+        Require(name, "live image keeps its slot",
+                translation.GetSlot(slot).InUse() &&
+                    translation.GetSlot(slot).image == deleted,
+                "a bindless slot of a live image was released");
+
+        // The image goes away; its id is free once the tick that deleted it
+        // is done, and the next image the cache inserts takes it.
+        TextureCacheTestAccess::DeleteImage(texture_cache, deleted);
+        scheduler.Finish();
+        auto other_desc = MakeLinearDesc(
+            base + 0x10000, 8u * 8u * 4u, vk::Format::eR8G8B8A8Unorm,
+            Prospero::BufferFormat::k8_8_8_8UNorm,
+            Prospero::ImageType::kColor2D, {8, 8, 1}, 1, 4, 1);
+        const auto reused =
+            TextureCacheTestAccess::InsertImage(texture_cache, other_desc.info);
+        Require(name, "id reuse",
+                reused == deleted &&
+                    texture_cache.GetImage(reused).serial != serial,
+                "the texture cache did not give the deleted image's id to the "
+                "next image, so this case does not model the reuse");
+
+        executor.ResolveBindlessImages(scheduler.Current());
+        Require(name, "slot of a deleted image whose id was reused",
+                !translation.GetSlot(slot).InUse() &&
+                    translation.FindSlot(deleted, serial, handle) ==
+                        BindlessTranslation::NoSlot,
+                "the bindless slot kept the view of a deleted image because "
+                "its texture cache id now holds another image");
+        TextureCacheTestAccess::DeleteImage(texture_cache, reused);
+      }
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "bindless test direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "bindless test direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s %s\n", name,
+                skipped ? "skipped (no bindless images)" : "ok");
+  }
+
   // A shader writes a linear R32 float image (Ghost of Yotei's hi-Z pyramid), a
   // later pass samples the same memory as D32 depth, and the guest CPU reads
   // the bytes after the frame. The format swap replaces the cached image; the
@@ -57419,6 +57537,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-slot-reuse-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindlessSlotImageReuse();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
@@ -57752,6 +57875,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckBindlessSlotImageReuse();
   vulkan.CheckSwappedDepthReadback();
   vulkan.CheckStencilPlaneStorage();
   vulkan.CheckUnifiedImageViewCache();
