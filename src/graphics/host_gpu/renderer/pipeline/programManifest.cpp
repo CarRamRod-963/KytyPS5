@@ -392,17 +392,21 @@ size_t ProgramManifest::Size() const {
 	return m_records.size();
 }
 
-PrecompileAttempts::PrecompileAttempts(std::filesystem::path path): m_path(std::move(path)) {
+PrecompileAttempts::PrecompileAttempts(std::filesystem::path path, std::filesystem::path previous)
+    : m_path(std::move(path)) {
 	if (m_path.empty()) {
 		return;
 	}
-	std::unordered_set<uint64_t> begun;
+	std::error_code error;
+	const auto      source =
+	    !previous.empty() && !std::filesystem::exists(m_path, error) ? previous : m_path;
 	{
-		std::ifstream file(m_path);
+		std::ifstream file(source);
 		std::string   line;
 		while (std::getline(file, line)) {
 			// A torn last line is ignored.
-			if (line.size() < 3 || line[1] != ' ' || (line[0] != 'B' && line[0] != 'E')) {
+			if (line.size() < 3 || line[1] != ' ' ||
+			    (line[0] != 'B' && line[0] != 'E' && line[0] != 'T')) {
 				continue;
 			}
 			char*      end = nullptr;
@@ -410,17 +414,22 @@ PrecompileAttempts::PrecompileAttempts(std::filesystem::path path): m_path(std::
 			if (end == line.c_str() + 2 || *end != '\0') {
 				continue;
 			}
-			if (line[0] == 'B') {
-				begun.insert(key);
-			} else {
-				begun.erase(key);
+			switch (line[0]) {
+				// One unfinished begin per process: a process builds a key once.
+				case 'B': m_loaded[key].unfinished++; break;
+				case 'T': m_loaded[key].timed_out = true; break;
+				default: m_loaded.erase(key); break;
 			}
 		}
 	}
-	m_failed = std::move(begun);
 	m_file.open(m_path, std::ios::trunc);
-	for (const auto key: m_failed) {
-		m_file << "B " << std::hex << key << '\n';
+	for (const auto& [key, state]: m_loaded) {
+		if (state.timed_out) {
+			m_file << "T " << std::hex << key << '\n';
+		}
+		for (uint32_t i = 0; i < std::min(state.unfinished, 2u); i++) {
+			m_file << "B " << std::hex << key << '\n';
+		}
 	}
 	m_file.flush();
 }
@@ -429,17 +438,44 @@ PrecompileAttempts::~PrecompileAttempts() = default;
 
 std::filesystem::path PrecompileAttempts::PathFor(const std::filesystem::path& directory,
                                                   const std::string&           title_id) {
+	return directory / (title_id + ".v5.attempts");
+}
+
+std::filesystem::path PrecompileAttempts::PreviousPathFor(const std::filesystem::path& directory,
+                                                          const std::string&           title_id) {
 	return directory / (title_id + ".v4.attempts");
 }
 
 bool PrecompileAttempts::Failed(uint64_t key) const {
 	std::lock_guard lock(m_mutex);
-	return m_failed.contains(key);
+	const auto      state = m_loaded.find(key);
+	return state != m_loaded.end() && (state->second.timed_out || state->second.unfinished >= 2u);
+}
+
+bool PrecompileAttempts::TimedOut(uint64_t key) const {
+	std::lock_guard lock(m_mutex);
+	const auto      state = m_loaded.find(key);
+	return state != m_loaded.end() && state->second.timed_out;
+}
+
+bool PrecompileAttempts::Retried(uint64_t key) const {
+	std::lock_guard lock(m_mutex);
+	const auto      state = m_loaded.find(key);
+	return state != m_loaded.end() && !state->second.timed_out && state->second.unfinished == 1u;
 }
 
 size_t PrecompileAttempts::FailedCount() const {
 	std::lock_guard lock(m_mutex);
-	return m_failed.size();
+	return static_cast<size_t>(std::ranges::count_if(m_loaded, [](const auto& entry) {
+		return entry.second.timed_out || entry.second.unfinished >= 2u;
+	}));
+}
+
+size_t PrecompileAttempts::RetriedCount() const {
+	std::lock_guard lock(m_mutex);
+	return static_cast<size_t>(std::ranges::count_if(m_loaded, [](const auto& entry) {
+		return !entry.second.timed_out && entry.second.unfinished == 1u;
+	}));
 }
 
 void PrecompileAttempts::Begin(uint64_t key) {
@@ -448,6 +484,10 @@ void PrecompileAttempts::Begin(uint64_t key) {
 
 void PrecompileAttempts::End(uint64_t key) {
 	Append('E', key);
+}
+
+void PrecompileAttempts::TimeOut(uint64_t key) {
+	Append('T', key);
 }
 
 void PrecompileAttempts::Append(char event, uint64_t key) {
