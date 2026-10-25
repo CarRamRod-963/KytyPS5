@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <utility>
 
@@ -205,9 +206,15 @@ PipelineListContents PipelineList::Read(const std::filesystem::path& path,
 
 PipelineListResolver::PipelineListResolver(PipelineListContents contents) {
 	m_compute.reserve(contents.compute.size());
+	const auto code_only = static_cast<size_t>(
+	    std::ranges::count_if(contents.compute, [](const auto& entry) { return entry.code_only; }));
+	const std::array<size_t, 2> kind_counts {contents.compute.size() - code_only, code_only};
+	std::array<size_t, 2>       kind_ranks {};
 	for (auto& entry: contents.compute) {
+		const auto kind     = entry.code_only ? 1u : 0u;
+		const auto position = FirstSeenPosition(kind_ranks[kind]++, kind_counts[kind]);
 		m_waiting[entry.code].compute.push_back(m_compute.size());
-		m_compute.push_back({.entry = std::move(entry)});
+		m_compute.push_back({.entry = std::move(entry), .position = position});
 	}
 	std::unordered_map<uint64_t, size_t> stage_index;
 	m_stages.reserve(contents.stages.size());
@@ -254,6 +261,9 @@ PipelineListResolver::PipelineListResolver(PipelineListContents contents) {
 		state.record  = std::make_shared<const GraphicsPipelineRecord>(record);
 		m_pipelines.push_back(std::move(state));
 	}
+	for (size_t i = 0; i < m_pipelines.size(); i++) {
+		m_pipelines[i].position = FirstSeenPosition(i, m_pipelines.size());
+	}
 }
 
 void PipelineListResolver::Supply(const ShaderCodeId& id, const ShaderCode& code, Resolved& out) {
@@ -271,6 +281,7 @@ void PipelineListResolver::Supply(const ShaderCodeId& id, const ShaderCode& code
 		record->code = code;
 		out.compute.push_back(std::move(record));
 		out.compute_code_only.push_back(state.entry.code_only);
+		out.compute_position.push_back(state.position);
 		m_compute_resolved++;
 	}
 	for (const auto index: waiters.stages) {
@@ -290,7 +301,7 @@ void PipelineListResolver::Supply(const ShaderCodeId& id, const ShaderCode& code
 				continue;
 			}
 			pipeline.done = true;
-			Resolved::Pipeline resolved {.record = pipeline.record};
+			Resolved::Pipeline resolved {.record = pipeline.record, .position = pipeline.position};
 			const auto         vertex_count = pipeline.record->vertex_stage_count;
 			for (uint32_t i = 0; i < pipeline.stages.size(); i++) {
 				const auto& stage_record = m_stages[pipeline.stages[i]].done;
@@ -346,6 +357,18 @@ PipelineListResolver::Counts PipelineListResolver::GetCounts() const {
 bool PipelineListResolver::Pending() const {
 	std::lock_guard lock(m_mutex);
 	return !m_waiting.empty();
+}
+
+std::unordered_set<uint64_t> PipelineListResolver::PendingShaderHashes() const {
+	std::lock_guard              lock(m_mutex);
+	std::unordered_set<uint64_t> hashes;
+	for (const auto& state: m_compute) {
+		if (!state.done) hashes.insert(state.entry.record.shader_hash);
+	}
+	for (const auto& stage: m_stages) {
+		if (stage.missing != 0) hashes.insert(stage.record.shader_hash);
+	}
+	return hashes;
 }
 
 } // namespace Libs::Graphics

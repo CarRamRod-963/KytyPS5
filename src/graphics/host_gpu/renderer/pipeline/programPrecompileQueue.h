@@ -104,31 +104,35 @@ private:
 };
 
 // Builds the pipelines of recorded programs (ProgramManifest) on background threads, one job
-// per program key, in the order they were queued. A program the renderer needs before its job
-// ran is expedited: the job runs on the renderer's thread, or the renderer waits for the running
-// job, and the pipeline build that follows finds the driver cache filled. A pipeline is
+// per program key, by their order and then in the order they were queued. A program the
+// renderer needs before its job ran is expedited: the job runs on the renderer's thread, or the
+// renderer waits for the running job, and the pipeline build that follows finds the driver cache
+// filled. A pipeline is
 // therefore never compiled twice at the same time, and nothing waits longer than its own build.
 // Vulkan-free so that the scheduling can be tested without a device.
 class ProgramPrecompileQueue {
 public:
 	using Job = Common::UniqueFunction<void>;
 
-	explicit ProgramPrecompileQueue(uint32_t thread_count)
-	    : m_queue(thread_count, [](uint64_t) {}) {}
+	explicit ProgramPrecompileQueue(uint32_t thread_count, bool low_priority = false)
+	    : m_queue(thread_count, [](uint64_t) {}, {.low_priority = low_priority}) {}
 	~ProgramPrecompileQueue() { Stop(); }
 	KYTY_CLASS_NO_COPY(ProgramPrecompileQueue);
 
-	// Queues the job of a program; a key that was queued before is ignored. Returns whether the
-	// job was queued. Not allowed after Stop.
-	bool Enqueue(uint64_t key, Job job) {
+	// Queues the job of a program; a key that was queued before is ignored. Jobs with a lower
+	// `order` start first (PipelineCompileQueue). Returns whether the job was queued. Not
+	// allowed after Stop.
+	bool Enqueue(uint64_t key, Job job, uint64_t order = 0) {
 		std::lock_guard lock(m_mutex);
 		if (m_stopped || !m_tickets.try_emplace(key, 0).second) {
 			return false;
 		}
-		const auto ticket     = m_queue.Enqueue([job = std::move(job)]() mutable -> uint64_t {
-			job();
-			return 0;
-		});
+		const auto ticket = m_queue.Enqueue(
+		    [job = std::move(job)]() mutable -> uint64_t {
+			    job();
+			    return 0;
+		    },
+		    order);
 		m_tickets[key]        = ticket;
 		m_ticket_keys[ticket] = key;
 		m_queued++;
@@ -155,6 +159,30 @@ public:
 		return finished;
 	}
 
+	// Gives up on the running job of a program (see PipelineCompileQueue::Abandon): it counts
+	// as finished, and its worker is replaced. Returns false when the job is not running on a
+	// worker.
+	bool Abandon(uint64_t key) {
+		uint64_t ticket = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto      entry = m_tickets.find(key);
+			if (entry == m_tickets.end() || entry->second == 0) {
+				return false;
+			}
+			ticket = entry->second;
+		}
+		const bool abandoned = m_queue.Abandon(ticket);
+		Collect();
+		return abandoned;
+	}
+
+	void                   SetActiveThreads(uint32_t count) { m_queue.SetActiveThreads(count); }
+	[[nodiscard]] uint32_t ActiveThreads() { return m_queue.ActiveThreads(); }
+	[[nodiscard]] uint32_t ThreadCount() const { return m_queue.ThreadCount(); }
+	// Jobs not started whose order is below `order`.
+	[[nodiscard]] size_t QueuedBelow(uint64_t order) { return m_queue.QueuedBelow(order); }
+
 	// Jobs queued or running (after Stop, also the dropped ones).
 	[[nodiscard]] size_t Remaining() {
 		Collect();
@@ -171,7 +199,8 @@ public:
 		Collect();
 	}
 
-	// Drops the jobs that have not started and waits for the running ones. Idempotent.
+	// Drops the jobs that have not started and waits for the running ones that were not
+	// abandoned. Idempotent.
 	void Stop() {
 		{
 			std::lock_guard lock(m_mutex);

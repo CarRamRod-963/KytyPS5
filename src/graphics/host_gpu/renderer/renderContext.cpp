@@ -27,10 +27,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_command_scheduler.GetTimestamps().SetPrimary(true);
 	// After the bindless table: precompiled layouts reference its set layout.
 	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
-		// Like the background pipeline builds: driver compilers are multithreaded themselves,
+		// While the session boots, about half the host threads (at low priority) build what
+		// earlier sessions or the list recorded, which the game is about to need; then as many
+		// as the background pipeline builds use: driver compilers are multithreaded themselves,
 		// and the guest needs the CPU.
-		m_pipeline_cache.StartPrecompile(
-		    std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 2u));
+		const auto host = std::thread::hardware_concurrency();
+		m_pipeline_cache.StartPrecompile(std::clamp(host / 2u, 2u, 8u),
+		                                 std::clamp(host / 8u, 1u, 2u));
 	}
 }
 
