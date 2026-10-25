@@ -20,7 +20,14 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.userdata = this;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? Read : nullptr;
+	runtime.read_memory                = m_source.read_memory != nullptr ? ReadMemory : nullptr;
 	return runtime;
+}
+
+// Reader loads are not captured here: WalkSrt reports the address of every load it makes.
+bool SrtReadCapture::ReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto& source = static_cast<SrtReadCapture*>(userdata)->m_source;
+	return source.read_memory(source.userdata, address, values);
 }
 
 bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -163,11 +170,21 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
-const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
+const uint8_t* Scratch(const ResourcePlan& plan, std::span<const uint64_t> scratch) {
+	return reinterpret_cast<const uint8_t*>(scratch.empty() ? plan.srt_scratch.data()
+	                                                        : scratch.data());
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+
+// The DWORD a reader load reads, or bit 32 set when the runtime's reader refuses it.
+uint64_t KYTY_SYSV_ABI ReadWalkerMemory(const SrtRuntime* runtime, uint64_t address) {
+	uint32_t word = 0;
+	return runtime->read_memory != nullptr &&
+	               runtime->read_memory(runtime->userdata, address, {&word, 1})
+	           ? word
+	           : uint64_t {1} << 32u;
+}
 
 class RuntimeValidator {
 public:
@@ -367,7 +384,8 @@ private:
 // plus m_bias, r8 capture cursor.
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool reader)
+	    : m_plan(plan), m_code(code), m_reader(reader) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -438,6 +456,8 @@ private:
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
+	void    EmitLoad();
+	void    EmitReadThunk();
 
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
@@ -449,10 +469,10 @@ private:
 	// Per user-data base pair of a read, the scratch slot holding the base for the walk.
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_bases;
 	std::deque<Stub>                                  m_stubs;
-	Xbyak::Label                                      m_ret;
+	Xbyak::Label                                      m_ret, m_read;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
-	bool     m_body = true;
+	bool     m_body = true, m_reader = false;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -694,7 +714,7 @@ WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg,
 void WalkerCompiler::Layout() {
 	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
 	m_shader_base = offset;
-	offset += 8u;
+	offset += 16u; // The shader base, then the runtime.
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (!Thunk(index)) continue;
 		auto& node = m_nodes[index];
@@ -1014,8 +1034,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 		}
-		// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-		c.mov(c.eax, c.dword[c.r10]);
+		EmitLoad();
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.add(c.r8, 8);
@@ -1026,6 +1045,46 @@ void WalkerCompiler::EmitRead(const Node& node) {
 	c.L(zero);
 	c.xor_(c.eax, c.eax);
 	Store(node);
+}
+
+// Loads the DWORD at r10 into eax. Every direct guest load is mov eax, [r10] (41 8b 02), so a
+// fault completes it as a zero read. A reader load calls the read thunk; a refused read leaves
+// the value unknown.
+void WalkerCompiler::EmitLoad() {
+	auto& c = m_code;
+	if (!m_reader) {
+		c.mov(c.eax, c.dword[c.r10]);
+		return;
+	}
+	c.call(m_read);
+	c.bt(c.rax, 32);
+	c.jc(m_ret, Near);
+}
+
+// Reads the DWORD at r10 through ReadWalkerMemory into rax; keeps rdi, rsi, rdx, r8 and r10.
+void WalkerCompiler::EmitReadThunk() {
+	auto& c = m_code;
+	c.L(m_read);
+	c.push(c.rbp);
+	c.mov(c.rbp, c.rsp);
+	c.push(c.rdi);
+	c.push(c.rsi);
+	c.push(c.rdx);
+	c.push(c.r8);
+	c.push(c.r10);
+	c.and_(c.rsp, -16);
+	c.mov(c.rdi, c.qword[At(m_shader_base + 8u)]);
+	c.mov(c.rsi, c.r10);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadWalkerMemory));
+	c.call(c.rax);
+	c.lea(c.rsp, c.ptr[c.rbp - 40]);
+	c.pop(c.r10);
+	c.pop(c.r8);
+	c.pop(c.rdx);
+	c.pop(c.rsi);
+	c.pop(c.rdi);
+	c.pop(c.rbp);
+	c.ret();
 }
 
 void WalkerCompiler::EmitStrict(const Node& node) {
@@ -1276,6 +1335,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	std::deque<Xbyak::Label> exits;
 	c.add(c.rdx, m_bias);
 	c.mov(c.qword[At(m_shader_base)], c.rcx);
+	c.mov(c.qword[At(m_shader_base + 8u)], c.r8);
 	for (const auto& [pair, slot]: m_bases) {
 		Base({Kind::UserData, pair.first}, {Kind::UserData, pair.second});
 		c.mov(c.qword[At(slot)], c.rax);
@@ -1386,11 +1446,12 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				c.mov(active, 1);
 			}
 		}
+		// Every known DWORD is cleared: a caller's scratch has no compile-time zeros.
 		for (uint32_t source = 0; source < sources.size(); ++source) {
-			if (gates[source].empty()) continue;
-			auto&      skip  = exits.emplace_back();
 			const auto known = c.dword[At(source * DescriptorStride + 8u * sizeof(uint32_t))];
 			c.mov(known, 0);
+			if (gates[source].empty()) continue;
+			auto& skip = exits.emplace_back();
 			Gate(gates[source], skip);
 			for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
 				Fetch(descriptors[source][word], skip);
@@ -1431,6 +1492,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		Branch(stub.operand, *stub.unknown);
 		c.jmp(stub.back, Near);
 	}
+	if (m_reader) EmitReadThunk();
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
@@ -1439,24 +1501,28 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 } // namespace
 
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values, SrtWalkerLoads loads) {
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+	WalkerCompiler(plan, *plan.srt_code, loads == SrtWalkerLoads::Reader).Compile(values);
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+             std::vector<std::pair<uint64_t, uint64_t>>* reads, std::span<uint64_t> scratch) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+	if (scratch.empty()) scratch = plan.srt_scratch;
+	if (scratch.size() < plan.srt_scratch.size()) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = plan.srt_code.get();
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
-	t_running_walker = nullptr;
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*,
+	                                                 uint64_t, const SrtRuntime*);
+	const auto*                    previous = t_running_walker;
+	t_running_walker                        = plan.srt_code.get();
+	const auto* end                         = plan.srt_code->getCode<Walker>()(
+	    runtime.user_data.data(), flat.data(), scratch.data(), runtime.shader_base, &runtime);
+	t_running_walker = previous;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
-		const std::span captured {plan.srt_scratch.data() + plan.srt_captures / 8u, end};
+		const std::span captured {scratch.data() + plan.srt_captures / 8u, end};
 		const auto      first = reads->size();
 		reads->resize(first + captured.size());
 		std::ranges::transform(captured, reads->data() + first, [](uint64_t address) {
@@ -1466,7 +1532,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	return true;
 }
 
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
+bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result,
+                 std::span<const uint64_t> scratch) {
 	value = value.Resolve();
 	uint64_t bits = 0;
 	if (value.IsImmediate()) {
@@ -1477,15 +1544,17 @@ bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr) return false;
 	EXIT_IF(inst->WalkOutput() == UINT32_MAX);
-	std::memcpy(&bits, Scratch(plan) + OutputOffset(plan) + inst->WalkOutput() * 8u, sizeof(bits));
+	std::memcpy(&bits, Scratch(plan, scratch) + OutputOffset(plan) + inst->WalkOutput() * 8u,
+	            sizeof(bits));
 	result = static_cast<uint32_t>(bits);
 	return bits <= UINT32_MAX;
 }
 
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result) {
+bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result,
+                      std::span<const uint64_t> scratch) {
 	if (source >= plan.descriptor_sources.size()) return false;
 	std::array<uint32_t, 9> words {};
-	std::memcpy(words.data(), Scratch(plan) + source * DescriptorStride, DescriptorStride);
+	std::memcpy(words.data(), Scratch(plan, scratch) + source * DescriptorStride, DescriptorStride);
 	if (words[8] == 0u) return false;
 	result = {};
 	result.dword_count = plan.descriptor_sources[source].dword_count;
@@ -1493,12 +1562,12 @@ bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue
 	return true;
 }
 
-bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
-	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
+bool WalkedActive(const ResourcePlan& plan, uint32_t source, std::span<const uint64_t> scratch) {
+	return Scratch(plan, scratch)[ActiveOffset(plan) + source] != 0u;
 }
 
-bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
-	return Scratch(plan)[ActiveOffset(plan) + plan.descriptor_sources.size() + image] != 0u;
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image, std::span<const uint64_t> scratch) {
+	return Scratch(plan, scratch)[ActiveOffset(plan) + plan.descriptor_sources.size() + image] != 0u;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
