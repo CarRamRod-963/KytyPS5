@@ -157,10 +157,6 @@ bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
-bool ShaderCacheEnabled() {
-	return g_config->shader_cache_enabled;
-}
-
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }

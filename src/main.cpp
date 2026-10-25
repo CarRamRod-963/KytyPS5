@@ -67,7 +67,6 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
-	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
@@ -201,7 +200,6 @@ static constexpr Flag FLAGS[] = {
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
-    {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
