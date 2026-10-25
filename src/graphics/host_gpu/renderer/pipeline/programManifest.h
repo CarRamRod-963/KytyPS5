@@ -94,6 +94,10 @@ public:
 
 	// The serialized body of a record (everything but the SPIR-V hash), exposed for tests.
 	static std::vector<uint8_t> EncodeComputeBody(const ComputeProgramRecord& record);
+	// Reads a body of EncodeComputeBody; the record's code stays null and `code_words` receives
+	// the length of its code.
+	static bool DecodeComputeBody(std::span<const uint8_t> body, ComputeProgramRecord& record,
+	                              uint32_t& code_words);
 
 private:
 	struct CodeKey {
