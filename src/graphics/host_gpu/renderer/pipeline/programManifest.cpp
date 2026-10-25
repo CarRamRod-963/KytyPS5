@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/programManifest.h"
 
+#include "graphics/host_gpu/renderer/pipeline/manifestFormat.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -17,9 +19,6 @@ using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 
 // Serialized field by field; these trip when a stored struct changes so that the format version
 // is revisited (a new field must be stored, or the version bumped).
-static_assert(sizeof(Specialization::Buffer) == 32);
-static_assert(sizeof(Specialization::Image) == 40);
-static_assert(sizeof(Specialization::Sampler) == 16);
 static_assert(sizeof(ShaderComputeInputInfo) == 112);
 
 constexpr std::array<char, 8> FileMagic          = {'K', 'y', 'P', 'r', 'o', 'g', 'M', 'f'};
@@ -30,84 +29,9 @@ constexpr size_t EntryHeaderSize = sizeof(uint32_t) + sizeof(uint64_t);
 // Bounds that no real entry reaches; a larger size field is corruption.
 constexpr uint32_t MaxPayloadSize = 64u << 20u;
 constexpr uint32_t MaxUserData    = 64;
-constexpr uint32_t MaxResources   = 1u << 16u;
 
-class Writer {
-public:
-	explicit Writer(std::vector<uint8_t>& out): m_out(out) {}
-	template <typename T>
-	void Put(T value) {
-		static_assert(std::is_trivially_copyable_v<T>);
-		const auto offset = m_out.size();
-		m_out.resize(offset + sizeof(T));
-		std::memcpy(m_out.data() + offset, &value, sizeof(T));
-	}
-	void PutBool(bool value) { Put<uint8_t>(value ? 1u : 0u); }
-	void PutWords(std::span<const uint32_t> words) {
-		const auto offset = m_out.size();
-		m_out.resize(offset + words.size_bytes());
-		if (!words.empty()) {
-			std::memcpy(m_out.data() + offset, words.data(), words.size_bytes());
-		}
-	}
-
-private:
-	std::vector<uint8_t>& m_out;
-};
-
-class Reader {
-public:
-	explicit Reader(std::span<const uint8_t> data): m_data(data) {}
-	template <typename T>
-	bool Get(T& value) {
-		static_assert(std::is_trivially_copyable_v<T>);
-		if (m_data.size() - m_offset < sizeof(T)) {
-			return false;
-		}
-		std::memcpy(&value, m_data.data() + m_offset, sizeof(T));
-		m_offset += sizeof(T);
-		return true;
-	}
-	bool GetBool(bool& value) {
-		uint8_t raw = 0;
-		if (!Get(raw) || raw > 1u) {
-			return false;
-		}
-		value = raw != 0u;
-		return true;
-	}
-	bool GetWords(std::vector<uint32_t>& words, uint32_t count) {
-		if ((m_data.size() - m_offset) / sizeof(uint32_t) < count) {
-			return false;
-		}
-		words.resize(count);
-		if (count != 0u) {
-			std::memcpy(words.data(), m_data.data() + m_offset, count * sizeof(uint32_t));
-		}
-		m_offset += count * sizeof(uint32_t);
-		return true;
-	}
-	[[nodiscard]] bool AtEnd() const { return m_offset == m_data.size(); }
-
-private:
-	std::span<const uint8_t> m_data;
-	size_t                   m_offset = 0;
-};
-
-template <typename Enum>
-void PutEnum(Writer& writer, Enum value) {
-	writer.Put(static_cast<uint32_t>(value));
-}
-
-template <typename Enum>
-bool GetEnum(Reader& reader, Enum& value) {
-	uint32_t raw = 0;
-	if (!reader.Get(raw)) {
-		return false;
-	}
-	value = static_cast<Enum>(raw);
-	return true;
-}
+using ManifestFormat::Reader;
+using ManifestFormat::Writer;
 
 void PutInput(Writer& w, const ShaderComputeInputInfo& input) {
 	for (const auto value: input.threads_num)
@@ -147,102 +71,10 @@ bool GetInput(Reader& r, ShaderComputeInputInfo& input) {
 	return true;
 }
 
-void PutSpecialization(Writer& w, const Specialization& specialization) {
-	w.Put(static_cast<uint32_t>(specialization.buffers.size()));
-	for (const auto& buffer: specialization.buffers) {
-		w.Put(buffer.packed_stride);
-		PutEnum(w, buffer.descriptor_format);
-		w.Put(buffer.descriptor_swizzle);
-		w.PutBool(buffer.zero_stride_oob);
-		w.PutBool(buffer.scalar_empty);
-		w.Put(buffer.indirect_root);
-		w.Put(buffer.indirect_mapping_offset);
-		w.Put(buffer.indirect_search_iterations);
-		w.PutBool(buffer.unbound);
-		w.PutBool(buffer.indirect_mapping_header);
-	}
-	w.Put(static_cast<uint32_t>(specialization.images.size()));
-	for (const auto& image: specialization.images) {
-		PutEnum(w, image.numeric_class);
-		PutEnum(w, image.dimension);
-		w.Put(image.mip_count);
-		PutEnum(w, image.conversion_format);
-		w.Put(image.shader_swizzle);
-		w.Put(image.indirect_root);
-		w.Put(image.indirect_mapping_offset);
-		w.Put(image.indirect_search_iterations);
-		w.PutBool(image.cube);
-		w.PutBool(image.fmask);
-		w.PutBool(image.bindless);
-		w.PutBool(image.bindless_byte_keys);
-		w.PutBool(image.indirect_mapping_header);
-		w.PutBool(image.heap);
-	}
-	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
-	for (const auto& sampler: specialization.samplers) {
-		w.Put(sampler.indirect_root);
-		w.Put(sampler.indirect_mapping_offset);
-		w.Put(sampler.indirect_search_iterations);
-		w.PutBool(sampler.indirect_mapping_header);
-	}
-}
-
 // Version 2 stored no mapping-header flags (every key map offset was a module constant),
 // version 3 no resident image heap flags (there were no heaps).
 constexpr uint32_t FirstHeaderVersion = 3;
 constexpr uint32_t FirstHeapVersion   = 4;
-
-bool GetSpecialization(Reader& r, Specialization& specialization, uint32_t version) {
-	const auto get_header = [&](bool& value) {
-		value = false;
-		return version < FirstHeaderVersion || r.GetBool(value);
-	};
-	const auto get_heap = [&](bool& value) {
-		value = false;
-		return version < FirstHeapVersion || r.GetBool(value);
-	};
-	uint32_t count = 0;
-	if (!r.Get(count) || count > MaxResources) {
-		return false;
-	}
-	specialization.buffers.resize(count);
-	for (auto& buffer: specialization.buffers) {
-		if (!r.Get(buffer.packed_stride) || !GetEnum(r, buffer.descriptor_format) ||
-		    !r.Get(buffer.descriptor_swizzle) || !r.GetBool(buffer.zero_stride_oob) ||
-		    !r.GetBool(buffer.scalar_empty) || !r.Get(buffer.indirect_root) ||
-		    !r.Get(buffer.indirect_mapping_offset) || !r.Get(buffer.indirect_search_iterations) ||
-		    !r.GetBool(buffer.unbound) || !get_header(buffer.indirect_mapping_header)) {
-			return false;
-		}
-	}
-	if (!r.Get(count) || count > MaxResources) {
-		return false;
-	}
-	specialization.images.resize(count);
-	for (auto& image: specialization.images) {
-		if (!GetEnum(r, image.numeric_class) || !GetEnum(r, image.dimension) ||
-		    !r.Get(image.mip_count) || !GetEnum(r, image.conversion_format) ||
-		    !r.Get(image.shader_swizzle) || !r.Get(image.indirect_root) ||
-		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
-		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless) ||
-		    !r.GetBool(image.bindless_byte_keys) || !get_header(image.indirect_mapping_header) ||
-		    !get_heap(image.heap)) {
-			return false;
-		}
-	}
-	if (!r.Get(count) || count > MaxResources) {
-		return false;
-	}
-	specialization.samplers.resize(count);
-	for (auto& sampler: specialization.samplers) {
-		if (!r.Get(sampler.indirect_root) || !r.Get(sampler.indirect_mapping_offset) ||
-		    !r.Get(sampler.indirect_search_iterations) ||
-		    !get_header(sampler.indirect_mapping_header)) {
-			return false;
-		}
-	}
-	return true;
-}
 
 std::vector<uint8_t> FileHeader(uint32_t version = ProgramManifest::FormatVersion) {
 	std::vector<uint8_t> header(FileMagic.begin(), FileMagic.end());
@@ -303,7 +135,7 @@ std::vector<uint8_t> ProgramManifest::EncodeComputeBody(const ComputeProgramReco
 	w.Put(record.user_data_count);
 	PutInput(w, record.input);
 	w.Put(record.push_data_cursor);
-	PutSpecialization(w, record.specialization);
+	ManifestFormat::PutSpecialization(w, record.specialization);
 	return out;
 }
 
@@ -367,8 +199,10 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload, uint32_t vers
 	if (!r.Get(record->shader_hash) || !r.Get(code_words) || !r.Get(record->user_data_count) ||
 	    record->user_data_count > MaxUserData || !GetInput(r, record->input) ||
 	    !r.Get(record->push_data_cursor) ||
-	    !GetSpecialization(r, record->specialization, version) || !r.Get(record->spirv_hash) ||
-	    !r.AtEnd()) {
+	    !ManifestFormat::GetSpecialization(r, record->specialization,
+	                                       {.mapping_header = version >= FirstHeaderVersion,
+	                                        .image_heap     = version >= FirstHeapVersion}) ||
+	    !r.Get(record->spirv_hash) || !r.AtEnd()) {
 		return false;
 	}
 	// An older record keeps its program only while the module it names can still be needed.
