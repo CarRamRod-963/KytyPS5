@@ -46,9 +46,13 @@ public:
 		[[nodiscard]] uint32_t Entries() const { return records * key.layer_count; }
 	};
 
+	// A slot names its image by texture cache id and serial: the cache reuses the id of a
+	// deleted image, and a slot whose serial no longer matches holds a view of an image that is
+	// gone.
 	struct Slot {
 		Common::SlotId        image;
-		uint64_t              view = 0;
+		uint64_t              serial = 0;
+		uint64_t              view   = 0;
 		std::vector<uint32_t> entries;
 
 		[[nodiscard]] bool InUse() const { return static_cast<bool>(image); }
@@ -72,8 +76,8 @@ public:
 	// The key a flagged entry stands for; false when the entry is pending in no live region.
 	[[nodiscard]] bool Decode(uint32_t entry, Request& request) const;
 
-	[[nodiscard]] uint32_t    FindSlot(Common::SlotId image, uint64_t view) const;
-	[[nodiscard]] uint32_t    AllocateSlot(Common::SlotId image, uint64_t view);
+	[[nodiscard]] uint32_t    FindSlot(Common::SlotId image, uint64_t serial, uint64_t view) const;
+	[[nodiscard]] uint32_t    AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view);
 	[[nodiscard]] const Slot& GetSlot(uint32_t slot) const { return m_slots[slot]; }
 	[[nodiscard]] uint32_t    SlotCount() const { return static_cast<uint32_t>(m_slots.size()); }
 	void                      Translate(uint32_t entry, uint32_t slot);
