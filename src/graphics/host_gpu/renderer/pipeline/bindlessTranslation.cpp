@@ -87,23 +87,24 @@ bool BindlessTranslation::Decode(uint32_t entry, Request& request) const {
 	return true;
 }
 
-uint32_t BindlessTranslation::FindSlot(Common::SlotId image, uint64_t view) const {
+uint32_t BindlessTranslation::FindSlot(Common::SlotId image, uint64_t serial, uint64_t view) const {
 	for (uint32_t slot = PlaceholderSlot + 1; slot < m_slots.size(); ++slot) {
-		if (m_slots[slot].image == image && m_slots[slot].view == view) {
+		const auto& entry = m_slots[slot];
+		if (entry.image == image && entry.serial == serial && entry.view == view) {
 			return slot;
 		}
 	}
 	return NoSlot;
 }
 
-uint32_t BindlessTranslation::AllocateSlot(Common::SlotId image, uint64_t view) {
+uint32_t BindlessTranslation::AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view) {
 	EXIT_IF(!image);
 	if (m_free_slots.empty()) {
 		return NoSlot;
 	}
 	const auto slot = m_free_slots.back();
 	m_free_slots.pop_back();
-	m_slots[slot] = {image, view, {}};
+	m_slots[slot] = {image, serial, view, {}};
 	return slot;
 }
 

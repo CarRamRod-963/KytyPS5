@@ -1240,7 +1240,10 @@ void RenderExecutor::CommitBindlessImages(const PreparedBindings& prepared,
 }
 
 // Slots of images the texture cache deleted go back to the placeholder; their keys resolve
-// again when a shader next flags them.
+// again when a shader next flags them. The cache reuses a deleted image's id for the next image
+// it inserts, so a slot is still valid only while that id holds the image of the slot's serial:
+// a slot kept for another image would leave the view of the deleted one in the table, and its
+// memory is freed once the cache's recycled backings are trimmed.
 void RenderExecutor::ValidateBindlessSlots() {
 	auto& cache       = m_context.GetTextureCache();
 	auto& table       = m_context.GetBindlessTable();
@@ -1251,7 +1254,10 @@ void RenderExecutor::ValidateBindlessSlots() {
 		const auto& entry = translation.GetSlot(slot);
 		if (!entry.InUse()) continue;
 		const auto* image = cache.m_slot_images.try_get(entry.image);
-		if (image != nullptr && (image->registered || image->info.data.Empty())) continue;
+		if (image != nullptr && image->serial == entry.serial &&
+		    (image->registered || image->info.data.Empty())) {
+			continue;
+		}
 		table.WriteSlot(slot, nullptr, vk::ImageLayout::eGeneral);
 		translation.FreeSlot(slot);
 	}
@@ -1324,9 +1330,9 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	}
 	const auto view = cache.FindTexture(binding.image_id, binding.desc);
 	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkImageView>(view));
-	auto       slot   = translation.FindSlot(binding.image_id, handle);
+	auto       slot   = translation.FindSlot(binding.image_id, image.serial, handle);
 	if (slot == BindlessTranslation::NoSlot) {
-		slot = translation.AllocateSlot(binding.image_id, handle);
+		slot = translation.AllocateSlot(binding.image_id, image.serial, handle);
 		if (slot == BindlessTranslation::NoSlot) {
 			static bool reported = false;
 			if (!std::exchange(reported, true)) {
@@ -1336,9 +1342,13 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		}
 		table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
 	}
-	auto& resolved = m_bindless_resolved[pointer + key.table_offset];
-	if (std::ranges::find(resolved, request.layer, &BindlessResolved::layer) == resolved.end()) {
-		resolved.push_back({request.layer, slot, binding.image_id});
+	auto&      resolved = m_bindless_resolved[pointer + key.table_offset];
+	const auto layer    = std::ranges::find(resolved, request.layer, &BindlessResolved::layer);
+	if (layer == resolved.end()) {
+		resolved.push_back({request.layer, slot, binding.image_id, image.serial});
+	} else {
+		// The key resolved before to an image that has gone since.
+		*layer = {request.layer, slot, binding.image_id, image.serial};
 	}
 	return slot;
 }
@@ -1362,7 +1372,10 @@ void RenderExecutor::FillBindlessHeap(uint32_t heap) {
 		if (pointer == 0 || resolved == m_bindless_resolved.end()) continue;
 		for (const auto& entry: resolved->second) {
 			const auto& slot = translation.GetSlot(entry.slot);
-			if (entry.layer >= key.layer_count || !slot.InUse() || slot.image != entry.image) continue;
+			if (entry.layer >= key.layer_count || !slot.InUse() || slot.image != entry.image ||
+			    slot.serial != entry.serial) {
+				continue;
+			}
 			translation.Translate(found.region + record * key.layer_count + entry.layer, entry.slot);
 			filled = true;
 		}

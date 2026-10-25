@@ -445,6 +445,7 @@ private:
 		uint32_t layer = 0;
 		uint32_t slot  = 0;
 		ImageId  image;
+		uint64_t serial = 0;
 	};
 	std::unordered_map<uint64_t, std::vector<BindlessResolved>> m_bindless_resolved;
 
