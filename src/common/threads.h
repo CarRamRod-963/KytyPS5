@@ -27,6 +27,9 @@ int ReserveCoreForCurrentThread();
 // Gives the calling thread the affinity the process started with, which exec keeps.
 void RestoreProcessAffinity();
 #endif
+// Lets the calling thread yield the CPU to normal-priority threads (background work such as
+// pipeline builds). Best effort: does nothing where the platform refuses.
+void LowerCurrentThreadPriority();
 
 } // namespace Thread
 

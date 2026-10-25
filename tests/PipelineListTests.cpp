@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 #include "graphics/host_gpu/renderer/pipeline/programManifest.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -419,6 +420,12 @@ void TestResolver() {
   Check(counts.compute == 2 && counts.pipelines == 3 &&
             counts.pipelines_broken == 0 && counts.shaders_pending == 5,
         "the resolver starts with every name pending");
+  const auto created_hash = ShaderCodeId::Of(*fixture.created_code).hash;
+  auto hashes = resolver.PendingShaderHashes();
+  Check(hashes.size() == 5 && hashes.contains(fixture.vs.shader_hash) &&
+            hashes.contains(fixture.ps2.shader_hash) &&
+            hashes.contains(created_hash),
+        "every pending entry names its program hash");
   // The local shaders: everything but the second pixel shader and the created
   // compute shader.
   const auto lookup = [&](const ShaderCodeId &id) -> ShaderCode {
@@ -435,6 +442,21 @@ void TestResolver() {
             !resolved.compute_code_only[0],
         "a compute entry resolves with its code");
   Check(resolved.pipelines.size() == 2, "pipelines of known shaders resolve");
+  // Positions keep first-seen order, recorded and code-only compute entries
+  // each among their own kind.
+  Check(resolved.compute_position.size() == 1 &&
+            resolved.compute_position[0] == 0 &&
+            std::min(resolved.pipelines[0].position,
+                     resolved.pipelines[1].position) == 0 &&
+            std::max(resolved.pipelines[0].position,
+                     resolved.pipelines[1].position) ==
+                Libs::Graphics::FirstSeenPosition(2, 3),
+        "resolved entries carry their first-seen positions");
+  Check(Libs::Graphics::FirstSeenPosition(1, 2) == (uint64_t{1} << 31u) &&
+            Libs::Graphics::FirstSeenPosition(5, 10) ==
+                Libs::Graphics::FirstSeenPosition(1, 2) &&
+            Libs::Graphics::FirstSeenPosition(0, 0) == 0,
+        "positions of different list lengths compare by fraction");
   for (const auto &pipeline : resolved.pipelines) {
     Check(pipeline.vertex_stages.size() == 1 &&
               pipeline.vertex_stages[0]->code != nullptr &&
@@ -449,14 +471,22 @@ void TestResolver() {
   // A shader the list does not name changes nothing.
   Check(resolver.OnCode(*Code(99, 10)).Empty(), "unknown code is ignored");
   // The guest creates the missing shaders.
+  hashes = resolver.PendingShaderHashes();
+  Check(hashes.size() == 2 && hashes.contains(fixture.ps2.shader_hash) &&
+            hashes.contains(created_hash),
+        "resolved entries leave the pending hashes");
   resolved = resolver.OnCode(*fixture.ps2_code);
   Check(resolved.pipelines.size() == 1 &&
-            resolved.pipelines[0].pixel_stage->Key() == fixture.ps2.Key(),
+            resolved.pipelines[0].pixel_stage->Key() == fixture.ps2.Key() &&
+            resolved.pipelines[0].position ==
+                Libs::Graphics::FirstSeenPosition(1, 3),
         "a pipeline resolves when its last shader is created");
   resolved = resolver.OnCode(*fixture.created_code);
-  Check(resolved.compute.size() == 1 && resolved.compute_code_only[0],
+  Check(resolved.compute.size() == 1 && resolved.compute_code_only[0] &&
+            resolved.compute_position[0] == 0,
         "a created compute entry resolves when the shader is created");
-  Check(!resolver.Pending() && resolver.GetCounts().compute_resolved == 2,
+  Check(!resolver.Pending() && resolver.GetCounts().compute_resolved == 2 &&
+            resolver.PendingShaderHashes().empty(),
         "everything resolved");
 
   // A pipeline whose stage entry is missing from the list.

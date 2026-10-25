@@ -74,6 +74,11 @@ static const CoreReservation& GetCoreReservation() {
 }
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -245,6 +250,15 @@ void Thread::RestoreProcessAffinity() {
 	}
 }
 #endif
+
+void Thread::LowerCurrentThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Linux applies nice values per thread.
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 5);
+#endif
+}
 
 int Thread::GetThreadIdUnique() {
 	static std::atomic<int> counter = 0;
