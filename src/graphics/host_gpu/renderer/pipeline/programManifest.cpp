@@ -139,6 +139,18 @@ std::vector<uint8_t> ProgramManifest::EncodeComputeBody(const ComputeProgramReco
 	return out;
 }
 
+bool ProgramManifest::DecodeComputeBody(std::span<const uint8_t> body, ComputeProgramRecord& record,
+                                        uint32_t& code_words) {
+	Reader  r(body);
+	uint8_t kind = 0;
+	record       = {};
+	return r.Get(kind) && kind == KindComputeProgram && r.Get(record.shader_hash) &&
+	       r.Get(code_words) && r.Get(record.user_data_count) &&
+	       record.user_data_count <= MaxUserData && GetInput(r, record.input) &&
+	       r.Get(record.push_data_cursor) &&
+	       ManifestFormat::GetSpecialization(r, record.specialization) && r.AtEnd();
+}
+
 std::vector<uint8_t> ProgramManifest::EncodeCode(uint64_t hash, std::span<const uint32_t> code) {
 	std::vector<uint8_t> out;
 	out.reserve(16 + code.size_bytes());
