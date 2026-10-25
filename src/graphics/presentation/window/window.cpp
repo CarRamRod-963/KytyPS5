@@ -865,7 +865,10 @@ void WindowRun() {
 
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());
-	g_window->render_context->GetPipelineCache().Save();
+	auto&             pipelines = g_window->render_context->GetPipelineCache();
+	// The process ends without joining the precompile builds that still run.
+	pipelines.EndPrecompileForExit();
+	pipelines.Save();
 }
 
 int WindowPrecompilePipelines() {

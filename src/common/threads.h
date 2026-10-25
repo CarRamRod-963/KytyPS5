@@ -34,6 +34,9 @@ public:
 	static void SleepMicro(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
+	// Lets the calling thread yield the CPU to normal-priority threads (background work such as
+	// pipeline builds). Best effort: does nothing where the platform refuses.
+	static void LowerCurrentThreadPriority();
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.

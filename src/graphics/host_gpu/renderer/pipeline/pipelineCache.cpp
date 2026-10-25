@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +42,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1017,7 +1020,9 @@ struct PipelineCache::ProgramCache {
 
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record, uint64_t* spirv_hash,
-                                           bool code_only, PipelineBuildMode mode) {
+                                           bool code_only, PipelineBuildMode mode,
+                                           const std::atomic<bool>* cancel) {
+	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
 	EXIT_IF(mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized);
 	EXIT_IF(record.code == nullptr || record.code->empty());
 	// The inputs GetComputeProgram derives from the device.
@@ -1076,6 +1081,9 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	if (spirv_hash != nullptr) {
 		*spirv_hash = XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
 	}
+	if (cancelled()) {
+		return PrecompileOutcome::TimedOut;
+	}
 	const auto module = CompileSPV(result->spirv, graphics.device);
 	if (module == nullptr) {
 		return PrecompileOutcome::Skipped;
@@ -1087,11 +1095,15 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	PipelineCache::Pipeline pipeline;
 	bool                    from_driver_cache = false;
 	(void)CreatePipelineInternal(graphics, pipeline, input, module, driver_cache, mode,
-	                             &from_driver_cache);
+	                             &from_driver_cache, cancel);
+	const bool built = pipeline.pipeline != nullptr;
 	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	graphics.device.destroyShaderModule(module, nullptr);
+	if (!built) {
+		return PrecompileOutcome::TimedOut;
+	}
 	return from_driver_cache ? PrecompileOutcome::Cached : PrecompileOutcome::Compiled;
 }
 
@@ -1190,11 +1202,16 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 
 PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
     const GraphicsPipelineRecord&                               record,
-    std::span<const std::shared_ptr<const GraphicsStageRecord>> stages, PipelineBuildMode mode) {
+    std::span<const std::shared_ptr<const GraphicsStageRecord>> stages, PipelineBuildMode mode,
+    const std::atomic<bool>* cancel) {
 	EXIT_IF(stages.size() != record.vertex_stage_count + (record.pixel_stage != 0 ? 1u : 0u));
+	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
 	// Each stage once, however many pipelines use it.
 	std::vector<std::shared_ptr<PrecompiledStage>> translated;
 	for (const auto& stage: stages) {
+		if (cancelled()) {
+			return PrecompileOutcome::TimedOut;
+		}
 		std::shared_ptr<PrecompiledStage> memo;
 		{
 			std::lock_guard lock(m_stage_memo_mutex);
@@ -1228,29 +1245,42 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 	}
 	state.topology                 = record.static_params.topology;
 	state.primitive_restart_enable = record.static_params.primitive_restart_enable;
-	Pipeline pipeline;
-	bool     from_driver_cache = false;
+	if (cancelled()) {
+		return PrecompileOutcome::TimedOut;
+	}
+	// An abandoned build may return from the driver after the cache is gone: nothing below the
+	// driver call reads members.
+	const auto device = m_graphics.device;
+	Pipeline   pipeline;
+	bool       from_driver_cache = false;
 	try {
 		const Common::RecoverableFatalScope recoverable;
 		(void)CreatePipelineInternal(m_graphics, pipeline, record.rendering, record.vertex_input,
 		                             state, record.static_params, m_driver_cache, mode,
-		                             &from_driver_cache);
+		                             &from_driver_cache, cancel);
 	} catch (const Common::RecoverableFatal& fatal) {
 		PipelineCacheLog("Precompile: recorded pipeline {:016x} cannot be built: {}", record.Key(),
 		                 fatal.message);
 		return PrecompileOutcome::Skipped;
 	}
-	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	const bool built = pipeline.pipeline != nullptr;
+	device.destroyPipeline(pipeline.pipeline, nullptr);
+	device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	if (!built) {
+		return PrecompileOutcome::TimedOut;
+	}
 	return from_driver_cache ? PrecompileOutcome::Cached : PrecompileOutcome::Compiled;
 }
 
 void PipelineCache::ReleasePrecompiledStages() {
 	std::lock_guard lock(m_stage_memo_mutex);
+	// An abandoned build may still be creating a pipeline from one of the modules: they are
+	// left to the process then.
+	const bool in_use = m_precompile_runs->abandoned.load() != 0;
 	for (const auto& [key, stage]: m_stage_memo) {
 		(void)key;
-		if (stage->module != nullptr) {
+		if (stage->module != nullptr && !in_use) {
 			m_graphics.device.destroyShaderModule(stage->module, nullptr);
 		}
 	}
@@ -1318,6 +1348,14 @@ void PipelineCache::StopBackgroundCompiles() {
 				(void)m_precompile_progress.EndQueueing();
 			}
 		}
+		{
+			// Running builds stop before their next driver call.
+			std::lock_guard lock(m_precompile_runs->mutex);
+			for (const auto& [key, running]: m_precompile_runs->running) {
+				(void)key;
+				running.cancel->store(true);
+			}
+		}
 		const auto remaining = m_precompile_queue->Remaining();
 		m_precompile_queue->Stop();
 		if (remaining != 0) {
@@ -1360,6 +1398,7 @@ void PipelineCache::InstallOptimizedPipelines() {
 	if (m_precompile_queue != nullptr && now >= m_next_timeout_check) {
 		m_next_timeout_check = now + std::chrono::seconds {5};
 		CheckPrecompileTimeouts();
+		UpdatePrecompileThreads();
 	}
 	// Sessions usually end without a save: the coverage is also logged once a minute.
 	if (m_pipeline_manifest != nullptr && now >= m_next_coverage_report) {
@@ -1504,10 +1543,9 @@ void PipelineCache::InitializeDriverCache() {
 	    PrecompileAttempts::PathFor(directory, title_id),
 	    PrecompileAttempts::PreviousPathFor(directory, title_id));
 	m_title_id = title_id;
-	m_pipeline_manifest =
-	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id));
-	m_program_cache->pipeline_manifest = m_pipeline_manifest.get();
-	m_program_cache->list_predicts     = [this](uint64_t key) {
+	SetPipelineManifest(
+	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id)));
+	m_program_cache->list_predicts = [this](uint64_t key) {
 		std::lock_guard lock(m_list_mutex);
 		return m_list_keys.contains(key);
 	};
@@ -1566,6 +1604,15 @@ constexpr auto PrecompileBuildBudget = std::chrono::seconds {300};
 // The renderer waits this long at most for a running precompile build of a program it needs,
 // then builds the pipeline itself.
 constexpr auto PrecompileExpediteWait = std::chrono::seconds {30};
+// Precompile order: recorded and listed programs and pipelines by their FirstSeenPosition (below
+// 2^32), then the created shaders without a record by theirs.
+constexpr uint64_t PrecompileCreatedOrder = uint64_t {1} << 32u;
+// The precompile keeps its boot threads while recorded or listed builds were queued this
+// recently: the guest creates its shaders during the boot, and the list resolves as it does.
+constexpr auto PrecompileBootQuiet = std::chrono::seconds {120};
+// The game renders steadily once this many 10 s windows in a row had this many guest flips.
+constexpr uint32_t PrecompileRenderingWindows = 12;
+constexpr uint64_t PrecompileRenderingFlips   = 10;
 
 // The attempts key of a build's unoptimized replacement.
 uint64_t UnoptimizedKey(uint64_t key) {
@@ -1573,6 +1620,11 @@ uint64_t UnoptimizedKey(uint64_t key) {
 }
 
 } // namespace
+
+void PipelineCache::SetPipelineManifest(std::unique_ptr<PipelineManifest> manifest) {
+	m_pipeline_manifest                = std::move(manifest);
+	m_program_cache->pipeline_manifest = m_pipeline_manifest.get();
+}
 
 void PipelineCache::SetCreatedCode(std::unique_ptr<ShaderCodeStore> store) {
 	ShaderSetCreatedCodeSink({});
@@ -1611,7 +1663,8 @@ void PipelineCache::SetCreatedCode(std::unique_ptr<ShaderCodeStore> store) {
 	});
 }
 
-bool PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build) {
+bool PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
+                                         uint64_t order) {
 	auto* attempts = m_precompile_attempts.get();
 	if (attempts != nullptr && attempts->Failed(key)) {
 		// An optimized build that timed out is replaced by the unoptimized build, which the
@@ -1620,43 +1673,51 @@ bool PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 			return false;
 		}
 		EnqueuePrecompileJob(UnoptimizedKey(key), label + " (unoptimized)", std::move(build),
-		                     PipelineBuildMode::Unoptimized);
+		                     PipelineBuildMode::Unoptimized, order);
 		return true;
 	}
-	EnqueuePrecompileJob(key, std::move(label), std::move(build), PipelineBuildMode::Precompile);
+	EnqueuePrecompileJob(key, std::move(label), std::move(build), PipelineBuildMode::Precompile,
+	                     order);
 	return true;
 }
 
 void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
-                                         PipelineBuildMode mode) {
+                                         PipelineBuildMode mode, uint64_t order) {
 	auto& progress = m_precompile_progress;
 	// Counted before the job can run; a key the queue rejects is uncounted again below.
 	progress.Queued();
-	const bool queued = m_precompile_queue->Enqueue(key, [this, key, label, build, mode] {
+	auto job = [this, runs = m_precompile_runs, key, label, build, mode, order] {
 		// A build that ends the process or never finishes leaves an unfinished attempt, so
 		// that later runs skip it (PrecompileAttempts).
 		auto*      attempts = m_precompile_attempts.get();
 		const auto settled  = std::make_shared<std::atomic<bool>>(false);
+		const auto cancel   = std::make_shared<std::atomic<bool>>(false);
 		const auto start    = std::chrono::steady_clock::now();
 		if (attempts != nullptr) {
 			attempts->Begin(key);
 		}
 		{
-			std::lock_guard lock(m_precompile_running_mutex);
-			m_precompile_running[key] = {
-			    .start = start, .settled = settled, .label = label, .build = build, .mode = mode};
+			std::lock_guard lock(runs->mutex);
+			runs->running[key] = {.start   = start,
+			                      .settled = settled,
+			                      .cancel  = cancel,
+			                      .label   = label,
+			                      .build   = build,
+			                      .mode    = mode,
+			                      .order   = order};
 		}
-		const auto outcome = build(mode);
+		const auto outcome = build(mode, *cancel);
 		const auto ms      = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                         std::chrono::steady_clock::now() - start)
 		                         .count();
 		{
-			std::lock_guard lock(m_precompile_running_mutex);
-			m_precompile_running.erase(key);
+			std::lock_guard lock(runs->mutex);
+			runs->running.erase(key);
 		}
 		if (settled->exchange(true)) {
-			// Abandoned by CheckPrecompileTimeouts; it stays quarantined.
-			m_precompile_abandoned.fetch_sub(1, std::memory_order_relaxed);
+			// Abandoned by CheckPrecompileTimeouts; it stays quarantined. Its worker was
+			// replaced and the cache may be gone: only the shared state is touched.
+			runs->abandoned.fetch_sub(1, std::memory_order_relaxed);
 			PipelineCacheLog("Precompile: {} finished after {} s, past the time budget", label,
 			                 ms / 1000);
 			return;
@@ -1672,9 +1733,13 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		    !m_precompile_only) {
 			LogPrecompileStats("done");
 		}
-	});
+	};
+	const bool queued = m_precompile_queue->Enqueue(key, std::move(job), order);
 	if (!queued) {
 		progress.Rejected();
+	} else if (order < PrecompileCreatedOrder) {
+		m_last_recorded_enqueue.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+		                              std::memory_order_relaxed);
 	}
 }
 
@@ -1682,15 +1747,16 @@ void PipelineCache::CheckPrecompileTimeouts() {
 	const auto                                          now = std::chrono::steady_clock::now();
 	std::vector<std::pair<uint64_t, RunningPrecompile>> expired;
 	{
-		std::lock_guard lock(m_precompile_running_mutex);
-		for (const auto& [key, running]: m_precompile_running) {
+		std::lock_guard lock(m_precompile_runs->mutex);
+		for (const auto& [key, running]: m_precompile_runs->running) {
 			if (now - running.start >= PrecompileBuildBudget && !running.settled->exchange(true)) {
+				running.cancel->store(true);
 				expired.emplace_back(key, running);
 			}
 		}
 	}
 	for (auto& [key, running]: expired) {
-		m_precompile_abandoned.fetch_add(1, std::memory_order_relaxed);
+		m_precompile_runs->abandoned.fetch_add(1, std::memory_order_relaxed);
 		if (m_precompile_attempts != nullptr) {
 			m_precompile_attempts->TimeOut(key);
 		}
@@ -1705,45 +1771,98 @@ void PipelineCache::CheckPrecompileTimeouts() {
 		// Queued before the abandoned build is counted as finished, so the run stays open.
 		if (replace) {
 			EnqueuePrecompileJob(UnoptimizedKey(key), running.label + " (unoptimized)",
-			                     running.build, PipelineBuildMode::Unoptimized);
+			                     running.build, PipelineBuildMode::Unoptimized, running.order);
 		}
 		if (m_precompile_progress.Finish(PrecompileOutcome::TimedOut, 0) && !m_precompile_only) {
 			LogPrecompileStats("done");
+		}
+		// The worker in the driver call is replaced, so the other builds keep their threads;
+		// it ends by itself if the call returns (a Vulkan call cannot be cancelled).
+		(void)m_precompile_queue->Abandon(key);
+	}
+}
+
+void PipelineCache::UpdatePrecompileThreads() {
+	if (m_precompile_queue == nullptr || m_precompile_steady_threads == 0 ||
+	    m_precompile_steady_threads >= m_precompile_queue->ThreadCount()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (!m_game_rendering) {
+		const auto flips = Common::GpuTiming::GuestFlips();
+		if (m_flip_window_start == std::chrono::steady_clock::time_point {}) {
+			m_flip_window_start       = now;
+			m_flip_window_start_count = flips;
+		} else if (now - m_flip_window_start >= std::chrono::seconds {10}) {
+			m_rendering_windows = flips - m_flip_window_start_count >= PrecompileRenderingFlips
+			                          ? m_rendering_windows + 1
+			                          : 0;
+			m_game_rendering    = m_rendering_windows >= PrecompileRenderingWindows;
+			m_flip_window_start = now;
+			m_flip_window_start_count = flips;
+		}
+	}
+	const auto last_recorded = std::chrono::steady_clock::time_point(
+	    std::chrono::steady_clock::duration(m_last_recorded_enqueue.load()));
+	const bool booting =
+	    !m_game_rendering && (m_precompile_queue->QueuedBelow(PrecompileCreatedOrder) != 0 ||
+	                          now - last_recorded < PrecompileBootQuiet);
+	const auto threads = booting ? m_precompile_queue->ThreadCount() : m_precompile_steady_threads;
+	if (threads != m_precompile_queue->ActiveThreads()) {
+		m_precompile_queue->SetActiveThreads(threads);
+		PipelineCacheLog("Precompile: {} threads from now on ({})", threads,
+		                 booting            ? "recorded builds are left"
+		                 : m_game_rendering ? "the game renders"
+		                                    : "no recorded build is left");
+	}
+}
+
+void PipelineCache::EndPrecompileForExit() {
+	std::lock_guard lock(m_precompile_runs->mutex);
+	for (const auto& [key, running]: m_precompile_runs->running) {
+		running.cancel->store(true);
+		if (m_precompile_attempts != nullptr && !running.settled->load()) {
+			m_precompile_attempts->Interrupt(key);
 		}
 	}
 }
 
 void PipelineCache::EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record,
-                                      bool                                        code_only) {
+                                      bool code_only, uint64_t position) {
 	const auto key = record->Key();
 	auto       label =
 	    fmt::format("{} CS {:016x}", code_only ? "created" : "recorded", record->shader_hash);
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
-	    [this, record = std::move(record), code_only](PipelineBuildMode mode) {
-		    return PrecompileComputeProgram(m_graphics, m_driver_cache, *record, nullptr, code_only,
-		                                    mode);
-	    });
+	    [graphics = &m_graphics, driver_cache = m_driver_cache, record = std::move(record),
+	     code_only](PipelineBuildMode mode, const std::atomic<bool>& cancel) {
+		    return PrecompileComputeProgram(*graphics, driver_cache, *record, nullptr, code_only,
+		                                    mode, &cancel);
+	    },
+	    code_only ? PrecompileCreatedOrder + position : position);
 }
 
 void PipelineCache::EnqueuePrecompile(
     std::shared_ptr<const GraphicsPipelineRecord>           record,
-    std::vector<std::shared_ptr<const GraphicsStageRecord>> stages) {
+    std::vector<std::shared_ptr<const GraphicsStageRecord>> stages, uint64_t position) {
 	const auto key = record->Key();
 	auto       label =
 	    fmt::format("pipeline {:016x} (VS {:016x} PS {:016x})", key, stages.front()->shader_hash,
 	                record->pixel_stage != 0 ? stages.back()->shader_hash : 0);
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
-	    [this, record = std::move(record), stages = std::move(stages)](PipelineBuildMode mode) {
-		    return PrecompileGraphicsPipeline(*record, stages, mode);
-	    });
+	    [this, record = std::move(record),
+	     stages = std::move(stages)](PipelineBuildMode mode, const std::atomic<bool>& cancel) {
+		    return PrecompileGraphicsPipeline(*record, stages, mode, &cancel);
+	    },
+	    position);
 }
 
 void PipelineCache::QueueResolved(PipelineListResolver::Resolved resolved) {
 	for (size_t i = 0; i < resolved.compute.size(); i++) {
 		m_list_keys.insert(resolved.compute[i]->Key());
-		EnqueuePrecompile(std::move(resolved.compute[i]), resolved.compute_code_only[i]);
+		EnqueuePrecompile(std::move(resolved.compute[i]), resolved.compute_code_only[i],
+		                  resolved.compute_position[i]);
 	}
 	for (auto& pipeline: resolved.pipelines) {
 		m_list_keys.insert(pipeline.record->Key());
@@ -1751,7 +1870,7 @@ void PipelineCache::QueueResolved(PipelineListResolver::Resolved resolved) {
 		if (pipeline.pixel_stage != nullptr) {
 			stages.push_back(std::move(pipeline.pixel_stage));
 		}
-		EnqueuePrecompile(std::move(pipeline.record), std::move(stages));
+		EnqueuePrecompile(std::move(pipeline.record), std::move(stages), pipeline.position);
 	}
 }
 
@@ -1792,19 +1911,35 @@ void PipelineCache::ImportPipelineList() {
 		return found != compute_code.end() ? found->second : nullptr;
 	});
 	size_t from_dumps = 0;
+	size_t dumps_read = 0;
 	if (m_list_resolver->Pending()) {
-		// File names carry the program hash, which is the code's for all but merged stages:
-		// read every dump once and offer its code.
+		// Dumped originals (--graphics-debug-dump) are named by program hash, which is the
+		// code's for all but merged stages: only the dumps of a pending entry's hash are read.
+		// --precompile-only, where no guest creates the rest, then offers the other dumps too.
+		const auto                         wanted = m_list_resolver->PendingShaderHashes();
 		std::error_code error;
 		const auto      folder = Config::GetShaderLogFolder() / "original";
+		std::vector<std::filesystem::path> matching;
+		std::vector<std::filesystem::path> others;
 		for (const auto& file: std::filesystem::directory_iterator(folder, error)) {
 			if (!file.is_regular_file(error) || file.path().extension() != ".bin") continue;
-			const auto size = file.file_size(error);
-			if (error || size == 0 || size % sizeof(uint32_t) != 0 || size > (64u << 20u)) continue;
+			const auto stem = file.path().stem().string();
+			const auto mark = stem.rfind('_');
+			uint64_t   hash = 0;
+			const bool named =
+			    mark != std::string::npos && stem.size() - mark - 1 == 16 &&
+			    std::from_chars(stem.data() + mark + 1, stem.data() + stem.size(), hash, 16).ec ==
+			        std::errc {};
+			(named && wanted.contains(hash) ? matching : others).push_back(file.path());
+		}
+		const auto offer = [&](const std::filesystem::path& path) {
+			const auto size = std::filesystem::file_size(path, error);
+			if (error || size == 0 || size % sizeof(uint32_t) != 0 || size > (64u << 20u)) return;
 			std::vector<uint32_t> code(size / sizeof(uint32_t));
-			std::ifstream         in(file.path(), std::ios::binary);
+			std::ifstream         in(path, std::ios::binary);
 			if (!in.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(size)))
-				continue;
+				return;
+			dumps_read++;
 			auto more = m_list_resolver->OnCode(code);
 			from_dumps += more.compute.size() + more.pipelines.size();
 			resolved.compute.insert(resolved.compute.end(), more.compute.begin(),
@@ -1812,41 +1947,58 @@ void PipelineCache::ImportPipelineList() {
 			resolved.compute_code_only.insert(resolved.compute_code_only.end(),
 			                                  more.compute_code_only.begin(),
 			                                  more.compute_code_only.end());
+			resolved.compute_position.insert(resolved.compute_position.end(),
+			                                 more.compute_position.begin(),
+			                                 more.compute_position.end());
 			std::ranges::move(more.pipelines, std::back_inserter(resolved.pipelines));
+		};
+		for (const auto& path: matching) {
 			if (!m_list_resolver->Pending()) break;
+			offer(path);
+		}
+		if (m_precompile_only) {
+			for (const auto& path: others) {
+				if (!m_list_resolver->Pending()) break;
+				offer(path);
+			}
 		}
 	}
 	const auto counts = m_list_resolver->GetCounts();
-	PipelineCacheLog("Pipeline list: {} entries in {}{}: compute {} of {} resolved, graphics "
-	                 "pipelines {} of {} ({} without their stages), {} from dumped shaders; {} "
-	                 "shaders unknown so far",
-	                 entries, Common::PathToString(path),
-	                 stats.dropped_bytes != 0
-	                     ? fmt::format(" ({} damaged bytes dropped)", stats.dropped_bytes)
-	                     : std::string {},
-	                 counts.compute_resolved, counts.compute, counts.pipelines_resolved,
-	                 counts.pipelines, counts.pipelines_broken, from_dumps, counts.shaders_pending);
+	PipelineCacheLog(
+	    "Pipeline list: {} entries in {}{}: compute {} of {} resolved, graphics "
+	    "pipelines {} of {} ({} without their stages), {} from {} dumped shaders; {} "
+	    "shaders unknown so far",
+	    entries, Common::PathToString(path),
+	    stats.dropped_bytes != 0 ? fmt::format(" ({} damaged bytes dropped)", stats.dropped_bytes)
+	                             : std::string {},
+	    counts.compute_resolved, counts.compute, counts.pipelines_resolved, counts.pipelines,
+	    counts.pipelines_broken, from_dumps, dumps_read, counts.shaders_pending);
 	QueueResolved(std::move(resolved));
 }
 
 void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	EXIT_IF(thread_count == 0);
 	if (m_precompile_queue == nullptr) {
-		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(thread_count);
+		// Next to a running guest the builds yield to it.
+		m_precompile_queue =
+		    std::make_unique<ProgramPrecompileQueue>(thread_count, !m_precompile_only);
 	}
 	auto&           progress = m_precompile_progress;
 	std::lock_guard lock(m_list_mutex);
 	progress.BeginQueueing();
-	// Recorded programs and pipelines first, in the order they were first needed.
-	for (const auto& record: m_manifest->Records()) {
-		EnqueuePrecompile(record, false);
+	// Recorded programs and pipelines first, in the order they were first needed: each
+	// manifest keeps first-seen order, and the two are interleaved by position.
+	const auto programs = m_manifest->Records();
+	for (size_t i = 0; i < programs.size(); i++) {
+		EnqueuePrecompile(programs[i], false, FirstSeenPosition(i, programs.size()));
 	}
 	const auto recorded_compute = progress.Get().queued;
 	const auto recorded_pipelines =
 	    m_pipeline_manifest != nullptr
 	        ? m_pipeline_manifest->Pipelines()
 	        : std::vector<std::shared_ptr<const GraphicsPipelineRecord>> {};
-	for (const auto& pipeline: recorded_pipelines) {
+	for (size_t i = 0; i < recorded_pipelines.size(); i++) {
+		const auto&                                             pipeline = recorded_pipelines[i];
 		std::vector<std::shared_ptr<const GraphicsStageRecord>> stages;
 		for (const auto key: pipeline->VertexStages())
 			stages.push_back(m_pipeline_manifest->FindStage(key));
@@ -1855,7 +2007,8 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 		if (std::ranges::find(stages, nullptr) != stages.end()) {
 			continue;
 		}
-		EnqueuePrecompile(pipeline, std::move(stages));
+		EnqueuePrecompile(pipeline, std::move(stages),
+		                  FirstSeenPosition(i, recorded_pipelines.size()));
 	}
 	const auto recorded = progress.Get().queued;
 	ImportPipelineList();
@@ -1863,9 +2016,10 @@ void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	// A created shader no session has dispatched gets the module of its code-only
 	// specialization, which the first dispatches of most such shaders use.
 	if (m_created != nullptr) {
-		for (const auto& record: m_created->Records()) {
-			if (!m_manifest->HasShader(record->shader_hash)) {
-				EnqueuePrecompile(record, true);
+		const auto created = m_created->Records();
+		for (size_t i = 0; i < created.size(); i++) {
+			if (!m_manifest->HasShader(created[i]->shader_hash)) {
+				EnqueuePrecompile(created[i], true, FirstSeenPosition(i, created.size()));
 			}
 		}
 	}
@@ -1893,11 +2047,15 @@ void PipelineCache::LogPrecompileStats(const char* when) {
 	    counts.timed_out);
 }
 
-void PipelineCache::StartPrecompile(uint32_t thread_count) {
+void PipelineCache::StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count) {
 	if (m_manifest == nullptr || m_driver_cache == nullptr) {
 		PipelineCacheLog("Precompile: no driver pipeline cache for this title; nothing to build");
 		return;
 	}
+	m_precompile_steady_threads = std::min(steady_thread_count, thread_count);
+	// The boot counts as a recorded enqueue: the guest has not created its shaders yet.
+	m_last_recorded_enqueue.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                              std::memory_order_relaxed);
 	QueuePrecompile(thread_count);
 }
 
@@ -1927,7 +2085,7 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 		PipelineCacheLog("Precompile: interrupted (window closed)");
 	}
 	LogPrecompileStats(interrupted ? "stopped" : "done");
-	const bool joinable = !interrupted && m_precompile_abandoned.load() == 0;
+	const bool joinable = !interrupted && m_precompile_runs->abandoned.load() == 0;
 	if (joinable) {
 		m_precompile_queue->Stop();
 		m_precompile_queue.reset();
