@@ -359,7 +359,14 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 	if (from_driver_cache != nullptr) {
 		*from_driver_cache = false;
 	}
-	// Probed in every mode: a hit is the whole build, and the outcome is reported.
+	if (mode == PipelineBuildMode::Unoptimized) {
+		result = BuildPipeline(device, nullptr, *inputs,
+		                       vk::PipelineCreateFlagBits::eDisableOptimization, "unoptimized-only",
+		                       pipeline.pipeline);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+		return {};
+	}
+	// Probed in every other mode: a hit is the whole build, and the outcome is reported.
 	if (driver_cache != nullptr && graphics.pipeline_creation_cache_control_enabled) {
 		result = BuildPipeline(device, driver_cache, *inputs,
 		                       vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
@@ -409,7 +416,8 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
                        const PipelineRenderingState&   rendering,
                        const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
                        const PipelineStaticParameters& static_params,
-                       vk::PipelineCache driver_cache, PipelineBuildMode mode) {
+                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
+                       bool* from_driver_cache) {
 	const auto  vertex_info    = state.VertexStages();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto* ps_input_info  = state.ps_active ? &state.ps_input_info : nullptr;
@@ -742,7 +750,8 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode);
+	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
+	                            from_driver_cache);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -787,7 +796,8 @@ PipelineCompileQueue::Job CreatePipelineInternal(GraphicContext&               g
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
 	// Precompile builds run on worker threads; only their outcome is traced.
-	const bool trace = mode != PipelineBuildMode::Precompile;
+	const bool trace =
+	    mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized;
 	if (trace) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=%u push_constants=%u\n",
 		     pipeline_layout_info.setLayoutCount, 1u);

@@ -6,6 +6,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -22,6 +23,9 @@ enum class PrecompileOutcome : uint8_t {
 	// The program cannot be rebuilt from its record (a shader with calls, or a specialization
 	// this recompiler no longer derives for the shader).
 	Skipped,
+	// The build ran past the precompile time budget; it is abandoned (still running) and
+	// quarantined for later runs.
+	TimedOut,
 };
 
 // Counts the outcomes of a precompile run and tells exactly one caller that the run is complete:
@@ -36,6 +40,7 @@ public:
 		uint64_t cached     = 0;
 		uint64_t compiled   = 0;
 		uint64_t skipped    = 0;
+		uint64_t timed_out  = 0;
 		uint64_t compile_ms = 0;
 	};
 
@@ -77,12 +82,18 @@ public:
 				m_counts.compile_ms += ms;
 				break;
 			case PrecompileOutcome::Skipped: m_counts.skipped++; break;
+			case PrecompileOutcome::TimedOut: m_counts.timed_out++; break;
 		}
 		return --m_open == 0;
 	}
 	[[nodiscard]] Counts Get() {
 		std::lock_guard lock(m_mutex);
 		return m_counts;
+	}
+	// Whether a run was started and every job it queued has finished (or timed out).
+	[[nodiscard]] bool Complete() {
+		std::lock_guard lock(m_mutex);
+		return m_open == 0;
 	}
 
 private:
@@ -126,18 +137,22 @@ public:
 
 	// Returns once the program's job has finished: runs it on the calling thread if it has not
 	// started, waits for it if it is running. Returns at once for a key without a job.
-	void Expedite(uint64_t key) {
+	void Expedite(uint64_t key) { (void)Expedite(key, std::chrono::milliseconds::max()); }
+	// Like Expedite, but waits at most `max_wait` for a running job (a driver may never finish
+	// a build). Returns whether the job has finished.
+	bool Expedite(uint64_t key, std::chrono::milliseconds max_wait) {
 		uint64_t ticket = 0;
 		{
 			std::lock_guard lock(m_mutex);
 			const auto      entry = m_tickets.find(key);
 			if (m_stopped || entry == m_tickets.end() || entry->second == 0) {
-				return;
+				return true;
 			}
 			ticket = entry->second;
 		}
-		m_queue.Expedite(ticket);
+		const bool finished = m_queue.Expedite(ticket, max_wait);
 		Collect();
+		return finished;
 	}
 
 	// Jobs queued or running (after Stop, also the dropped ones).

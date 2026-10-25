@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineState.h"
 #include "graphics/host_gpu/renderer/pipeline/programManifest.h"
 #include "graphics/host_gpu/renderer/pipeline/programPrecompileQueue.h"
@@ -21,10 +23,14 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -40,7 +46,8 @@ class ImageHeapSource;
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
-	// ComputeProgramRecord::Key of a recorded compute program, else 0.
+	// ComputeProgramRecord::Key of a recorded compute program, GraphicsStageRecord::Key of a
+	// recorded graphics stage, else 0.
 	uint64_t record_key = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
@@ -57,6 +64,11 @@ enum class PipelineBuildMode : uint8_t {
 	// Optimized on the calling thread unless the driver cache holds the pipeline; fills the
 	// driver cache ahead of the pipeline's use (see PrecompileComputeProgram).
 	Precompile,
+	// Unoptimized on the calling thread and never optimized: for a pipeline whose optimized
+	// build did not finish within the precompile time budget (PrecompileAttempts::TimedOut).
+	// Built the way UnoptimizedFirst builds, so that a precompile of it fills the driver's own
+	// disk cache for that build.
+	Unoptimized,
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -96,10 +108,22 @@ public:
 	// earlier sessions, and of every created compute shader without a recorded program
 	// (--precompile-pipelines). Needs the renderer's bindless set layout.
 	void StartPrecompile(uint32_t thread_count);
-	// --precompile-only: builds every recorded program's pipeline on `thread_count` threads,
-	// waits for all of them, logs the outcome counts and saves the driver cache. Returns false
-	// when the driver cache could not be written.
-	bool PrecompileAll(uint32_t thread_count);
+	enum class PrecompileResult : uint8_t {
+		Done,
+		// The driver cache could not be written.
+		SaveFailed,
+		// The window was closed; the builds that were running are retried by the next run.
+		Interrupted,
+	};
+	// --precompile-only: builds every recorded program's and pipeline's pipeline on
+	// `thread_count` threads and waits for all of them; a build that runs past the time budget
+	// is abandoned (and quarantined). Logs the outcome counts and saves the driver cache.
+	// `pump` runs about four times a second on the calling thread (window messages); it returns
+	// false to stop. Builds that are still running when this returns may never finish: the
+	// caller ends the process without joining them.
+	PrecompileResult PrecompileAll(uint32_t thread_count, const std::function<bool()>& pump);
+	// --export-pipeline-list: writes the title's manifests as a shareable list (no shader code).
+	bool ExportPipelineList(const std::filesystem::path& path);
 	// Joins the background compiles. Their pipeline layouts reference the renderer's bindless
 	// set layout, so the owner calls this before destroying it.
 	void StopBackgroundCompiles();
@@ -216,12 +240,54 @@ private:
 	// input without a specialization. Precompile builds those the manifest has no program for
 	// with their code-only specialization. Null without a driver cache file.
 	std::unique_ptr<ProgramManifest> m_created;
-	// Created shaders whose precompile never finished; null without a driver cache file.
+	// Precompile builds that never finished; null without a driver cache file.
 	std::unique_ptr<PrecompileAttempts>     m_precompile_attempts;
+	// Graphics pipelines of this title and their stages (_PipelineCache/<title>.v5.pipelines),
+	// and the code of every shader the guest created (<title>.v5.created); null without a driver
+	// cache file.
+	std::unique_ptr<PipelineManifest> m_pipeline_manifest;
+	std::unique_ptr<ShaderCodeStore>  m_created_code;
+	std::string                       m_title_id;
+	// The imported pipeline list's entries whose shaders the guest has not created yet
+	// (--import-pipeline-list); guarded by m_list_mutex, which also guards queueing from guest
+	// threads against the queue's shutdown.
+	std::mutex                            m_list_mutex;
+	std::unique_ptr<PipelineListResolver> m_list_resolver;
+	bool                                  m_list_open = false;
+	// Keys the imported list predicts (compute program and graphics pipeline records).
+	std::unordered_set<uint64_t>            m_list_keys;
 	std::unique_ptr<ProgramPrecompileQueue> m_precompile_queue;
 	PrecompileProgress                      m_precompile_progress;
 	// Set by precompile builds that added to the driver cache; the GPU thread checkpoints it.
 	std::atomic<bool> m_precompile_dirty {false};
+	// A precompile build that runs: when it started, and whether it has finished or timed out
+	// (whichever comes first settles it).
+	using PrecompileBuild = std::function<PrecompileOutcome(PipelineBuildMode)>;
+	struct RunningPrecompile {
+		std::chrono::steady_clock::time_point start;
+		std::shared_ptr<std::atomic<bool>>    settled;
+		std::string                           label;
+		PrecompileBuild                       build;
+		PipelineBuildMode                     mode = PipelineBuildMode::Precompile;
+	};
+	std::mutex                                      m_precompile_running_mutex;
+	std::unordered_map<uint64_t, RunningPrecompile> m_precompile_running;
+	std::atomic<uint64_t>                           m_precompile_abandoned {0};
+	std::chrono::steady_clock::time_point           m_next_timeout_check {};
+	std::chrono::steady_clock::time_point           m_next_coverage_report {};
+	// --precompile-only logs its outcome itself.
+	bool m_precompile_only = false;
+	// Translated stages of graphics pipelines being precompiled, shared by the pipelines that
+	// use them; released when the precompile stops.
+	struct PrecompiledStage;
+	std::mutex                                                      m_stage_memo_mutex;
+	std::unordered_map<uint64_t, std::shared_ptr<PrecompiledStage>> m_stage_memo;
+	// Graphics pipelines created this session: from the driver cache or compiled, and whether a
+	// record (local or imported) predicted them.
+	uint64_t m_graphics_from_cache = 0;
+	uint64_t m_graphics_compiled   = 0;
+	uint64_t m_graphics_predicted  = 0;
+	uint64_t m_graphics_recorded   = 0;
 	// Live compute pipelines the driver cache provided or compiled.
 	uint64_t m_compute_from_cache = 0;
 	uint64_t m_compute_compiled   = 0;
@@ -240,6 +306,28 @@ private:
 	// one exists.
 	void QueuePrecompile(uint32_t thread_count);
 	void EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record, bool code_only);
+	void EnqueuePrecompile(std::shared_ptr<const GraphicsPipelineRecord>           record,
+	                       std::vector<std::shared_ptr<const GraphicsStageRecord>> stages);
+	// Queues a build under the attempts rules: quarantined keys are skipped, and a key whose
+	// optimized build timed out is built unoptimized instead. Returns whether it was queued.
+	bool EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build);
+	void EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
+	                          PipelineBuildMode mode);
+	// Abandons the precompile builds that ran past the time budget.
+	void        CheckPrecompileTimeouts();
+	void        QueueResolved(PipelineListResolver::Resolved resolved);
+	void        ImportPipelineList();
+	void        SetCreatedCode(std::unique_ptr<ShaderCodeStore> store);
+	void        ReleasePrecompiledStages();
+	static bool TranslateRecordedStage(GraphicContext& graphics, const GraphicsStageRecord& record,
+	                                   PrecompiledStage& out);
+	PrecompileOutcome
+	PrecompileGraphicsPipeline(const GraphicsPipelineRecord&                               record,
+	                           std::span<const std::shared_ptr<const GraphicsStageRecord>> stages,
+	                           PipelineBuildMode                                           mode);
+	void LogCoverage();
+	// Adds a pipeline the cache is about to create to the pipeline manifest.
+	void RecordGraphicsPipeline(const GraphicsPipelineKey& key, const DrawRenderState& state);
 
 	void LogPrecompileStats(const char* when);
 	// Returns the pipeline of a pending first build, or null when the draw may skip it.
@@ -263,7 +351,8 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
                        const PipelineRenderingState&   rendering,
                        const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
                        const PipelineStaticParameters& static_params,
-                       vk::PipelineCache driver_cache, PipelineBuildMode mode);
+                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
+                       bool* from_driver_cache = nullptr);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
@@ -276,9 +365,11 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 // With `code_only`, the record's specialization is ignored and the module is built for
 // ShaderRecompiler::IR::CodeOnlySpecialization of the translated program (a created shader that
 // no dispatch has specialized yet).
+// `mode` is Precompile, or Unoptimized for a program whose optimized build timed out.
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record,
-                                           uint64_t* spirv_hash = nullptr, bool code_only = false);
+                                           uint64_t* spirv_hash = nullptr, bool code_only = false,
+                                           PipelineBuildMode mode = PipelineBuildMode::Precompile);
 
 } // namespace Libs::Graphics
 

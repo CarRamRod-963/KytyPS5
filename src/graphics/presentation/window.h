@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <filesystem>
+
 namespace Libs::Graphics {
 
 class Presenter;
@@ -11,8 +13,10 @@ class Presenter;
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
 // --precompile-only: builds the recorded pipelines into the driver cache and saves it. Returns
-// false when the driver cache could not be saved.
-[[nodiscard]] bool       WindowPrecompilePipelines();
+// the process exit code: 0 done, 1 the driver cache was not written, 2 the window was closed.
+[[nodiscard]] int WindowPrecompilePipelines();
+// --export-pipeline-list: whether the list was written.
+[[nodiscard]] bool       WindowExportPipelineList(const std::filesystem::path& path);
 void                     WindowShutdown();
 
 } // namespace Libs::Graphics
