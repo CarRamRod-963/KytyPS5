@@ -21,6 +21,9 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+// Lets the calling thread yield the CPU to normal-priority threads (background work such as
+// pipeline builds). Best effort: does nothing where the platform refuses.
+void LowerCurrentThreadPriority();
 
 } // namespace Thread
 
