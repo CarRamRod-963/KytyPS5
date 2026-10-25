@@ -723,7 +723,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
-	const auto& program  = runtime.module->info;
+	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
@@ -764,7 +764,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
-		const auto& program  = prepared.runtime->module->info;
+		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
@@ -820,7 +820,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program  = prepared.runtime->module->info;
+	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 
@@ -853,7 +853,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program       = prepared.runtime->module->info;
+	const auto& program       = *prepared.runtime->program;
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;
 	auto&       texture_cache = m_context.GetTextureCache();
@@ -895,8 +895,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->module->info.info.uses_dma;
-		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
+		uses_dma |= stage->runtime->program->info.uses_dma;
+		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
@@ -936,7 +936,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	for (const auto* prepared: prepared_bindings) {
-		const auto& program = prepared->runtime->module->info;
+		const auto& program = *prepared->runtime->program;
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
 			const auto count = program.bindings.descriptor_counts[index];
@@ -956,7 +956,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
-		const auto& program     = prepared->runtime->module->info;
+		const auto& program     = *prepared->runtime->program;
 		auto&       descriptors = *prepared;
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
