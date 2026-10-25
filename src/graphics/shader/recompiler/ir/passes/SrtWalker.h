@@ -40,12 +40,20 @@ protected:
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
+	// Guest memory for the loads of a walker compiled with SrtWalkerLoads::Reader: the walk can
+	// run on a thread that must not fault into the caches, or over a snapshot. A refused read
+	// leaves its value unknown.
+	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
 };
+
+// How walker loads read guest memory: in place (a fault completes the load as a zero read), or
+// through SrtRuntime::read_memory.
+enum class SrtWalkerLoads : uint8_t { Direct, Reader };
 
 class SrtReadCapture {
 public:
@@ -55,6 +63,7 @@ public:
 
 private:
 	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool ReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
@@ -69,16 +78,23 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 // Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
 // only evaluates the values, with every block reachable.
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
+void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {},
+                      SrtWalkerLoads loads = SrtWalkerLoads::Direct);
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
+// one DWORD range per guest load. False when a reachable read is unknown. The results go to
+// scratch when it is not empty (at least plan.srt_scratch.size() words), else to the plan's
+// scratch: threads with their own scratch can walk one plan at the same time.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads);
-// Results of the last walk; false when unknown.
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
-bool WalkedActive(const ResourcePlan& plan, uint32_t source);
-bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
+             std::vector<std::pair<uint64_t, uint64_t>>* reads, std::span<uint64_t> scratch = {});
+// Results of the last walk with that scratch; false when unknown.
+bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result,
+                 std::span<const uint64_t> scratch = {});
+bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result,
+                      std::span<const uint64_t> scratch = {});
+bool WalkedActive(const ResourcePlan& plan, uint32_t source,
+                  std::span<const uint64_t> scratch = {});
+bool WalkedImageActive(const ResourcePlan& plan, uint32_t image,
+                       std::span<const uint64_t> scratch = {});
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
