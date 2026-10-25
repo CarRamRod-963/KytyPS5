@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/scalarReadCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1442,36 +1443,27 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
+	const auto           signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::vector<uint8_t> initial_data;
 	if (cache_exists) {
-		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
-		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
-				    path);
-			}
-		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		auto loaded = DriverCacheFile::Load(m_driver_cache_path, signature);
+		switch (loaded.status) {
+			case DriverCacheFile::LoadStatus::Loaded:
+				initial_data = std::move(loaded.payload);
+				break;
+			case DriverCacheFile::LoadStatus::SignatureMismatch:
+			case DriverCacheFile::LoadStatus::DataMismatch:
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
+				                 path);
+				break;
+			case DriverCacheFile::LoadStatus::InvalidSize:
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)",
+				                 path);
+				break;
+			case DriverCacheFile::LoadStatus::Missing:
+			case DriverCacheFile::LoadStatus::ReadFailed:
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (read failed)", path);
+				break;
 		}
 	}
 
@@ -2194,8 +2186,7 @@ bool PipelineCache::WriteDriverCache() {
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
+		if (result != vk::Result::eSuccess || size == 0) {
 			break;
 		}
 		payload.resize(size);
@@ -2204,37 +2195,14 @@ bool PipelineCache::WriteDriverCache() {
 			break;
 		}
 	}
-	if (result != vk::Result::eSuccess || size == 0 ||
-	    size > std::numeric_limits<uint32_t>::max()) {
+	if (result != vk::Result::eSuccess || size == 0) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return false;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return false;
-	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
-	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
-	std::error_code error;
-	if (written) {
-		std::filesystem::rename(temp_path, m_driver_cache_path, error);
-	}
-	if (!written || error) {
+	const auto signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	if (!DriverCacheFile::Store(m_driver_cache_path, signature, payload.data(), payload.size())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return false;

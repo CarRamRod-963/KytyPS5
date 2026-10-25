@@ -784,6 +784,13 @@ add_executable(pipeline_cache_writer_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(pipeline_cache_writer_tests PRIVATE ${inc_headers})
 
+add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DriverCacheFileTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/driverCacheFile.cpp"
+)
+target_link_libraries(driver_cache_file_tests xxhash)
+target_include_directories(driver_cache_file_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -866,6 +873,7 @@ if(BUILD_TESTING)
 	add_test(NAME program_manifest COMMAND $<TARGET_FILE:program_manifest_tests>)
 	add_test(NAME pipeline_list COMMAND $<TARGET_FILE:pipeline_list_tests>)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
+	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
@@ -986,6 +994,7 @@ if(BUILD_TESTING)
 		pipeline_compile_queue_tests
 		pipeline_list_tests
 		pipeline_cache_writer_tests
+		driver_cache_file_tests
 		pending_draw_policy_tests
 		memory_priority_tests
 		barrier_tracker_tests
