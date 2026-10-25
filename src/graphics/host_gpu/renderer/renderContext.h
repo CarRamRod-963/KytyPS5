@@ -32,8 +32,7 @@ class GuestGpu;
 
 class RenderContext {
 public:
-	explicit RenderContext(GraphicContext&              graphics,
-	                       const std::filesystem::path& shader_store = ShaderStorePath());
+	explicit RenderContext(GraphicContext& graphics);
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
