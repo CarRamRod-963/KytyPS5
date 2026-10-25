@@ -2,10 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SERIALIZE_H_
 
 #include "common/assert.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/rectListShader.h"
 
 #include <algorithm>
 #include <bit>
@@ -155,7 +153,7 @@ KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K)
+               A, B, C, D, E, F, G, H, I, J, K, L)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
@@ -172,11 +170,6 @@ KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j)
-KYTY_IO_FIELDS(Spirv::Profile, a, b, c)
-KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
-KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

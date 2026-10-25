@@ -137,10 +137,6 @@ bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
-bool ShaderCacheEnabled() {
-	return g_config->shader_cache_enabled;
-}
-
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }

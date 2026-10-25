@@ -122,7 +122,6 @@ public:
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
-	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -165,7 +164,6 @@ public:
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
-		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;

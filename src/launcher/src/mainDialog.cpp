@@ -278,7 +278,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
-	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

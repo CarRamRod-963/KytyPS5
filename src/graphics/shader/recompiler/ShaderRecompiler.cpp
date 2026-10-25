@@ -30,6 +30,10 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
 
+const char* GetDumpLabel(const CompileOptions& options) {
+	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
+
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += cfg;
@@ -40,17 +44,30 @@ std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	return dump;
 }
 
+const char* StageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Pixel: return "PS";
+		default: return "unknown";
+	}
+}
+
 void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
 	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
 	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
-	LOGF("ShaderRecompiler %s CFG dispatcher fallback: hash=0x%016" PRIx64
+	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
 	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
 	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
 	     " reason=%s\n",
-	     StageName(options.stage), options.shader_hash, phase,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase,
 	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
@@ -580,19 +597,6 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 
 } // namespace
 
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Compute: return "CS";
-		case ShaderType::Vertex: return "VS";
-		case ShaderType::Local: return "LS";
-		case ShaderType::TessellationControl: return "HS";
-		case ShaderType::TessellationEvaluation: return "TES";
-		case ShaderType::Mesh: return "MS";
-		case ShaderType::Pixel: return "PS";
-		default: return "unknown";
-	}
-}
-
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -763,7 +767,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		     static_cast<unsigned>(options.stage));
 	}
 
-	const auto* stage        = StageName(options.stage);
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms = [&compile_begin]() {
 		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -773,25 +776,27 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
-		LOGF("ShaderRecompiler %s decoded RDNA2:\n%s", stage, decoded_dump.c_str());
+		if (options.early_dump) {
+			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
+		}
 	}
 
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG BuildGraph\n", stage,
-	     options.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
-		LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG Structurize\n", stage,
-		     options.shader_hash);
+		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		structured_cfg = CFG::Structurize(native_cfg);
 		if (structured_cfg.unsupported) {
 			native_cfg.unsupported = true;
@@ -801,12 +806,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
 			selected_cfg = &structured_cfg;
-			LOGF("ShaderRecompiler %s structured CFG success: blocks=%" PRIu64 "\n", stage,
+			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(selected_cfg->blocks.size()));
 		}
-		LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-		     stage, options.shader_hash,
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(selected_cfg->blocks.size()),
 		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
@@ -819,7 +824,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		    decoded, *options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
-			LOGF("ShaderRecompiler %s embedded vertex fetch plan: detected=%" PRIu64 "\n", stage,
+			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
@@ -832,12 +837,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
-	     options.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
-	     stage, options.shader_hash,
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
@@ -848,9 +853,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
-		LOGF("ShaderRecompiler %s read-lane elimination: reads=%" PRIu32
-		     " reductions=%" PRIu32 "\n",
-		     stage, read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
+		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
+		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
@@ -864,8 +868,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
-		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
-		     MakeIrDump(cfg_dump, ir).c_str());
+		if (options.early_dump) {
+			LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+			     MakeIrDump(cfg_dump, ir).c_str());
+		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
@@ -882,7 +888,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
-	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
@@ -929,16 +934,19 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
-		LOGF("ShaderRecompiler %s native IR:\n%s", stage, ir_dump.c_str());
+		if (options.early_dump) {
+			LOGF("%s native IR (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
+		}
 	}
 
-	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
-	     ir.shader_hash);
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
 	                                options.emit_debug_info);
-	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
-	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
-	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
+	     static_cast<uint64_t>(spirv.size()),
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));

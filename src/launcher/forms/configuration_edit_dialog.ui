@@ -203,12 +203,6 @@
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
-            <item row="10" column="1">
-             <widget class="QCheckBox" name="checkBox_shader_cache">
-              <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
-              <property name="text"><string>Cache shaders</string></property>
-             </widget>
-            </item>
            </layout>
           </widget>
          </item>
