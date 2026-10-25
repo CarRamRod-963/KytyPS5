@@ -909,6 +909,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME compute_program_precompile
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-precompile-only)
+	add_test(NAME graphics_pipeline_precompile
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --graphics-precompile-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
