@@ -681,7 +681,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
-	const auto& program  = runtime.module->info;
+	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
@@ -723,7 +723,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-		const auto& program  = prepared.runtime->module->info;
+		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
@@ -780,7 +780,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program   = prepared.runtime->module->info;
+	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
@@ -813,7 +813,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program  = prepared.runtime->module->info;
+	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
@@ -859,8 +859,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->module->info.info.uses_dma;
-		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
+		uses_dma |= stage->runtime->program->info.uses_dma;
+		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
@@ -909,7 +909,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	                                       : vk::ShaderStageFlags {};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
-		const auto& program = prepared->runtime->module->info;
+		const auto& program = *prepared->runtime->program;
 		write_count += std::popcount(program.bindings.descriptor_mask);
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
@@ -930,7 +930,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->module->info.has_address_writes) {
+			if (writer->runtime->program->has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
@@ -947,7 +947,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
-				const auto& program = writer->runtime->module->info;
+				const auto& program = *writer->runtime->program;
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
@@ -973,7 +973,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
-		const auto& program       = prepared->runtime->module->info;
+		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);

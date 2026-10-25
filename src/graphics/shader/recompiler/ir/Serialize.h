@@ -2,10 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SERIALIZE_H_
 
 #include "common/assert.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/rectListShader.h"
 
 #include <algorithm>
 #include <bit>
@@ -169,11 +167,6 @@ KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j)
-KYTY_IO_FIELDS(Spirv::Profile, a, b, c)
-KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
-KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

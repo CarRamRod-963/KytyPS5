@@ -22,8 +22,10 @@ struct CompileOptions {
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
+	bool                        early_dump                 = false;
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
+	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
@@ -67,7 +69,6 @@ struct ShaderSource {
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 
-[[nodiscard]] const char* StageName(ShaderType stage);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

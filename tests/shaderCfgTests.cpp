@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -164,10 +163,10 @@ void CompilePixelRuntime(const ShaderParams &params,
 
   options.input_info.pixel = &input_info;
   auto result = RecompileForTest(params.code, options);
-  static std::deque<ShaderModule> modules;
+  static std::deque<ShaderRecompiler::IR::CompiledShaderInfo> programs;
   static std::deque<ShaderRecompiler::IR::ResourceSnapshot> resources;
-  modules.push_back({.info = std::move(result.program).TakeCompiledInfo()});
-  input_info.stage.module = &modules.back();
+  programs.push_back(std::move(result.program).TakeCompiledInfo());
+  input_info.stage.program = &programs.back();
   resources.push_back(std::move(result.resources));
   input_info.stage.resources = &resources.back();
 }
@@ -1158,7 +1157,7 @@ void TestNativeShaderResourceDependencies() {
   set_buffer(0, 0x1000, 16, 3);
   set_buffer(1, 0x1800, 4, 7);
   set_buffer(2, 0x2000, 0, 64);
-  const ShaderModule compiled{.info = {
+  const ShaderRecompiler::IR::CompiledShaderInfo compiled{
       .stage = program.stage,
       .shader_hash = program.shader_hash,
       .wave_size = program.wave_size,
@@ -1167,8 +1166,8 @@ void TestNativeShaderResourceDependencies() {
       .scratch_dwords = program.scratch_dwords,
       .info = program.info,
       .bindings = program.bindings,
-  }};
-  ShaderStageRuntime runtime{.module = &compiled, .resources = &resources};
+  };
+  ShaderStageRuntime runtime{.program = &compiled, .resources = &resources};
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost nonempty written buffers");
   set_buffer(0, 0, 16, 3);
@@ -15926,8 +15925,8 @@ void TestPixelProgramCacheBindingIdentity() {
         first_params.hash == XXH3_64bits(shader.data(), shader.size_bytes()) &&
             first_params.hash == second_params.hash &&
             first_key == MakeStageStaticKey(second_info) &&
-            first_info.stage.module != nullptr &&
-            second_info.stage.module != nullptr,
+            first_info.stage.program != nullptr &&
+            second_info.stage.program != nullptr,
         "pixel program matching did not preserve an identical source/static identity");
     return std::pair {first_params.hash, first_key};
   };
