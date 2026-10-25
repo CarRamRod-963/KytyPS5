@@ -18,6 +18,11 @@
 #include <string>
 #include <thread>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -233,6 +238,15 @@ void Thread::SleepNano(uint64_t nanos) {
 
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
+}
+
+void Thread::LowerCurrentThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Linux applies nice values per thread.
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 5);
+#endif
 }
 
 std::string Thread::GetId() const {

@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <limits>
@@ -347,12 +348,15 @@ static vk::Result BuildPipeline(vk::Device device, vk::PipelineCache cache, Inpu
 // of magnitude faster, Background leaves pipeline.pipeline null, and the returned job builds the
 // optimized pipeline through the driver cache. Unoptimized pipelines stay out of the driver
 // cache: it is persisted, and the optimized build supersedes them. `from_driver_cache` tells
-// whether the driver cache provided the pipeline.
+// whether the driver cache provided the pipeline. A Precompile build stops after a cache probe
+// that missed once `cancel` is set and leaves pipeline.pipeline null: a driver call cannot be
+// interrupted, but the build behind the probe is the long one.
 template <typename Inputs>
 static PipelineCompileQueue::Job
 CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                      std::unique_ptr<Inputs> inputs, vk::PipelineCache driver_cache,
-                     PipelineBuildMode mode, bool* from_driver_cache = nullptr) {
+                     PipelineBuildMode mode, bool* from_driver_cache = nullptr,
+                     const std::atomic<bool>* cancel = nullptr) {
 	EXIT_IF(pipeline.pipeline != nullptr);
 	const auto device = graphics.device;
 	vk::Result result = vk::Result::eSuccess;
@@ -382,6 +386,9 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::ePipelineCompileRequired);
 		pipeline.pipeline = nullptr;
+	}
+	if (mode == PipelineBuildMode::Precompile && cancel != nullptr && cancel->load()) {
+		return {};
 	}
 	if (mode == PipelineBuildMode::Optimized || mode == PipelineBuildMode::Precompile) {
 		result = BuildPipeline(device, driver_cache, *inputs, {},
@@ -417,7 +424,7 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
                        const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
                        const PipelineStaticParameters& static_params,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool* from_driver_cache) {
+                       bool* from_driver_cache, const std::atomic<bool>* cancel) {
 	const auto  vertex_info    = state.VertexStages();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto* ps_input_info  = state.ps_active ? &state.ps_input_info : nullptr;
@@ -751,16 +758,15 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 		     dynamic_state.dynamicStateCount);
 	}
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache);
+	                            from_driver_cache, cancel);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-PipelineCompileQueue::Job CreatePipelineInternal(GraphicContext&               graphics,
-                                                 PipelineCache::Pipeline&      pipeline,
-                                                 const ShaderComputeInputInfo& input_info,
-                                                 vk::ShaderModule              compute_module,
-                                                 vk::PipelineCache             driver_cache,
-                                                 PipelineBuildMode mode, bool* from_driver_cache) {
+PipelineCompileQueue::Job
+CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                       const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
+                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
+                       bool* from_driver_cache, const std::atomic<bool>* cancel) {
 	EXIT_IF(compute_module == nullptr);
 
 	auto  inputs                  = std::make_unique<ComputePipelineInputs>();
@@ -823,7 +829,7 @@ PipelineCompileQueue::Job CreatePipelineInternal(GraphicContext&               g
 		     static_cast<void*>(pipeline.pipeline_layout));
 	}
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache);
+	                            from_driver_cache, cancel);
 }
 
 } // namespace Libs::Graphics
