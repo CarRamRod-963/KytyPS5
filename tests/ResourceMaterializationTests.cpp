@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <thread>
 
 namespace {
 
@@ -1429,7 +1430,121 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+void TestReaderLoadsWalkOnSeveralThreads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // The back-edge plan of TestBackEdgeReachesPhiPredecessor, compiled with
+  // reader loads: threads with their own scratch walk it at once, each over its
+  // own snapshot of a table at an address no memory backs (no FakeGuestMemory:
+  // a direct load would crash the test).
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 3;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 4; ++i)
+    AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &header = *program.blocks[1];
+  auto &body = *program.blocks[2];
+  auto &exit = *program.blocks[3];
+  const auto branch = [](Block &block, Block &target, Value condition = {},
+                         Block *other = nullptr) {
+    block.terminator.kind =
+        other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
+    block.terminator.true_block = &target;
+    block.terminator.false_block = other;
+    block.condition = condition;
+    block.AddBranch(&target);
+    if (other)
+      block.AddBranch(other);
+  };
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto table = Value(&entry.AppendNewInst(
+      ValueOpcode::GetAddressResource,
+      {Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
+                                  {Value(ScalarReg(0))})),
+       Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
+                                  {Value(ScalarReg(1))}))}));
+  const auto load = [&](Block &block, uint32_t offset) -> Inst & {
+    auto &read =
+        block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                            {table, Value(offset), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    return read;
+  };
+  auto &p = header.AppendNewInst(ValueOpcode::Phi);
+  p.SetFlags(Type::U32);
+  p.AddPhiOperand(&entry, Value(0u));
+  p.AddPhiOperand(&body, Value(1u));
+  branch(entry, header);
+  branch(header, body,
+         Value(&header.AppendNewInst(ValueOpcode::IEqual32,
+                                     {Value(&load(header, 4u)), Value(&p)})),
+         &exit);
+  branch(body, header);
+  exit.terminator.kind = TerminatorKind::Return;
+  program.srt_reads.push_back({Value(&load(exit, 0u)), 0});
+  exit.AppendNewInst(
+      ValueOpcode::ReadConst,
+      {Value(&exit.AppendNewInst(ValueOpcode::GetSrtResource)), Value(0u)});
+  auto plan = Extract(program);
+  CompileSrtWalker(plan, {}, SrtWalkerLoads::Reader);
+  struct Snapshot {
+    uint64_t base = 0;
+    std::array<uint32_t, 2> words{};
+    uint32_t reads = 0;
+  };
+  constexpr uint32_t threads = 4, iterations = 20000;
+  std::array<bool, threads> passed{};
+  std::vector<std::thread> workers;
+  for (uint32_t thread = 0; thread < threads; ++thread) {
+    workers.emplace_back([&, thread] {
+      Snapshot snapshot{.base = 0x7e0000000000ull + thread * 0x10000ull};
+      const std::array<uint32_t, 2> user_data{
+          static_cast<uint32_t>(snapshot.base),
+          static_cast<uint32_t>(snapshot.base >> 32u)};
+      const SrtRuntime runtime{
+          .user_data = user_data,
+          .read_memory =
+              +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                auto &memory = *static_cast<Snapshot *>(data);
+                const auto index = (address - memory.base) / 4u;
+                if (address < memory.base || index >= memory.words.size())
+                  return false;
+                words[0] = memory.words[index];
+                ++memory.reads;
+                return true;
+              },
+          .userdata = &snapshot};
+      std::vector<uint64_t> scratch(plan.srt_scratch.size());
+      std::vector<uint32_t> flat;
+      bool ok = true;
+      for (uint32_t i = 0; i < iterations && ok; ++i) {
+        const uint32_t tag = thread << 16u | i;
+        snapshot.words = {tag, (i + thread) & 1u};
+        ok = WalkSrt(plan, runtime, flat, nullptr, scratch) &&
+             flat == std::vector<uint32_t>{tag};
+      }
+      passed[thread] = ok && snapshot.reads >= iterations * 2u;
+    });
+  }
+  for (auto &worker : workers)
+    worker.join();
+  Check(std::ranges::all_of(passed, [](bool ok) { return ok; }),
+        "reader walks on several threads saw each other's results or memory");
+  // A refused read leaves the walk unknown instead of reading zero.
+  const std::array<uint32_t, 2> user_data{0u, 0x7d00u};
+  std::vector<uint32_t> flat;
+  Check(!WalkSrt(plan,
+                 {.user_data = user_data,
+                  .read_memory = +[](void *, uint64_t,
+                                     std::span<uint32_t>) { return false; }},
+                 flat, nullptr),
+        "a reader walk read a refused address as zero");
+}
+
 int main() {
+  TestReaderLoadsWalkOnSeveralThreads();
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
