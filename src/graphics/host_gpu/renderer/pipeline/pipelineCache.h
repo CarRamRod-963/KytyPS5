@@ -224,6 +224,9 @@ private:
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	// Set when pipelines were created since the last snapshot; a failed write sets it again.
 	std::atomic<bool> m_driver_cache_dirty {false};
+	// --precompile-only started from an empty driver cache (the file was too large, or
+	// --rebuild-pipeline-cache): the file is written only when the precompile has finished.
+	bool m_driver_cache_rebuild = false;
 	// Writes the driver cache off the GPU thread; joined before the cache is destroyed.
 	PipelineCacheWriter m_driver_cache_writer;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>

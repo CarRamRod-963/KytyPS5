@@ -1445,7 +1445,20 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	const auto           signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::vector<uint8_t> initial_data;
-	if (cache_exists) {
+	std::error_code      size_error;
+	const auto           file_size =
+	    cache_exists ? std::filesystem::file_size(m_driver_cache_path, size_error) : uint64_t {0};
+	if (cache_exists && Config::PrecompileOnlyEnabled() &&
+	    DriverCacheFile::RebuildOnPrecompile(Config::RebuildPipelineCacheEnabled(),
+	                                         size_error ? 0 : file_size)) {
+		// Only the pipelines this run builds end up in the file; it replaces the old one when
+		// the precompile has finished.
+		m_driver_cache_rebuild = true;
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: rebuilding {} ({:.2f} MB) from the pipelines this precompile "
+		    "builds",
+		    path, static_cast<double>(size_error ? 0 : file_size) / 1'000'000.0);
+	} else if (cache_exists) {
 		auto loaded = DriverCacheFile::Load(m_driver_cache_path, signature);
 		switch (loaded.status) {
 			case DriverCacheFile::LoadStatus::Loaded:
@@ -2047,6 +2060,12 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 	}
 	if (interrupted) {
 		PipelineCacheLog("Precompile: interrupted (window closed)");
+		if (m_driver_cache_rebuild) {
+			// The next run rebuilds again; the old file stays meanwhile.
+			m_driver_cache_dirty.store(false);
+			PipelineCacheLog("Vulkan pipeline cache: not rebuilt, keeping {}",
+			                 Common::PathToString(m_driver_cache_path));
+		}
 	}
 	LogPrecompileStats(interrupted ? "stopped" : "done");
 	const bool joinable = !interrupted && m_precompile_runs->abandoned.load() == 0;
@@ -2145,6 +2164,11 @@ void PipelineCache::CheckpointDriverCache() {
 		return;
 	}
 	m_driver_cache_dirty.store(true, std::memory_order_relaxed);
+	// A cache being rebuilt holds only part of the old file's pipelines until the precompile
+	// ends; it is written once, then.
+	if (m_driver_cache_rebuild) {
+		return;
+	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now < m_next_driver_cache_save || m_driver_cache_writer.Busy()) {
 		return;

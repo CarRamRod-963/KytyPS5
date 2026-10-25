@@ -92,6 +92,7 @@ struct ConfigOptions {
 	bool                   serialize_dispatches            = false;
 	bool                   precompile_pipelines            = false;
 	bool                   precompile_only                 = false;
+	bool                   rebuild_pipeline_cache          = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -168,6 +169,7 @@ bool     SkipPendingDrawsEnabled();
 bool     SerializeDispatchesEnabled();
 bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
+bool     RebuildPipelineCacheEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();

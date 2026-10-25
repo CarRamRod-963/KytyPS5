@@ -171,6 +171,10 @@ static void PrintUsage() {
 	    "                                       and the created compute shaders into the driver\n"
 	    "                                       cache, save it and exit (code 0 when done).\n");
 	::printf(
+	    "  --rebuild-pipeline-cache             With --precompile-only: replace the driver cache\n"
+	    "                                       with only the pipelines this run builds (also\n"
+	    "                                       done for a cache file larger than 3 GiB).\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -303,6 +307,7 @@ static constexpr Flag FLAGS[] = {
     {"--skip-pending-draws", &ConfigOptions::skip_pending_draws},
     {"--precompile-pipelines", &ConfigOptions::precompile_pipelines},
     {"--precompile-only", &ConfigOptions::precompile_only},
+    {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},

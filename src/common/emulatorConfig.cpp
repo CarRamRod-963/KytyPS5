@@ -217,6 +217,10 @@ bool PrecompileOnlyEnabled() {
 	return g_config->precompile_only;
 }
 
+bool RebuildPipelineCacheEnabled() {
+	return g_config->rebuild_pipeline_cache;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }
