@@ -57,7 +57,7 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	}
 
 	EXIT_IF(!vs_input_info.stage);
-	const auto& program   = vs_input_info.stage.module->info;
+	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = *vs_input_info.stage.resources;
 	if (index_offset == 0 &&
 	    program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
@@ -197,7 +197,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto& dc             = ctx.GetDepthControl();
 	const auto& vp             = ctx.GetScreenViewport();
 	const auto& vp0            = vp.viewports[0];
-	const auto& ps_resources   = ps_input_info.stage.module->info.info;
+	const auto& ps_resources   = ps_input_info.stage.program->info;
 	const auto  sampled_images = std::count_if(
 	    ps_resources.images.begin(), ps_resources.images.end(), [](const auto& image) {
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -320,7 +320,7 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
-	const auto& outputs = vs_input_info.stage.module->info.info.outputs;
+	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
 		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
@@ -840,7 +840,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
-	if (state.vertex_info[0].stage.module == nullptr) {
+	if (state.vertex_info[0].stage.program == nullptr) {
 		return false;
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -1042,8 +1042,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		return;
 	}
 	const auto  vertex_stages = state.VertexStages();
-	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
-	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
+	const bool  mesh_active   = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool  mesh_task     = mesh_active && state.vertex_info[0].indirect_draw;
 	const auto& mesh          = state.vertex_info[0].mesh;
 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
 	uint32_t    mesh_groups   = 0;
@@ -1401,7 +1401,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
-	    state.vertex_info[0].stage.module->info.param_export_mask == 0 &&
+	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
