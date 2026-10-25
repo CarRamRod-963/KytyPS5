@@ -1761,10 +1761,6 @@ void PipelineCache::SetLookaheadCommand(const void* stream, const void* command)
 	m_program_cache->lookahead_command = command;
 }
 
-bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
-	return std::memcmp(this, &other, sizeof(*this)) == 0;
-}
-
 PipelineCache::Pipeline* PipelineCache::ResolvePendingBuild(Pipeline&          pipeline,
                                                             PendingDrawBlocker blocker) {
 	const auto entry = m_pending_builds.find(&pipeline);
