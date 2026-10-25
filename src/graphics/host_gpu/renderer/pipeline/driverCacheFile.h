@@ -15,6 +15,9 @@ namespace Libs::Graphics::DriverCacheFile {
 
 // Reads and writes go through the stream in pieces of at most this many bytes.
 inline constexpr uint64_t DefaultChunkSize = uint64_t {1} << 30u;
+// --precompile-only rebuilds a cache file larger than this from the pipelines it builds: the
+// driver keeps every pipeline it ever saw, also those of shader code no build emits anymore.
+inline constexpr uint64_t RebuildThreshold = uint64_t {3} << 30u;
 
 enum class LoadStatus {
 	Missing,
@@ -42,6 +45,12 @@ struct Loaded {
 [[nodiscard]] bool Store(const std::filesystem::path& path, std::string_view signature,
                          const uint8_t* payload, uint64_t payload_size,
                          uint64_t chunk_size = DefaultChunkSize);
+
+// Whether --precompile-only starts from an empty driver cache instead of the file's
+// (`requested` = --rebuild-pipeline-cache).
+[[nodiscard]] constexpr bool RebuildOnPrecompile(bool requested, uint64_t file_size) {
+	return requested || file_size > RebuildThreshold;
+}
 
 } // namespace Libs::Graphics::DriverCacheFile
 

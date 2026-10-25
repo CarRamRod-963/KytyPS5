@@ -128,6 +128,23 @@ void TestFailedStoreKeepsFile() {
         "a failed store leaves the previous file");
 }
 
+void TestRebuildPolicy() {
+  constexpr uint64_t GiB = uint64_t{1} << 30u;
+  Check(!DriverCacheFile::RebuildOnPrecompile(false, 0), "no file");
+  Check(!DriverCacheFile::RebuildOnPrecompile(false, 2 * GiB),
+        "a small file is kept");
+  Check(!DriverCacheFile::RebuildOnPrecompile(
+            false, DriverCacheFile::RebuildThreshold),
+        "a file at the threshold is kept");
+  Check(DriverCacheFile::RebuildOnPrecompile(
+            false, DriverCacheFile::RebuildThreshold + 1),
+        "a file past the threshold is rebuilt");
+  Check(DriverCacheFile::RebuildOnPrecompile(false, 5 * GiB),
+        "a file past 4 GiB is rebuilt");
+  Check(DriverCacheFile::RebuildOnPrecompile(true, 1),
+        "a requested rebuild rebuilds any file");
+}
+
 } // namespace
 
 int main() {
@@ -135,6 +152,7 @@ int main() {
   TestCreatesDirectory();
   TestRejects();
   TestFailedStoreKeepsFile();
+  TestRebuildPolicy();
   std::filesystem::remove_all(std::filesystem::temp_directory_path() /
                               "kyty_driver_cache_file_tests");
   std::printf("DriverCacheFileTests: all tests passed\n");
