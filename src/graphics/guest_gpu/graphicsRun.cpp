@@ -299,6 +299,8 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
                                                      uint32_t, uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	// The counter is a packet input in guest memory, maybe written by recorded GPU work.
+	SettleMemoryRead(counter, sizeof(uint64_t));
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -621,6 +623,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
+		// The parser reads the commands like a packet input (SettleMemoryRead).
+		SettleMemoryRead(commands.data(), commands.size_bytes());
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
@@ -724,8 +728,16 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 		}
 		const auto opcode = (header >> 8u) & 0xffu;
 		switch (opcode) {
-			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_SH_REG_INDIRECT:
+				// A register table recorded GPU work still writes is read back by the parser.
+				if (size == 5u &&
+				    LibKernel::Memory::HasGpuDirtyBytes(
+				        (packet[1] & 0xfffffffcu) | (static_cast<uint64_t>(packet[2]) << 32u),
+				        (packet[4] & 0x3fffu) * 2ull * sizeof(uint32_t))) {
+					return Stop(packet);
+				}
+				[[fallthrough]];
+			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_BASE:
 				(void)g_cp_op_func[opcode](*this, header & ~1u, packet + 1, remaining, total_dw);
 				break;
@@ -775,6 +787,12 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 				    packet[1] | (static_cast<uint64_t>(packet[2]) << 32u));
 				const auto count = packet[3] & 0xfffffu;
 				if (count != 0 && buffer == nullptr) return Stop(packet);
+				// Recorded GPU work may still write the commands; the parser reads them back.
+				if (count != 0 &&
+				    LibKernel::Memory::HasGpuDirtyBytes(reinterpret_cast<uint64_t>(buffer),
+				                                        count * sizeof(uint32_t))) {
+					return Stop(packet);
+				}
 				if (count != 0 && !ScanLookahead({buffer, count}, depth + 1)) return false;
 				if ((packet[3] & (1u << 20u)) != 0) return true; // a chain does not return
 				break;
@@ -819,6 +837,9 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	// Recorded GPU work may have written the commands: games generate command buffers with
+	// compute shaders and call them after that work.
+	SettleMemoryRead(commands.data(), commands.size_bytes());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -960,7 +981,6 @@ void CommandProcessor::SettleMemoryRead(const volatile void* address, uint64_t s
 	const std::pair<uint64_t, uint64_t> range {reinterpret_cast<uint64_t>(address), size};
 	LibKernel::Memory::ReadGpuDirtyBytes(std::span {&range, 1u});
 }
-
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
 		SettleMemoryRead(reinterpret_cast<const void*>(m_num_instances_addr), sizeof(uint32_t));
@@ -1003,7 +1023,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			SettleLabelAccess(address, sizeof(uint64_t));
+			SettleMemoryRead(address, sizeof(uint64_t));
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
