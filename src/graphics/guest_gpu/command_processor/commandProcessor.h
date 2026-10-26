@@ -123,8 +123,9 @@ public:
 			m_renderer.SettleElidedLabels(reinterpret_cast<uint64_t>(address), size);
 		}
 	}
-	// Before a packet reads guest memory as its own input (indirect arguments, draw counts): the
-	// label settlement above, then a readback of the bytes recorded GPU work writes. The packet
+	// Before a packet reads guest memory as its own input (indirect arguments, draw counts,
+	// compared values, register tables, the commands of a buffer it starts): the label
+	// settlement above, then a readback of the bytes recorded GPU work writes. The packet
 	// runs after that work, but a page with a pending GPU write may keep its old bytes readable
 	// for the guest's CPU threads (BufferCache::NoteGpuWrite), so a plain read can be stale.
 	void SettleMemoryRead(const volatile void* address, uint64_t size);

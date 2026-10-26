@@ -13533,6 +13533,74 @@ public:
                       ": the packet read stale thread dimensions");
         }
       }
+      // A game can generate a command buffer with a compute shader and call it
+      // after that work: the parser reads the commands like a packet input.
+      // Saros reserves the space with single-DWORD NOPs, a dispatch writes the
+      // packets, and the parser read the hot page's old NOPs, then landed in
+      // the middle of a packet past the page boundary ("unknown op").
+      {
+        constexpr auto hot_commands = base + 0xec000;
+        constexpr u32 command_dwords = 5;
+        std::vector<u32> command_writer;
+        for (u32 i = 0; i < command_dwords; i++) {
+          command_writer.push_back(EncodeVop1(0x01u, 1, 4u + i));
+          command_writer.push_back(EncodeMubuf0(0x1cu, i * 4u, false, false));
+          command_writer.push_back(EncodeMubuf1(1, 0, 0));
+        }
+        AppendEnd(&command_writer);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(command_writer.data()),
+                          {.type = Prospero::ShaderBinaryType::kCs,
+                           .code_size_bytes = static_cast<u32>(
+                               command_writer.size() * sizeof(u32))});
+        const auto write_commands =
+            [&](const std::array<u32, command_dwords> &words) {
+              shaders.SetCsShader(
+                  {.data_addr =
+                       reinterpret_cast<uint64_t>(command_writer.data()),
+                   .num_thread_x = 1,
+                   .num_thread_y = 1,
+                   .num_thread_z = 1,
+                   .wave_size = 64,
+                   .user_sgpr = 4u + command_dwords});
+              set_buffer(0, hot_commands, command_dwords * sizeof(u32));
+              for (u32 i = 0; i < command_dwords; i++) {
+                shaders.SetCsUserSgpr(4u + i, words[i]);
+              }
+              processor.DispatchDirect(1, 1, 1, 0x41u);
+            };
+        constexpr u32 reserved = 0xffff1000u;
+        constexpr std::array<u32, command_dwords> reservation{
+            reserved, reserved, reserved, reserved, reserved};
+        write_commands(reservation);
+        cache.ReadMemory(hot_commands, command_dwords * sizeof(u32));
+        volatile u32 marker = 0;
+        const auto marker_address = reinterpret_cast<uint64_t>(&marker);
+        constexpr u32 written = 0x5a5a1234u;
+        // WRITE_DATA of one DWORD to memory.
+        write_commands({0xc0033700u, 0x40100200u,
+                        static_cast<u32>(marker_address),
+                        static_cast<u32>(marker_address >> 32u), written});
+        std::array<u32, command_dwords> visible{};
+        Require(name, "hot command page fixture",
+                cache.HasGpuDirtyBytes(hot_commands, sizeof(visible)) &&
+                    LibKernel::Memory::TryReadBacking(
+                        hot_commands, visible.data(), sizeof(visible)) &&
+                    visible == reservation,
+                "the generated commands were not pending over the published "
+                "reservation");
+        const std::array<u32, 4> call{
+            0xc0023f00u, static_cast<u32>(hot_commands),
+            static_cast<u32>(hot_commands >> 32u),
+            0x0f200000u | command_dwords};
+        Pm4Execution execution;
+        Require(name, "generated command buffer call",
+                processor.Process(execution, call) ==
+                    Pm4ProcessResult::Complete,
+                "the call into the generated command buffer did not finish");
+        Require(name, "generated command buffer contents", marker == written,
+                "the parser read the reservation instead of the generated "
+                "WRITE_DATA (marker " + Hex(marker) + ")");
+      }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
       constexpr auto image_address = base + cases.size() * case_size;
