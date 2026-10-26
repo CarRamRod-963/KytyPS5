@@ -513,9 +513,18 @@ void BufferCache::DrainPublished() {
 		std::lock_guard lock(m_published_mutex);
 		published.swap(m_published);
 	}
+	// A published tracker page that is still clean holds no GPU write recorded since the
+	// download (recording one marks the page first), so all its dirty intervals were published.
+	// One that is dirty again keeps them: the download that cleans it takes the whole page. The
+	// caching page's epoch cannot decide this: a write to another tracker page of the caching
+	// page moves it (and the published bytes stayed dirty with a clean tracker page, so no
+	// download ever took them), and a hot page evicted and written again starts a new epoch.
 	for (const auto& entry: published) {
-		if (entry.epoch_ptr->load(std::memory_order_acquire) == entry.epoch) {
-			m_gpu_modified_ranges.Subtract(entry.address, entry.size);
+		for (auto page = entry.address; page < entry.address + entry.size;
+		     page += TRACKER_PAGE_SIZE) {
+			if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+				m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+			}
 		}
 	}
 }
@@ -733,7 +742,7 @@ void BufferCache::RecordAsyncDownloads() {
 						            end - begin);
 					        }
 				        }
-				        published.push_back({address, bytes, page.epoch, page.epoch_ptr});
+				        published.push_back({address, bytes});
 			        });
 		    }
 		    if (!published.empty()) {
@@ -1208,6 +1217,9 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
+			// No tracker page of the buffer is GPU-dirty: intervals left here were published
+			// (DrainPublished drops them later) and must not outlive the buffer.
+			m_gpu_modified_ranges.Subtract(buffer.CpuAddress(), buffer.Size());
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
