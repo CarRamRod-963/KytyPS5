@@ -1240,7 +1240,15 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
 		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
-			EXIT("BufferCache: garbage collection retained GPU ownership\n");
+			// GPU-dirty bytes the download did not take (no tracker page claimed them). The
+			// buffer stays registered and is collected at a later pass, when its pages are
+			// clean, instead of ending the process.
+			if (m_gc_deferred++ < 8) {
+				LOGF("BufferCache: collection of 0x%016" PRIx64 " (0x%" PRIx64
+				     " bytes) deferred: GPU-dirty bytes outside its dirty pages\n",
+				     buffer.CpuAddress(), buffer.Size());
+			}
+			continue;
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);

@@ -269,6 +269,8 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Collections of a dirty buffer that left GPU-dirty bytes behind and were deferred.
+	uint64_t m_gc_deferred = 0;
 };
 
 } // namespace Libs::Graphics
