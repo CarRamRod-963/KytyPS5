@@ -240,13 +240,11 @@ private:
 	// in the download ring, which synchronous readbacks share (at most a quarter of it).
 	static constexpr uint64_t MaxAsyncDownload     = uint64_t {16} << 20u;
 	uint64_t                  m_async_download_cap = MaxAsyncDownload;
-	// Ranges a publish cleaned, with the epoch it was valid at: the GPU thread drops their exact
-	// dirty intervals unless the page was written again since (the new intervals overlap).
+	// Tracker pages a publish cleaned: the GPU thread drops their dirty intervals unless a page
+	// is GPU-dirty again (DrainPublished).
 	struct Published {
-		uint64_t                               address;
-		uint64_t                               size;
-		uint64_t                               epoch;
-		std::shared_ptr<std::atomic<uint64_t>> epoch_ptr;
+		uint64_t address;
+		uint64_t size;
 	};
 	std::mutex             m_published_mutex;
 	std::vector<Published> m_published;

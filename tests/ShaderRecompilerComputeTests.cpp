@@ -14984,6 +14984,56 @@ public:
                   value_at(pages[1]) == 0x90909091u &&
                   value_at(pages[2]) == 0x90909092u,
               "deferred pages' downloads did not ride the next submission");
+
+      // A download published while the GPU writes another tracker page of
+      // the same caching page before the GPU thread drains the publication:
+      // the write moves the caching page's epoch, and the published bytes
+      // must still stop being GPU-dirty. Left dirty, no dirty tracker page
+      // claims them for a download, and a critical collection of the buffer
+      // found them GPU-owned after its download.
+      {
+        constexpr uint64_t caching_page = base + 0x70000;
+        constexpr uint64_t published = caching_page + 0x1000;
+        constexpr uint64_t rewritten = caching_page + 0x3000;
+        fill_at(published, 0x5a5a0001u);
+        cache.ReadMemory(published, bytes);
+        fill_at(published, 0x5a5a0002u);
+        const auto download_tick = scheduler.CurrentTick();
+        scheduler.Flush();
+        scheduler.Wait(download_tick);
+        scheduler.WaitPriorityOperations(download_tick);
+        Require(name, "published before the drain",
+                value_at(published) == 0x5a5a0002u &&
+                    !cache.IsRegionGpuModified(published, bytes),
+                "the asynchronous download did not publish the page");
+        fill_at(rewritten, 0x5a5a0003u);
+        scheduler.Flush();
+        Require(name, "drained after another page's write",
+                !cache.HasGpuDirtyBytes(published, bytes) &&
+                    cache.HasGpuDirtyBytes(rewritten, bytes),
+                "published bytes stayed GPU-dirty after a write to another "
+                "page of their caching page");
+        // A critical collection of the buffer while the other page is dirty.
+        fill_at(rewritten, 0x5a5a0004u);
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(
+            cache, std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max());
+        for (uint32_t pass = 0; pass < 200; pass++)
+          cache.RunGarbageCollector();
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+        cache.RunGarbageCollector();
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(
+            cache, std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max());
+        Require(name, "critical collection after the drain",
+                value_at(rewritten) == 0x5a5a0004u &&
+                    value_at(published) == 0x5a5a0002u &&
+                    !cache.HasGpuDirtyBytes(caching_page,
+                                            BufferCache::CACHING_PAGESIZE) &&
+                    !cache.IsRegionRegistered(caching_page,
+                                              BufferCache::CACHING_PAGESIZE),
+                "the collection lost a write or kept the buffer");
+      }
     });
     // Readbacks that guest threads request while the GPU thread is busy share
     // one submission: a read of one page and a CPU write into another.
