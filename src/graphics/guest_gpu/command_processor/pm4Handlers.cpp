@@ -616,7 +616,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	cp.SettleLabelAccess(reinterpret_cast<const volatile void*>(addr), sizeof(uint32_t));
+	cp.SettleMemoryRead(reinterpret_cast<const volatile void*>(addr), sizeof(uint32_t));
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -647,7 +647,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	cp.SettleLabelAccess(compare_addr, sizeof(uint64_t));
+	cp.SettleMemoryRead(compare_addr, sizeof(uint64_t));
 	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
@@ -1046,6 +1046,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Register tables may be written by recorded GPU work, like the commands that use them.
+	cp.SettleMemoryRead(indirect_buffer, indirect_num_dw * 2ull * sizeof(uint32_t));
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1115,6 +1117,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Register tables may be written by recorded GPU work, like the commands that use them.
+	cp.SettleMemoryRead(indirect_buffer, indirect_num_dw * 2ull * sizeof(uint32_t));
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
@@ -1168,6 +1172,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Register tables may be written by recorded GPU work, like the commands that use them.
+	cp.SettleMemoryRead(indirect_buffer, indirect_num_dw * 2ull * sizeof(uint32_t));
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
