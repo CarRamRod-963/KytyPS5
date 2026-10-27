@@ -885,9 +885,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
+	// Scheduler ticks count submissions, hundreds of them per frame in some titles; an image the
+	// title uses once per frame (a transient target aliasing memory with others) must not be
+	// deleted, and created and uploaded again, at every use. Age it in frames as well.
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	    (cached.touched_tick == UINT64_MAX ||
+	     m_gc_tick - std::min(m_gc_tick, cached.touched_tick) > NumFramesBeforeRemoval) &&
 	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
