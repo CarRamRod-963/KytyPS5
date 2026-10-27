@@ -1482,6 +1482,22 @@ static uint64_t EndOfPipeTimestamp(CommandScheduler& scheduler, uint64_t tick, i
 	return Sync::MonotonicReferenceClock(std::max(Sync::ReferenceClockAt(at_ns), issued_clock));
 }
 
+bool CommandProcessor::SubmitForLabel(bool with_interrupt, bool timestamp) {
+	// Some games end almost every command with a label (Saros: ~900 per frame, many after a
+	// single dispatch), and a submission per label costs more than the work it carries. While
+	// the GPU still runs earlier submissions, a label can ride with the commands recorded after
+	// it: it lands when that larger submission completes, and the GPU has queued work meanwhile.
+	// The submission follows at a later label once enough work is recorded or the GPU caught
+	// up, and at the end of the queue slice at the latest (GuestGpu::Process). Interrupts and
+	// timestamps are submitted at once: their time is what the guest observes.
+	auto& scheduler = GetScheduler();
+	if (with_interrupt || timestamp || !CurrentBuffer().HasCommands() ||
+	    CurrentBuffer().CommandCount() >= LabelBatchCommands) {
+		return true;
+	}
+	return scheduler.IsFree(scheduler.CurrentTick() - 1);
+}
+
 template <typename T>
 void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrupt,
                                              uint32_t interrupt_context_id, bool timestamp) {
@@ -1494,7 +1510,7 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	const auto issued_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                           std::chrono::steady_clock::now().time_since_epoch())
 	                           .count();
-	{
+	if (SubmitForLabel(with_interrupt, timestamp)) {
 		const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Label);
 		scheduler.Flush();
 	}
