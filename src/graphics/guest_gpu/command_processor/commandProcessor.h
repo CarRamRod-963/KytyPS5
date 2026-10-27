@@ -151,6 +151,8 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	friend struct CommandProcessorTestAccess;
+
 	void ProcessPm4(Pm4Execution& execution);
 	// Scans commands for PlanLookahead; false once it reached a command it cannot look past.
 	bool ScanLookahead(std::span<const uint32_t> commands, uint32_t depth);
@@ -199,6 +201,8 @@ private:
 		const volatile uint32_t* count_addr   = nullptr;
 	};
 	std::vector<DeferredIndirectValue> m_deferred_indirect;
+	// PlanLookahead's copy of m_deferred_indirect while its scan applies register packets.
+	std::vector<DeferredIndirectValue> m_lookahead_saved_deferred;
 
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;

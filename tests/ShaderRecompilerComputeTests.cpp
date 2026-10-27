@@ -182,6 +182,27 @@ static_assert(ImageSubresources{2, 6}.Covers(ImageSubresources{2, 6}));
 static_assert(!ImageSubresources{2, 6}.Covers(ImageSubresources{3, 6}));
 static_assert(!ImageSubresources{2, 6}.Covers(ImageSubresources{2, 7}));
 
+struct CommandProcessorTestAccess {
+  // Leaves `location` as an earlier native indirect draw would: its value is
+  // the base vertex of the single non-indexed record at `args_address`.
+  static void DeferBaseVertex(CommandProcessor &processor, uint32_t location,
+                              uint64_t args_address) {
+    processor.m_deferred_indirect.push_back(
+        {.location = location,
+         .field = CommandProcessor::DeferredIndirectValue::Field::BaseVertex,
+         .indexed = false,
+         .args_address = args_address,
+         .stride = sizeof(vk::DrawIndirectCommand),
+         .max_count = 1});
+  }
+  static size_t DeferredCount(const CommandProcessor &processor) {
+    return processor.m_deferred_indirect.size();
+  }
+  static void SettleRegisters(CommandProcessor &processor) {
+    processor.SettleIndirectDrawState(true, false);
+  }
+};
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
@@ -13696,6 +13717,40 @@ public:
         Require(name, "generated command buffer contents", marker == written,
                 "the parser read the reservation instead of the generated "
                 "WRITE_DATA (marker " + Hex(marker) + ")");
+      }
+      // The lookahead scan applies the shader-register packets ahead of the
+      // stream to know the registers of the work it plans, then restores the
+      // registers. A vertex user-data write it scans must not drop the value an
+      // earlier native indirect draw left on the GPU for that register: the
+      // draws before that packet still read the GPU value.
+      {
+        constexpr const char *case_name = "lookahead keeps deferred registers";
+        Require(name, case_name, context.GetPipelineCache().LookaheadEnabled(),
+                "the fixture runs without the resource lookahead");
+        const std::array<u32, 4> record{3, 1, 0x5a5a17u, 0};
+        constexpr auto record_address = base + 0xfc000;
+        Require(name, case_name,
+                LibKernel::Memory::TryWriteBacking(
+                    record_address, record.data(), sizeof(record)),
+                "the indirect record could not be written");
+        constexpr u32 location = Pm4::SPI_SHADER_USER_DATA_GS_0 + 3u;
+        shaders.SetGsUserSgpr(3, 0x1111u);
+        CommandProcessorTestAccess::DeferBaseVertex(processor, location,
+                                                    record_address);
+        // SET_SH_REG of that register, as the stream sets it for a later draw.
+        const std::array<u32, 3> ahead{KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0),
+                                       location, 0x2222u};
+        const Pm4Execution idle;
+        processor.PlanLookahead(idle, ahead);
+        Require(name, case_name,
+                CommandProcessorTestAccess::DeferredCount(processor) == 1 &&
+                    shaders.GetVs().gs_user_sgpr.value[3] == 0x1111u,
+                "the scan changed the processor's register state");
+        CommandProcessorTestAccess::SettleRegisters(processor);
+        Require(
+            name, case_name, shaders.GetVs().gs_user_sgpr.value[3] == record[2],
+            "the register read " + Hex(shaders.GetVs().gs_user_sgpr.value[3]) +
+                " instead of the GPU-set base vertex");
       }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
