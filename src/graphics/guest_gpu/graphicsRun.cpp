@@ -684,10 +684,13 @@ void CommandProcessor::PlanLookahead(const Pm4Execution&       execution,
 	pipelines.BeginLookaheadRun(this);
 	m_lookahead_stop = nullptr;
 	// The scan applies the shader-register packets to this processor's state to know each
-	// dispatch's registers, then restores it; nothing else changes.
+	// dispatch's registers, then restores it; nothing else changes. A scanned user-data write
+	// also drops the deferred indirect-draw value of its register (NoteUserDataWrite), which
+	// the draws before that packet still read.
 	const auto saved_sh            = m_sh_ctx;
 	const auto saved_draw_base     = m_draw_indirect_args_base_addr;
 	const auto saved_dispatch_base = m_dispatch_indirect_args_base_addr;
+	m_lookahead_saved_deferred.assign(m_deferred_indirect.begin(), m_deferred_indirect.end());
 	if (execution.m_buffer_stack.empty()) {
 		(void)ScanLookahead(commands, 0);
 	} else {
@@ -699,6 +702,7 @@ void CommandProcessor::PlanLookahead(const Pm4Execution&       execution,
 	m_sh_ctx                           = saved_sh;
 	m_draw_indirect_args_base_addr     = saved_draw_base;
 	m_dispatch_indirect_args_base_addr = saved_dispatch_base;
+	m_deferred_indirect.swap(m_lookahead_saved_deferred);
 	pipelines.KickLookahead();
 }
 
