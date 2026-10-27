@@ -107,6 +107,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Called before a GPU buffer write of guest memory is recorded. The write refreshes images
+	// from guest memory (InvalidateMemoryFromGPU); one it covers only partly keeps its other
+	// GPU-written contents, which move into the buffer cache ahead of the write.
+	void               PrepareGpuBufferWrite(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
@@ -178,6 +182,10 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// Whether a GPU buffer write of [address, address + size) refreshes the image from guest
+	// memory.
+	[[nodiscard]] static bool BufferWriteRefreshes(const Image& image, uint64_t address,
+	                                               uint64_t size);
 
 	// FindImage; sole_owner, when given, tells whether the result is the only image overlapping
 	// the description's memory and matched it without an overlap resolution.

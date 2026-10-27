@@ -214,6 +214,9 @@ public:
 	uint64_t         native_write_sequence  = 0;
 	uint64_t         metadata_read_sequence = 0;
 	uint64_t         metadata_write_sequence = 0;
+	// A GPU buffer write overlapped the image since its last native write (TextureCache::
+	// PrepareGpuBufferWrite): its memory may hold newer bytes than the image.
+	bool buffer_written = false;
 
 private:
 	friend struct ImageTestAccess;

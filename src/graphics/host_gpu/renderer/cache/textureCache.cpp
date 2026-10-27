@@ -1882,6 +1882,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	image.buffer_written        = false;
 	image.native_write_sequence = ++m_event_sequence;
 }
 
@@ -2279,6 +2280,42 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+bool TextureCache::BufferWriteRefreshes(const Image& image, uint64_t address, uint64_t size) {
+	// A block-compressed image is only ever filled through a buffer alias, piece by piece
+	// (Ghost of Yotei compresses reflection cubes into a 102-layer BC6H array in 64K, 16K and
+	// 4K pieces, none at the array's start), so a write anywhere inside it counts.
+	const bool inside = image.info.IsBlock() && address >= image.info.data.address &&
+	                    address + size <= image.info.data.End();
+	return image.info.data.address == address || inside;
+}
+
+void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto&      image = m_slot_images[id];
+		const bool covered =
+		    address <= image.info.data.address && address + size >= image.info.data.End();
+		if (covered || !image.IsGpuModified()) {
+			continue;
+		}
+		// The image holds its rendered contents only while no buffer write overlaps them; one
+		// that does (conservative write ranges included) leaves the image behind its memory.
+		const bool current   = !image.buffer_written;
+		image.buffer_written = true;
+		// A displaced image's contents are superseded by the image that displaced it.
+		if (!current || image.depth_id || image.displaced || !image.SafeToDownload() ||
+		    !BufferWriteRefreshes(image, address, size)) {
+			continue;
+		}
+		// The write refreshes the whole image from guest memory, which does not hold what the
+		// GPU rendered into it: copy those contents into the buffer before the write lands.
+		(void)BcAlias::Publish(*this, image);
+	}
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
@@ -2286,12 +2323,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		// A block-compressed image is only ever filled through a buffer alias, piece by piece
-		// (Ghost of Yotei compresses reflection cubes into a 102-layer BC6H array in 64K, 16K and
-		// 4K pieces, none at the array's start), so a write anywhere inside it counts.
-		const bool inside = image.info.IsBlock() && address >= image.info.data.address &&
-		                    address + size <= image.info.data.End();
-		if (image.info.data.address != address && !inside) {
+		if (!BufferWriteRefreshes(image, address, size)) {
 			continue;
 		}
 		if (image.IsGpuModified()) {

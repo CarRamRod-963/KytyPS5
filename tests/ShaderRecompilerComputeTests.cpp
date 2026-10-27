@@ -8426,7 +8426,8 @@ public:
       }
 
       // A write through a separate buffer must not replace untouched image
-      // texels with stale backing bytes. Exact-base writes still refresh it.
+      // texels with stale backing bytes. Exact-base writes still refresh it,
+      // keeping the GPU-written texels the write does not cover.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;
       constexpr uint32_t buffer_alias_image_value = 0x13579bdfu;
       constexpr uint32_t buffer_alias_write_value = 0x2468ace0u;
@@ -8443,6 +8444,7 @@ public:
             texture_cache, scheduler.Current(), buffer_alias_image,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
         const auto write_address = buffer_alias_desc.info.data.address + write_offset;
+        texture_cache.PrepareGpuBufferWrite(write_address, sizeof(uint32_t));
         auto writable = resources.GetBufferCache().ObtainBuffer(
             write_address, sizeof(uint32_t), true, false);
         Require(name, "image alias buffer allocation", writable.first != nullptr,
@@ -8451,15 +8453,60 @@ public:
         texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t));
         (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
         const bool exact_base = write_offset == 0;
-        const uint32_t read_texels = exact_base ? 1 : 3;
-        Require(name, exact_base ? "exact-base buffer write refresh"
-                                 : "overlapping buffer preserves untouched texels",
-                ReadCachedTexel(name, context, buffer_alias_image, {},
-                                {read_texels, 1, 1}) ==
-                    std::vector<u32>(read_texels, exact_base ? buffer_alias_write_value
-                                                           : buffer_alias_image_value),
-                exact_base ? "exact-base buffer write did not refresh the native image"
-                           : "overlapping buffer write replaced untouched GPU image texels");
+        // The write at texel 3 does not refresh the image; its value is not
+        // checked.
+        const uint32_t read_texels = exact_base ? 4 : 3;
+        auto expected_texels =
+            std::vector<u32>(read_texels, buffer_alias_image_value);
+        if (exact_base) {
+          expected_texels[0] = buffer_alias_write_value;
+        }
+        Require(
+            name,
+            exact_base ? "exact-base buffer write refresh"
+                       : "overlapping buffer preserves untouched texels",
+            ReadCachedTexel(name, context, buffer_alias_image, {},
+                            {read_texels, 1, 1}) == expected_texels,
+            exact_base
+                ? "exact-base buffer write did not refresh the native image or "
+                  "replaced texels it does not cover with stale backing bytes"
+                : "overlapping buffer write replaced untouched GPU image "
+                  "texels");
+      }
+      {
+        // Once a buffer write has landed inside the image, its memory is newer
+        // than the image there: an exact-base write must not copy the image's
+        // older texels over it.
+        constexpr uint32_t newer_value = 0x0badf00du;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto image_address = buffer_alias_desc.info.data.address;
+        for (const auto &[offset, value] :
+             {std::pair{12u, newer_value},
+              std::pair{0u, buffer_alias_write_value}}) {
+          texture_cache.PrepareGpuBufferWrite(image_address + offset,
+                                              sizeof(uint32_t));
+          auto writable = resources.GetBufferCache().ObtainBuffer(
+              image_address + offset, sizeof(uint32_t), true, false);
+          Require(name, "image alias buffer allocation",
+                  writable.first != nullptr,
+                  "failed to allocate the image alias write buffer");
+          writable.first->Fill(writable.second, sizeof(uint32_t), value);
+          texture_cache.InvalidateMemoryFromGPU(image_address + offset,
+                                                sizeof(uint32_t));
+        }
+        (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
+        const auto texels =
+            ReadCachedTexel(name, context, buffer_alias_image, {}, {4, 1, 1});
+        Require(
+            name, "newer buffer bytes survive an exact-base refresh",
+            texels.size() == 4 && texels[0] == buffer_alias_write_value &&
+                texels[3] == newer_value,
+            "an exact-base buffer write copied older image texels over newer "
+            "buffer bytes");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

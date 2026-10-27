@@ -1070,7 +1070,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			source = {address, size, {}};
+			if (metadata.written) {
+				m_context.GetTextureCache().PrepareGpuBufferWrite(address, size);
+			}
+		}
+	}
+	// Preparing a write can reserve buffers for image contents, so the buffers are found last.
+	for (auto* stage: stages) {
+		for (auto& source: stage->buffer_sources) {
+			if (source.address != 0 && source.size != 0) {
+				source.id = cache.FindBuffer(source.address, source.size);
+			}
 		}
 	}
 }
