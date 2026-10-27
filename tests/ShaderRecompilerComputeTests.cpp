@@ -3332,12 +3332,18 @@ public:
 
         // Every data label defers its write to the submission it ends; an
         // interrupt-only release (selector 1 on the graphics queue) writes
-        // nothing and rides on the end-of-slice flush.
+        // nothing and rides on the end-of-slice flush. The GPU has finished
+        // the earlier submissions here: a label behind a busy GPU may ride
+        // with later work (LabelDelivery).
+        const auto gpu_caught_up = [&] {
+          gpu_scheduler.Wait(gpu_scheduler.CurrentTick() - 1);
+        };
         for (const auto interrupt : {0u, 3u, 1u, 2u}) {
           auto immediate =
               make_release_mem(1, interrupt, &release_label, 0x11223344u);
           Pm4Execution immediate_execution;
           record_work();
+          gpu_caught_up();
           const auto immediate_tick = gpu_scheduler.CurrentTick();
           const auto immediate_result =
               processor->Process(immediate_execution, immediate);
@@ -3366,6 +3372,7 @@ public:
         // Back-to-back releases with nothing recorded between them: the
         // first submits the pending work, the others complete with it.
         record_work();
+        gpu_caught_up();
         const auto coalesced_tick = gpu_scheduler.CurrentTick();
         for (const auto value : {0x51u, 0x52u, 0x53u}) {
           auto release = make_release_mem(1, 0, &coalesced_label, value);
@@ -14859,6 +14866,104 @@ public:
                         .Since(before_direct)
                         .labels_direct == 1u,
             "labels stayed on the GPU thread");
+
+    // A label behind work while the GPU still runs an earlier submission rides
+    // with the work recorded after it: the recorded commands are submitted at
+    // the end of the slice (BufferFlush) instead of one submission per label.
+    // Labels with an interrupt or a timestamp are submitted at once.
+    {
+      constexpr uint64_t busy_output = base + 0x60000;
+      // A long scalar loop keeps the GPU busy; its result is stored.
+      std::vector<u32> busy;
+      AppendSMovLiteral(&busy, 0, 1u << 23u);
+      busy.push_back(EncodeSMovB32(1, InlineU32(1)));
+      const auto loop = busy.size();
+      busy.push_back(EncodeSop2(0x24, 1, 1, InlineU32(3))); // s_mul_i32
+      busy.push_back(EncodeSop2(0x00, 1, 1, InlineU32(1))); // s_add_u32
+      busy.push_back(EncodeSop2(0x01, 0, 0, InlineU32(1))); // s_sub_u32
+      busy.push_back(EncodeSopc(0x07, 0, InlineU32(0)));    // s_cmp_lg_u32
+      busy.push_back(EncodeSopp(0x05, static_cast<u32>(static_cast<int16_t>(
+                                          loop - busy.size() - 1u))));
+      busy.push_back(EncodeVop1(0x01, 1, 1));
+      busy.push_back(EncodeMubuf0(0x1c, 0, false, false));
+      busy.push_back(EncodeMubuf1(1, 1, 0));
+      AppendEnd(&busy);
+      ShaderMapUserData(
+          reinterpret_cast<uint64_t>(busy.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(busy.size() * sizeof(u32))});
+      auto &scheduler = context.GetCommandScheduler();
+      const auto run_busy = [&] {
+        auto &shaders = processor->GetShCtx();
+        shaders.SetCsShader(
+            {.data_addr = reinterpret_cast<uint64_t>(busy.data()),
+             .num_thread_x = 1,
+             .num_thread_y = 1,
+             .num_thread_z = 1,
+             .wave_size = 64,
+             .user_sgpr = 8});
+        ShaderBufferResource out{};
+        out.UpdateAddress48(busy_output);
+        out.fields[2] = 4;
+        out.fields[3] =
+            DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; ++i) {
+          shaders.SetCsUserSgpr(4u + i, out.fields[i]);
+        }
+        processor->DispatchDirect(1, 1, 1, 0x41u);
+        scheduler.Flush();
+      };
+      bool busy_gpu = false;
+      bool batched = false;
+      bool rode_slice = false;
+      bool interrupt_at_once = false;
+      bool timestamp_at_once = false;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        run_busy();
+        const auto tick = scheduler.CurrentTick();
+        gpu_fill(0x6000u);
+        busy_gpu = !scheduler.IsFree(tick - 1u);
+        write_label(label, 0x6161u, 0);
+        batched = scheduler.CurrentTick() == tick;
+        processor->BufferFlush();
+        rode_slice = scheduler.CurrentTick() > tick;
+
+        run_busy();
+        const auto interrupt_tick = scheduler.CurrentTick();
+        gpu_fill(0x6001u);
+        write_label(label, 0x6262u, 2);
+        interrupt_at_once = scheduler.CurrentTick() > interrupt_tick;
+
+        run_busy();
+        const auto timestamp_tick = scheduler.CurrentTick();
+        gpu_fill(0x6002u);
+        processor->ReleaseMem(3, 0, reinterpret_cast<void *>(watched), 0, 0);
+        timestamp_at_once = scheduler.CurrentTick() > timestamp_tick;
+        processor->BufferFlush();
+      });
+      Require(name, "busy GPU fixture", busy_gpu,
+              "the busy dispatch finished before the label was written");
+      Require(name, "label batched behind a busy GPU", batched && rode_slice,
+              "a label submitted its single command while the GPU was busy, "
+              "or the end of the slice did not submit it");
+      Require(name, "interrupt and timestamp labels submit at once",
+              interrupt_at_once && timestamp_at_once,
+              "a label the guest observes the time of waited for later work");
+      Require(name, "batched labels land",
+              wait_for([&] { return backing(label) == 0x6262u; }) &&
+                  wait_for([&] { return backing(watched) != 0x5157u; }),
+              "a batched label did not land after its submission");
+      LibKernel::EventQueue::KernelEvent event{};
+      int count = 0;
+      LibKernel::KernelUseconds timeout = 2000000;
+      Require(name, "batched interrupt",
+              LibKernel::EventQueue::KernelWaitEqueue(
+                  interrupt_queue, &event, 1, &count, &timeout) == 0 &&
+                  count == 1,
+              "the interrupt of a label behind a busy GPU was lost");
+    }
 
     // A stream suspended on WAIT_REG_MEM for a label resumes when the label
     // lands, not when the GPU thread's next poll times out. The timeouts

@@ -168,6 +168,10 @@ private:
 	// Reads back the arguments the draws recorded by DrawIndirectOnGpu left the persistent state
 	// in: with `registers` the user SGPRs they wrote, with `num_instances` the instance count.
 	void                SettleIndirectDrawState(bool registers, bool num_instances);
+	// Whether an end-of-pipe label submits the recorded work now (WriteLabelAtEndOfPipe).
+	bool SubmitForLabel(bool with_interrupt, bool timestamp);
+	// Recorded commands from which a label always submits them.
+	static constexpr uint32_t LabelBatchCommands = 32;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
