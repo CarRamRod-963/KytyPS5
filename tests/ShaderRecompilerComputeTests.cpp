@@ -10963,6 +10963,102 @@ public:
                 skipped ? "skipped (no bindless images)" : "ok");
   }
 
+  // A title that aliases transient targets in one memory pool (Unreal Engine's
+  // render graph) uses each of them once per frame, between hundreds of
+  // submissions. An image another overlapping image displaces must survive
+  // while the title still uses it every frame (it was deleted, created and
+  // uploaded again at every use when its age counted submissions), and go once
+  // it has been unused for frames.
+  void CheckTransientAliasReuse() {
+    constexpr const char *name = "TransientAliasReuse";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "transient alias direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "transient alias fixed mapping failed");
+    std::memset(mapped, 0, 0x10000);
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      resources.MapMemory(base, allocation_size);
+      auto &texture_cache = resources.GetTextureCache();
+      const auto describe = [](uint64_t address, uint32_t width) {
+        return MakeLinearDesc(
+            address, uint64_t{width} * width * 4u, vk::Format::eR8G8B8A8Unorm,
+            Prospero::BufferFormat::k8_8_8_8UNorm,
+            Prospero::ImageType::kColor2D, {width, width, 1}, 1, 4, 1);
+      };
+      // A covers 0x0000-0x4000; B (0x2000-0x3000) and C (0x3000-0x3400) lie
+      // inside it.
+      auto a_desc = describe(base, 64);
+      auto b_desc = describe(base + 0x2000, 32);
+      auto c_desc = describe(base + 0x3000, 16);
+      // More submissions than the removal age, all in one frame.
+      const auto submissions = [&] {
+        for (int i = 0; i < 40; i++) {
+          scheduler.FlushAndWait();
+        }
+      };
+      const auto a = texture_cache.FindImage(a_desc);
+      submissions();
+      const auto b = texture_cache.FindImage(b_desc);
+      Require(name, "displaced image of this frame kept",
+              a && b && a != b &&
+                  TextureCacheTestAccess::Contains(texture_cache, a),
+              "an overlapping image deleted an image the title used in the "
+              "same frame");
+      const auto again = texture_cache.FindImage(a_desc);
+      Require(name, "displaced image found again", again == a,
+              "the image used in the same frame was created again");
+
+      // Unused for more frames than the removal age: the next overlapping image
+      // deletes it.
+      for (int frame = 0; frame < 40; frame++) {
+        texture_cache.RunGarbageCollector();
+        scheduler.FlushAndWait();
+      }
+      const auto c = texture_cache.FindImage(c_desc);
+      Require(name, "stale displaced image deleted",
+              c && !TextureCacheTestAccess::Contains(texture_cache, a),
+              "an image unused for frames survived an overlapping image");
+      for (const auto id : {b, c}) {
+        if (TextureCacheTestAccess::Contains(texture_cache, id)) {
+          TextureCacheTestAccess::DeleteImage(texture_cache, id);
+        }
+      }
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "transient alias direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "transient alias direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A shader writes a linear R32 float image (Ghost of Yotei's hi-Z pyramid), a
   // later pass samples the same memory as D32 depth, and the guest CPU reads
   // the bytes after the frame. The format swap replaces the cached image; the
@@ -57571,6 +57667,12 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    vulkan.CheckTransientAliasReuse();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--transient-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTransientAliasReuse();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
