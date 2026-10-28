@@ -126,10 +126,19 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
-		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
+		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds;
+		// the reports past them were dropped.
+		const auto reported = faults[0];
+		const auto count    = std::min<uint64_t>(reported, MaxPageFaults - 1);
+		if (reported != count) {
+			m_buffer_cache.NoteLostBdaReports();
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
+			if (m_buffer_cache.NoteBdaAccess(address)) {
+				// A watched resident page (BufferCache::BdaWatchBit): the access was made.
+				continue;
+			}
 			// The access that faulted is lost for its dispatch; streaming then touches the
 			// pages after it. Caching the rest of the page's 16 MiB block (the mapped part)
 			// keeps the following accesses from faulting one page at a time.
