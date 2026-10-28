@@ -339,6 +339,7 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	image.displaced = false;
 	// The LRU and the residency tracker keep the tick and frame of the last use only; a bind in
 	// the same tick (hundreds of thousands a second) changes neither. Registration inserts the
 	// image into the LRU at the current tick.
@@ -895,13 +896,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	}
 	// Scheduler ticks count submissions, hundreds of them per frame in some titles; an image the
 	// title uses once per frame (a transient target aliasing memory with others) must not be
-	// deleted, and created and uploaded again, at every use. Age it in frames as well.
+	// deleted, and created and uploaded again, at every use. While the cache has memory headroom,
+	// such an image is aged in frames as well and kept as displaced until then; at or above the
+	// pressure mark it is deleted as before.
 	const auto current_tick = m_scheduler.CurrentTick();
-	const bool safe_to_delete =
+	const bool displaceable =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
-	    (cached.touched_tick == UINT64_MAX ||
-	     m_gc_tick - std::min(m_gc_tick, cached.touched_tick) > NumFramesBeforeRemoval) &&
 	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
+	const bool safe_to_delete =
+	    displaceable &&
+	    (m_total_used_memory >= m_pressure_gc_memory || cached.touched_tick == UINT64_MAX ||
+	     m_gc_tick - std::min(m_gc_tick, cached.touched_tick) > NumFramesBeforeRemoval);
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -924,6 +929,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                 }))) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
+			} else if (displaceable) {
+				MarkDisplaced(cached_id);
 			}
 			return {merged_id};
 		}
@@ -1006,10 +1013,48 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+	if (requested.data.address >= cached.info.data.address) {
+		if (safe_to_delete) {
+			FreeImage(cached_id);
+		} else if (displaceable) {
+			MarkDisplaced(cached_id);
+		}
 	}
 	return {merged_id};
+}
+
+void TextureCache::MarkDisplaced(ImageId id) {
+	auto& image     = m_slot_images[id];
+	image.displaced = true;
+	if (!image.displaced_listed) {
+		image.displaced_listed = true;
+		m_displaced_images.emplace_back(id, image.serial);
+	}
+}
+
+void TextureCache::ReleaseDisplaced(bool pressured) {
+	// Entries of images used again, deleted or replaced under a reused id are dropped. Under
+	// pressure the rest are freed oldest first: an overlapping image superseded their contents, so
+	// they are not downloaded (as when ResolveOverlap deletes one).
+	size_t kept = 0;
+	for (const auto& [id, serial]: m_displaced_images) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || image->serial != serial) {
+			continue;
+		}
+		if (!image->registered || !image->displaced) {
+			image->displaced_listed = false;
+			continue;
+		}
+		if (pressured && m_total_used_memory >= m_pressure_gc_memory && !image->depth_id &&
+		    image->heap_refs.load(std::memory_order_relaxed) == 0u) {
+			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+			continue;
+		}
+		m_displaced_images[kept++] = {id, serial};
+	}
+	m_displaced_images.resize(kept);
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -1641,7 +1686,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto* owner = &m_slot_images[id];
-		if (owner->info.data.address != address) {
+		// A displaced image's contents are superseded by the image that displaced it.
+		if (owner->info.data.address != address || owner->displaced) {
 			continue;
 		}
 		if (ensure_valid && owner->depth_id) {
@@ -2180,7 +2226,7 @@ void TextureCache::DownloadStencil(Image& association, Buffer& destination,
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (!image.SafeToDownload() ||
+	if (image.displaced || !image.SafeToDownload() ||
 	    (image.depth_id ? !CanDownloadStencil(image) : !CanDownload(image))) {
 		return false;
 	}
@@ -2346,6 +2392,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	ReleaseDisplaced(m_total_used_memory >= m_pressure_gc_memory);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
