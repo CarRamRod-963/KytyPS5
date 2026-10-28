@@ -123,14 +123,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
-		std::vector<vk::DeviceAddress> addresses;
-		addresses.reserve(size_pages);
-		for (uint64_t i = 0; i < size_pages; ++i) {
-			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
-		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.bda_watch_tick = 0;
+		WriteBdaEntries(buffer, false);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -145,10 +140,62 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-void BufferCache::TouchBuffer(const Buffer& buffer) {
+void BufferCache::TouchBuffer(Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		if (buffer.bda_watch_tick != 0) {
+			buffer.bda_watch_tick = 0;
+			WriteBdaEntries(buffer, false);
+		}
 	}
+}
+
+void BufferCache::WriteBdaEntries(const Buffer& buffer, bool watched) {
+	PageTable::PageRange pages {};
+	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	const auto                     flags = watched ? BdaWatchBit : vk::DeviceAddress {0};
+	std::vector<vk::DeviceAddress> addresses;
+	addresses.reserve(pages.last_exclusive - pages.first);
+	for (uint64_t i = 0; i < pages.last_exclusive - pages.first; ++i) {
+		const auto address = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
+		EXIT_IF((address & BdaWatchBit) != 0);
+		addresses.push_back(address | flags);
+	}
+	WriteDataBuffer(m_bda_pagetable_buffer,
+	                PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress), addresses.data(),
+	                addresses.size() * sizeof(vk::DeviceAddress));
+}
+
+bool BufferCache::NoteBdaAccess(uint64_t address) {
+	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || m_slot_buffers[*owner].bda_watch_tick == 0) {
+		return false;
+	}
+	m_bda_accessed.push_back(address);
+	return true;
+}
+
+void BufferCache::KeepAccessedBdaBuffers() {
+	for (const auto address: m_bda_accessed) {
+		// The page's buffer, which may have replaced the reported one since.
+		if (const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+		    owner != nullptr && *owner) {
+			TouchBuffer(m_slot_buffers[*owner]);
+		}
+	}
+	m_bda_accessed.clear();
+	// Touched and deleted buffers leave the list; an ID reused by a new buffer is not watched.
+	std::erase_if(m_bda_watched, [&](BufferId id) {
+		if (!m_slot_buffers.is_allocated(id)) {
+			return true;
+		}
+		auto& buffer = m_slot_buffers[id];
+		if (m_bda_reports_lost) {
+			TouchBuffer(buffer);
+		}
+		return buffer.is_deleted || buffer.bda_watch_tick == 0;
+	});
+	m_bda_reports_lost = false;
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -1189,6 +1236,7 @@ bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -1212,6 +1260,19 @@ void BufferCache::RunGarbageCollector() {
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
 			return false;
+		}
+		if (m_bda_in_use) {
+			// Shaders may still use the buffer through the page table: they report it while it
+			// is watched, and only a buffer nobody reported is evicted.
+			if (buffer.bda_watch_tick == 0) {
+				buffer.bda_watch_tick = tick + 1;
+				WriteBdaEntries(buffer, true);
+				m_bda_watched.push_back(id);
+				return ++retire_count == limit;
+			}
+			if (tick + 1 - buffer.bda_watch_tick < BdaWatchTicks) {
+				return false;
+			}
 		}
 		if (dirty) {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
@@ -1273,6 +1334,7 @@ RangeSet BufferCache::TakeBdaSync() {
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	m_bda_in_use = true;
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = TakeBdaSync();
 	auto&      ranges  = m_bda_ranges;

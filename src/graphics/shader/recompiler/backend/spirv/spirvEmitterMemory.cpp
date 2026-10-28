@@ -189,6 +189,9 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 struct BdaPage {
 	uint32_t page;  // Index into the page table and the fault bitmap.
 	uint32_t entry; // Device address of the page, zero when it is not resident.
+	// Whether the host watches the page (BufferCache::BdaWatchBit): an access is reported in
+	// the fault bitmap as a fault is, and still made. Zero when the entry is not read.
+	uint32_t watched = 0;
 };
 
 // The page of a guest address in the page table (see GetBdaPointer); `entry` is not read.
@@ -214,9 +217,15 @@ BdaPage BdaPageEntry(EmitterState& state, uint32_t address) {
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto entry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, entry, entry_pointer);
-	return {page, entry};
+	const auto raw = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, raw, entry_pointer);
+	const auto watch_bit = ConstantU64(state, BufferCache::BdaWatchBit);
+	const auto entry =
+	    Binary(state, spv::OpBitwiseAnd, type, raw, Unary(state, spv::OpNot, type, watch_bit));
+	const auto watched =
+	    Binary(state, spv::OpINotEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, type, raw, watch_bit), ConstantU64(state, 0));
+	return {page, entry, watched};
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
@@ -289,21 +298,26 @@ std::array<uint32_t, 4> LoadBdaDwords(EmitterState& state, std::span<const uint3
 	const auto first_page = BdaPageEntry(state, addresses[0]);
 	const auto last_page  = count == 1u ? first_page : BdaPageEntry(state, addresses[count - 1]);
 	for (size_t index = 0; index < count; index++) {
-		auto [page, entry] = index == 0u           ? first_page
-		                     : index + 1u == count ? last_page
-		                                           : BdaPageOf(state, addresses[index]);
+		auto [page, entry, watched] = index == 0u           ? first_page
+		                              : index + 1u == count ? last_page
+		                                                    : BdaPageOf(state, addresses[index]);
 		if (index != 0u && index + 1u != count) {
-			entry = Select(state, TypeU64(state),
-			               Binary(state, spv::OpIEqual, TypeBool(state), page, first_page.page),
-			               first_page.entry, last_page.entry);
+			const auto on_first =
+			    Binary(state, spv::OpIEqual, TypeBool(state), page, first_page.page);
+			entry = Select(state, TypeU64(state), on_first, first_page.entry, last_page.entry);
+			watched =
+			    Select(state, TypeBool(state), on_first, first_page.watched, last_page.watched);
 		}
 		const auto present =
 		    Binary(state, spv::OpINotEqual, TypeBool(state), entry, ConstantU64(state, 0));
-		const auto absent = Unary(state, spv::OpLogicalNot, TypeBool(state), present);
+		// A watched page is read as a resident one and reported as a fault.
+		const auto reported =
+		    Binary(state, spv::OpLogicalOr, TypeBool(state),
+		           Unary(state, spv::OpLogicalNot, TypeBool(state), present), watched);
 		const auto wanted = conditions[index];
 		pages[index]      = page;
 		hits[index]       = wanted == always ? present : AndCondition(state, wanted, present);
-		misses[index]     = wanted == always ? absent : AndCondition(state, wanted, absent);
+		misses[index]     = wanted == always ? reported : AndCondition(state, wanted, reported);
 		pointers[index] = Binary(state, spv::OpIAdd, TypeU64(state), entry,
 		                         Binary(state, spv::OpBitwiseAnd, TypeU64(state), addresses[index],
 		                                ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1)));
@@ -1236,13 +1250,15 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 // resident; a wanted page that is not resident records a fault.
 std::pair<uint32_t, uint32_t> ResolveBdaStore(EmitterState& state, uint32_t address,
                                               uint32_t condition) {
-	const auto [page, entry] = BdaPageEntry(state, address);
+	const auto [page, entry, watched] = BdaPageEntry(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), entry, ConstantU64(state, 0));
-	EmitIfCondition(
-	    state,
-	    AndCondition(state, condition, Unary(state, spv::OpLogicalNot, TypeBool(state), present)),
-	    [&]() { RecordBdaFault(state, page); });
+	// A watched page is written as a resident one and reported as a fault.
+	const auto reported =
+	    Binary(state, spv::OpLogicalOr, TypeBool(state),
+	           Unary(state, spv::OpLogicalNot, TypeBool(state), present), watched);
+	EmitIfCondition(state, AndCondition(state, condition, reported),
+	                [&]() { RecordBdaFault(state, page); });
 	const auto pointer = Binary(state, spv::OpIAdd, TypeU64(state), entry,
 	                            Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 	                                   ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1)));
@@ -1929,28 +1945,15 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto [page, base] = BdaPageEntry(state, address);
+	const auto [page, base, watched] = BdaPageEntry(state, address);
 	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
-	const auto fault_label     = state.builder.AllocateId();
-	const auto available_label = state.builder.AllocateId();
-	const auto merge_label     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
-
-	EmitLabel(state, fault_label);
-	RecordBdaFault(state, page);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-
-	EmitLabel(state, available_label);
+	// A watched page is resident and reported as a fault.
+	EmitIfCondition(state, Binary(state, spv::OpLogicalOr, TypeBool(state), missing, watched),
+	                [&]() { RecordBdaFault(state, page); });
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
 	                              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
 	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-
-	EmitLabel(state, merge_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
-	                          available, available_label);
+	const auto result    = Select(state, type, missing, ConstantU64(state, 0), available);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

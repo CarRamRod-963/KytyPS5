@@ -40,6 +40,16 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Set in a page table entry (device addresses are aligned past it) while the garbage
+	// collector considers the page's buffer: shaders still access the page and also report the
+	// access in the fault bitmap, which keeps the buffer. Accesses through the page table
+	// (addresses, GPU-selected V#s, BVH nodes) never obtain the buffer, so its age alone does
+	// not show that shaders still use it, and an evicted page loses every access until the
+	// fault is processed.
+	static constexpr vk::DeviceAddress BdaWatchBit = 1;
+	// Garbage-collector ticks a watched buffer waits for a reported access before it is evicted:
+	// more than a fault report takes to reach the cache (ProcessFaultBuffer).
+	static constexpr uint64_t BdaWatchTicks = 16;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -119,6 +129,12 @@ public:
 		return std::exchange(m_watched_write_pending, false);
 	}
 	void               ProcessFaultBuffer();
+	// A fault report of a resident page whose buffer is watched (BdaWatchBit): records the
+	// access for the next collection and returns true; false when the page needs a buffer.
+	[[nodiscard]] bool NoteBdaAccess(uint64_t address);
+	// Fault reports were dropped (the report area was full): every watched buffer counts as
+	// accessed at the next collection.
+	void               NoteLostBdaReports() noexcept { m_bda_reports_lost = true; }
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
@@ -147,7 +163,11 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
-	void TouchBuffer(const Buffer& buffer);
+	void TouchBuffer(Buffer& buffer);
+	// Writes the page table entries of a registered buffer, with BdaWatchBit when `watched`.
+	void WriteBdaEntries(const Buffer& buffer, bool watched);
+	// Keeps the watched buffers shaders reported (NoteBdaAccess, NoteLostBdaReports).
+	void                        KeepAccessedBdaBuffers();
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
@@ -271,6 +291,11 @@ private:
 	uint64_t m_gc_tick            = 0;
 	// Collections of a dirty buffer that left GPU-dirty bytes behind and were deferred.
 	uint64_t m_gc_deferred = 0;
+	// Shaders read the page table (SynchronizeBda ran), so collection watches buffers first.
+	bool                  m_bda_in_use       = false;
+	bool                  m_bda_reports_lost = false;
+	std::vector<uint64_t> m_bda_accessed;
+	std::vector<BufferId> m_bda_watched;
 };
 
 } // namespace Libs::Graphics

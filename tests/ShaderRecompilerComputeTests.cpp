@@ -91,6 +91,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -1465,6 +1466,8 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  // The entries carry BufferCache::BdaWatchBit.
+  bool watched = false;
 };
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
@@ -6289,6 +6292,146 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Shaders reach a buffer through the BDA page table (addresses, GPU-selected
+  // V#s, BVH nodes) without obtaining it, so its age says nothing about their
+  // use. Under memory pressure the garbage collector first watches such a
+  // buffer (BufferCache::BdaWatchBit in its entries); a reported access keeps
+  // it, and only a buffer nobody reported for BdaWatchTicks collections is
+  // evicted. Evicting it at once dropped the accesses of the next dispatches (a
+  // ray traversal reading zeros never finished).
+  void CheckBdaWatchedEviction() {
+    constexpr const char *name = "BdaWatchedEviction";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * page, 0x3,
+                                                         0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    std::fill_n(static_cast<u32 *>(mapped), 2 * page / sizeof(u32),
+                0x600dcafeu);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 2 * page);
+    constexpr auto never = std::numeric_limits<uint64_t>::max();
+    const auto collect = [&](uint32_t times) {
+      for (uint32_t i = 0; i < times; i++) {
+        cache.RunGarbageCollector();
+      }
+    };
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+    collect(4);
+    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
+    context.PrepareBda();
+    collect(100);
+
+    auto entries = CreateHostBuffer(name, 2 * sizeof(vk::DeviceAddress),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto read_entries = [&] {
+      auto command = scheduler.Current().Handle();
+      const vk::MemoryBarrier before{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                              &before, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy copy{BufferCache::PageIndex(base) *
+                                    sizeof(vk::DeviceAddress),
+                                0, entries.size};
+      command.copyBuffer(cache.GetBdaPageTableBuffer()->Handle(),
+                         entries.buffer, 1, &copy);
+      const vk::MemoryBarrier after{
+          .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+          .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &after,
+                              0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, entries, 4);
+      return std::array<uint64_t, 2>{words[0] | (uint64_t{words[1]} << 32u),
+                                     words[2] | (uint64_t{words[3]} << 32u)};
+    };
+    const auto watched_entries = [&](bool watched) {
+      const auto bit = watched ? BufferCache::BdaWatchBit : 0u;
+      return std::array<uint64_t, 2>{device_address | bit,
+                                     (device_address + page) | bit};
+    };
+    Require(name, "resident", read_entries() == watched_entries(false),
+            "the page table does not map the buffer");
+
+    // Pressure: the old buffer is watched, not evicted.
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+    collect(1);
+    Require(name, "watched first",
+            cache.IsRegionRegistered(base, 2 * page) &&
+                read_entries() == watched_entries(true),
+            "garbage collection evicted a buffer shaders may reach through the "
+            "page table "
+            "without watching it first");
+
+    // A shader access of the second page, reported in the fault bitmap, keeps
+    // the buffer.
+    const auto reported_page = BufferCache::PageIndex(base + page);
+    cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                 sizeof(u32), 1u << (reported_page & 31u));
+    cache.ProcessFaultBuffer();
+    scheduler.Finish();
+    collect(1);
+    Require(name, "reported access",
+            cache.IsRegionRegistered(base, 2 * page) &&
+                cache.FindBuffer(base, 2 * page) == id &&
+                read_entries() == watched_entries(false),
+            "a reported access of a watched page did not keep and unwatch its "
+            "buffer");
+
+    // A dropped report keeps every watched buffer too.
+    collect(81);
+    Require(name, "watched again", read_entries() == watched_entries(true),
+            "the buffer was not watched again once it aged");
+    cache.NoteLostBdaReports();
+    collect(1);
+    Require(name, "lost reports",
+            cache.IsRegionRegistered(base, 2 * page) &&
+                read_entries() == watched_entries(false),
+            "dropped reports did not keep the watched buffers");
+
+    // Without a report the buffer is evicted once the watch ends.
+    collect(81);
+    Require(name, "watched third", read_entries() == watched_entries(true),
+            "the buffer was not watched again once it aged");
+    collect(static_cast<uint32_t>(BufferCache::BdaWatchTicks) - 2u);
+    Require(name, "watch window", cache.IsRegionRegistered(base, 2 * page),
+            "a watched buffer was evicted before its watch ended");
+    collect(2);
+    Require(name, "evicted", !cache.IsRegionRegistered(base, 2 * page),
+            "an unreported watched buffer was kept");
+    Require(name, "page table cleared",
+            read_entries() == std::array<uint64_t, 2>{0u, 0u},
+            "an evicted buffer left page table entries behind");
+
+    context.UnmapMemory(base, 2 * page);
+    scheduler.Finish();
+    DestroyBuffer(&entries);
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -6373,10 +6516,15 @@ public:
     fault.join();
     later_command.acquire();
 
-    // Garbage collection untracks a clean buffer; its replacement queues the range on Register.
+    // Garbage collection untracks a clean buffer; its replacement queues the
+    // range on Register. Shaders read the page table here, so the buffer is
+    // watched first and evicted when no access was reported for BdaWatchTicks
+    // collections (CheckBdaWatchedEviction).
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
         cache, 0, std::numeric_limits<uint64_t>::max());
-    cache.RunGarbageCollector();
+    for (uint64_t tick = 0; tick <= BufferCache::BdaWatchTicks; tick++) {
+      cache.RunGarbageCollector();
+    }
     Require(name, "clean eviction", !cache.IsRegionRegistered(base, 3 * page),
             "garbage collection kept the clean buffer");
     (void)cache.FindBuffer(base, 3 * page);
@@ -21519,7 +21667,7 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, watched] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -21532,9 +21680,11 @@ public:
         auto address = buffer.device_address + backing - page_offset;
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
+          const vk::DeviceAddress entry =
+              address | (watched ? BufferCache::BdaWatchBit : 0u);
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
                            (page + mapped) * sizeof(vk::DeviceAddress),
-                           sizeof(address), &address);
+                           sizeof(entry), &entry);
           address += BufferCache::CACHING_PAGESIZE;
         }
       }
@@ -37598,6 +37748,41 @@ TestCase BufferLoadDwordx4GpuSelectedPageSplit(u32 wave) {
   return test;
 }
 
+// The garbage collector watches a buffer before it evicts it
+// (BufferCache::BdaWatchBit): accesses through the page table still reach the
+// watched pages and also report each page in the fault bitmap, as a fault of a
+// page that is not resident does. `pages` are the guest pages the case reports,
+// faulted or watched.
+TestCase WatchedBdaMappings(TestCase test,
+                            std::initializer_list<uint64_t> pages) {
+  static std::deque<std::string> names;
+  test.name = names.emplace_back(std::string(test.name) + "Watched").c_str();
+  for (auto &mapping : test.bda_mappings)
+    mapping.watched = true;
+  uint64_t first = UINT64_MAX, last = 0;
+  for (const auto address : pages) {
+    first = std::min(first, BufferCache::PageIndex(address) >> 5u);
+    last = std::max(last, BufferCache::PageIndex(address) >> 5u);
+  }
+  test.fault_words_address =
+      BufferCache::GuestAddress(first << (5u + BufferCache::CACHING_PAGEBITS));
+  test.expected_fault_words.assign(last - first + 1u, 0u);
+  for (const auto address : pages) {
+    const auto page = BufferCache::PageIndex(address);
+    test.expected_fault_words[(page >> 5u) - first] |= 1u << (page & 31u);
+  }
+  return test;
+}
+
+// A watched page and the unmapped page after it: the DWORDs on the watched page
+// load, the others read zero, and both pages are reported.
+TestCase BufferLoadDwordx4GpuSelectedPageSplitWatched() {
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  return WatchedBdaMappings(
+      BufferLoadDwordx4GpuSelectedPageSplit(32u),
+      {GuestBase, GuestBase + BufferCache::CACHING_PAGESIZE});
+}
+
 TestCase BufferLoadDwordx4GpuSelectedPageSplit32() {
   return BufferLoadDwordx4GpuSelectedPageSplit(32u);
 }
@@ -45739,166 +45924,236 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
-  for (const bool wide : {false, true})
-  for (const u32 wave : {32u, 64u}) {
-    const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
-    const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
-    TestCase test;
-    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
-    test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
-    auto bytes = std::as_writable_bytes(std::span(test.initial));
-    if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
-    for (u32 row = 0; row < 6u; ++row) {
-      if (wide && row != 0u && row != 3u) continue;
-      const std::array descriptor{slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
-          wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7)
-               : (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
-      std::copy(descriptor.begin(), descriptor.end(),
-                test.initial.begin() + (table + (wide ? row * 16u : row * stride + member)) / 4u);
-      for (u32 element = 0; element < 20u; ++element) {
-        if (wide) {
-          test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
-          test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] = 0x38003400u;
-        } else bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
-      }
-    }
-    auto records = MakeStructuredStorageBufferData(stride, 6u);
-    records[0] = table;
-    std::copy_n(records.begin(), 4, test.user_data.begin() + 32u);
-    if (wide) { test.user_data[32] = table - 48u; test.user_data[33] = 0u; }
-    auto selector_buffer = MakeStructuredStorageBufferData(0u, (keys.size() + u32(wide)) * 4u);
-    selector_buffer[0] = selectors;
-    std::copy_n(selector_buffer.begin(), 4, test.user_data.begin() + 4u);
-    auto output = MakeStructuredStorageBufferData(0u, keys.size() * wave * 4u);
-    output[0] = slot * 7u;
-    std::copy_n(output.begin(), 4, test.user_data.begin() + 48u);
-    test.has_user_data = test.has_compute_info = true;
-    test.bda_mappings = {{0u, 0u}};
-    test.compute_info.wave_size = wave;
-    test.compute_info.threads_num[0] = wave;
-    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
-    test.compute_info.thread_ids_num = 1u;
-    test.compute_info.group_id[0] = true;
-    test.compute_info.workgroup_register = 44u;
-    test.dispatch_x = keys.size();
-    auto &code = test.code;
-    // Keep the finite32-key proof independent of workgroup-prefix materialization:
-    // this fixture changes GPU keys after compiling its complete candidate domain.
-    if (wide) code.push_back(EncodeSop2(0x12, 23, 44, InlineU32(1)));
-    code.push_back(EncodeSop2(0x1e, 23, wide ? 23u : 44u, InlineU32(2)));
-    if (wide) {
-      code.insert(code.end(), {EncodeSmem0(0x08, 22, 2), EncodeSmem1(0, 23),
-          EncodeSop2(0x27, 22, 22, 255), (5u << 16u) | 16u,
-          EncodeSop2(0x1e, 23, 22, InlineU32(4)),
-          EncodeSmem0(0x02, 8, 16), EncodeSmem1(48, 23)});
-    } else {
-      code.insert(code.end(), {EncodeVop1(0x01, 30, 23), EncodeMubuf0(0x0c),
-          EncodeMubuf1(4, 1, 30), EncodeVop2(0x16, 6, InlineU32(16), 4)});
-      AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
-      code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
-          EncodeSmem0(0x0a, 8, 16), EncodeSmem1(member, 23)});
-    }
-    code.insert(code.end(), {EncodeMubuf0(0x00, 0, true, false, true), EncodeMubuf1(4, 2, 0),
-        EncodeSop2(0x1e, 34, 44, InlineU32(std::countr_zero(wave))),
-        EncodeVop2(0x25, 30, 34, 0), EncodeVop2(0x1a, 30, InlineU32(2), 30)});
-    AppendBufferStoreDword(&code, 4, 30);
-    if (wide) {
-      // The existing direct RGBA16 fixture proves these rounded FP32-to-FP16 values.
-      for (const auto [vgpr, bits] : std::array<std::pair<u32, u32>, 4>{{
-          {10u, 0x3f807e63u}, {11u, 0xc0000000u}, {12u, 0x3f000000u}, {13u, 0x3e800000u}}})
-        AppendVMovLiteral(&code, vgpr, bits);
-    } else {
-      code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
-      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
-    }
-    AppendSMovLiteral(&code, 126, 0x55555555u);
-    AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
-    // Captured e01c6000/80010f01, adjusted only to v10:13/v0 and s8:11.
-    code.insert(code.end(), {EncodeMubuf0(wide ? 0x07 : 0x04, 0, true, false, true),
-                            EncodeMubuf1(10, 2, 0)});
-    AppendEnd(&code);
-    test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
-        {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
-    test.required_spirv = {"bda_pagetable", "convert_indirect_buffer_format"};
-    if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
-    test.forbidden_spirv = {"OpAtomicCompareExchange"};
-    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    if (!wide) {
-      std::set<u32> nonuniform;
-      u32 shared_stores = 0;
-      for (size_t offset = 5; offset < compiled.spirv.size();) {
-        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
-        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-        if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
-          nonuniform.insert(words[1]);
-        if (opcode == spv::OpStore && nonuniform.contains(words[1])) ++shared_stores;
-        offset += words.size();
-      }
-      Require(test.name, "one shared store after the null candidate",
-              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
-              "homogeneous children duplicated the native store per descriptor");
-    }
-    u32 bda_loads = 0, native_stores = 0;
-    for (const auto *block : compiled.program.blocks)
-      for (const auto &inst : *block) {
-        using namespace ShaderRecompiler::IR;
-        if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 &&
-            inst.GetOpcode() != (wide ? ValueOpcode::StoreBufferU32x4 : ValueOpcode::StoreBufferU32)) continue;
-        const auto &memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
-        if (inst.GetOpcode() == ValueOpcode::LoadBufferU32)
-          bda_loads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
-        else
-          native_stores += memory.kind == ResourceKind::Buffer && memory.formatted;
-      }
-    Require(test.name, "shared scalar descriptor reads", bda_loads == 1u && native_stores == 1u,
-            "native store planning replaced the BDA read or bypassed formatted conversion");
-    for (const auto &value : compiled.resources.buffers) {
-      ShaderBufferResource descriptor{};
-      std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
-      auto range = std::max(4u, u32(descriptor.GetSize()));
-      if (wide && descriptor.Base48() == slot * 4u) range -= 11u; // Last active record is partial.
-      test.storage_buffer_ranges.emplace_back(descriptor.Base48(), range);
-    }
-    TestCase producer;
-    producer.name = "FormattedRecordSelectorProducer";
-    producer.initial = test.initial;
-    producer.has_compute_info = true;
-    producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
-        producer.compute_info.threads_num[2] = 1u;
-    producer.compute_info.wave_size = 32u;
-    for (u32 group = 0; group < keys.size(); ++group) {
-      AppendVMovLiteral(&producer.code, 1, (keys[group] << 16u) | 0xbeefu);
-      AppendVMovLiteral(&producer.code, 2, selectors + selector_index(group) * 4u);
-      AppendBufferStoreDword(&producer.code, 1, 2);
-    }
-    AppendEnd(&producer.code);
-    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
-    test.expected = test.initial;
-    auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
-    for (u32 group = 0; group < keys.size(); ++group) {
-      const auto row = keys[group];
-      test.expected[selectors / 4u + selector_index(group)] = (row << 16u) | 0xbeefu;
-      for (u32 lane = 0; lane < wave; ++lane) {
-        const bool valid = wide ? row == 0u || row == 3u : row < 6u;
-        test.expected[slot * 7u / 4u + group * wave + lane] =
-            valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
-        if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
-          if (wide) {
-            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
-            test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
-          } else expected_bytes[slot * (row + 1u) + lane] =
-              std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
+  // Watched page table entries (BufferCache::BdaWatchBit) store to the same
+  // bytes.
+  for (const bool watched : {false, true})
+    for (const bool wide : {false, true})
+      for (const u32 wave : {32u, 64u}) {
+        const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
+        const auto selector_index = [wide](u32 group) {
+          return wide ? group ^ 1u : group;
+        };
+        TestCase test;
+        test.name = wide ? (watched ? "GpuSelectedFormattedRgba16StoreWatched"
+                                    : "GpuSelectedFormattedRgba16Store")
+                         : (watched ? "GpuSelectedFormattedRecordStoreWatched"
+                                    : "GpuSelectedFormattedRecordStore");
+        test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u,
+                            0xdeadbeefu);
+        auto bytes = std::as_writable_bytes(std::span(test.initial));
+        if (wide)
+          std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
+        for (u32 row = 0; row < 6u; ++row) {
+          if (wide && row != 0u && row != 3u)
+            continue;
+          const std::array descriptor{
+              slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
+              wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                         DstSel(4, 5, 6, 7)
+                   : (u32(Prospero::BufferFormat::k8SInt) << 12u) |
+                         DstSel(4, 0, 0, 0)};
+          std::copy(descriptor.begin(), descriptor.end(),
+                    test.initial.begin() +
+                        (table + (wide ? row * 16u : row * stride + member)) /
+                            4u);
+          for (u32 element = 0; element < 20u; ++element) {
+            if (wide) {
+              test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
+              test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] =
+                  0x38003400u;
+            } else
+              bytes[slot * (row + 1u) + element] =
+                  std::byte(0x80u + row + element);
+          }
         }
+        auto records = MakeStructuredStorageBufferData(stride, 6u);
+        records[0] = table;
+        std::copy_n(records.begin(), 4, test.user_data.begin() + 32u);
+        if (wide) {
+          test.user_data[32] = table - 48u;
+          test.user_data[33] = 0u;
+        }
+        auto selector_buffer =
+            MakeStructuredStorageBufferData(0u, (keys.size() + u32(wide)) * 4u);
+        selector_buffer[0] = selectors;
+        std::copy_n(selector_buffer.begin(), 4, test.user_data.begin() + 4u);
+        auto output =
+            MakeStructuredStorageBufferData(0u, keys.size() * wave * 4u);
+        output[0] = slot * 7u;
+        std::copy_n(output.begin(), 4, test.user_data.begin() + 48u);
+        test.has_user_data = test.has_compute_info = true;
+        test.bda_mappings = {{0u, 0u, watched}};
+        test.compute_info.wave_size = wave;
+        test.compute_info.threads_num[0] = wave;
+        test.compute_info.threads_num[1] = test.compute_info.threads_num[2] =
+            1u;
+        test.compute_info.thread_ids_num = 1u;
+        test.compute_info.group_id[0] = true;
+        test.compute_info.workgroup_register = 44u;
+        test.dispatch_x = keys.size();
+        auto &code = test.code;
+        // Keep the finite32-key proof independent of workgroup-prefix
+        // materialization: this fixture changes GPU keys after compiling its
+        // complete candidate domain.
+        if (wide)
+          code.push_back(EncodeSop2(0x12, 23, 44, InlineU32(1)));
+        code.push_back(EncodeSop2(0x1e, 23, wide ? 23u : 44u, InlineU32(2)));
+        if (wide) {
+          code.insert(code.end(),
+                      {EncodeSmem0(0x08, 22, 2), EncodeSmem1(0, 23),
+                       EncodeSop2(0x27, 22, 22, 255), (5u << 16u) | 16u,
+                       EncodeSop2(0x1e, 23, 22, InlineU32(4)),
+                       EncodeSmem0(0x02, 8, 16), EncodeSmem1(48, 23)});
+        } else {
+          code.insert(code.end(), {EncodeVop1(0x01, 30, 23), EncodeMubuf0(0x0c),
+                                   EncodeMubuf1(4, 1, 30),
+                                   EncodeVop2(0x16, 6, InlineU32(16), 4)});
+          AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+          code.insert(code.end(),
+                      {EncodeSop2(0x26, 23, 22, 255), stride,
+                       EncodeSmem0(0x0a, 8, 16), EncodeSmem1(member, 23)});
+        }
+        code.insert(
+            code.end(),
+            {EncodeMubuf0(0x00, 0, true, false, true), EncodeMubuf1(4, 2, 0),
+             EncodeSop2(0x1e, 34, 44, InlineU32(std::countr_zero(wave))),
+             EncodeVop2(0x25, 30, 34, 0),
+             EncodeVop2(0x1a, 30, InlineU32(2), 30)});
+        AppendBufferStoreDword(&code, 4, 30);
+        if (wide) {
+          // The existing direct RGBA16 fixture proves these rounded
+          // FP32-to-FP16 values.
+          for (const auto [vgpr, bits] :
+               std::array<std::pair<u32, u32>, 4>{{{10u, 0x3f807e63u},
+                                                   {11u, 0xc0000000u},
+                                                   {12u, 0x3f000000u},
+                                                   {13u, 0x3e800000u}}})
+            AppendVMovLiteral(&code, vgpr, bits);
+        } else {
+          code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
+          code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+        }
+        AppendSMovLiteral(&code, 126, 0x55555555u);
+        AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
+        // Captured e01c6000/80010f01, adjusted only to v10:13/v0 and s8:11.
+        code.insert(code.end(),
+                    {EncodeMubuf0(wide ? 0x07 : 0x04, 0, true, false, true),
+                     EncodeMubuf1(10, 2, 0)});
+        AppendEnd(&code);
+        test.decoded_counts = {
+            {"V_LSHLREV_B32", wide ? 1u : 2u},
+            {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
+        test.required_spirv = {"bda_pagetable",
+                               "convert_indirect_buffer_format"};
+        if (!wide)
+          test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
+        test.forbidden_spirv = {"OpAtomicCompareExchange"};
+        const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+        if (!wide) {
+          std::set<u32> nonuniform;
+          u32 shared_stores = 0;
+          for (size_t offset = 5; offset < compiled.spirv.size();) {
+            const auto words =
+                std::span(compiled.spirv)
+                    .subspan(offset, compiled.spirv[offset] >> 16u);
+            const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+            if (opcode == spv::OpDecorate &&
+                words[2] == spv::DecorationNonUniform)
+              nonuniform.insert(words[1]);
+            if (opcode == spv::OpStore && nonuniform.contains(words[1]))
+              ++shared_stores;
+            offset += words.size();
+          }
+          Require(test.name, "one shared store after the null candidate",
+                  shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+                  "homogeneous children duplicated the native store per "
+                  "descriptor");
+        }
+        u32 bda_loads = 0, native_stores = 0;
+        for (const auto *block : compiled.program.blocks)
+          for (const auto &inst : *block) {
+            using namespace ShaderRecompiler::IR;
+            if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 &&
+                inst.GetOpcode() != (wide ? ValueOpcode::StoreBufferU32x4
+                                          : ValueOpcode::StoreBufferU32))
+              continue;
+            const auto &memory =
+                compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+            if (inst.GetOpcode() == ValueOpcode::LoadBufferU32)
+              bda_loads += memory.kind == ResourceKind::IndirectBuffer &&
+                           memory.formatted;
+            else
+              native_stores +=
+                  memory.kind == ResourceKind::Buffer && memory.formatted;
+          }
+        Require(test.name, "shared scalar descriptor reads",
+                bda_loads == 1u && native_stores == 1u,
+                "native store planning replaced the BDA read or bypassed "
+                "formatted conversion");
+        for (const auto &value : compiled.resources.buffers) {
+          ShaderBufferResource descriptor{};
+          std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+          auto range = std::max(4u, u32(descriptor.GetSize()));
+          if (wide && descriptor.Base48() == slot * 4u)
+            range -= 11u; // Last active record is partial.
+          test.storage_buffer_ranges.emplace_back(descriptor.Base48(), range);
+        }
+        TestCase producer;
+        producer.name = "FormattedRecordSelectorProducer";
+        producer.initial = test.initial;
+        producer.has_compute_info = true;
+        producer.compute_info.threads_num[0] =
+            producer.compute_info.threads_num[1] =
+                producer.compute_info.threads_num[2] = 1u;
+        producer.compute_info.wave_size = 32u;
+        for (u32 group = 0; group < keys.size(); ++group) {
+          AppendVMovLiteral(&producer.code, 1, (keys[group] << 16u) | 0xbeefu);
+          AppendVMovLiteral(&producer.code, 2,
+                            selectors + selector_index(group) * 4u);
+          AppendBufferStoreDword(&producer.code, 1, 2);
+        }
+        AppendEnd(&producer.code);
+        const auto producer_shader =
+            CompileCase(producer, vulkan.SubgroupSize());
+        test.expected = test.initial;
+        auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+        for (u32 group = 0; group < keys.size(); ++group) {
+          const auto row = keys[group];
+          test.expected[selectors / 4u + selector_index(group)] =
+              (row << 16u) | 0xbeefu;
+          for (u32 lane = 0; lane < wave; ++lane) {
+            const bool valid = wide ? row == 0u || row == 3u : row < 6u;
+            test.expected[slot * 7u / 4u + group * wave + lane] =
+                valid && lane < 20u
+                    ? (wide ? 0x3f800000u
+                            : u32(int32_t(0x80u + row + lane) - 256))
+                    : 0u;
+            if (valid && lane < (wide && row == 3u ? 18u : 20u) &&
+                (lane & 1u) == 0u) {
+              if (wide) {
+                test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+                test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] =
+                    0x34003800u;
+              } else
+                expected_bytes[slot * (row + 1u) + lane] = std::byte(
+                    u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) &
+                    255u);
+            }
+          }
+        }
+        auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial,
+                                                 test.initial.size(), true);
+        vulkan.Dispatch(producer, producer_shader, buffer);
+        vulkan.Dispatch(test, compiled, buffer);
+        CompareWords(
+            test,
+            "shared BDA reads, formatted conversion, EXEC, OOB and neighboring "
+            "canaries",
+            test.expected,
+            vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+        vulkan.DestroyBuffer(&buffer);
+        std::printf("[compute] %s wave=%u ok\n", test.name, wave);
       }
-    }
-    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
-    vulkan.Dispatch(producer, producer_shader, buffer);
-    vulkan.Dispatch(test, compiled, buffer);
-    CompareWords(test, "shared BDA reads, formatted conversion, EXEC, OOB and neighboring canaries",
-                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
-    vulkan.DestroyBuffer(&buffer);
-    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
-  }
 }
 
 void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
@@ -50696,6 +50951,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx4GpuSelectedPageSplit32);
   AddCase(BufferLoadDwordx4GpuSelectedPageSplit64);
+  AddCase(BufferLoadDwordx4GpuSelectedPageSplitWatched);
   AddCase(BufferLoadsGpuSelectedOutlined);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
@@ -50811,6 +51067,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatStackApertures(64));
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
+  cases.push_back(
+      WatchedBdaMappings(BvhIntersections(true, true), {0x10000, 0x14000}));
   for (bool barycentrics : {false, true}) {
     for (bool sorted : {false, true}) {
       cases.push_back(BvhIntersections(barycentrics, sorted));
@@ -57370,6 +57628,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatStackApertures(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));
     RunCase(&vulkan, BvhIntersections(true, true, 0, true));
+    RunCase(&vulkan, WatchedBdaMappings(BvhIntersections(true, true),
+                                        {0x10000, 0x14000}));
     for (bool barycentrics : {false, true}) {
       for (bool sorted : {false, true}) {
         RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
@@ -57438,6 +57698,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    RunCase(&vulkan, BufferLoadDwordx4GpuSelectedPageSplitWatched());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-sample-offset-only") == 0) {
@@ -58037,6 +58298,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckBdaWatchedEviction();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -58047,6 +58309,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBdaWatchedEviction();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -58295,6 +58558,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckBdaWatchedEviction();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBindlessSlotImageReuse();

@@ -71,6 +71,9 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The garbage-collector tick (plus one) since which shaders report their accesses to the
+	// buffer's pages (BufferCache::BdaWatchBit), or 0.
+	uint64_t bda_watch_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
