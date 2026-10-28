@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <xxhash.h>
 
 namespace {
 
@@ -22,6 +23,7 @@ using Libs::Graphics::PipelineList;
 using Libs::Graphics::PipelineListContents;
 using Libs::Graphics::PipelineListResolver;
 using Libs::Graphics::PipelineManifest;
+using Libs::Graphics::ShaderIndirectOffsets;
 using Libs::Graphics::PrecompileAttempts;
 using Libs::Graphics::ProgramManifest;
 using Libs::Graphics::ShaderCode;
@@ -235,6 +237,90 @@ void TestManifestDamage() {
   }
   PipelineManifest manifest(path);
   Check(manifest.Loaded().stages == 1, "the replaced file is appended to");
+}
+
+// A layout-1 file (<title>.v5.pipelines) is imported once into the current file: its stages keep
+// their fields, its pipelines name the stages by their new keys, and the old file stays.
+void TestManifestImport() {
+  namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
+  using Libs::Graphics::ManifestFormat::Writer;
+  const auto previous = TempPath("import.v5.pipelines");
+  const auto path = TempPath("import.v6.pipelines");
+  auto vs = VertexStage(4, Code(4, 80));
+  vs.vertex.has_dynamic_vertex_fetch = true;
+  vs.vertex.indirect_draw = true;
+  vs.vertex.indirect_offsets = {3, ShaderIndirectOffsets::None};
+  const auto ps = PixelStage(5, Code(5, 30));
+  const auto code_entry = [](const ShaderCode &code) {
+    std::vector<uint8_t> out;
+    Writer w(out);
+    w.Put(uint8_t{1});
+    const auto id = ShaderCodeId::Of(*code);
+    w.Put(id.hash);
+    w.Put(id.words);
+    w.PutWords(*code);
+    return out;
+  };
+  std::vector<std::vector<uint8_t>> payloads{code_entry(vs.code), code_entry(ps.code)};
+  std::vector<uint64_t> old_keys;
+  for (const GraphicsStageRecord *stage : {static_cast<const GraphicsStageRecord *>(&vs), &ps}) {
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{2});
+    RecordFormat::PutStage(w, *stage, 1);
+    old_keys.push_back(XXH3_64bits(body.data(), body.size()));
+    w.Put(stage->spirv_hash);
+    payloads.push_back(std::move(body));
+  }
+  auto pipeline = Pipeline(vs, &ps, 1);
+  pipeline.vertex_stages[0] = old_keys[0];
+  pipeline.pixel_stage = old_keys[1];
+  {
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{3});
+    RecordFormat::PutPipeline(w, pipeline, 1);
+    payloads.push_back(std::move(body));
+  }
+  Check(old_keys[0] != vs.Key(), "the layouts encode a stage differently");
+  Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
+            previous, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
+            PipelineManifest::FormatVersion, payloads),
+        "the layout-1 file is written");
+  const auto previous_size = std::filesystem::file_size(previous);
+  const auto ps2 = [] {
+    auto stage = PixelStage(6, Code(6, 20));
+    stage.pixel.target_uint_mask = 2;
+    stage.pixel.target_sint_mask = 4;
+    return stage;
+  }();
+  {
+    PipelineManifest manifest(path, previous);
+    const auto loaded = manifest.Loaded();
+    Check(loaded.imported && loaded.stages == 2 && loaded.pipelines == 1,
+          "the layout-1 records are imported");
+    const auto imported = manifest.FindStage(vs.Key());
+    Check(imported != nullptr && imported->vertex.indirect_draw &&
+              imported->vertex.indirect_offsets == vs.vertex.indirect_offsets &&
+              imported->vertex.has_dynamic_vertex_fetch,
+          "a layout-1 stage keeps its indirect draw and fetch fields");
+    const auto pipelines = manifest.Pipelines();
+    Check(pipelines[0]->vertex_stages[0] == vs.Key() &&
+              pipelines[0]->pixel_stage == ps.Key() &&
+              pipelines[0]->Key() == Pipeline(vs, &ps, 1).Key(),
+          "an imported pipeline names its stages by their current keys");
+    Check(manifest.AddStage(ps2), "the imported manifest is appended to");
+  }
+  Check(std::filesystem::file_size(previous) == previous_size,
+        "the layout-1 file is left as it is");
+  PipelineManifest manifest(path, previous);
+  const auto loaded = manifest.Loaded();
+  Check(!loaded.imported && !loaded.rewritten && loaded.stages == 3 && loaded.pipelines == 1,
+        "the current file is read without importing again");
+  const auto masks = manifest.FindStage(ps2.Key());
+  Check(masks != nullptr && masks->pixel.target_uint_mask == 2 &&
+            masks->pixel.target_sint_mask == 4,
+        "the integer target masks read back");
 }
 
 void TestFieldValidation() {
@@ -541,6 +627,7 @@ int main() {
   TestStageKeys();
   TestManifestRoundTrip();
   TestManifestDamage();
+  TestManifestImport();
   TestFieldValidation();
   TestCodeStore();
   TestListRoundTrip();
