@@ -457,7 +457,8 @@ void ImageHeap::Release(View& view, uint32_t entry) {
 void ImageHeap::Unreference(Element& element) {
 	if (auto* image = ImageOf(element)) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
-		image->tick_accessed_last = m_context.GetTextureCache().m_gc_tick;
+		image->tick_accessed_last  = m_context.GetTextureCache().m_gc_tick;
+		image->tick_submitted_last = m_context.GetCommandScheduler().CurrentTick();
 	}
 }
 

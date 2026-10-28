@@ -863,7 +863,8 @@ void RenderExecutor::ResolveTextureMemo(const ShaderRecompiler::IR::ImageResourc
 			auto& image              = texture_cache.GetImage(entry->image_id);
 			entry->stamp             = now;
 			entry->validated         = now.sequence;
-			image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+			image.tick_accessed_last  = texture_cache.m_gc_tick;
+			image.tick_submitted_last = m_context.GetCommandScheduler().CurrentTick();
 			texture_cache.TouchImage(image);
 			texture_cache.MaterializeColorClear(entry->image_id, entry->desc,
 			                                    entry->desc.metadata_base_layer);
