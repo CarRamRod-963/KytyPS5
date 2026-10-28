@@ -161,6 +161,10 @@ private:
 	void                      DeleteImage(ImageId id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
+	// Keeps an image an overlapping image displaced (Image::displaced).
+	void MarkDisplaced(ImageId id);
+	// Under memory pressure, frees displaced images oldest first until the pressure mark.
+	void                             ReleaseDisplaced(bool pressured);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
@@ -239,6 +243,8 @@ private:
 	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
+	// Displaced images in the order they were displaced, with their serial (ids are reused).
+	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;

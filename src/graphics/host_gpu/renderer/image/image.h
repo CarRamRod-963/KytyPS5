@@ -201,6 +201,13 @@ public:
 	// image again within the tick has nothing left to record.
 	uint64_t                      touched_tick   = UINT64_MAX;
 	const MemoryPriority::Object* touched_memory = nullptr;
+	// Displaced by an overlapping image while the texture cache had memory headroom
+	// (TextureCache::ResolveOverlap) and not used since: kept for reuse, but its contents are
+	// superseded, so it is never a source of guest data and is the first image released under
+	// memory pressure.
+	bool displaced = false;
+	// In TextureCache::m_displaced_images.
+	bool displaced_listed = false;
 	// TextureCache event sequence numbers: the last native GPU write to the image and the last
 	// time its guest color metadata was read for a clear code. Native rendering leaves the guest
 	// metadata untouched, so a code read before a later native write describes an older surface.

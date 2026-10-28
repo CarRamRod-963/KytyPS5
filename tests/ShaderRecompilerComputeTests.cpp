@@ -365,6 +365,11 @@ struct TextureCacheTestAccess {
     return owner != nullptr && owner->registered;
   }
 
+  // Returns the previous pressure mark.
+  static uint64_t SetPressureMark(TextureCache &cache, uint64_t pressure) {
+    return std::exchange(cache.m_pressure_gc_memory, pressure);
+  }
+
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
                                          uint64_t size, bool page_overlap) {
     std::lock_guard lock(cache.m_lock);
@@ -10783,7 +10788,44 @@ public:
       Require(name, "stale displaced image deleted",
               c && !TextureCacheTestAccess::Contains(texture_cache, a),
               "an image unused for frames survived an overlapping image");
-      for (const auto id : {b, c}) {
+
+      // At or above the memory pressure mark a displaced image is deleted as
+      // before, after NumFramesBeforeRemoval submissions.
+      auto d_desc = describe(base + 0x8000, 64);
+      auto e_desc = describe(base + 0xa000, 32);
+      auto f_desc = describe(base + 0x10000, 64);
+      auto g_desc = describe(base + 0x12000, 32);
+      const auto pressure_mark =
+          TextureCacheTestAccess::SetPressureMark(texture_cache, 0);
+      const auto d = texture_cache.FindImage(d_desc);
+      submissions();
+      const auto e = texture_cache.FindImage(e_desc);
+      Require(name, "displaced image deleted under pressure",
+              d && e && !TextureCacheTestAccess::Contains(texture_cache, d),
+              "a displaced image was kept while the cache was over its "
+              "pressure mark");
+      // With headroom it is kept, but its superseded contents are no source
+      // of guest data, and the collector releases it first once the cache
+      // reaches the pressure mark.
+      TextureCacheTestAccess::SetPressureMark(texture_cache, UINT64_MAX);
+      const auto f = texture_cache.FindImage(f_desc);
+      submissions();
+      const auto g = texture_cache.FindImage(g_desc);
+      Require(name, "displaced image kept with headroom",
+              f && g && TextureCacheTestAccess::Contains(texture_cache, f),
+              "a displaced image of this frame was deleted with headroom");
+      Require(
+          name, "displaced image is no data source",
+          texture_cache.FindImageFromRange(base + 0x10000, 64u * 64u * 4u) != f,
+          "a buffer read could copy the contents of a displaced image");
+      TextureCacheTestAccess::SetPressureMark(texture_cache, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "displaced image released under pressure",
+              !TextureCacheTestAccess::Contains(texture_cache, f) &&
+                  TextureCacheTestAccess::Contains(texture_cache, g),
+              "the collector kept a displaced image under memory pressure");
+      TextureCacheTestAccess::SetPressureMark(texture_cache, pressure_mark);
+      for (const auto id : {b, c, e, g}) {
         if (TextureCacheTestAccess::Contains(texture_cache, id)) {
           TextureCacheTestAccess::DeleteImage(texture_cache, id);
         }
