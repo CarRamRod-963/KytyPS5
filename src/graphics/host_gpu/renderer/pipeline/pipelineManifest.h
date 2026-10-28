@@ -94,17 +94,23 @@ struct GraphicsPipelineRecord {
 // field against the values the pipeline cache can produce, so that a damaged or foreign record
 // is rejected instead of reaching the recompiler or the driver.
 namespace PipelineRecordFormat {
-// Changes with the stored fields of any record.
-constexpr uint32_t LayoutVersion = 1;
-void               PutStage(ManifestFormat::Writer& w, const GraphicsStageRecord& record);
+// Changes with the stored fields of any record. Layout 2: the vertex stage's indirect-draw
+// offsets as upstream's ShaderIndirectOffsets, the pixel stage's integer target masks, no cull
+// mode or front face (dynamic state). Layout 1 is still read (and written, for tests).
+constexpr uint32_t LayoutVersion = 2;
+void               PutStage(ManifestFormat::Writer& w, const GraphicsStageRecord& record,
+                            uint32_t layout = LayoutVersion);
 // The record's code stays null; its code ids are read.
-bool GetStage(ManifestFormat::Reader& r, GraphicsStageRecord& record);
-void PutPipeline(ManifestFormat::Writer& w, const GraphicsPipelineRecord& record);
-bool GetPipeline(ManifestFormat::Reader& r, GraphicsPipelineRecord& record);
+bool GetStage(ManifestFormat::Reader& r, GraphicsStageRecord& record,
+              uint32_t layout = LayoutVersion);
+void PutPipeline(ManifestFormat::Writer& w, const GraphicsPipelineRecord& record,
+                 uint32_t layout = LayoutVersion);
+bool GetPipeline(ManifestFormat::Reader& r, GraphicsPipelineRecord& record,
+                 uint32_t layout = LayoutVersion);
 } // namespace PipelineRecordFormat
 
 // The graphics pipelines a title has needed and their stage programs, persisted next to its
-// driver pipeline cache (_PipelineCache/<title>.v5.pipelines), so that the pipelines can be
+// driver pipeline cache (_PipelineCache/<title>.v6.pipelines), so that the pipelines can be
 // built ahead of their first use (--precompile-pipelines, --precompile-only). Append-only like
 // ProgramManifest: checksummed entries, guest code once per shader, a torn or corrupt tail or
 // another format version rewrites the file with the readable entries. A pipeline is kept only
@@ -115,13 +121,17 @@ class PipelineManifest {
 public:
 	static constexpr uint32_t FormatVersion = 1;
 
-	// An empty path keeps the manifest in memory only.
-	explicit PipelineManifest(std::filesystem::path path = {});
+	// An empty path keeps the manifest in memory only. Without a file at `path`, the records of
+	// `previous` (record layout 1, <title>.v5.pipelines) are read and written to `path`; that
+	// file stays as it is for builds that read it.
+	explicit PipelineManifest(std::filesystem::path path = {}, std::filesystem::path previous = {});
 	~PipelineManifest();
 	KYTY_CLASS_NO_COPY(PipelineManifest);
 
 	static std::filesystem::path PathFor(const std::filesystem::path& directory,
 	                                     const std::string&           title_id);
+	static std::filesystem::path PreviousPathFor(const std::filesystem::path& directory,
+	                                             const std::string&           title_id);
 
 	struct LoadStats {
 		size_t stages        = 0;
@@ -129,6 +139,8 @@ public:
 		size_t code_entries  = 0;
 		size_t dropped_bytes = 0;
 		bool   rewritten     = false;
+		// The records came from the previous file.
+		bool imported = false;
 	};
 	[[nodiscard]] LoadStats Loaded() const { return m_loaded; }
 
@@ -145,7 +157,7 @@ public:
 	[[nodiscard]] const std::filesystem::path& Path() const { return m_path; }
 
 private:
-	bool       Parse(std::span<const uint8_t> payload);
+	bool       Parse(std::span<const uint8_t> payload, uint32_t layout);
 	ShaderCode StoreCode(const ShaderCode& code, std::vector<std::vector<uint8_t>>* out);
 	bool       Rewrite();
 
@@ -158,6 +170,8 @@ private:
 	std::vector<std::shared_ptr<const GraphicsStageRecord>>                  m_stage_order;
 	std::unordered_set<uint64_t>                                             m_pipeline_keys;
 	std::vector<std::shared_ptr<const GraphicsPipelineRecord>>               m_pipelines;
+	// While reading another record layout: the stage keys of that layout -> current keys.
+	std::unordered_map<uint64_t, uint64_t> m_legacy_stage_keys;
 };
 
 // The code of every shader the guest created (sceAgcCreateShader), of every stage, by content
