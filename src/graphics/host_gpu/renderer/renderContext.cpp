@@ -129,16 +129,34 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	Common::GpuTiming::Sync().AddLabel(false);
 	m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
 	GetGpu().SendCommand([this, dst, value, size, label_id, notify = std::move(notify)]() mutable {
-		// What a write fault would do, without relying on one: the caches drop or read back
-		// what they hold of the label's pages and stop watching them.
-		(void)InvalidateMemory(reinterpret_cast<uint64_t>(dst), size);
+		const auto vaddr = reinterpret_cast<uint64_t>(dst);
 		// A settled access may have stored the label, and later ones, already.
-		if (label_id == 0 || m_pending_labels.ShouldStore(label_id)) {
-			if (size == sizeof(uint32_t)) {
-				const auto word = static_cast<uint32_t>(value);
-				std::memcpy(dst, &word, sizeof(word));
-			} else {
-				std::memcpy(dst, &value, sizeof(value));
+		const auto store = [&] { return label_id == 0 || m_pending_labels.ShouldStore(label_id); };
+		// As upstream's RELEASE_MEM (2463e3aaf): a label beside GPU-written bytes goes to the
+		// backing store, so those bytes stay with the GPU instead of being read back for a CPU
+		// write to their page. GPU-written ranges are tracked by byte here, so "beside" means
+		// on a page with GPU-written bytes, none of them under the label.
+		const auto page   = vaddr & ~(TRACKER_PAGE_SIZE - 1u);
+		const bool beside = GuestRange {vaddr, size}.Valid() &&
+		                    (m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ||
+		                     m_buffer_cache.HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) &&
+		                    !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+		                    (!store() || LibKernel::Memory::TryWriteBacking(vaddr, &value, size));
+		if (!beside) {
+			// What a write fault would do, without relying on one: GPU-written bytes under the
+			// label are read back first (a later download would overwrite the label), then the
+			// caches drop or read back what they hold of the label's pages and stop watching them.
+			if (GuestRange {vaddr, size}.Valid() && m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) {
+				m_buffer_cache.ReadMemory(vaddr, size, true);
+			}
+			(void)InvalidateMemory(vaddr, size);
+			if (store()) {
+				if (size == sizeof(uint32_t)) {
+					const auto word = static_cast<uint32_t>(value);
+					std::memcpy(dst, &word, sizeof(word));
+				} else {
+					std::memcpy(dst, &value, sizeof(value));
+				}
 			}
 		}
 		if (label_id != 0) {
