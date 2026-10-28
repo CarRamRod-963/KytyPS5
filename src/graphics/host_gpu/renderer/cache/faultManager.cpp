@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -135,9 +136,18 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The count goes on past the area's last entry when reports were dropped.
+		const auto reported = static_cast<uint32_t>(faults[0]);
+		const auto count    = std::min<uint32_t>(reported, MaxPageFaults - 1);
+		if (reported != count) {
+			m_buffer_cache.NoteLostBdaReports();
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
+			if (m_buffer_cache.NoteBdaAccess(address)) {
+				// A watched resident page (BufferCache::BdaWatchBit): the access was made.
+				continue;
+			}
 			// The access that faulted is lost for its dispatch; streaming then touches the
 			// pages after it. Caching the rest of the page's 16 MiB block (the mapped part)
 			// keeps the following accesses from faulting one page at a time.
