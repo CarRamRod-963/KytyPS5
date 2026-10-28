@@ -143,6 +143,38 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 	}
+	// The red 16x16 picture lands in a 256-byte pitch; the padding holds limited-range black.
+	{
+		const auto* luma   = static_cast<const uint8_t*>(info.data);
+		const auto* chroma = luma + 256 * 16;
+		Check(info.details.video.pitch == 256 && info.details.video.height == 16 &&
+		          info.details.video.crop_right_offset == 240,
+		      "video layout");
+		bool picture = true;
+		bool padding = true;
+		for (unsigned y = 0; y < 16; ++y) {
+			for (unsigned x = 0; x < 256; ++x) {
+				const auto value = luma[y * 256 + x];
+				if (x < 16) {
+					picture &= value > 60 && value < 100;
+				} else {
+					padding &= value == 16;
+				}
+			}
+		}
+		for (unsigned y = 0; y < 8; ++y) {
+			for (unsigned x = 0; x < 256; ++x) {
+				const auto value = chroma[y * 256 + x];
+				if (x < 16) {
+					picture &= x % 2 == 0 ? value < 110 : value > 220;
+				} else {
+					padding &= value == 128;
+				}
+			}
+		}
+		Check(picture, "video picture converted to NV12");
+		Check(padding, "video padding filled");
+	}
 	// Let the producer refill, then model the game's immediate late-frame retries.
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	for (unsigned i = 0; i < 5; ++i) {
