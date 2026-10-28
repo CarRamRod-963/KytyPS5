@@ -1,7 +1,10 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BARRIERTRACKER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BARRIERTRACKER_H_
 
+#include <algorithm>
 #include <cstdint>
+#include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -142,6 +145,113 @@ private:
 	bool m_other_since_compute_order = true;
 	bool m_other_since_flush         = true;
 	bool m_serialize_dispatches      = false;
+};
+
+// Chooses the pipeline barriers around the buffer copies that upload guest data. Each copy used
+// to be recorded between a barrier from all earlier commands to the copy and one from the copy
+// to all later commands. Copies recorded back to back (a run) now share them:
+//   - the barrier before a copy is recorded for the first copy of a run, and between two copies
+//     of a run only when the later one writes bytes an earlier one wrote since the last barrier
+//     (copies are not ordered against each other otherwise);
+//   - the barrier after the copies is deferred until a command of another kind, a barrier or
+//     the end of the command buffer is recorded.
+// The copies read staging memory that no copy writes.
+class CopyRunTracker {
+public:
+	enum class Barrier : uint8_t {
+		None,
+		// All earlier commands -> transfer writes.
+		AllToTransfer,
+		// Transfer writes -> transfer writes.
+		TransferToTransfer,
+	};
+
+	// Bytes [begin, end) of a destination buffer.
+	struct Range {
+		uint64_t buffer = 0;
+		uint64_t begin  = 0;
+		uint64_t end    = 0;
+	};
+
+	// A copy writing `ranges` is about to be recorded.
+	[[nodiscard]] Barrier BeforeCopy(std::span<const Range> ranges) {
+		Barrier barrier = Barrier::None;
+		if (!m_open) {
+			barrier = Barrier::AllToTransfer;
+			m_open  = true;
+		} else if (OverlapsWritten(ranges)) {
+			barrier = Barrier::TransferToTransfer;
+		}
+		if (barrier != Barrier::None) {
+			m_written.clear();
+		}
+		for (const auto& range: ranges) {
+			if (range.begin < range.end) {
+				Insert(range);
+			}
+		}
+		return barrier;
+	}
+
+	// A command of another kind, a barrier recorded by other code, the start of a render pass
+	// instance or the end of the command buffer is about to be recorded. True when copies wait
+	// for their barrier to all later commands, which the caller records now.
+	[[nodiscard]] bool BeforeOther() noexcept {
+		if (!m_open) {
+			return false;
+		}
+		m_open = false;
+		m_written.clear();
+		return true;
+	}
+
+	[[nodiscard]] bool HasPendingCopies() const noexcept { return m_open; }
+
+private:
+	static bool Less(const Range& a, const Range& b) noexcept {
+		return a.buffer != b.buffer ? a.buffer < b.buffer : a.begin < b.begin;
+	}
+
+	// m_written holds disjoint ranges sorted by buffer and start, so their ends are sorted too:
+	// the last one starting before a range's end is the only one that can overlap it.
+	[[nodiscard]] bool OverlapsWritten(std::span<const Range> ranges) const noexcept {
+		for (const auto& range: ranges) {
+			if (range.begin >= range.end) {
+				continue;
+			}
+			const auto next = std::lower_bound(m_written.begin(), m_written.end(),
+			                                   Range {range.buffer, range.end, range.end}, Less);
+			if (next != m_written.begin()) {
+				const auto& previous = *(next - 1);
+				if (previous.buffer == range.buffer && previous.end > range.begin) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// Adds a range, merged with the ranges it overlaps or touches.
+	void Insert(Range range) {
+		auto first = std::lower_bound(m_written.begin(), m_written.end(),
+		                              Range {range.buffer, range.begin, range.begin}, Less);
+		if (first != m_written.begin() && (first - 1)->buffer == range.buffer &&
+		    (first - 1)->end >= range.begin) {
+			--first;
+		}
+		auto last = first;
+		for (; last != m_written.end() && last->buffer == range.buffer && last->begin <= range.end;
+		     ++last) {
+			range.begin = std::min(range.begin, last->begin);
+			range.end   = std::max(range.end, last->end);
+		}
+		m_written.insert(m_written.erase(first, last), range);
+	}
+
+	// Copies were recorded since the last barrier to all later commands.
+	bool m_open = false;
+	// The ranges the copies wrote since the last barrier before a copy.
+	std::vector<Range> m_written;
 };
 
 } // namespace Libs::Graphics

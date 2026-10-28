@@ -29,6 +29,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FinishCopies();
 	RecordBarrier(m_barriers.BeforeCommand());
 	m_has_commands = true;
 	m_command_count++;
@@ -44,6 +45,7 @@ vk::CommandBuffer CommandBuffer::PipelineHandle() const {
 
 vk::CommandBuffer CommandBuffer::BarrierHandle() const {
 	EXIT_IF(IsInvalid());
+	FinishCopies();
 	RecordBarrier(m_barriers.BeforeBarrier());
 	return m_buffer;
 }
@@ -73,6 +75,7 @@ void CommandBuffer::BindGraphicsPipeline(vk::Pipeline pipeline) const {
 vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const {
 	EXIT_IF(IsInvalid() || m_rendering);
 	Common::GpuTiming::Sync().AddUnmergedBarriers(writes ? 2 : 1);
+	FinishCopies();
 	RecordBarrier(m_barriers.BeforeDispatch(writes, shared));
 	m_has_commands = true;
 	m_command_count++;
@@ -82,6 +85,7 @@ vk::CommandBuffer CommandBuffer::DispatchHandle(bool writes, bool shared) const 
 void CommandBuffer::GuestFlush() const {
 	EXIT_IF(IsInvalid());
 	Common::GpuTiming::Sync().AddUnmergedBarriers(1);
+	FinishCopies();
 	const auto barrier = m_barriers.Flush();
 	if (barrier != BarrierTracker::Barrier::None) {
 		EndRendering();
@@ -91,6 +95,7 @@ void CommandBuffer::GuestFlush() const {
 
 void CommandBuffer::OrderDispatches() const {
 	EXIT_IF(IsInvalid());
+	FinishCopies();
 	RecordBarrier(m_barriers.BeforeBarrier());
 }
 
@@ -110,6 +115,66 @@ void CommandBuffer::OrderIndirectReads() const {
 	dependency.pMemoryBarriers    = &memory;
 	BarrierHandle().pipelineBarrier2(dependency);
 	m_indirect_reads_since = m_render_passes + 1;
+}
+
+void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
+                                 std::span<const vk::BufferCopy> regions) const {
+	EXIT_IF(IsInvalid());
+	if (regions.empty()) {
+		return;
+	}
+	EndRendering();
+	RecordBarrier(m_barriers.BeforeCommand());
+	// Outside a batch no later copy joins the run, so its ranges are not needed.
+	m_copy_ranges.clear();
+	if (m_copy_batches != 0) {
+		const auto key =
+		    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(destination)));
+		for (const auto& region: regions) {
+			m_copy_ranges.push_back({key, region.dstOffset, region.dstOffset + region.size});
+		}
+	}
+	const auto barrier = m_copies.BeforeCopy(m_copy_ranges);
+	if (barrier != CopyRunTracker::Barrier::None) {
+		vk::MemoryBarrier2 memory {};
+		if (barrier == CopyRunTracker::Barrier::AllToTransfer) {
+			memory.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+			memory.srcAccessMask =
+			    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		} else {
+			memory.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			memory.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		}
+		memory.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		memory.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &memory;
+		m_buffer.pipelineBarrier2(dependency);
+	}
+	m_buffer.copyBuffer(source, destination, static_cast<uint32_t>(regions.size()), regions.data());
+	m_has_commands = true;
+	m_command_count++;
+	if (m_copy_batches == 0) {
+		FinishCopies();
+	}
+}
+
+void CommandBuffer::FinishCopies() const {
+	if (!m_copies.BeforeOther()) {
+		return;
+	}
+	// A copy ends the render pass instance, and starting one records this barrier first.
+	EXIT_IF(m_rendering);
+	vk::MemoryBarrier2 memory {};
+	memory.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	memory.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	memory.dstAccessMask = LaterAccess2;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &memory;
+	m_buffer.pipelineBarrier2(dependency);
 }
 
 static_assert(static_cast<uint8_t>(BarrierTracker::Barrier::ComputeToCompute) - 1u ==
@@ -177,6 +242,8 @@ void CommandBuffer::Begin() {
 	auto result = m_buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// The previous buffer recorded the barrier of its copies when it ended.
+	(void)m_copies.BeforeOther();
 	m_has_commands         = false;
 	m_command_count        = 0;
 	m_compute_pipeline     = nullptr;
@@ -186,7 +253,7 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	// The deferred barrier after the last dispatches stays in this submission.
+	// The deferred barriers after the last copies and dispatches stay in this submission.
 	OrderDispatches();
 
 	auto result = m_buffer.end();

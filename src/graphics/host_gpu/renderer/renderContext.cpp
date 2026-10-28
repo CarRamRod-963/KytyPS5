@@ -257,6 +257,8 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	// The uploads of every written range share their barriers.
+	const auto batch = m_command_scheduler.Current().BatchCopies();
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
 }

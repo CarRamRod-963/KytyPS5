@@ -187,6 +187,34 @@ public:
 	// the render pass instances that follow such a barrier back to back only draws ran, so it
 	// records nothing there; otherwise it ends the current instance for the barrier.
 	void OrderIndirectReads() const;
+	// Records a copy of staged bytes into a buffer, ordered after every earlier command and
+	// before every later one. Inside a batch (BatchCopies), copies recorded back to back share
+	// their barriers (CopyRunTracker); outside one each copy gets its own pair. The source must
+	// be memory no recorded command writes, such as a staging buffer.
+	void CopyToBuffer(vk::Buffer source, vk::Buffer destination,
+	                  std::span<const vk::BufferCopy> regions) const;
+	// Batches the copies CopyToBuffer records until the guard is destroyed. The barrier after the
+	// copies is deferred to the next command recorded through Handle(), DispatchHandle(),
+	// BarrierHandle() and the like, or to the end of the batch: code inside a batch must not
+	// record commands through a handle it obtained before a copy.
+	class [[nodiscard]] CopyBatch {
+	public:
+		explicit CopyBatch(const CommandBuffer& command) noexcept: m_command(command) {
+			m_command.m_copy_batches++;
+		}
+		~CopyBatch() {
+			if (--m_command.m_copy_batches == 0) {
+				m_command.FinishCopies();
+			}
+		}
+		KYTY_CLASS_NO_COPY(CopyBatch);
+
+	private:
+		const CommandBuffer& m_command;
+	};
+	[[nodiscard]] CopyBatch BatchCopies() const { return CopyBatch {*this}; }
+	// Copies that still wait for their barrier to later commands.
+	[[nodiscard]] bool HasPendingCopies() const noexcept { return m_copies.HasPendingCopies(); }
 	// Whether anything but barriers was recorded since the buffer began.
 	[[nodiscard]] bool              HasCommands() const noexcept { return m_has_commands; }
 	// Commands recorded through Handle() and DispatchHandle() since the buffer began.
@@ -208,6 +236,8 @@ private:
 	void Begin();
 	void End() const;
 	void RecordBarrier(BarrierTracker::Barrier barrier) const;
+	// Records the barrier from pending copies to all later commands.
+	void FinishCopies() const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -232,6 +262,10 @@ private:
 	mutable vk::Pipeline m_graphics_pipeline = nullptr;
 	// Kept across submissions: barriers order commands in submission order on the queue.
 	mutable BarrierTracker m_barriers;
+	// Copies whose barrier to later commands is deferred (End() records it), and the batches open.
+	mutable CopyRunTracker                     m_copies;
+	mutable std::vector<CopyRunTracker::Range> m_copy_ranges;
+	mutable uint32_t                           m_copy_batches = 0;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

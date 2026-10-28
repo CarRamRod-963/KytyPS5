@@ -6555,6 +6555,107 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Buffer uploads recorded in a batch share their barriers: the barrier after
+  // them waits for the next other command or the end of the batch, a copy over
+  // bytes an earlier copy of the batch wrote is ordered after it, and outside a
+  // batch every copy is finished at once.
+  void CheckBatchedUploads() {
+    constexpr const char *name = "BatchedUploads";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * page, 0x3,
+                                                         0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto *words = static_cast<u32 *>(mapped);
+    std::fill_n(words, 2 * page / sizeof(u32), 0x11111111u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    // Guest writes invalidate the pages first, as the write-fault handler
+    // would.
+    context.MapMemory(base, 2 * page);
+    const auto id = cache.FindBuffer(base, 2 * page);
+    auto &buffer = cache.GetBuffer(id);
+    auto readback = CreateHostBuffer(name, 4 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+      const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer,
+                                              1, &copy);
+    };
+    {
+      const auto batch = scheduler.Current().BatchCopies();
+      (void)cache.ObtainBuffer(base, 2 * page, false, false);
+      Require(name, "deferred barrier", scheduler.Current().HasPendingCopies(),
+              "an upload in a batch recorded its barrier to later commands at "
+              "once");
+      cache.InvalidateMemory(base + 4, 4);
+      words[1] = 0x22222222u;
+      (void)cache.ObtainBuffer(base, 2 * page, false, false);
+      Require(name, "uploads consumed",
+              !cache.IsRegionCpuModified(base, 2 * page),
+              "batched uploads left their ranges dirty");
+      Require(name, "pending in batch", scheduler.Current().HasPendingCopies(),
+              "a later upload of the batch finished the earlier ones");
+      snapshot(4, 0);
+      Require(
+          name, "other command", !scheduler.Current().HasPendingCopies(),
+          "a command recorded after batched uploads ran without their barrier");
+      cache.InvalidateMemory(base + 8, 4);
+      words[2] = 0x33333333u;
+      (void)cache.ObtainBuffer(base, 2 * page, false, false);
+      Require(name, "new run", scheduler.Current().HasPendingCopies(),
+              "an upload after another command did not start a new run");
+    }
+    Require(name, "end of batch", !scheduler.Current().HasPendingCopies(),
+            "the end of a batch left uploads without their barrier");
+    cache.InvalidateMemory(base + 12, 4);
+    words[3] = 0x44444444u;
+    (void)cache.ObtainBuffer(base, 2 * page, false, false);
+    Require(name, "unbatched", !scheduler.Current().HasPendingCopies(),
+            "an upload outside a batch deferred its barrier");
+    snapshot(8, 1);
+    snapshot(12, 2);
+    snapshot(page, 3);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex =
+        VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "GPU contents",
+            ReadBuffer(name, readback, 4) ==
+                std::vector<u32>{0x22222222u, 0x33333333u, 0x44444444u,
+                                 0x11111111u},
+            "a batched upload was lost or overwritten by an earlier one");
+    context.UnmapMemory(base, 2 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -58348,6 +58449,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaWatchedEviction();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBatchedUploads();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -58606,6 +58712,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBdaWatchedEviction();
+  vulkan.CheckBatchedUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBindlessSlotImageReuse();
