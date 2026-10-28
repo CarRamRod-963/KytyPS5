@@ -1521,15 +1521,17 @@ void PipelineCache::InitializeDriverCache() {
 	    PrecompileAttempts::PreviousPathFor(directory, title_id));
 	m_title_id = title_id;
 	SetPipelineManifest(
-	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id)));
+	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id),
+	                                       PipelineManifest::PreviousPathFor(directory, title_id)));
 	m_program_cache->list_predicts = [this](uint64_t key) {
 		std::lock_guard lock(m_list_mutex);
 		return m_list_keys.contains(key);
 	};
 	const auto pipelines = m_pipeline_manifest->Loaded();
-	PipelineCacheLog("Pipeline manifest: {} graphics pipelines, {} stages in {}{}",
+	PipelineCacheLog("Pipeline manifest: {} graphics pipelines, {} stages in {}{}{}",
 	                 pipelines.pipelines, pipelines.stages,
 	                 Common::PathToString(m_pipeline_manifest->Path()),
+	                 pipelines.imported ? " (imported from the v5 file)" : "",
 	                 pipelines.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
 	                                                   pipelines.dropped_bytes)
 	                                     : std::string {});

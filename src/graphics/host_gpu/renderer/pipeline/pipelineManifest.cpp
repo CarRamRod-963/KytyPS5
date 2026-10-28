@@ -17,7 +17,7 @@ using ManifestFormat::Writer;
 // is revisited (a new field must be stored and PipelineRecordFormat::LayoutVersion bumped).
 static_assert(sizeof(ShaderVertexInputInfo) == 2112);
 static_assert(sizeof(ShaderPixelInputInfo) == 232);
-static_assert(sizeof(PipelineStaticParameters) == 117);
+static_assert(sizeof(PipelineStaticParameters) == 114);
 static_assert(sizeof(PipelineRenderingState) == 44);
 static_assert(sizeof(PipelineVertexInputState) == 516);
 
@@ -70,7 +70,33 @@ bool GetInt(Reader& r, int& value, int min, int max) {
 	return true;
 }
 
-void PutVertexInput(Writer& w, const ShaderVertexInputInfo& info) {
+// Layout 1 stored a native indirect draw's vertex stage as one word: bit 31 set for such a draw,
+// bits 0-7 and 8-15 the vertex and instance offset slots plus one (zero for none).
+constexpr uint32_t IndirectDrawEnabled = 1u << 31u;
+
+uint32_t EncodeIndirectDrawWord(const ShaderVertexInputInfo& info) {
+	if (!info.indirect_draw) return 0;
+	const auto field = [](uint8_t slot) {
+		return slot == ShaderIndirectOffsets::None ? 0u : uint32_t {slot} + 1u;
+	};
+	return IndirectDrawEnabled | field(info.indirect_offsets.vertex) |
+	       (field(info.indirect_offsets.instance) << 8u);
+}
+
+bool DecodeIndirectDrawWord(uint32_t word, ShaderVertexInputInfo& info) {
+	if ((word & ~(IndirectDrawEnabled | 0xffffu)) != 0u ||
+	    ((word & IndirectDrawEnabled) == 0u && word != 0u)) {
+		return false;
+	}
+	const auto slot = [](uint32_t field) {
+		return field == 0u ? ShaderIndirectOffsets::None : static_cast<uint8_t>(field - 1u);
+	};
+	info.indirect_draw    = word != 0u;
+	info.indirect_offsets = {slot(word & 0xffu), slot((word >> 8u) & 0xffu)};
+	return true;
+}
+
+void PutVertexInput(Writer& w, const ShaderVertexInputInfo& info, uint32_t layout) {
 	w.PutEnum(info.logical_stage);
 	w.Put(static_cast<int32_t>(info.resources_num));
 	w.Put(static_cast<int32_t>(info.fetch_attrib_reg));
@@ -121,12 +147,20 @@ void PutVertexInput(Writer& w, const ShaderVertexInputInfo& info) {
 	     {tess.input_control_points, tess.output_control_points, tess.ls_stride, tess.hs_stride,
 	      tess.patch_base, tess.patch_size, tess.domain, tess.partitioning, tess.output_topology})
 		w.Put(value);
-	w.PutBool(info.fetch_external);
-	w.PutBool(info.fetch_embedded);
-	w.Put(info.indirect_draw);
+	if (layout == 1) {
+		// fetch_external, removed upstream; the indirect draw as one word.
+		w.PutBool(false);
+		w.PutBool(info.has_dynamic_vertex_fetch);
+		w.Put(EncodeIndirectDrawWord(info));
+		return;
+	}
+	w.PutBool(info.has_dynamic_vertex_fetch);
+	w.PutBool(info.indirect_draw);
+	w.Put(info.indirect_offsets.vertex);
+	w.Put(info.indirect_offsets.instance);
 }
 
-bool GetVertexInput(Reader& r, ShaderVertexInputInfo& info) {
+bool GetVertexInput(Reader& r, ShaderVertexInputInfo& info, uint32_t layout) {
 	info = {};
 	if (!r.GetEnum(info.logical_stage, static_cast<uint32_t>(ShaderType::TessellationEvaluation)) ||
 	    !IsVertexSideStage(info.logical_stage) || !GetInt(r, info.resources_num, 0, ResMax) ||
@@ -178,11 +212,20 @@ bool GetVertexInput(Reader& r, ShaderVertexInputInfo& info) {
 	                   &tess.partitioning, &tess.output_topology}) {
 		if (!r.Get(*value)) return false;
 	}
-	return tess.input_control_points <= 32u && r.GetBool(info.fetch_external) &&
-	       r.GetBool(info.fetch_embedded) && r.Get(info.indirect_draw);
+	if (tess.input_control_points > 32u) {
+		return false;
+	}
+	if (layout == 1) {
+		bool     fetch_external = false;
+		uint32_t indirect_word  = 0;
+		return r.GetBool(fetch_external) && r.GetBool(info.has_dynamic_vertex_fetch) &&
+		       r.Get(indirect_word) && DecodeIndirectDrawWord(indirect_word, info);
+	}
+	return r.GetBool(info.has_dynamic_vertex_fetch) && r.GetBool(info.indirect_draw) &&
+	       r.Get(info.indirect_offsets.vertex) && r.Get(info.indirect_offsets.instance);
 }
 
-void PutPixelInput(Writer& w, const ShaderPixelInputInfo& info) {
+void PutPixelInput(Writer& w, const ShaderPixelInputInfo& info, uint32_t layout) {
 	w.Put(info.input_num);
 	for (uint32_t i = 0; i < info.input_num; i++)
 		w.Put(info.interpolator_settings[i]);
@@ -199,6 +242,10 @@ void PutPixelInput(Writer& w, const ShaderPixelInputInfo& info) {
 		w.Put(mapping.packed);
 	w.Put(info.target_packed_unorm_mask);
 	w.Put(info.target_round_mode);
+	if (layout >= 2) {
+		w.Put(info.target_uint_mask);
+		w.Put(info.target_sint_mask);
+	}
 	w.Put(info.scratch_size_dwords);
 	w.Put(info.lds_size_dwords);
 	for (const bool value:
@@ -215,7 +262,7 @@ void PutPixelInput(Writer& w, const ShaderPixelInputInfo& info) {
 	w.PutBool(info.ps_execute_on_noop);
 }
 
-bool GetPixelInput(Reader& r, ShaderPixelInputInfo& info) {
+bool GetPixelInput(Reader& r, ShaderPixelInputInfo& info, uint32_t layout) {
 	info = {};
 	if (!r.Get(info.input_num) || info.input_num > std::size(info.interpolator_settings)) {
 		return false;
@@ -237,6 +284,7 @@ bool GetPixelInput(Reader& r, ShaderPixelInputInfo& info) {
 		if (!r.Get(mapping.packed)) return false;
 	}
 	if (!r.Get(info.target_packed_unorm_mask) || !r.Get(info.target_round_mode) ||
+	    (layout >= 2 && (!r.Get(info.target_uint_mask) || !r.Get(info.target_sint_mask))) ||
 	    !r.Get(info.scratch_size_dwords) || !r.Get(info.lds_size_dwords)) {
 		return false;
 	}
@@ -367,7 +415,7 @@ uint64_t GraphicsPipelineRecord::Key() const {
 	return XXH3_64bits(body.data(), body.size());
 }
 
-void PipelineRecordFormat::PutStage(Writer& w, const GraphicsStageRecord& record) {
+void PipelineRecordFormat::PutStage(Writer& w, const GraphicsStageRecord& record, uint32_t layout) {
 	w.PutEnum(record.stage);
 	w.Put(record.shader_hash);
 	PutCodeId(w, record.code_id);
@@ -375,14 +423,14 @@ void PipelineRecordFormat::PutStage(Writer& w, const GraphicsStageRecord& record
 	w.Put(record.user_data_count);
 	w.Put(record.push_data_cursor);
 	if (record.stage == ShaderType::Pixel) {
-		PutPixelInput(w, record.pixel);
+		PutPixelInput(w, record.pixel, layout);
 	} else {
-		PutVertexInput(w, record.vertex);
+		PutVertexInput(w, record.vertex, layout);
 	}
 	ManifestFormat::PutSpecialization(w, record.specialization);
 }
 
-bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record) {
+bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record, uint32_t layout) {
 	if (!r.GetEnum(record.stage, static_cast<uint32_t>(ShaderType::TessellationEvaluation)) ||
 	    !GraphicsStageRecord::IsGraphicsStage(record.stage) || !r.Get(record.shader_hash) ||
 	    !GetCodeId(r, record.code_id) || !record.code_id || !GetCodeId(r, record.back_code_id) ||
@@ -391,14 +439,16 @@ bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record) {
 		return false;
 	}
 	if (record.stage == ShaderType::Pixel) {
-		if (!GetPixelInput(r, record.pixel)) return false;
-	} else if (!GetVertexInput(r, record.vertex) || record.vertex.logical_stage != record.stage) {
+		if (!GetPixelInput(r, record.pixel, layout)) return false;
+	} else if (!GetVertexInput(r, record.vertex, layout) ||
+	           record.vertex.logical_stage != record.stage) {
 		return false;
 	}
 	return ManifestFormat::GetSpecialization(r, record.specialization);
 }
 
-void PipelineRecordFormat::PutPipeline(Writer& w, const GraphicsPipelineRecord& record) {
+void PipelineRecordFormat::PutPipeline(Writer& w, const GraphicsPipelineRecord& record,
+                                       uint32_t layout) {
 	w.Put(record.vertex_stage_count);
 	for (const auto key: record.VertexStages())
 		w.Put(key);
@@ -422,9 +472,14 @@ void PipelineRecordFormat::PutPipeline(Writer& w, const GraphicsPipelineRecord& 
 	}
 	const auto& p = record.static_params;
 	for (const bool value: {p.negative_one_to_one, p.depth_clip_enable, p.primitive_restart_enable,
-	                        p.sample_shading_enable, p.alpha_to_coverage_enable, p.cull_front,
-	                        p.cull_back, p.face, p.provoking_vtx_last})
+	                        p.sample_shading_enable, p.alpha_to_coverage_enable})
 		w.PutBool(value);
+	if (layout == 1) {
+		// Cull mode and front face, dynamic state since upstream's 1ec69f8e7.
+		for (uint32_t i = 0; i < 3; i++)
+			w.PutBool(false);
+	}
+	w.PutBool(p.provoking_vtx_last);
 	w.PutEnum(p.topology);
 	w.Put(p.samples);
 	w.PutEnum(p.polygon_mode);
@@ -441,7 +496,7 @@ void PipelineRecordFormat::PutPipeline(Writer& w, const GraphicsPipelineRecord& 
 	}
 }
 
-bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record) {
+bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record, uint32_t layout) {
 	record = {};
 	if (!r.Get(record.vertex_stage_count) ||
 	    (record.vertex_stage_count != 1u && record.vertex_stage_count != 3u)) {
@@ -479,12 +534,20 @@ bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record
 	}
 	auto& p = record.static_params;
 	for (auto* value: {&p.negative_one_to_one, &p.depth_clip_enable, &p.primitive_restart_enable,
-	                   &p.sample_shading_enable, &p.alpha_to_coverage_enable, &p.cull_front,
-	                   &p.cull_back, &p.face, &p.provoking_vtx_last}) {
+	                   &p.sample_shading_enable, &p.alpha_to_coverage_enable}) {
 		bool raw = false;
 		if (!r.GetBool(raw)) return false;
 		*value = raw;
 	}
+	if (layout == 1) {
+		for (uint32_t i = 0; i < 3; i++) {
+			bool cull = false;
+			if (!r.GetBool(cull)) return false;
+		}
+	}
+	bool provoking_vtx_last = false;
+	if (!r.GetBool(provoking_vtx_last)) return false;
+	p.provoking_vtx_last = provoking_vtx_last;
 	vk::PrimitiveTopology topology {};
 	vk::PolygonMode       polygon_mode {};
 	uint32_t              samples = 0;
@@ -515,21 +578,37 @@ bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record
 
 std::filesystem::path PipelineManifest::PathFor(const std::filesystem::path& directory,
                                                 const std::string&           title_id) {
+	return directory / (title_id + ".v6.pipelines");
+}
+
+std::filesystem::path PipelineManifest::PreviousPathFor(const std::filesystem::path& directory,
+                                                        const std::string&           title_id) {
 	return directory / (title_id + ".v5.pipelines");
 }
 
-PipelineManifest::PipelineManifest(std::filesystem::path path): m_path(std::move(path)) {
+PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::path previous)
+    : m_path(std::move(path)) {
 	if (m_path.empty()) {
 		return;
 	}
 	const auto read = ManifestFormat::ReadEntryFile(
 	    m_path, ManifestMagic, [this](std::span<const uint8_t> payload, uint32_t version) {
-		    return version == FormatVersion && Parse(payload);
+		    return version == FormatVersion && Parse(payload, PipelineRecordFormat::LayoutVersion);
 	    });
+	std::error_code error;
+	if (read.size == 0 && !previous.empty() && std::filesystem::exists(previous, error)) {
+		// The previous file (record layout 1) is read once and left as it is for older builds.
+		(void)ManifestFormat::ReadEntryFile(
+		    previous, ManifestMagic, [this](std::span<const uint8_t> payload, uint32_t version) {
+			    return version == FormatVersion && Parse(payload, 1);
+		    });
+		m_legacy_stage_keys.clear();
+		m_loaded.imported = !m_stage_order.empty();
+	}
 	m_loaded.stages       = m_stage_order.size();
 	m_loaded.pipelines    = m_pipelines.size();
 	m_loaded.code_entries = m_code.size();
-	if (!read.Clean() || read.version != FormatVersion) {
+	if (!read.Clean() || read.version != FormatVersion || m_loaded.imported) {
 		m_loaded.dropped_bytes = read.valid ? read.size - read.intact : read.size;
 		m_loaded.rewritten     = read.size != 0;
 		// A file that cannot be rewritten is not appended to; the manifest then lives in memory.
@@ -542,7 +621,7 @@ PipelineManifest::PipelineManifest(std::filesystem::path path): m_path(std::move
 
 PipelineManifest::~PipelineManifest() = default;
 
-bool PipelineManifest::Parse(std::span<const uint8_t> payload) {
+bool PipelineManifest::Parse(std::span<const uint8_t> payload, uint32_t layout) {
 	Reader  r(payload);
 	uint8_t kind = 0;
 	if (!r.Get(kind)) {
@@ -559,9 +638,15 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload) {
 	}
 	if (kind == KindStage) {
 		auto record = std::make_shared<GraphicsStageRecord>();
-		if (!PipelineRecordFormat::GetStage(r, *record) || !r.Get(record->spirv_hash) ||
+		if (!PipelineRecordFormat::GetStage(r, *record, layout) || !r.Get(record->spirv_hash) ||
 		    !r.AtEnd()) {
 			return false;
+		}
+		if (layout != PipelineRecordFormat::LayoutVersion) {
+			// Pipelines of another layout name their stages by the key of that layout's body:
+			// the payload without its SPIR-V hash.
+			const auto body = payload.first(payload.size() - sizeof(record->spirv_hash));
+			m_legacy_stage_keys.emplace(XXH3_64bits(body.data(), body.size()), record->Key());
 		}
 		const auto front = m_code.find(record->code_id);
 		const auto back  = record->back_code_id ? m_code.find(record->back_code_id) : m_code.end();
@@ -581,8 +666,18 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload) {
 		return false;
 	}
 	auto record = std::make_shared<GraphicsPipelineRecord>();
-	if (!PipelineRecordFormat::GetPipeline(r, *record) || !r.AtEnd()) {
+	if (!PipelineRecordFormat::GetPipeline(r, *record, layout) || !r.AtEnd()) {
 		return false;
+	}
+	if (layout != PipelineRecordFormat::LayoutVersion) {
+		const auto current = [this](uint64_t& key) {
+			if (key == 0) return;
+			const auto found = m_legacy_stage_keys.find(key);
+			key              = found != m_legacy_stage_keys.end() ? found->second : 1u;
+		};
+		for (uint32_t i = 0; i < record->vertex_stage_count; i++)
+			current(record->vertex_stages[i]);
+		current(record->pixel_stage);
 	}
 	const auto known = [this](uint64_t key) { return m_stages.contains(key); };
 	if (!std::ranges::all_of(record->VertexStages(), known) ||
