@@ -1510,6 +1510,26 @@ private:
 			default: *type = AvPlayerStreamUnknown; break;
 		}
 	}
+	// Fills the columns right of the picture and the rows below it.
+	static void FillPadding(uint8_t* plane, uint32_t pitch, uint32_t rows, uint32_t width,
+	                        uint32_t picture_rows, uint8_t value) {
+		if (width < pitch) {
+			for (uint32_t y = 0; y < picture_rows; y++) {
+				std::memset(plane + static_cast<size_t>(y) * pitch + width, value, pitch - width);
+			}
+		}
+		if (picture_rows < rows) {
+			std::memset(plane + static_cast<size_t>(picture_rows) * pitch, value,
+			            static_cast<size_t>(rows - picture_rows) * pitch);
+		}
+	}
+	static void CopyPlane(uint8_t* dst, uint32_t pitch, const uint8_t* src, int linesize,
+	                      uint32_t width, uint32_t rows) {
+		for (uint32_t y = 0; y < rows; y++) {
+			std::memcpy(dst + static_cast<size_t>(y) * pitch,
+			            src + static_cast<ptrdiff_t>(y) * linesize, width);
+		}
+	}
 	bool PrepareVideo(AVFrame* src, std::unique_ptr<GuestBuffer>& buffer,
 	                  AvPlayerFrameInfoEx* info) {
 		auto*    s     = fmt->streams[video_id.value()];
@@ -1521,20 +1541,21 @@ private:
 		    size > buffer->Size()) {
 			return false;
 		}
-		AVFrame* nv12 = src;
-		AVFrame* tmp  = nullptr;
-		if (src->format != AV_PIX_FMT_NV12) {
-			tmp = av_frame_alloc();
-			if (tmp == nullptr) {
+		const auto width  = static_cast<uint32_t>(src->width);
+		const auto height = static_cast<uint32_t>(src->height);
+		auto*      dst    = buffer->Get();
+		auto*      c      = dst + static_cast<size_t>(pitch) * h;
+		// An NV12 picture of an odd height has one more chroma row than the guest layout holds.
+		const bool direct      = (height + 1) / 2 <= h / 2;
+		uint32_t   chroma_rows = direct ? (height + 1) / 2 : height / 2;
+		if (src->format == AV_PIX_FMT_NV12) {
+			if (src->data[0] == nullptr || src->data[1] == nullptr ||
+			    src->linesize[0] < src->width || src->linesize[1] < src->width) {
 				return false;
 			}
-			tmp->format = AV_PIX_FMT_NV12;
-			tmp->width  = src->width;
-			tmp->height = src->height;
-			if (av_frame_get_buffer(tmp, 0) < 0) {
-				av_frame_free(&tmp);
-				return false;
-			}
+			CopyPlane(dst, pitch, src->data[0], src->linesize[0], width, height);
+			CopyPlane(c, pitch, src->data[1], src->linesize[1], width, chroma_rows);
+		} else {
 			if (sws == nullptr || sws_src_width != src->width || sws_src_height != src->height ||
 			    sws_src_format != src->format) {
 				if (sws != nullptr) {
@@ -1548,35 +1569,41 @@ private:
 				sws_src_format = src->format;
 			}
 			if (sws == nullptr) {
-				av_frame_free(&tmp);
 				return false;
 			}
-			if (sws_scale(sws, src->data, src->linesize, 0, src->height, tmp->data,
-			              tmp->linesize) != src->height) {
+			if (direct) {
+				// Convert straight into the guest buffer: a 4K frame is 12 MB per copy.
+				uint8_t* const planes[4] = {dst, c, nullptr, nullptr};
+				const int strides[4]     = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
+				if (sws_scale(sws, src->data, src->linesize, 0, src->height, planes, strides) !=
+				    src->height) {
+					return false;
+				}
+			} else {
+				AVFrame* tmp = av_frame_alloc();
+				if (tmp == nullptr) {
+					return false;
+				}
+				tmp->format          = AV_PIX_FMT_NV12;
+				tmp->width           = src->width;
+				tmp->height          = src->height;
+				const bool converted = av_frame_get_buffer(tmp, 0) >= 0 &&
+				                       sws_scale(sws, src->data, src->linesize, 0, src->height,
+				                                 tmp->data, tmp->linesize) == src->height;
+				if (converted) {
+					CopyPlane(dst, pitch, tmp->data[0], tmp->linesize[0], width, height);
+					CopyPlane(c, pitch, tmp->data[1], tmp->linesize[1], width, chroma_rows);
+				}
 				av_frame_free(&tmp);
-				return false;
+				if (!converted) {
+					return false;
+				}
 			}
-			nv12 = tmp;
 		}
-		if (nv12->data[0] == nullptr || nv12->data[1] == nullptr ||
-		    nv12->linesize[0] < src->width || nv12->linesize[1] < src->width) {
-			if (tmp != nullptr) {
-				av_frame_free(&tmp);
-			}
-			return false;
-		}
-		auto* dst = buffer->Get();
-		auto* c   = dst + pitch * h;
 		// PPSA02433 samples the padded columns; zero chroma would turn them green.
-		std::memset(dst, s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
-		            static_cast<size_t>(pitch) * h);
-		std::memset(c, 128, static_cast<size_t>(pitch) * h / 2);
-		for (int y = 0; y < src->height; y++) {
-			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);
-		}
-		for (int y = 0; y < src->height / 2; y++) {
-			std::memcpy(c + y * pitch, nv12->data[1] + y * nv12->linesize[1], src->width);
-		}
+		FillPadding(dst, pitch, h, width, height,
+		            s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16);
+		FillPadding(c, pitch, h / 2, width, chroma_rows, 128);
 		std::memset(info, 0, sizeof(*info));
 		info->data       = dst;
 		info->time_stamp = to_ms(
@@ -1590,9 +1617,6 @@ private:
 		info->details.video.crop_bottom_offset =
 		    static_cast<uint32_t>(src->crop_bottom + (h - src->height));
 		info->details.video.pitch = pitch;
-		if (tmp) {
-			av_frame_free(&tmp);
-		}
 		return true;
 	}
 	bool PrepareAudio(AVFrame* src, std::unique_ptr<GuestBuffer>& buffer,
