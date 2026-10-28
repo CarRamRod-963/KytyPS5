@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 extern "C" {
@@ -401,6 +402,14 @@ static const AVCodec* find_decoder(AVCodecID codec_id) {
 		    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
 	}
 	return decoder;
+}
+
+// The console decodes movies in hardware at their frame rate. FFmpeg decodes on one thread
+// unless told otherwise, which plays a 4K H.264 stream at about 45 frames per second; the late
+// video then fills its demux queue, and the demuxer, blocked on it, stops feeding the audio
+// decoder (the sound cuts in and out).
+static int video_decoder_threads() {
+	return static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u));
 }
 
 struct PacketDeleter {
@@ -1128,6 +1137,9 @@ private:
 		auto* c = avcodec_alloc_context3(dec);
 		if (c == nullptr) {
 			return false;
+		}
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			c->thread_count = video_decoder_threads();
 		}
 		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
 		    avcodec_open2(c, dec, nullptr) < 0) {
