@@ -446,7 +446,8 @@ void ImageHeap::Release(uint32_t entry) {
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
-		image->tick_accessed_last = textures.m_gc_tick;
+		image->tick_accessed_last  = textures.m_gc_tick;
+		image->tick_submitted_last = m_context.GetCommandScheduler().CurrentTick();
 	}
 	m_released.push_back(index);
 }
