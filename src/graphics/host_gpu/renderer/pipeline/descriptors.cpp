@@ -1102,6 +1102,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	// The uploads of the stage's buffers share their barriers.
+	const auto batch = m_context.GetCommandScheduler().Current().BatchCopies();
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -1492,6 +1494,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	const auto batch = m_context.GetCommandScheduler().Current().BatchCopies();
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

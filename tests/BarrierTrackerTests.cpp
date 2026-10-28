@@ -9,7 +9,10 @@
 namespace {
 
 using Libs::Graphics::BarrierTracker;
+using Libs::Graphics::CopyRunTracker;
 using Barrier = BarrierTracker::Barrier;
+using CopyBarrier = CopyRunTracker::Barrier;
+using CopyRange = CopyRunTracker::Range;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -275,6 +278,124 @@ void TestAgainstPerDispatchBarriers(bool serialize) {
               static_cast<unsigned long long>(legacy_barriers));
 }
 
+void TestCopyRuns() {
+  CopyRunTracker tracker;
+  Check(!tracker.BeforeOther(), "no copies, no barrier");
+  const CopyRange first[] = {{1, 0, 16}, {1, 64, 80}};
+  Check(tracker.BeforeCopy(first) == CopyBarrier::AllToTransfer,
+        "the first copy waits for everything recorded before");
+  Check(tracker.HasPendingCopies(), "copies wait for their barrier");
+  const CopyRange other_buffer[] = {{2, 0, 16}};
+  Check(tracker.BeforeCopy(other_buffer) == CopyBarrier::None,
+        "a copy into another buffer joins the run");
+  const CopyRange disjoint[] = {{1, 16, 64}, {1, 80, 96}};
+  Check(tracker.BeforeCopy(disjoint) == CopyBarrier::None,
+        "a copy of adjacent bytes joins the run");
+  const CopyRange overlap[] = {{1, 90, 100}};
+  Check(tracker.BeforeCopy(overlap) == CopyBarrier::TransferToTransfer,
+        "a copy over bytes the run wrote waits for that copy");
+  const CopyRange after_barrier[] = {{1, 0, 90}};
+  Check(tracker.BeforeCopy(after_barrier) == CopyBarrier::None,
+        "the transfer barrier ordered the earlier copies");
+  Check(tracker.BeforeCopy(after_barrier) == CopyBarrier::TransferToTransfer,
+        "the same bytes twice are ordered");
+  Check(tracker.BeforeOther(), "another command waits for the copies");
+  Check(!tracker.HasPendingCopies() && !tracker.BeforeOther(),
+        "the barrier after the copies is recorded once");
+  Check(tracker.BeforeCopy(after_barrier) == CopyBarrier::AllToTransfer,
+        "a copy after another command waits for it");
+  const CopyRange empty[] = {{1, 8, 8}};
+  Check(tracker.BeforeCopy(empty) == CopyBarrier::None,
+        "an empty range writes nothing");
+  Check(tracker.BeforeOther(), "the run ends");
+
+  // Ranges merged from several copies still find overlaps inside them.
+  const CopyRange low[] = {{3, 0, 100}};
+  const CopyRange high[] = {{3, 100, 200}};
+  const CopyRange inner[] = {{3, 150, 160}};
+  Check(tracker.BeforeCopy(low) == CopyBarrier::AllToTransfer, "new run");
+  Check(tracker.BeforeCopy(high) == CopyBarrier::None, "adjacent bytes");
+  Check(tracker.BeforeCopy(inner) == CopyBarrier::TransferToTransfer,
+        "bytes inside a merged range overlap");
+  (void)tracker.BeforeOther();
+}
+
+// Random sequences of copies and other commands against a model that keeps
+// every range: each copy must be ordered after every earlier command of another
+// kind and after every earlier copy that wrote one of its bytes, and before
+// every later command of another kind.
+void TestCopyRunsAgainstModel() {
+  std::mt19937 random(7);
+  uint64_t copies = 0;
+  uint64_t barriers = 0;
+  for (int round = 0; round < 2000; round++) {
+    CopyRunTracker tracker;
+    // Copies recorded since the last barrier before a copy (all of their
+    // ranges), and whether copies wait for their barrier to later commands.
+    std::vector<CopyRange> unordered;
+    bool pending = false;
+    const int count = 1 + static_cast<int>(random() % 24);
+    for (int i = 0; i < count; i++) {
+      if (random() % 5 == 0) {
+        const bool barrier = tracker.BeforeOther();
+        Check(barrier == pending,
+              "copies are ordered before the next other command");
+        pending = false;
+        unordered.clear();
+        barriers += barrier ? 1 : 0;
+        continue;
+      }
+      std::vector<CopyRange> ranges;
+      const int regions = 1 + static_cast<int>(random() % 3);
+      for (int r = 0; r < regions; r++) {
+        const uint64_t buffer = 1 + random() % 3;
+        const uint64_t begin = random() % 64;
+        const uint64_t size = random() % 12;
+        // The regions of one copy are disjoint.
+        bool overlaps_own = false;
+        for (const auto &own : ranges) {
+          overlaps_own |= own.buffer == buffer && own.begin < begin + size &&
+                          begin < own.end;
+        }
+        if (!overlaps_own) {
+          ranges.push_back({buffer, begin, begin + size});
+        }
+      }
+      bool hazard = false;
+      for (const auto &range : ranges) {
+        for (const auto &earlier : unordered) {
+          hazard |= range.begin < range.end && earlier.begin < earlier.end &&
+                    earlier.buffer == range.buffer &&
+                    earlier.begin < range.end && range.begin < earlier.end;
+        }
+      }
+      const auto barrier = tracker.BeforeCopy(ranges);
+      copies++;
+      if (!pending) {
+        Check(barrier == CopyBarrier::AllToTransfer,
+              "the first copy after another command waits for it");
+      } else if (hazard) {
+        Check(barrier == CopyBarrier::TransferToTransfer,
+              "a copy over bytes of an unordered copy waits for it");
+      } else {
+        Check(barrier == CopyBarrier::None,
+              "an independent copy records no barrier");
+      }
+      if (barrier != CopyBarrier::None) {
+        unordered.clear();
+        barriers++;
+      }
+      unordered.insert(unordered.end(), ranges.begin(), ranges.end());
+      pending = true;
+    }
+    barriers += tracker.BeforeOther() ? 1 : 0;
+  }
+  Check(barriers < copies * 2, "fewer barriers than two per copy");
+  std::printf("BarrierTrackerTests: %llu copy barriers instead of %llu\n",
+              static_cast<unsigned long long>(barriers),
+              static_cast<unsigned long long>(copies * 2));
+}
+
 } // namespace
 
 int main() {
@@ -283,6 +404,8 @@ int main() {
   TestFlushes();
   TestAgainstPerDispatchBarriers(true);
   TestAgainstPerDispatchBarriers(false);
+  TestCopyRuns();
+  TestCopyRunsAgainstModel();
   std::printf("BarrierTrackerTests: ok\n");
   return 0;
 }
