@@ -62,6 +62,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// The command stream reached a point that orders guest CPU stores before the work after it:
+	// a submission starts or resumes, or the command processor waits for a memory value.
+	void               NoteCommandOrderingPoint();
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
