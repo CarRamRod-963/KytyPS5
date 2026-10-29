@@ -717,6 +717,12 @@ struct PipelineCacheTestAccess {
     return cache.m_compute_from_cache;
   }
 
+  // Lets `history` learn the pipelines built through the cache's driver cache.
+  static void AttachHistory(PipelineCache &cache,
+                            std::shared_ptr<DriverCacheHistory> history) {
+    cache.m_driver_history = std::move(history);
+  }
+
   // Queues the manifest's programs behind `blocker` on a single precompile
   // thread.
   static void QueuePrecompileBehind(PipelineCache &cache,
@@ -23354,6 +23360,8 @@ public:
               fresh, std::make_unique<ProgramManifest>(), fresh_driver_cache());
           (void)PipelineCacheTestAccess::AttachPipelineManifest(
               fresh, std::move(replay));
+          const auto history = std::make_shared<DriverCacheHistory>();
+          PipelineCacheTestAccess::AttachHistory(fresh, history);
           Require(name, "graphics precompile-all",
                   fresh.PrecompileAll(2, {}) ==
                       PipelineCache::PrecompileResult::Done,
@@ -23372,6 +23380,22 @@ public:
                         fresh, *record, stages) == PrecompileOutcome::Cached,
                     "the driver cache does not hold the precompiled graphics "
                     "pipeline");
+          }
+          // Another cache translating the same records fingerprints the
+          // pipeline alike (DriverCacheHistory across sessions).
+          {
+            PipelineCache again(m_runtime_context, nullptr);
+            PipelineCacheTestAccess::AttachPersistence(
+                again, std::make_unique<ProgramManifest>(),
+                fresh_driver_cache());
+            const auto again_history = std::make_shared<DriverCacheHistory>();
+            PipelineCacheTestAccess::AttachHistory(again, again_history);
+            Require(name, "graphics fingerprint",
+                    PipelineCacheTestAccess::PrecompileGraphics(
+                        again, *record, stages) != PrecompileOutcome::Skipped &&
+                        history->Size() == 1 &&
+                        again_history->Snapshot() == history->Snapshot(),
+                    "the same graphics pipeline was fingerprinted differently");
           }
           // A stage this recompiler no longer derives is skipped, not built.
           auto stale = *stages.back();
@@ -51765,6 +51789,34 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
             PrecompileComputeProgram(graphics, driver_cache, *record) ==
                 PrecompileOutcome::Cached,
             "the driver cache does not hold the precompiled pipeline");
+  }
+
+  // The precompile and the first use of a program give its pipeline the same
+  // fingerprint (DriverCacheHistory).
+  {
+    auto history = std::make_shared<DriverCacheHistory>();
+    auto history_cache = new_driver_cache();
+    Require(name, "history precompile",
+            PrecompileComputeProgram(graphics, history_cache, *record, nullptr,
+                                     false, PipelineBuildMode::Precompile,
+                                     nullptr,
+                                     history) != PrecompileOutcome::Skipped,
+            "the record was not built");
+    Require(name, "history after the precompile", history->Size() == 1,
+            "the precompiled pipeline was not remembered");
+    PipelineCache cache(graphics, nullptr);
+    PipelineCacheTestAccess::AttachPersistence(
+        cache, std::make_unique<ProgramManifest>(), history_cache);
+    PipelineCacheTestAccess::AttachHistory(cache, history);
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    Require(name, "history live pipeline",
+            cache.GetComputePipeline(input).pipeline != nullptr,
+            "no pipeline for the precompiled program");
+    Require(name, "history fingerprint",
+            history->Size() == 1 && history->StaleCount() == 0,
+            "the first use of a precompiled program fingerprinted its pipeline "
+            "differently");
   }
 
   // A specialization the shader no longer has is skipped, not applied.

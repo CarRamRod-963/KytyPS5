@@ -90,6 +90,12 @@ public:
 		std::lock_guard lock(m_mutex);
 		return m_counts;
 	}
+	// Starts the counts of a new run; not allowed while one is open.
+	void Reset() {
+		std::lock_guard lock(m_mutex);
+		EXIT_IF(m_open != 0);
+		m_counts = {};
+	}
 	// Whether a run was started and every job it queued has finished (or timed out).
 	[[nodiscard]] bool Complete() {
 		std::lock_guard lock(m_mutex);

@@ -522,12 +522,14 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		const auto spirv_hash =
+		    XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
-		    .spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)),
+		    .handle         = {.id = ++next_shader_id, .module = module, .spirv_hash = spirv_hash},
+		    .spirv_hash     = spirv_hash,
 		};
 	}
 
@@ -994,7 +996,8 @@ struct PipelineCache::ProgramCache {
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record, uint64_t* spirv_hash,
                                            bool code_only, PipelineBuildMode mode,
-                                           const std::atomic<bool>* cancel) {
+                                           const std::atomic<bool>*            cancel,
+                                           std::shared_ptr<DriverCacheHistory> history) {
 	const auto cancelled = [cancel] { return cancel != nullptr && cancel->load(); };
 	EXIT_IF(mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized);
 	EXIT_IF(record.code == nullptr || record.code->empty());
@@ -1051,8 +1054,10 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	                                                result->spirv, profile.maintenance8)) {
 		return PrecompileOutcome::Skipped;
 	}
+	const auto module_hash =
+	    XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
 	if (spirv_hash != nullptr) {
-		*spirv_hash = XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
+		*spirv_hash = module_hash;
 	}
 	if (cancelled()) {
 		return PrecompileOutcome::TimedOut;
@@ -1063,12 +1068,13 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	}
 	const auto                             program = std::move(result->program).TakeCompiledInfo();
 	ShaderRecompiler::IR::ResourceSnapshot resources;
-	input.stage = {.program = &program, .resources = &resources};
+	const ShaderProgram                    handle {.module = module, .spirv_hash = module_hash};
+	input.stage = {.program = &program, .resources = &resources, .handle = &handle};
 
 	PipelineCache::Pipeline pipeline;
 	bool                    from_driver_cache = false;
 	(void)CreatePipelineInternal(graphics, pipeline, input, module, driver_cache, mode,
-	                             &from_driver_cache, cancel);
+	                             &from_driver_cache, cancel, std::move(history));
 	const bool built = pipeline.pipeline != nullptr;
 	graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 	graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
@@ -1169,7 +1175,10 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 		return false;
 	}
 	out.program.emplace(std::move(result->program).TakeCompiledInfo());
-	out.handle = {.id = ++next_id, .module = out.module};
+	out.handle = {.id     = ++next_id,
+	              .module = out.module,
+	              .spirv_hash =
+	                  XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t))};
 	return true;
 }
 
@@ -1230,7 +1239,7 @@ PrecompileOutcome PipelineCache::PrecompileGraphicsPipeline(
 		const Common::RecoverableFatalScope recoverable;
 		(void)CreatePipelineInternal(m_graphics, pipeline, record.rendering, record.vertex_input,
 		                             state, record.static_params, m_driver_cache, mode,
-		                             &from_driver_cache, cancel);
+		                             &from_driver_cache, cancel, m_driver_history);
 	} catch (const Common::RecoverableFatal& fatal) {
 		PipelineCacheLog("Precompile: recorded pipeline {:016x} cannot be built: {}", record.Key(),
 		                 fatal.message);
@@ -1377,6 +1386,8 @@ void PipelineCache::InstallOptimizedPipelines() {
 	if (m_pipeline_manifest != nullptr && now >= m_next_coverage_report) {
 		if (m_next_coverage_report != std::chrono::steady_clock::time_point {}) {
 			LogCoverage();
+			LogStaleDriverCache();
+			PersistStaleMisses();
 		}
 		m_next_coverage_report = now + std::chrono::minutes {1};
 	}
@@ -1445,6 +1456,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	const auto           signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::vector<uint8_t> initial_data;
+	uint64_t             initial_hash = 0;
 	std::error_code      size_error;
 	const auto           file_size =
 	    cache_exists ? std::filesystem::file_size(m_driver_cache_path, size_error) : uint64_t {0};
@@ -1463,6 +1475,7 @@ void PipelineCache::InitializeDriverCache() {
 		switch (loaded.status) {
 			case DriverCacheFile::LoadStatus::Loaded:
 				initial_data = std::move(loaded.payload);
+				initial_hash = loaded.payload_hash;
 				break;
 			case DriverCacheFile::LoadStatus::SignatureMismatch:
 			case DriverCacheFile::LoadStatus::DataMismatch:
@@ -1504,7 +1517,21 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 
-	const auto directory = m_driver_cache_path.parent_path();
+	const auto directory  = m_driver_cache_path.parent_path();
+	m_driver_history      = std::make_shared<DriverCacheHistory>();
+	m_driver_history_path = DriverCacheHistory::PathFor(directory, title_id);
+	if (!initial_data.empty()) {
+		if (m_driver_history->Load(m_driver_history_path,
+		                           DriverCacheHistory::Signature(signature, initial_hash))) {
+			PipelineCacheLog("Vulkan pipeline cache: {} pipelines were given to it ({})",
+			                 m_driver_history->Size(), Common::PathToString(m_driver_history_path));
+			LogStaleDriverCache();
+		}
+		std::lock_guard lock(m_history_file_mutex);
+		m_history_file_built      = m_driver_history->Snapshot();
+		m_history_file_cache_hash = initial_hash;
+		m_history_file_stale      = m_driver_history->StaleCount();
+	}
 	SetManifest(
 	    std::make_unique<ProgramManifest>(ProgramManifest::PathFor(directory, title_id),
 	                                      ProgramManifest::PreviousPathFor(directory, title_id)));
@@ -1815,10 +1842,11 @@ void PipelineCache::EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord
 	    fmt::format("{} CS {:016x}", code_only ? "created" : "recorded", record->shader_hash);
 	(void)EnqueuePrecompileJob(
 	    key, std::move(label),
-	    [graphics = &m_graphics, driver_cache = m_driver_cache, record = std::move(record),
+	    [graphics = &m_graphics, driver_cache = m_driver_cache, history = m_driver_history,
+	     record = std::move(record),
 	     code_only](PipelineBuildMode mode, const std::atomic<bool>& cancel) {
 		    return PrecompileComputeProgram(*graphics, driver_cache, *record, nullptr, code_only,
-		                                    mode, &cancel);
+		                                    mode, &cancel, history);
 	    },
 	    code_only ? PrecompileCreatedOrder + position : position);
 }
@@ -2043,6 +2071,11 @@ void PipelineCache::StartPrecompile(uint32_t thread_count, uint32_t steady_threa
 PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_count,
                                                              const std::function<bool()>& pump) {
 	m_precompile_only = true;
+	// Sessions found stale entries: this precompile builds a new cache.
+	if (!m_driver_cache_rebuild && m_driver_history != nullptr &&
+	    m_driver_history->StaleCount() != 0 && m_driver_cache != nullptr) {
+		(void)StartEmptyDriverCache();
+	}
 	StartPrecompile(thread_count);
 	if (m_precompile_queue == nullptr) {
 		return Save() ? PrecompileResult::Done : PrecompileResult::SaveFailed;
@@ -2077,6 +2110,12 @@ PipelineCache::PrecompileResult PipelineCache::PrecompileAll(uint32_t thread_cou
 		m_precompile_queue->Stop();
 		m_precompile_queue.reset();
 		ReleasePrecompiledStages();
+		// Builds the driver cache was given before but no longer provides compile again in every
+		// session, and the driver does not replace their entries: only a new cache has them.
+		if (!m_driver_cache_rebuild && m_driver_history != nullptr &&
+		    m_driver_history->StaleCount() != 0 && StartEmptyDriverCache()) {
+			return PrecompileAll(thread_count, pump);
+		}
 		return Save() ? PrecompileResult::Done : PrecompileResult::SaveFailed;
 	}
 	// Builds still run (abandoned, or interrupted): their threads are never joined. The driver
@@ -2126,6 +2165,16 @@ bool PipelineCache::ExportPipelineList(const std::filesystem::path& path) {
 	return true;
 }
 
+void PipelineCache::LogStaleDriverCache() const {
+	if (m_driver_history == nullptr || m_driver_history->StaleCount() == 0) {
+		return;
+	}
+	PipelineCacheLog("Vulkan pipeline cache: {} builds ({} this session) missed pipelines the "
+	                 "cache was given before (stale entries the driver keeps but does not "
+	                 "provide); --precompile-only rebuilds the cache",
+	                 m_driver_history->StaleCount(), m_driver_history->SessionStaleCount());
+}
+
 void PipelineCache::LogCoverage() {
 	auto& programs = *m_program_cache;
 	if (m_graphics_from_cache + m_graphics_compiled != 0) {
@@ -2162,6 +2211,29 @@ void PipelineCache::LogCoverage() {
 	}
 }
 
+bool PipelineCache::StartEmptyDriverCache() {
+	LogStaleDriverCache();
+	vk::PipelineCacheCreateInfo create {};
+	vk::PipelineCache           empty = nullptr;
+	const auto result = m_graphics.device.createPipelineCache(&create, nullptr, &empty);
+	if (result != vk::Result::eSuccess) {
+		PipelineCacheLog("Vulkan pipeline cache: cannot start an empty cache ({})",
+		                 vk::to_string(result));
+		return false;
+	}
+	m_driver_cache_writer.Wait();
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache         = empty;
+	m_driver_cache_rebuild = true;
+	m_driver_cache_dirty.store(false);
+	m_driver_history->Clear();
+	m_precompile_progress.Reset();
+	PipelineCacheLog(
+	    "Vulkan pipeline cache: rebuilding {} from the pipelines this precompile builds",
+	    Common::PathToString(m_driver_cache_path));
+	return true;
+}
+
 void PipelineCache::CheckpointDriverCache() {
 	// A driver cache without a file (tests) is not persisted.
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {
@@ -2193,8 +2265,10 @@ bool PipelineCache::Save() {
 		PipelineCacheLog("Compute pipelines this session: {} from the driver cache, {} compiled",
 		                 m_compute_from_cache, m_compute_compiled);
 	}
+	LogStaleDriverCache();
 	LogCoverage();
 	m_driver_cache_writer.Wait();
+	PersistStaleMisses();
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||
 	    !m_driver_cache_dirty.exchange(false)) {
 		return true;
@@ -2208,7 +2282,11 @@ bool PipelineCache::Save() {
 }
 
 bool PipelineCache::WriteDriverCache() {
-	size_t               size = 0;
+	// Taken first: every pipeline it names is in the data below.
+	const auto built =
+	    m_driver_history != nullptr ? m_driver_history->Snapshot() : std::vector<uint64_t> {};
+	const auto           stale = m_driver_history != nullptr ? m_driver_history->StaleCount() : 0;
+	size_t               size  = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
@@ -2230,15 +2308,54 @@ bool PipelineCache::WriteDriverCache() {
 	}
 	payload.resize(size);
 	const auto signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	if (!DriverCacheFile::Store(m_driver_cache_path, signature, payload.data(), payload.size())) {
+	uint64_t   hash      = 0;
+	if (!DriverCacheFile::Store(m_driver_cache_path, signature, payload.data(), payload.size(),
+	                            DriverCacheFile::DefaultChunkSize, &hash)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return false;
+	}
+	if (m_driver_history != nullptr) {
+		WriteDriverHistory(built, hash, stale);
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 	return true;
+}
+
+void PipelineCache::WriteDriverHistory(std::vector<uint64_t> built, uint64_t cache_hash,
+                                       uint64_t stale) {
+	const auto      signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	std::lock_guard lock(m_history_file_mutex);
+	if (!DriverCacheHistory::Store(m_driver_history_path,
+	                               DriverCacheHistory::Signature(signature, cache_hash), built,
+	                               stale)) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
+		                 Common::PathToString(m_driver_history_path));
+		return;
+	}
+	m_history_file_built      = std::move(built);
+	m_history_file_cache_hash = cache_hash;
+	m_history_file_stale      = stale;
+}
+
+void PipelineCache::PersistStaleMisses() {
+	if (m_driver_history == nullptr || m_driver_cache_rebuild) {
+		return;
+	}
+	const auto      stale     = m_driver_history->StaleCount();
+	const auto      signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	std::lock_guard lock(m_history_file_mutex);
+	if (m_history_file_cache_hash == 0 || stale == m_history_file_stale) {
+		return;
+	}
+	if (DriverCacheHistory::Store(
+	        m_driver_history_path,
+	        DriverCacheHistory::Signature(signature, m_history_file_cache_hash),
+	        m_history_file_built, stale)) {
+		m_history_file_stale = stale;
+	}
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -2799,8 +2916,8 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		return CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, state,
-		                              static_params, m_driver_cache, build_mode,
-		                              &from_driver_cache);
+		                              static_params, m_driver_cache, build_mode, &from_driver_cache,
+		                              nullptr, m_driver_history);
 	}();
 	(from_driver_cache ? m_graphics_from_cache : m_graphics_compiled)++;
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -2876,7 +2993,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                              optimized_hangs        ? PipelineBuildMode::Unoptimized
 		                              : m_defer_optimization ? PipelineBuildMode::UnoptimizedFirst
 		                                                     : PipelineBuildMode::Optimized,
-		                              &from_driver_cache);
+		                              &from_driver_cache, nullptr, m_driver_history);
 	}();
 	(from_driver_cache ? m_compute_from_cache : m_compute_compiled)++;
 
