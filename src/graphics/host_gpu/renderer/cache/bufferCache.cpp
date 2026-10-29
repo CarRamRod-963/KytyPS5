@@ -349,14 +349,14 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
-void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::CpuWrite);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
+	QueueBdaSync(vaddr, size, guest_store);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -1300,16 +1300,21 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
+	m_bda_sync.Queue(begin, end - begin, at_ordering_point);
+}
+
+void BufferCache::NoteBdaOrderingPoint() {
+	// The flag belongs to the GPU thread, which also takes (only guest stores queue elsewhere).
+	m_bda_sync.NoteOrderingPoint();
 }
 
 RangeSet BufferCache::TakeBdaSync() {
 	std::lock_guard lock(m_bda_sync_mutex);
-	return std::exchange(m_bda_sync, {});
+	return m_bda_sync.Take();
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {

@@ -263,6 +263,7 @@ template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
+	m_renderer.NoteCommandOrderingPoint();
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
@@ -301,6 +302,9 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	// The counter is a packet input in guest memory, maybe written by recorded GPU work.
 	SettleMemoryRead(counter, sizeof(uint64_t));
+	if (!signal) {
+		m_renderer.NoteCommandOrderingPoint();
+	}
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -560,6 +564,7 @@ void GuestGpu::NotifyMemoryWritten() {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
+	m_renderer.NoteCommandOrderingPoint();
 
 	if (first_slice) {
 		submission.started = true;

@@ -6461,7 +6461,7 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 8 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
     const auto snapshot = [&](uint64_t offset, uint32_t index) {
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
@@ -6490,6 +6490,24 @@ public:
     snapshot(page, 4);
     Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
             "mapping into an existing buffer did not queue its dirty pages");
+    // A guest CPU store (a write fault off the GPU thread) reaches BDA accesses
+    // at the next ordering point of the command stream, not at the next access.
+    const auto guest_page = base + 2 * TRACKER_PAGE_SIZE;
+    Require(name, "guest store fault",
+            context.HandleFault(PageFaultAccess::Write, guest_page),
+            "a guest write fault on mapped memory was not handled");
+    words[2 * TRACKER_PAGE_SIZE / sizeof(u32)] = 0x2468ace0u;
+    context.PrepareBda();
+    snapshot(2 * TRACKER_PAGE_SIZE, 6);
+    Require(name, "guest store deferred",
+            cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "a guest store was uploaded before an ordering point");
+    context.NoteCommandOrderingPoint();
+    context.PrepareBda();
+    snapshot(2 * TRACKER_PAGE_SIZE, 7);
+    Require(name, "guest store at ordering point",
+            !cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "an ordering point did not release a guest store");
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
     context.PrepareBda();
@@ -6541,10 +6559,13 @@ public:
     scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
-    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
-        std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
-                        0x12345678u, 0xfedcba98u},
-        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
+    Require(name, "GPU contents",
+            ReadBuffer(name, readback, 8) ==
+                std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u,
+                                 0xabcdef01u, 0x12345678u, 0xfedcba98u,
+                                 0x12345678u, 0x2468ace0u},
+            "initial, re-dirtied, newly mapped, remapped or guest-stored bytes "
+            "were stale on the GPU");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);

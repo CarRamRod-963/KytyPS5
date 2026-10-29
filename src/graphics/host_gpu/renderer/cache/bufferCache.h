@@ -7,6 +7,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/bdaSyncQueue.h"
 #include "graphics/host_gpu/filteredRangeSet.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -68,7 +69,9 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A store of the guest CPU (guest_store) reaches BDA accesses at the next ordering point of
+	// the command stream, any other write at the next access (see BdaSyncQueue).
+	void InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store = false);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Reads back the GPU-modified range containing vaddr, from its page to at most window
 	// bytes past vaddr, or just the byte at vaddr when no GPU-modified range contains it.
@@ -137,7 +140,9 @@ public:
 	void               NoteLostBdaReports() noexcept { m_bda_reports_lost = true; }
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
+	// GPU thread: a submission starts or resumes, or the command processor waits for memory.
+	void                   NoteBdaOrderingPoint();
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
 	// Called before every submission on the GPU thread: records downloads of the hot read-back
@@ -279,7 +284,7 @@ private:
 	uint64_t                                          m_gpu_write_sequence     = 0;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
-	RangeSet                                          m_bda_sync;
+	BdaSyncQueue                                      m_bda_sync;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

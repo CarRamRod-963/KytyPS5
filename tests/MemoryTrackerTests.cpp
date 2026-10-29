@@ -1,5 +1,6 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/bdaSyncQueue.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
@@ -310,6 +311,50 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> Ranges(const RangeSet &ranges) {
+  std::vector<std::pair<uint64_t, uint64_t>> result;
+  ranges.ForEach(
+      [&](uint64_t begin, uint64_t end) { result.emplace_back(begin, end); });
+  return result;
+}
+
+void TestBdaSyncQueue() {
+  using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
+  Libs::Graphics::BdaSyncQueue queue;
+  // Before the first synchronization everything is due.
+  queue.Queue(0x1000, 0x1000, true);
+  queue.Queue(0x8000, 0x1000, false);
+  Check(Ranges(queue.Take()) == Ranges_t{{0x1000, 0x2000}, {0x8000, 0x9000}},
+        "the first BDA synchronization did not take every queued range");
+  Check(queue.Take().Empty(), "a BDA synchronization took a range twice");
+
+  // A guest store waits for the next ordering point; other writes are due at
+  // once.
+  queue.Queue(0x2000, 0x1000, true);
+  queue.Queue(0x3000, 0x1000, false);
+  Check(Ranges(queue.Take()) == Ranges_t{{0x3000, 0x4000}},
+        "a guest store was synchronized before an ordering point");
+  queue.Queue(0x2000, 0x2000, true);
+  Check(queue.Take().Empty(),
+        "a guest store was synchronized before an ordering point");
+  queue.NoteOrderingPoint();
+  // A store queued after the point and before the synchronization rides along.
+  queue.Queue(0x6000, 0x1000, true);
+  queue.Queue(0x5000, 0x1000, false);
+  Check(Ranges(queue.Take()) == Ranges_t{{0x2000, 0x4000}, {0x5000, 0x7000}},
+        "an ordering point did not release the queued guest stores");
+  // One synchronization per point: later stores wait for the next one.
+  queue.Queue(0x2000, 0x1000, true);
+  Check(queue.Take().Empty(),
+        "an ordering point released stores queued after its synchronization");
+  queue.NoteOrderingPoint();
+  queue.NoteOrderingPoint();
+  Check(Ranges(queue.Take()) == Ranges_t{{0x2000, 0x3000}},
+        "an ordering point did not release a store queued before it");
+  Check(queue.Take().Empty(),
+        "repeated ordering points released a store twice");
 }
 
 void TestGuestRange() {
@@ -1535,6 +1580,7 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestBdaSyncQueue();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
