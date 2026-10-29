@@ -1,0 +1,42 @@
+#version 450
+
+// Turns a guest indirect draw record (VkDrawIndirectCommand or VkDrawIndexedIndirectCommand:
+// vertex or index count first, instance count second) into the VkDrawMeshTasksIndirectCommandEXT
+// of the mesh shader that emulates the draw: the groups that cover its input primitives, one row
+// of them per instance. A draw past the host limits draws nothing.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer record_buf {
+    uint record[];
+};
+
+layout(std430, binding = 1) writeonly buffer tasks_buf {
+    uint tasks[];
+};
+
+layout(push_constant) uniform Conversion {
+    uint record_word;          // first word of the record in record[]
+    uint max_count;            // the index buffer's size in indices, ~0u when not indexed
+    uint primitive_size;       // vertices of the first input primitive
+    uint primitive_step;       // vertices each further input primitive adds
+    uint primitives_per_group; // input primitives a mesh workgroup handles
+    uint max_groups_x;
+    uint max_groups_y;
+    uint max_groups_total;
+} pc;
+
+void main() {
+    const uint count     = min(record[pc.record_word], pc.max_count);
+    const uint instances = record[pc.record_word + 1u];
+    const uint primitives =
+        count < pc.primitive_size ? 0u : (count - pc.primitive_size) / pc.primitive_step + 1u;
+    uint groups = primitives == 0u ? 0u : (primitives - 1u) / pc.primitives_per_group + 1u;
+    if (instances == 0u || groups > pc.max_groups_x || instances > pc.max_groups_y ||
+        groups > pc.max_groups_total / instances) {
+        groups = 0u;
+    }
+    tasks[0] = groups;
+    tasks[1] = instances;
+    tasks[2] = 1u;
+}

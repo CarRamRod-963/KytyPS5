@@ -1207,8 +1207,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		m_num_instances_addr = 0;
 		return;
 	}
-	// The packet replaces the deferred state only when it draws, and its shader may read any.
-	SettleIndirectDrawState(true, true);
+	// The packet replaces the deferred state only when it draws, and its shader may read any
+	// register. Its instance count replaces the deferred one, which is read only when the packet
+	// may draw nothing (a GPU-written instance count is then not waited for).
+	SettleIndirectDrawState(true, count_addr != nullptr || max_count_or_count == 0);
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
@@ -1218,6 +1220,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
+	std::erase_if(m_deferred_indirect, [](const DeferredIndirectValue& value) {
+		return value.field == DeferredIndirectValue::Field::InstanceCount;
+	});
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
 	auto&      executor  = m_renderer.GetRenderExecutor();

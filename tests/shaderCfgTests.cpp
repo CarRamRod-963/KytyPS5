@@ -11819,6 +11819,67 @@ void TestFusedShaderHandoffPreservesRegisters() {
 #endif
 }
 
+// A mesh program of an indirect draw reads the counts and offsets from the
+// guest's record (its address in the draw parameters) instead of taking them
+// from the draw parameters.
+void TestMeshIndirectRecordLoads() {
+  using namespace ShaderRecompiler;
+  // Stores through s[8:11] at the vertex ID, so the draw's counts and offsets
+  // stay live.
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255),   0x1003u,
+      EncodeSMovB32(124, 12),   EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x01, 0, 128), EncodeMubuf0(0x1c),
+      EncodeMubuf1(0, 2, 5),    EncodeExp0(0x14, 0x1),
+      EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 3840;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  mesh.host_subgroup_size = 32;
+  std::array<uint32_t, 12> user_data{};
+  user_data[8] = 0x10000008u;
+  user_data[9] = 4u << 16u;
+  user_data[10] = 64u;
+  user_data[11] = 0x00027000u;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  const auto record_loads = [&](bool indirect) {
+    input.indirect_draw = indirect;
+    auto translated = TranslateProgram(code, options);
+    std::vector<uint32_t> offsets;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 &&
+            inst.Arg(1).Resolve().IsImmediate()) {
+          offsets.push_back(inst.Arg(1).Resolve().U32());
+        }
+      }
+    }
+    return offsets;
+  };
+  const auto direct = record_loads(false);
+  const auto indirect = record_loads(true);
+  const auto added = [&](uint32_t offset) {
+    return std::ranges::count(indirect, offset) >
+           std::ranges::count(direct, offset);
+  };
+  Check(added(0) && added(8) && added(12),
+        "an indirect mesh program did not read its record's count, first index "
+        "or offset");
+  input.indirect_draw = true;
+  CheckSpirvBinaryValidates(RecompileForTest(code, options).spirv);
+}
+
 void TestMeshExportStorage() {
   using ShaderRecompiler::IR::PushData;
   const uint32_t front[] = {
@@ -18407,6 +18468,7 @@ int main() {
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshIndirectRecordLoads();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

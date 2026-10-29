@@ -1226,10 +1226,47 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                     mesh.primitives_per_group > 0x1ffu ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
-			const auto draw = [&](uint32_t index) {
-				return IR::U32(
-				    entry_ir.Emit(IR::ValueOpcode::MeshDrawParameter, {IR::Value(index)}));
-			};
+			// The draw parameters (PushData::MeshDrawDwordCount): vertex or index count, vertex
+			// offset, index size in bytes (0 without indices) and the 64-bit index address.
+			std::array<IR::U32, IR::PushData::MeshDrawDwordCount> parameters;
+			for (uint32_t index = 0; index < parameters.size(); index++) {
+				parameters[index] =
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::MeshDrawParameter, {IR::Value(index)}));
+			}
+			if (options.input_info.vertex->indirect_draw) {
+				// An indirect draw (RenderExecutor::DrawIndirect) passes the guest address of its
+				// record with the index size in bits 16-31 of the high word, the most indices it
+				// may use and the index buffer's address. The record, as the GPU wrote it, holds
+				// the rest: VkDrawIndirectCommand (count, instances, first vertex, first instance)
+				// or VkDrawIndexedIndirectCommand (count, instances, first index, vertex offset,
+				// first instance).
+				const auto index_bytes     = entry_ir.ShiftRightLogical(parameters[1], u32(16));
+				const auto indexed         = entry_ir.INotEqual(index_bytes, u32(0));
+				const auto record_resource = entry_ir.Emit(
+				    IR::ValueOpcode::GetAddressResource,
+				    {parameters[0], entry_ir.BitwiseAnd(parameters[1], u32(0xffffu))});
+				const auto record_memory = static_cast<uint32_t>(result.memory_info.size());
+				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				const auto record = [&](uint32_t field, IR::U1 condition) {
+					return IR::U32(
+					    entry_ir.Emit(IR::ValueOpcode::LoadAddressU32,
+					                  {record_resource, u32(field * 4u), u32(0), condition},
+					                  IR::MemoryFlags {.index = record_memory}));
+				};
+				const auto always      = IR::U1(IR::Value(true));
+				const auto first_index = record(2, indexed);
+				const auto index_low =
+				    entry_ir.IAdd(parameters[3], entry_ir.IMul(first_index, index_bytes));
+				const auto carry =
+				    entry_ir.Select(entry_ir.ULessThan(index_low, parameters[3]), u32(1), u32(0));
+				const auto count = IR::U32(
+				    entry_ir.Emit(IR::ValueOpcode::UMin32, {record(0, always), parameters[2]}));
+				const auto vertex_offset =
+				    entry_ir.Select(indexed, record(3, indexed), record(2, always));
+				parameters = {count, vertex_offset, index_bytes, index_low,
+				              entry_ir.IAdd(parameters[4], carry)};
+			}
+			const auto draw    = [&](uint32_t index) { return parameters[index]; };
 			const auto minimum = [&](IR::U32 lhs, IR::U32 rhs) {
 				return IR::U32(entry_ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
 			};

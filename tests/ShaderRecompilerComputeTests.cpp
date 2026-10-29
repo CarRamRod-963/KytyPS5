@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/meshIndirectTasks.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -6677,6 +6678,103 @@ public:
         LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
             LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
         "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A GPU-written indirect record becomes the task counts of the mesh draw that
+  // emulates it (MeshIndirectTasks): the groups covering its input primitives,
+  // one row per instance, nothing past the host limits.
+  void CheckMeshIndirectTasks() {
+    constexpr const char *name = "MeshIndirectTasks";
+    EnsureRuntimeContext();
+    if (m_runtime_context.mesh_shader_properties.maxMeshWorkGroupCount[0] ==
+        0) {
+      // The harness does not enable mesh shaders; the task-count compute shader
+      // needs only the device's limits.
+      for (const auto &extension :
+           m_physical_device.enumerateDeviceExtensionProperties().value) {
+        if (std::strcmp(extension.extensionName,
+                        VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0) {
+          vk::PhysicalDeviceMeshShaderPropertiesEXT mesh{};
+          vk::PhysicalDeviceProperties2 properties{};
+          properties.pNext = &mesh;
+          m_physical_device.getProperties2(&properties);
+          mesh.pNext = nullptr;
+          m_runtime_context.mesh_shader_properties = mesh;
+        }
+      }
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    const auto &limits = context.GetGraphics().mesh_shader_properties;
+    if (limits.maxMeshWorkGroupCount[0] == 0) {
+      std::printf("[gpu]     %-32s unavailable, skipped\n", name);
+      return;
+    }
+    struct Case {
+      const char *label;
+      std::array<u32, 5> record;
+      uint64_t record_word; // the record's dword offset past an aligned base
+      MeshIndirectShape shape;
+      std::array<u32, 3> expected;
+    };
+    const MeshIndirectShape list{UINT32_MAX, 3, 3, 62};
+    const MeshIndirectShape strip{UINT32_MAX, 3, 1, 62};
+    const u32 over_y = limits.maxMeshWorkGroupCount[1] + 1u;
+    const Case cases[] = {
+        {"triangle list", {3u * 125u, 2, 7, 5, 0}, 0, list, {3, 2, 1}},
+        {"unaligned record", {3u * 62u, 4, 0, 0, 0}, 3, list, {1, 4, 1}},
+        {"index buffer bound",
+         {3u * 125u, 1, 0, 0, 0},
+         0,
+         {3u * 62u, 3, 3, 62},
+         {1, 1, 1}},
+        {"triangle strip", {65, 1, 0, 0, 0}, 1, strip, {2, 1, 1}},
+        {"too few vertices", {2, 1, 0, 0, 0}, 0, list, {0, 1, 1}},
+        {"no instances", {3u * 62u, 0, 0, 0, 0}, 0, list, {0, 0, 1}},
+        {"over the instance limit",
+         {3, over_y, 0, 0, 0},
+         0,
+         list,
+         {0, over_y, 1}},
+    };
+    auto &stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+    const uint64_t alignment = std::max<uint64_t>(
+        context.GetGraphics()
+            .physical_device_properties.limits.minStorageBufferOffsetAlignment,
+        4);
+    // The host reads the task counts back from download memory.
+    auto &download = cache.GetUtilityBuffer(MemoryUsage::Download);
+    MeshIndirectTasks tasks(context.GetGraphics());
+    std::vector<std::pair<uint8_t *, uint64_t>> outputs;
+    for (const auto &test : cases) {
+      const auto [record, record_offset] = stream.Map(64, alignment);
+      std::memcpy(record + test.record_word * 4u, test.record.data(),
+                  sizeof(test.record));
+      stream.Commit();
+      const auto [output, output_offset] = download.Map(16, alignment);
+      std::memset(output, 0xcd, 16);
+      download.Commit();
+      tasks.Record(scheduler.Current(), stream,
+                   record_offset + test.record_word * 4u, download,
+                   output_offset, test.shape);
+      outputs.emplace_back(output, output_offset);
+    }
+    scheduler.Finish();
+    for (size_t i = 0; i < std::size(cases); i++) {
+      download.Invalidate(outputs[i].second, 16);
+      std::array<u32, 3> words{};
+      std::memcpy(words.data(), outputs[i].first, sizeof(words));
+      Require(name, cases[i].label, words == cases[i].expected,
+              "the task counts do not cover the record's primitives and "
+              "instances");
+    }
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -58538,6 +58636,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBatchedUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-tasks-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMeshIndirectTasks();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -58797,6 +58900,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBdaWatchedEviction();
   vulkan.CheckBatchedUploads();
+  vulkan.CheckMeshIndirectTasks();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBindlessSlotImageReuse();

@@ -640,6 +640,9 @@ struct PreparedIndirectArgs {
 	vk::DeviceSize args_offset  = 0;
 	vk::Buffer     count_buffer = nullptr;
 	vk::DeviceSize count_offset = 0;
+	// A mesh draw's VkDrawMeshTasksIndirectCommandEXT.
+	vk::Buffer     tasks_buffer = nullptr;
+	vk::DeviceSize tasks_offset = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1180,16 +1183,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
+		// An indirect draw's groups come from its record on the GPU (MeshIndirectTasks).
 		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
+		if (emit.indirect_source == nullptr && (primitives == 0 || draw.instance_count == 0)) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		mesh_groups = primitives == 0 ? 0u : (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		if (emit.indirect_source == nullptr &&
+		    (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+		     draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+		     static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+		         limits.maxMeshWorkGroupTotalCount)) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1213,9 +1218,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		(void)m_context.GetBufferCache().FindBuffer(index_source.address,
+		                                            emit.indirect_source != nullptr
+		                                                ? index_source.size
+		                                                : static_cast<uint64_t>(draw.index_count) *
+		                                                      index_source.guest_element_size);
+	}
+	if (mesh_active && emit.indirect_source != nullptr) {
+		// The mesh stage reads the indirect record through the page table too.
+		(void)m_context.GetBufferCache().FindBuffer(emit.indirect_source->args_address,
+		                                            draw.IsIndexed()
+		                                                ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                                : sizeof(vk::DrawIndirectCommand));
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1266,6 +1280,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			indirect_binding.count_buffer = count_buffer->Handle();
 			indirect_binding.count_offset = count_offset;
 		}
+		if (mesh_active) {
+			// The groups and instances of the mesh draw, from the record on the GPU.
+			const auto& mesh      = state.vertex_info[0].mesh;
+			const auto  alignment = std::max<uint64_t>(
+			    m_context.GetGraphics()
+			        .physical_device_properties.limits.minStorageBufferOffsetAlignment,
+			    4);
+			auto& tasks = cache.GetUtilityBuffer(MemoryUsage::Stream);
+			const auto [mapped, offset] =
+			    tasks.Map(sizeof(vk::DrawMeshTasksIndirectCommandEXT), alignment);
+			EXIT_IF(mapped == nullptr);
+			tasks.Commit();
+			if (!m_mesh_indirect_tasks) {
+				m_mesh_indirect_tasks =
+				    std::make_unique<MeshIndirectTasks>(m_context.GetGraphics());
+			}
+			m_mesh_indirect_tasks->Record(
+			    buffer, *args_buffer, args_offset, tasks, offset,
+			    {.max_count            = args.indexed ? args.index_buffer_size : UINT32_MAX,
+			     .primitive_size       = mesh.InputPrimitiveSize(),
+			     .primitive_step       = mesh.InputPrimitiveStep(),
+			     .primitives_per_group = mesh.primitives_per_group});
+			indirect_binding.tasks_buffer = tasks.Handle();
+			indirect_binding.tasks_offset = offset;
+		}
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1300,7 +1339,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
-		if (mesh_active) {
+		if (mesh_active && emit.indirect_source != nullptr) {
+			// The record's address with the index size in bits 16-31 of its high word, the most
+			// indices the draw may use and the index buffer's address (Translate reads the record).
+			const auto& args = *emit.indirect_source;
+			draw_data        = {static_cast<uint32_t>(args.args_address),
+			                    static_cast<uint32_t>(args.args_address >> 32u) |
+			                        (index_source.guest_element_size << 16u),
+			                    args.indexed ? args.index_buffer_size : UINT32_MAX,
+			                    static_cast<uint32_t>(index_source.address),
+			                    static_cast<uint32_t>(index_source.address >> 32u)};
+		} else if (mesh_active) {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
@@ -1353,7 +1402,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_active) {
+	if (mesh_active && emit.indirect_source != nullptr) {
+		vk_buffer.drawMeshTasksIndirectEXT(indirect_binding.tasks_buffer,
+		                                   indirect_binding.tasks_offset, 1,
+		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (emit.indirect_source != nullptr) {
 		EmitIndirectDraw(vk_buffer, *emit.indirect_source, indirect_binding);
@@ -1664,6 +1717,17 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 	if (m_indirect_readback_shaders.contains(vs_address)) {
 		return ReadArguments;
 	}
+	// A mesh program reads the record on the GPU only when the GPU wrote it and the host would
+	// otherwise wait for that write; a record in guest memory costs nothing to read.
+	const auto record_size =
+	    static_cast<uint64_t>(args.stride) * (args.max_draw_count - 1u) +
+	    (args.indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand));
+	const auto record_gpu_dirty = [&] {
+		return m_context.GetBufferCache().HasGpuDirtyBytes(args.args_address, record_size);
+	};
+	if (m_indirect_mesh_shaders.contains(vs_address) && !record_gpu_dirty()) {
+		return ReadArguments;
+	}
 
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(args.indexed ? CommandBufferDebugOp::DrawIndex
@@ -1717,12 +1781,27 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 		}
 		return prolog_sgpr == sgpr(slot);
 	};
-	if (state.VertexStages().size() != 1 || program.stage != ShaderType::Vertex ||
-	    !vertex.indirect_draw || vertex.indirect_offsets != state.indirect_offsets ||
-	    read_by_walk(args.vertex_offset_slot) ||
-	    read_by_walk(args.instance_offset_slot) ||
-	    !offsets_match(program.info.vertex_offset_sgpr, args.vertex_offset_slot) ||
-	    !offsets_match(program.info.instance_offset_sgpr, args.instance_offset_slot)) {
+	if (program.stage == ShaderType::Mesh) {
+		// One record whose counts the mesh draw takes from the GPU (MeshIndirectTasks), and
+		// whose offsets no user SGPR receives.
+		if (state.VertexStages().size() != 1 || !vertex.indirect_draw || args.max_draw_count != 1 ||
+		    args.count_address != 0 || args.vertex_offset_slot >= 0 ||
+		    args.instance_offset_slot >= 0 || vertex.mesh.fast_launch ||
+		    vertex.mesh.primitives_per_group == 0 || (args.args_address >> 48u) != 0) {
+			m_indirect_readback_shaders.insert(vs_address);
+			ResetBindings();
+			return ReadArguments;
+		}
+		m_indirect_mesh_shaders.insert(vs_address);
+		if (!record_gpu_dirty()) {
+			ResetBindings();
+			return ReadArguments;
+		}
+	} else if (state.VertexStages().size() != 1 || program.stage != ShaderType::Vertex ||
+	           !vertex.indirect_draw || vertex.indirect_offsets != state.indirect_offsets ||
+	           read_by_walk(args.vertex_offset_slot) || read_by_walk(args.instance_offset_slot) ||
+	           !offsets_match(program.info.vertex_offset_sgpr, args.vertex_offset_slot) ||
+	           !offsets_match(program.info.instance_offset_sgpr, args.instance_offset_slot)) {
 		m_indirect_readback_shaders.insert(vs_address);
 		ResetBindings();
 		return ReadArguments;

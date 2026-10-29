@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/barrierTracker.h"
+#include "graphics/host_gpu/renderer/meshIndirectTasks.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/guestWriteSet.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -309,6 +311,10 @@ private:
 	                                              const IndirectDrawSource& args);
 	// Vertex shaders (code addresses) whose programs need indirect arguments on the host.
 	std::unordered_set<uint64_t> m_indirect_readback_shaders;
+	// Vertex shaders (code addresses) of mesh programs that may read a GPU-written indirect
+	// record on the GPU (DrawIndirect); a record the GPU did not write is read on the host.
+	std::unordered_set<uint64_t>       m_indirect_mesh_shaders;
+	std::unique_ptr<MeshIndirectTasks> m_mesh_indirect_tasks;
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
