@@ -28,6 +28,7 @@
 #include <span>
 #include <type_traits>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -355,8 +356,9 @@ template <typename Inputs>
 static PipelineCompileQueue::Job
 CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                      std::unique_ptr<Inputs> inputs, vk::PipelineCache driver_cache,
-                     PipelineBuildMode mode, bool* from_driver_cache = nullptr,
-                     const std::atomic<bool>* cancel = nullptr) {
+                     PipelineBuildMode mode, bool* from_driver_cache,
+                     const std::atomic<bool>* cancel, std::shared_ptr<DriverCacheHistory> history,
+                     uint64_t fingerprint) {
 	EXIT_IF(pipeline.pipeline != nullptr);
 	const auto device = graphics.device;
 	vk::Result result = vk::Result::eSuccess;
@@ -370,6 +372,9 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
 		return {};
 	}
+	if (driver_cache == nullptr) {
+		history = nullptr;
+	}
 	// Probed in every other mode: a hit is the whole build, and the outcome is reported.
 	if (driver_cache != nullptr && graphics.pipeline_creation_cache_control_enabled) {
 		result = BuildPipeline(device, driver_cache, *inputs,
@@ -382,10 +387,19 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 			if (from_driver_cache != nullptr) {
 				*from_driver_cache = true;
 			}
+			if (history != nullptr) {
+				history->Built(fingerprint);
+			}
 			return {};
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::ePipelineCompileRequired);
 		pipeline.pipeline = nullptr;
+		if (history != nullptr && history->Missed(fingerprint)) {
+			LOGF("PipelineCache: the driver cache was given %s pipeline %016" PRIx64
+			     " before and no longer provides it (a stale entry)\n",
+			     std::is_same_v<Inputs, GraphicsPipelineInputs> ? "graphics" : "compute",
+			     fingerprint);
+		}
 	}
 	if (mode == PipelineBuildMode::Precompile && cancel != nullptr && cancel->load()) {
 		return {};
@@ -395,6 +409,9 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 		                       mode == PipelineBuildMode::Precompile ? "precompile" : "optimized",
 		                       pipeline.pipeline);
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+		if (history != nullptr) {
+			history->Built(fingerprint);
+		}
 		return {};
 	}
 	if (mode == PipelineBuildMode::UnoptimizedFirst) {
@@ -403,7 +420,8 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 		                       pipeline.pipeline);
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
 	}
-	return [device, driver_cache, inputs = std::move(inputs)]() -> uint64_t {
+	return [device, driver_cache, inputs = std::move(inputs), history = std::move(history),
+	        fingerprint]() -> uint64_t {
 		vk::Pipeline optimized = nullptr;
 		const auto   result =
 		    BuildPipeline(device, driver_cache, *inputs, {}, "optimized-background", optimized);
@@ -413,18 +431,86 @@ CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline
 			}
 			return 0;
 		}
+		if (history != nullptr) {
+			history->Built(fingerprint);
+		}
 		return PipelineCompileHandle(optimized);
 	};
 }
 
+// A pipeline layout as a fingerprint sees it: the bindings of descriptor set 0, the number of
+// set layouts (the bindless and heap sets are fixed) and the push constant stages.
+static uint64_t LayoutFingerprint(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                  uint32_t set_layout_count, vk::ShaderStageFlags push_stages) {
+	std::vector<uint64_t> words;
+	words.reserve(bindings.size() * 2 + 2);
+	for (const auto& binding: bindings) {
+		words.push_back(uint64_t {binding.binding} |
+		                uint64_t {static_cast<uint32_t>(binding.descriptorType)} << 32u);
+		words.push_back(uint64_t {binding.descriptorCount} |
+		                uint64_t {static_cast<uint32_t>(binding.stageFlags)} << 32u |
+		                uint64_t {binding.pImmutableSamplers != nullptr} << 63u);
+	}
+	words.push_back(set_layout_count);
+	words.push_back(static_cast<uint32_t>(push_stages));
+	return XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
+}
+
+// Identifies a graphics pipeline's create info across sessions (DriverCacheHistory): the
+// record of its fixed-function state with the stages' SPIR-V in place of their records, the
+// vertex attribute formats, the generated rect-list stages and the layout. Zero when a stage's
+// SPIR-V is unknown.
+static uint64_t GraphicsFingerprint(const GraphicsPipelineInputs&   inputs,
+                                    const PipelineRenderingState&   rendering,
+                                    const PipelineVertexInputState& vertex_input,
+                                    const DrawRenderState&          state,
+                                    const PipelineStaticParameters& static_params,
+                                    uint64_t rect_list_spirv, uint64_t layout) {
+	GraphicsPipelineRecord record;
+	const auto             stages = state.VertexStages();
+	record.vertex_stage_count     = static_cast<uint32_t>(stages.size());
+	for (size_t i = 0; i < stages.size(); i++) {
+		record.vertex_stages[i] = stages[i].stage.handle->spirv_hash;
+		if (record.vertex_stages[i] == 0) {
+			return 0;
+		}
+	}
+	if (state.ps_active) {
+		record.pixel_stage = state.ps_input_info.stage.handle->spirv_hash;
+		if (record.pixel_stage == 0) {
+			return 0;
+		}
+	}
+	record.rendering     = rendering;
+	record.vertex_input  = vertex_input;
+	record.static_params = static_params;
+	std::vector<uint64_t> words {record.Key(), rect_list_spirv, layout,
+	                             inputs.tessellation_state.patchControlPoints};
+	for (uint32_t i = 0; i < inputs.vertex_input_info.vertexAttributeDescriptionCount; i++) {
+		words.push_back(static_cast<uint32_t>(inputs.input_attr[i].format));
+	}
+	return XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
+}
+
+// Identifies a compute pipeline's create info across sessions (see GraphicsFingerprint).
+static uint64_t ComputeFingerprint(const ComputePipelineInputs& inputs, uint64_t spirv_hash,
+                                   uint64_t layout) {
+	if (spirv_hash == 0) {
+		return 0;
+	}
+	const std::array<uint64_t, 4> words {
+	    spirv_hash, layout, static_cast<uint32_t>(inputs.info.flags),
+	    inputs.info.stage.pNext != nullptr ? inputs.subgroup_size.requiredSubgroupSize : 0u};
+	return XXH3_64bits(words.data(), sizeof(words));
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-PipelineCompileQueue::Job
-CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                       const PipelineRenderingState&   rendering,
-                       const PipelineVertexInputState& vertex_input, const DrawRenderState& state,
-                       const PipelineStaticParameters& static_params,
-                       vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool* from_driver_cache, const std::atomic<bool>* cancel) {
+PipelineCompileQueue::Job CreatePipelineInternal(
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
+    const DrawRenderState& state, const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache,
+    const std::atomic<bool>* cancel, std::shared_ptr<DriverCacheHistory> history) {
 	const auto  vertex_info    = state.VertexStages();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto* ps_input_info  = state.ps_active ? &state.ps_input_info : nullptr;
@@ -443,8 +529,13 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	auto& tess_control_shader_module = inputs->tess_control_shader_module;
 	auto& tess_eval_shader_module    = inputs->tess_eval_shader_module;
 
+	uint64_t rect_list_spirv = 0;
 	if (rect_list) {
 		const auto shaders = BuildRectListShaders(vs_input_info, ps_input_info);
+		rect_list_spirv =
+		    XXH3_64bits(shaders.control.data(), shaders.control.size() * sizeof(uint32_t)) ^
+		    (XXH3_64bits(shaders.evaluation.data(), shaders.evaluation.size() * sizeof(uint32_t)) *
+		     3u);
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
@@ -657,6 +748,8 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+	const auto layout_fingerprint               = LayoutFingerprint(
+	    descriptor_bindings, pipeline_layout_info.setLayoutCount, graphics_stages);
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
@@ -746,8 +839,11 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	const auto fingerprint =
+	    GraphicsFingerprint(*inputs, rendering, vertex_input, state, static_params, rect_list_spirv,
+	                        layout_fingerprint);
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache, cancel);
+	                            from_driver_cache, cancel, std::move(history), fingerprint);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -755,7 +851,8 @@ PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool* from_driver_cache, const std::atomic<bool>* cancel) {
+                       bool* from_driver_cache, const std::atomic<bool>* cancel,
+                       std::shared_ptr<DriverCacheHistory> history) {
 	EXIT_IF(compute_module == nullptr);
 
 	auto  inputs                  = std::make_unique<ComputePipelineInputs>();
@@ -787,6 +884,9 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+	const auto layout_fingerprint =
+	    LayoutFingerprint(descriptor_bindings, pipeline_layout_info.setLayoutCount,
+	                      vk::ShaderStageFlagBits::eCompute);
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
@@ -817,8 +917,11 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 		LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 		     static_cast<void*>(pipeline.pipeline_layout));
 	}
+	const auto fingerprint = ComputeFingerprint(
+	    *inputs, input_info.stage.handle != nullptr ? input_info.stage.handle->spirv_hash : 0,
+	    layout_fingerprint);
 	return CreatePipelineHandle(graphics, pipeline, std::move(inputs), driver_cache, mode,
-	                            from_driver_cache, cancel);
+	                            from_driver_cache, cancel, std::move(history), fingerprint);
 }
 
 } // namespace Libs::Graphics

@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheHistory.h"
 #include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
@@ -49,6 +50,9 @@ struct ShaderProgram {
 	// ComputeProgramRecord::Key of a recorded compute program, GraphicsStageRecord::Key of a
 	// recorded graphics stage, else 0.
 	uint64_t record_key = 0;
+	// XXH3-64 of the module's SPIR-V (part of a pipeline's fingerprint, see
+	// DriverCacheHistory); 0 when unknown.
+	uint64_t spirv_hash = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -229,6 +233,16 @@ private:
 	// --precompile-only started from an empty driver cache (the file was too large, or
 	// --rebuild-pipeline-cache): the file is written only when the precompile has finished.
 	bool m_driver_cache_rebuild = false;
+	// The pipelines the driver cache file was given (<title>.v1.built), written with it. Shared
+	// with builds that may outlive the cache (abandoned precompile builds).
+	std::shared_ptr<DriverCacheHistory> m_driver_history;
+	std::filesystem::path               m_driver_history_path;
+	// What the history file holds: the pipelines of the cache file on disk (by its payload hash,
+	// zero without a file) and the stale misses. Written by the cache writer and the GPU thread.
+	std::mutex            m_history_file_mutex;
+	std::vector<uint64_t> m_history_file_built;
+	uint64_t              m_history_file_cache_hash = 0;
+	uint64_t              m_history_file_stale      = 0;
 	// Writes the driver cache off the GPU thread; joined before the cache is destroyed.
 	PipelineCacheWriter m_driver_cache_writer;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
@@ -328,6 +342,16 @@ private:
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void LogStaleDriverCache() const;
+	// Writes the history file for the cache file whose payload hash is `cache_hash`.
+	void WriteDriverHistory(std::vector<uint64_t> built, uint64_t cache_hash, uint64_t stale);
+	// Stale misses are kept even when the session ends without a save: the next
+	// --precompile-only must see them. Writes the history file when they changed.
+	void PersistStaleMisses();
+	// --precompile-only found stale entries: replaces the driver cache with an empty one for a
+	// second precompile pass (written when it finishes, as a rebuild). Needs every precompile
+	// build joined.
+	bool StartEmptyDriverCache();
 	// Snapshots the driver cache and writes it to m_driver_cache_path through a temporary file.
 	// Safe on any thread while the cache lives: the driver synchronizes the cache object.
 	bool WriteDriverCache();
@@ -389,19 +413,20 @@ inline vk::Pipeline PipelineFromCompileHandle(uint64_t handle) {
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 // Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
 // the pipeline may be unoptimized or (Background) still null; the returned job then builds the
-// optimized one (see PipelineCache::DeferOptimization).
+// optimized one (see PipelineCache::DeferOptimization). `history` (optional) learns which
+// pipelines went through `driver_cache` and counts probes that missed one of them.
 PipelineCompileQueue::Job CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const DrawRenderState& state, const PipelineStaticParameters& static_params,
     vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache = nullptr,
-    const std::atomic<bool>* cancel = nullptr);
+    const std::atomic<bool>* cancel = nullptr, std::shared_ptr<DriverCacheHistory> history = {});
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
-                       bool*                    from_driver_cache = nullptr,
-                       const std::atomic<bool>* cancel            = nullptr);
+                       bool* from_driver_cache = nullptr, const std::atomic<bool>* cancel = nullptr,
+                       std::shared_ptr<DriverCacheHistory> history = {});
 
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
@@ -415,7 +440,8 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
                                            const ComputeProgramRecord& record,
                                            uint64_t* spirv_hash = nullptr, bool code_only = false,
                                            PipelineBuildMode mode = PipelineBuildMode::Precompile,
-                                           const std::atomic<bool>* cancel = nullptr);
+                                           const std::atomic<bool>*            cancel  = nullptr,
+                                           std::shared_ptr<DriverCacheHistory> history = {});
 
 } // namespace Libs::Graphics
 
