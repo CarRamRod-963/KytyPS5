@@ -34,6 +34,8 @@ enum class LoadStatus {
 struct Loaded {
 	LoadStatus           status    = LoadStatus::Missing;
 	uint64_t             file_size = 0;
+	// The payload's hash (as stored and checked) when the file loaded.
+	uint64_t             payload_hash = 0;
 	std::vector<uint8_t> payload;
 };
 
@@ -41,10 +43,11 @@ struct Loaded {
                           uint64_t chunk_size = DefaultChunkSize);
 
 // Writes the file through `<path>.tmp` and renames it over `path`, so that a failed or
-// interrupted write leaves the previous file. Creates the directory.
+// interrupted write leaves the previous file. Creates the directory. `payload_hash` receives the
+// payload's hash (Loaded::payload_hash of the file).
 [[nodiscard]] bool Store(const std::filesystem::path& path, std::string_view signature,
                          const uint8_t* payload, uint64_t payload_size,
-                         uint64_t chunk_size = DefaultChunkSize);
+                         uint64_t chunk_size = DefaultChunkSize, uint64_t* payload_hash = nullptr);
 
 // Whether --precompile-only starts from an empty driver cache instead of the file's
 // (`requested` = --rebuild-pipeline-cache).

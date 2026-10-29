@@ -74,12 +74,13 @@ Loaded Load(const std::filesystem::path& path, std::string_view signature, uint6
 		loaded.status  = LoadStatus::DataMismatch;
 		return loaded;
 	}
-	loaded.status = LoadStatus::Loaded;
+	loaded.status       = LoadStatus::Loaded;
+	loaded.payload_hash = hash;
 	return loaded;
 }
 
 bool Store(const std::filesystem::path& path, std::string_view signature, const uint8_t* payload,
-           uint64_t payload_size, uint64_t chunk_size) {
+           uint64_t payload_size, uint64_t chunk_size, uint64_t* payload_hash) {
 	std::error_code error;
 	if (path.has_parent_path()) {
 		std::filesystem::create_directories(path.parent_path(), error);
@@ -89,7 +90,10 @@ bool Store(const std::filesystem::path& path, std::string_view signature, const 
 	}
 	chunk_size      = std::max<uint64_t>(chunk_size, 1);
 	const auto hash = XXH3_64bits(payload, payload_size);
-	auto       temp = path;
+	if (payload_hash != nullptr) {
+		*payload_hash = hash;
+	}
+	auto temp = path;
 	temp += ".tmp";
 	bool written = false;
 	{
