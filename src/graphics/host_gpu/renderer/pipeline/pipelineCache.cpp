@@ -1704,7 +1704,9 @@ void PipelineCache::EnqueuePrecompileJob(uint64_t key, std::string label, Precom
 		if (attempts != nullptr) {
 			attempts->End(key);
 		}
-		if (outcome == PrecompileOutcome::Compiled) {
+		// A probe hit may have been served by the driver's own disk cache, which then adds the
+		// pipeline to the application's cache: that changes the file too.
+		if (outcome == PrecompileOutcome::Compiled || outcome == PrecompileOutcome::Cached) {
 			m_driver_cache_dirty.store(true, std::memory_order_relaxed);
 			m_precompile_dirty.store(true, std::memory_order_relaxed);
 		}
