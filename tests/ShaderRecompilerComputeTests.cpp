@@ -7770,7 +7770,7 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 9 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 11 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
     const auto snapshot_of = [&](const auto &source, uint64_t offset, uint32_t index) {
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
@@ -7802,6 +7802,24 @@ public:
     snapshot(page, 4);
     Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
             "mapping into an existing buffer did not queue its dirty pages");
+    // A guest CPU store (a write fault off the GPU thread) reaches BDA accesses
+    // at the next ordering point of the command stream, not at the next access.
+    const auto guest_page = base + 2 * TRACKER_PAGE_SIZE;
+    Require(name, "guest store fault",
+            context.HandleFault(PageFaultAccess::Write, guest_page),
+            "a guest write fault on mapped memory was not handled");
+    words[2 * TRACKER_PAGE_SIZE / sizeof(u32)] = 0x2468ace0u;
+    context.PrepareBda();
+    snapshot(2 * TRACKER_PAGE_SIZE, 6);
+    Require(name, "guest store deferred",
+            cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "a guest store was uploaded before an ordering point");
+    context.NoteCommandOrderingPoint();
+    context.PrepareBda();
+    snapshot(2 * TRACKER_PAGE_SIZE, 7);
+    Require(name, "guest store at ordering point",
+            !cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "an ordering point did not release a guest store");
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
     context.PrepareBda();
@@ -7844,8 +7862,8 @@ public:
     context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
             "buffers replacing an evicted one did not upload their untracked pages");
-    snapshot_of(cache.GetBuffer(low), 16, 6);
-    snapshot_of(cache.GetBuffer(high), page, 7);
+    snapshot_of(cache.GetBuffer(low), 16, 8);
+    snapshot_of(cache.GetBuffer(high), page, 9);
 
     // Every write fault queues its page, however often the CPU rewrites it.
     BufferCacheTestAccess::SetGarbageCollectionThresholds(
@@ -7861,7 +7879,7 @@ public:
           !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
           "a write fault on a page the CPU keeps rewriting was not uploaded");
     }
-    snapshot_of(cache.GetBuffer(low), 8, 8);
+    snapshot_of(cache.GetBuffer(low), 8, 10);
 
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -7873,12 +7891,13 @@ public:
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
     Require(name, "GPU contents",
-            ReadBuffer(name, readback, 9) ==
+            ReadBuffer(name, readback, 11) ==
                 std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u,
                                  0xabcdef01u, 0x12345678u, 0xfedcba98u,
-                                 0x87654321u, 0xfedcba98u, 7u},
-            "initial, re-dirtied, rewritten, newly mapped, remapped or "
-            "replacement bytes were stale on the GPU");
+                                 0x12345678u, 0x2468ace0u, 0x87654321u,
+                                 0xfedcba98u, 7u},
+            "initial, re-dirtied, rewritten, newly mapped, remapped, "
+            "guest-stored or replacement bytes were stale on the GPU");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
