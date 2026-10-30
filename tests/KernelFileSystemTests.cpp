@@ -2167,6 +2167,11 @@ void TestNetCtlHostIpv4() {
 
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
+  // A distinct object per mode keeps the instantiations distinct functions:
+  // with identical code folding (LTO builds) the four callbacks would share one
+  // address, and the NP manager refuses a callback that is already registered.
+  static volatile int calls = 0;
+  calls = calls + 1;
   auto& event = *static_cast<std::array<int, 3>*>(arg);
   ++event[0];
   event[1] = user_id;
