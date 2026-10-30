@@ -77,27 +77,22 @@ public:
 	template <typename Condition>
 	[[nodiscard]] bool Elide(uint64_t address, uint32_t size, Condition&& condition) {
 		std::lock_guard lock(m_mutex);
-		for (auto it = m_labels.rbegin(); it != m_labels.rend(); ++it) {
-			if (!Overlaps(*it, address, size)) {
-				continue;
-			}
-			if (!it->known || address < it->address || address + size > it->address + it->size) {
-				return false;
-			}
-			uint64_t value = 0;
-			std::memcpy(&value,
-			            reinterpret_cast<const uint8_t*>(&it->value) + (address - it->address),
-			            size);
-			if (!condition(value)) {
-				return false;
-			}
-			if (!it->elided) {
-				it->elided = true;
-				m_elided.fetch_add(1, std::memory_order_release);
-			}
-			return true;
+		auto*           label = Satisfying(address, size, condition);
+		if (label == nullptr) {
+			return false;
 		}
-		return false;
+		if (!label->elided) {
+			label->elided = true;
+			m_elided.fetch_add(1, std::memory_order_release);
+		}
+		return true;
+	}
+
+	// Whether Elide would find a label for the wait, without eliding it.
+	template <typename Condition>
+	[[nodiscard]] bool Satisfies(uint64_t address, uint32_t size, Condition&& condition) {
+		std::lock_guard lock(m_mutex);
+		return Satisfying(address, size, condition) != nullptr;
 	}
 
 	// Overlays the elided labels onto `size` bytes read from `address`, in recording order: what
@@ -169,6 +164,26 @@ public:
 private:
 	static bool Overlaps(const Label& label, uint64_t address, uint64_t size) noexcept {
 		return address < label.address + label.size && label.address < address + size;
+	}
+
+	// The latest label overlapping the bytes when it covers them all and its value satisfies
+	// `condition(value)`, else null. The labels recorded later win: they are stored later.
+	template <typename Condition>
+	Label* Satisfying(uint64_t address, uint32_t size, Condition& condition) {
+		for (auto it = m_labels.rbegin(); it != m_labels.rend(); ++it) {
+			if (!Overlaps(*it, address, size)) {
+				continue;
+			}
+			if (!it->known || address < it->address || address + size > it->address + it->size) {
+				return nullptr;
+			}
+			uint64_t value = 0;
+			std::memcpy(&value,
+			            reinterpret_cast<const uint8_t*>(&it->value) + (address - it->address),
+			            size);
+			return condition(value) ? &*it : nullptr;
+		}
+		return nullptr;
 	}
 
 	mutable std::mutex    m_mutex;
