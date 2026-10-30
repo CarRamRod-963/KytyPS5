@@ -284,9 +284,14 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		// Read back, the backing holds them; the guest mapping of the page may still fault on
+		// other GPU-written bytes.
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
+		if (!LibKernel::Memory::TryReadBacking(indirect_args, input.workgroup_counts,
+		                                       sizeof(input.workgroup_counts))) {
+			std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
+			            sizeof(input.workgroup_counts));
+		}
 	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
