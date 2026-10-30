@@ -13,11 +13,13 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
@@ -71,13 +73,107 @@ struct MaterializationScratch {
 		uint32_t                                          dwords   = 0;
 		bool                                              affine   = false;
 		bool                                              float_2d = false;
+		// Candidates that are not float 2D (float_2d is false while there is one).
+		uint64_t                                          other_class = 0;
 		std::vector<uint32_t>                             table;
 		std::vector<std::pair<uint64_t, DescriptorValue>> candidates;
+		// UpdateHeapCandidates' next candidate list.
+		std::vector<std::pair<uint64_t, DescriptorValue>> next;
 	};
 	std::vector<HeapCandidates> heaps;
+	// UpdateHeapCandidates: the changed DWORDs, then the DWORD starts that read them.
+	std::vector<uint64_t> heap_starts;
 };
 
 namespace {
+
+// Brings an image heap's candidates (MaterializationScratch::HeapCandidates of a table with the
+// same geometry) up to `table`: only the DWORD starts whose candidate reads a changed DWORD are
+// normalized again. A Saros heap of 1.6M DWORDs changes ~200 of them per frame, and normalizing
+// every start took ~2 ms per walk. `offset_of(start)` is a start's byte offset, increasing with
+// the start; `candidate_at(offset)` the normalized candidate there, or nothing when it does not
+// normalize. False when every start must be normalized again: a start does not normalize, or so
+// many DWORDs changed that the update would not be cheaper (`heap` may then be partly updated;
+// the caller rebuilds it).
+template <typename OffsetOf, typename CandidateAt, typename OtherClass>
+bool UpdateHeapCandidates(MaterializationScratch::HeapCandidates& heap,
+                          std::span<const uint32_t> table, OffsetOf&& offset_of,
+                          CandidateAt&& candidate_at, const DescriptorValue& null_candidate,
+                          OtherClass&& other_class, std::vector<uint64_t>& starts) {
+	constexpr size_t Block = 256;
+	const size_t     words = table.size();
+	const size_t     limit = heap.count / 16u + 64u;
+	starts.clear();
+	// The changed DWORDs, ascending.
+	for (size_t block = 0; block < words; block += Block) {
+		const size_t length = std::min(Block, words - block);
+		if (std::memcmp(heap.table.data() + block, table.data() + block,
+		                length * sizeof(uint32_t)) == 0) {
+			continue;
+		}
+		for (size_t word = block; word < block + length; ++word) {
+			if (heap.table[word] != table[word]) starts.push_back(word);
+		}
+		if (starts.size() > limit) return false;
+	}
+	if (starts.empty()) return true;
+	const size_t changed = starts.size();
+	// The first start at or past a byte offset.
+	const auto first_start = [&](uint64_t offset) {
+		uint64_t low = 0, high = heap.count;
+		while (low < high) {
+			const auto middle = low + (high - low) / 2u;
+			if (offset_of(middle) < offset) {
+				low = middle + 1u;
+			} else {
+				high = middle;
+			}
+		}
+		return low;
+	};
+	// The starts whose candidate (`dwords` DWORDs from DWORD offset / 4) reads a changed DWORD.
+	for (size_t i = 0; i < changed; ++i) {
+		const auto word  = starts[i];
+		const auto begin = word >= heap.dwords - 1u ? word - (heap.dwords - 1u) : 0u;
+		for (auto start = first_start(begin * 4u);
+		     start < heap.count && offset_of(start) / 4u <= word; ++start) {
+			starts.push_back(start);
+		}
+	}
+	const auto affected = std::span(starts).subspan(changed);
+	std::ranges::sort(affected);
+	const auto unique_end = std::unique(affected.begin(), affected.end());
+	// Merge the starts' new candidates into the list, which is ordered by offset.
+	auto& next = heap.next;
+	next.clear();
+	next.reserve(heap.candidates.size() + changed);
+	uint64_t other = heap.other_class;
+	size_t   kept  = 0;
+	for (auto it = affected.begin(); it != unique_end; ++it) {
+		const auto offset = offset_of(*it);
+		while (kept < heap.candidates.size() && heap.candidates[kept].first < offset) {
+			next.push_back(heap.candidates[kept++]);
+		}
+		if (kept < heap.candidates.size() && heap.candidates[kept].first == offset) {
+			other -= other_class(heap.candidates[kept].second) ? 1u : 0u;
+			++kept;
+		}
+		const auto candidate = candidate_at(offset);
+		if (!candidate) return false;
+		if (*candidate == null_candidate) continue;
+		other += other_class(*candidate) ? 1u : 0u;
+		next.emplace_back(offset, *candidate);
+	}
+	next.insert(next.end(), heap.candidates.begin() + static_cast<ptrdiff_t>(kept),
+	            heap.candidates.end());
+	heap.candidates.swap(next);
+	heap.other_class = other;
+	heap.float_2d    = other == 0u;
+	for (size_t i = 0; i < changed; ++i) {
+		heap.table[starts[i]] = table[starts[i]];
+	}
+	return true;
+}
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 // An image table with more keys than this is not enumerated: its program would bake the
@@ -1323,39 +1419,53 @@ bool MaterializeIndirectDescriptor(
 				if (found == heaps.end()) {
 					found = heaps.insert(heaps.end(), {.resource = resource_index});
 				}
-				auto& cached = *found;
-				if (cached.first == first && cached.step == step && cached.count == count &&
-				    cached.dwords == read_dwords && cached.affine == affine &&
-				    cached.table == heap_words) {
+				auto&                         cached = *found;
+				const auto&                   image  = program.info.images[resource_index];
+				const std::array<uint32_t, 3> float_2d {
+				    static_cast<uint32_t>(Prospero::TextureNumericClass::Float),
+				    static_cast<uint32_t>(Decoder::ImageDimension::Dim2D), 0u};
+				const DescriptorValue null_candidate {.dword_count = dword_count};
+				const auto            other_class = [&](const DescriptorValue& candidate) {
+					return !NullImageDescriptor(candidate) &&
+					       ImageCandidateClass(image, candidate) != float_2d;
+				};
+				const auto offset_of = [&](uint64_t word) {
+					return affine ? first + word * step : word * 4u;
+				};
+				const auto candidate_at = [&](uint64_t offset) {
+					auto candidate = heap_candidate(offset);
+					if (!normalize(candidate)) return std::optional<DescriptorValue> {};
+					return std::optional<DescriptorValue> {candidate};
+				};
+				if (!cached.table.empty() && cached.first == first && cached.step == step &&
+				    cached.count == count && cached.dwords == read_dwords &&
+				    cached.affine == affine && cached.table.size() == heap_words.size() &&
+				    (!affine || step != 0u) &&
+				    UpdateHeapCandidates(cached, heap_words, offset_of, candidate_at,
+				                         null_candidate, other_class,
+				                         program.materialization_scratch->heap_starts)) {
 					heap = &cached;
 				} else {
 					cached.table.clear();
 					cached.candidates.clear();
-					const auto&                   image = program.info.images[resource_index];
-					const std::array<uint32_t, 3> float_2d {
-					    static_cast<uint32_t>(Prospero::TextureNumericClass::Float),
-					    static_cast<uint32_t>(Decoder::ImageDimension::Dim2D), 0u};
-					const DescriptorValue null_candidate {.dword_count = dword_count};
-					bool                  normalized = true;
-					bool                  all_float  = true;
+					bool     normalized  = true;
+					uint64_t other_count = 0;
 					for (uint32_t word = 0; word < count && normalized; ++word) {
-						const auto table_offset =
-						    affine ? first + word * step : uint64_t {word} * 4u;
-						auto candidate = heap_candidate(table_offset);
-						normalized     = normalize(candidate);
+						const auto table_offset = offset_of(word);
+						auto       candidate    = heap_candidate(table_offset);
+						normalized              = normalize(candidate);
 						if (!normalized || candidate == null_candidate) continue;
-						all_float =
-						    all_float && (NullImageDescriptor(candidate) ||
-						                  ImageCandidateClass(image, candidate) == float_2d);
+						other_count += other_class(candidate) ? 1u : 0u;
 						cached.candidates.emplace_back(table_offset, candidate);
 					}
 					if (normalized) {
-						cached.first    = first;
-						cached.step     = step;
-						cached.count    = count;
-						cached.dwords   = read_dwords;
-						cached.affine   = affine;
-						cached.float_2d = all_float;
+						cached.first       = first;
+						cached.step        = step;
+						cached.count       = count;
+						cached.dwords      = read_dwords;
+						cached.affine      = affine;
+						cached.other_class = other_count;
+						cached.float_2d    = other_count == 0u;
 						cached.table.assign(heap_words.begin(), heap_words.end());
 						heap = &cached;
 					} else {
