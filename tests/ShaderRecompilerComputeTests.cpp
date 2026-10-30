@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -748,6 +749,10 @@ struct PipelineCacheTestAccess {
                          std::unique_ptr<PipelineManifest> manifest) {
     cache.SetPipelineManifest(std::move(manifest));
     return cache.m_pipeline_manifest.get();
+  }
+
+  static ResourceLookahead *Lookahead(const PipelineCache &cache) {
+    return cache.Lookahead();
   }
 
   static PrecompileOutcome PrecompileGraphics(
@@ -14913,6 +14918,62 @@ public:
                 "the scan stopped at a wait a data write satisfies");
         Require(name, case_name, !scan({}),
                 "a scan kept the writes an earlier scan saw");
+      }
+      // A scan that reaches the end of the running submission continues into
+      // the ones queued behind it on the same queue, whose first commands run
+      // right after it, and plans each program recently used at a shader
+      // address when two of them alternate there (the scan cannot tell which
+      // one a command takes).
+      {
+        constexpr const char *case_name = "lookahead plans queued submissions";
+        auto *lookahead =
+            PipelineCacheTestAccess::Lookahead(context.GetPipelineCache());
+        Require(name, case_name, lookahead != nullptr,
+                "the fixture runs without the resource lookahead");
+        constexpr auto output = base + 0xfd000;
+        const auto use_consumer = [&](u32 threads) {
+          shaders.SetCsShader(
+              {.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+               .num_thread_x = threads,
+               .num_thread_y = 1,
+               .num_thread_z = 1,
+               .wave_size = 64,
+               .user_sgpr = 4,
+               .tgid_x_en = true});
+          set_buffer(0, output, 16u * sizeof(u32));
+        };
+        // Two programs of the consumer's address (other workgroup sizes).
+        use_consumer(4);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        use_consumer(8);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        use_consumer(4);
+        const std::array<u32, 5> dispatch{
+            KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1u, 1u, 1u, 0x41u};
+        const std::array<std::span<const u32>, 1> queued{dispatch};
+        (void)lookahead->TakeStats();
+        const Pm4Execution idle;
+        processor.SetLookaheadQueue(queued);
+        processor.PlanLookahead(idle, {});
+        processor.SetLookaheadQueue({});
+        lookahead->WaitIdle();
+        const auto planned = lookahead->TakeStats().planned;
+        Require(
+            name, case_name, planned == 2u,
+            "the scan planned " + std::to_string(planned) +
+                " walks for the queued dispatch instead of one per program");
+        Pm4Execution execution;
+        Require(name, case_name,
+                processor.Process(execution, dispatch) ==
+                    Pm4ProcessResult::Complete,
+                "the queued dispatch did not run");
+        const auto stats = lookahead->TakeStats();
+        using Outcome = ResourceLookahead::Outcome;
+        Require(name, case_name,
+                stats.outcomes[static_cast<size_t>(Outcome::Adopted)] == 1u &&
+                    stats.outcomes[static_cast<size_t>(Outcome::NotPlanned)] ==
+                        0u,
+                "the queued dispatch did not adopt the helper's walk");
       }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
