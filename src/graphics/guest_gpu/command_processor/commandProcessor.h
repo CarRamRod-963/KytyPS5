@@ -217,6 +217,18 @@ private:
 	// The packet the last lookahead plan stopped at, if any.
 	const uint32_t* m_lookahead_stop   = nullptr;
 	bool            m_lookahead_active = false;
+	// Memory the scanned packets write before the commands after them run: end-of-pipe labels
+	// (which a WAIT_REG_MEM on them continues behind, see WaitRegMem) and CP data writes.
+	struct LookaheadWrite {
+		uint64_t address = 0;
+		uint64_t value   = 0;
+		uint32_t size    = 0;
+	};
+	std::vector<LookaheadWrite> m_lookahead_writes;
+	// Whether the CP will get past a WAIT_REG_MEM the memory does not satisfy yet because a
+	// label or write the stream records before it, or a pending label, satisfies it.
+	[[nodiscard]] bool LookaheadWaitPasses(uint64_t address, uint32_t size, uint64_t ref,
+	                                       uint64_t mask, uint32_t func);
 };
 
 } // namespace Libs::Graphics

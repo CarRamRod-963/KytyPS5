@@ -692,6 +692,7 @@ void CommandProcessor::PlanLookahead(const Pm4Execution&       execution,
 	}
 	pipelines.BeginLookaheadRun(this);
 	m_lookahead_stop = nullptr;
+	m_lookahead_writes.clear();
 	// The scan applies the shader-register packets to this processor's state to know each
 	// dispatch's registers, then restores it; nothing else changes. A scanned user-data write
 	// also drops the deferred indirect-draw value of its register (NoteUserDataWrite), which
@@ -831,9 +832,49 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 					mask |= static_cast<uint64_t>(packet[7]) << 32u;
 				}
 				if (address == 0 ||
-				    !LibKernel::Memory::TryReadBacking(address, &value, wide ? 8u : 4u) ||
-				    !TestWaitRegMemValue(value, ref, mask, packet[1] & 0x7u)) {
+				    !LibKernel::Memory::TryReadBacking(address, &value, wide ? 8u : 4u)) {
 					return Stop(packet);
+				}
+				if (!TestWaitRegMemValue(value, ref, mask, packet[1] & 0x7u) &&
+				    !LookaheadWaitPasses(address, wide ? 8u : 4u, ref, mask, packet[1] & 0x7u)) {
+					return Stop(packet);
+				}
+				break;
+			}
+			case Pm4::IT_RELEASE_MEM: {
+				// As CommandProcessor::ReleaseMem: data_sel 1/2 store an immediate label, which
+				// interrupt selector 4 and graphics-queue selector 1 leave out.
+				if (size != 8u) break;
+				const auto data_sel  = (packet[2] >> 29u) & 0x7u;
+				const auto interrupt = (packet[2] >> 24u) & 0x7u;
+				const auto address =
+				    (packet[3] & ~0x3ull) | (static_cast<uint64_t>(packet[4]) << 32u);
+				const bool label_stored =
+				    interrupt != 4u && (interrupt != 1u || IsAsyncComputeQueue());
+				if ((data_sel == 1u || data_sel == 2u) && address != 0 && label_stored) {
+					const auto value = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
+					m_lookahead_writes.push_back(
+					    {.address = address,
+					     .value   = data_sel == 1u ? value & 0xffffffffu : value,
+					     .size    = data_sel == 1u ? 4u : 8u});
+				}
+				break;
+			}
+			case Pm4::IT_WRITE_DATA: {
+				// The CP stores the data when it executes the packet (CommandProcessor::WriteData).
+				if (size < 5u) break;
+				const auto control = packet[1];
+				const auto address = packet[2] | (static_cast<uint64_t>(packet[3]) << 32u);
+				const auto data    = std::span(packet + 4, size - 4u);
+				const bool one     = ((control >> 16u) & 0x1u) != 0;
+				// A long write is data, not a flag a wait could be on.
+				if (data.size() > 16u) break;
+				for (uint32_t i = one ? static_cast<uint32_t>(data.size()) - 1u : 0u;
+				     i < data.size(); ++i) {
+					m_lookahead_writes.push_back(
+					    {.address = address + (one ? 0u : i * sizeof(uint32_t)),
+					     .value   = data[i],
+					     .size    = 4u});
 				}
 				break;
 			}
@@ -845,6 +886,24 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 		offset += size;
 	}
 	return true;
+}
+
+bool CommandProcessor::LookaheadWaitPasses(uint64_t address, uint32_t size, uint64_t ref,
+                                           uint64_t mask, uint32_t func) {
+	const auto satisfied = [&](uint64_t value) {
+		return TestWaitRegMemValue(value, ref, mask, func);
+	};
+	// The latest scanned write overlapping the bytes decides, as the latest label does for
+	// PendingLabels; one that does not cover them all leaves the wait undecided.
+	for (auto it = m_lookahead_writes.rbegin(); it != m_lookahead_writes.rend(); ++it) {
+		if (address >= it->address + it->size || it->address >= address + size) continue;
+		if (address < it->address || address + size > it->address + it->size) return false;
+		uint64_t value = 0;
+		std::memcpy(&value, reinterpret_cast<const uint8_t*>(&it->value) + (address - it->address),
+		            size);
+		return satisfied(value);
+	}
+	return m_renderer.GetPendingLabels().Satisfies(address, size, satisfied);
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {

@@ -202,6 +202,9 @@ struct CommandProcessorTestAccess {
   static void SettleRegisters(CommandProcessor &processor) {
     processor.SettleIndirectDrawState(true, false);
   }
+  static const uint32_t *LookaheadStop(const CommandProcessor &processor) {
+    return processor.m_lookahead_stop;
+  }
 };
 
 struct BufferCacheTestAccess {
@@ -14502,6 +14505,66 @@ public:
             name, case_name, shaders.GetVs().gs_user_sgpr.value[3] == record[2],
             "the register read " + Hex(shaders.GetVs().gs_user_sgpr.value[3]) +
                 " instead of the GPU-set base vertex");
+      }
+      // The scan looks past a WAIT_REG_MEM that the memory does not satisfy yet
+      // when a label or data write the stream records before it does: the
+      // command processor continues behind such a wait (WaitRegMem elides waits
+      // on pending labels), so the commands after it are already released.
+      {
+        constexpr const char *case_name =
+            "lookahead passes waits on own labels";
+        constexpr auto label_address = base + 0xfc100;
+        const u32 zero = 0;
+        Require(name, case_name,
+                LibKernel::Memory::TryWriteBacking(label_address, &zero,
+                                                   sizeof(zero)),
+                "the label could not be cleared");
+        const auto lo = static_cast<u32>(label_address);
+        const auto hi = static_cast<u32>(label_address >> 32u);
+        // WAIT_REG_MEM: memory space, function 3 (equal) on 7.
+        const std::array<u32, 7> wait{KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0),
+                                      0x13u,
+                                      lo,
+                                      hi,
+                                      7u,
+                                      0xffffffffu,
+                                      4u};
+        const auto scan = [&](std::span<const u32> prefix) {
+          std::vector<u32> commands(prefix.begin(), prefix.end());
+          commands.insert(commands.end(), wait.begin(), wait.end());
+          const Pm4Execution idle;
+          processor.PlanLookahead(idle, commands);
+          const auto *stop =
+              CommandProcessorTestAccess::LookaheadStop(processor);
+          const bool stopped_at_wait = stop == commands.data() + prefix.size();
+          Require(name, case_name, stop == nullptr || stopped_at_wait,
+                  "the scan stopped at another packet");
+          return !stopped_at_wait;
+        };
+        Require(name, case_name, !scan({}),
+                "the scan passed a wait nothing satisfies");
+        // RELEASE_MEM with a 32-bit end-of-pipe label (data_sel 1, no
+        // interrupt).
+        const auto release = [&](u32 value) {
+          return std::array<u32, 8>{KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0),
+                                    0x28u,
+                                    1u << 29u,
+                                    lo,
+                                    hi,
+                                    value,
+                                    0u,
+                                    0u};
+        };
+        Require(name, case_name, scan(release(7)),
+                "the scan stopped at a wait its own label satisfies");
+        Require(name, case_name, !scan(release(6)),
+                "the scan passed a wait its own label does not satisfy");
+        // WRITE_DATA of one DWORD to memory.
+        const std::array<u32, 5> write{0xc0033700u, 0x40100200u, lo, hi, 7u};
+        Require(name, case_name, scan(write),
+                "the scan stopped at a wait a data write satisfies");
+        Require(name, case_name, !scan({}),
+                "a scan kept the writes an earlier scan saw");
       }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
