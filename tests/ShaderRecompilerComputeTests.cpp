@@ -23345,6 +23345,7 @@ public:
         return code;
       }();
       const auto saved_vertex = vertex;
+      const auto saved_vertex_shader = vertex_shader;
       for (const u32 wave : {32u, 64u}) {
         ShaderVertexInputInfo local_info{};
         local_info.logical_stage = ShaderType::Local;
@@ -23356,16 +23357,18 @@ public:
         auto translated = ShaderRecompiler::TranslateProgram(local_waterfall, options);
         auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, {});
         ValidateSpirv(name, compiled.spirv);
-        ShaderModule local_module{
+        const ShaderProgram local_module{
             .id = 0x4c53000000000000ull | wave,
-            .module = CreateShaderModule(name, compiled.spirv),
-            .info = std::move(compiled.program).TakeCompiledInfo()};
+            .module = CreateShaderModule(name, compiled.spirv)};
+        const auto local_program =
+            std::move(compiled.program).TakeCompiledInfo();
         ShaderRecompiler::IR::ResourceSnapshot local_resources;
-        local_info.stage = {&local_module, &local_resources};
+        local_info.stage = {&local_program, &local_resources, &local_module};
         vertex = local_info;
+        vertex_shader = local_module;
         Require(name, "native local waterfall stage",
-                local_module.info.stage == ShaderType::Local &&
-                    local_module.info.wave_size == wave,
+                local_program.stage == ShaderType::Local &&
+                    local_program.wave_size == wave,
                 "local waterfall lost its native stage or guest wave width");
         for (const u32 count : {3u, 6u, 33u, 96u}) {
           draw(pipeline(true, 2, 2), count);
@@ -23378,6 +23381,7 @@ public:
         m_device.destroyShaderModule(local_module.module);
       }
       vertex = saved_vertex;
+      vertex_shader = saved_vertex_shader;
 
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
