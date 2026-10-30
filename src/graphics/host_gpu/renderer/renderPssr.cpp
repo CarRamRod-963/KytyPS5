@@ -145,7 +145,8 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		RequireVulkanSuccess(result, "create upscaling pipeline");
 	}
 	buffer.EndRendering();
-	const auto command = buffer.Handle();
+	// Binds its own pipeline: the next guest dispatch or draw must bind its pipeline again.
+	const auto command = buffer.PipelineHandle();
 	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
 	               ImageSubresourceRange {source_view.base_level, 1, source_view.base_layer, 1},
 	               command);
@@ -170,7 +171,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	                      0, sizeof(parameters), &parameters);
 	command.dispatch((parameters.output_size[0] + 7) / 8,
 	                 (parameters.output_size[1] + 7) / 8, 1);
-	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderWriteBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 
