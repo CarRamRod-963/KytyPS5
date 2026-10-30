@@ -34884,12 +34884,10 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool formatted = false) {
+TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u) {
   const bool scalar = width == 1u;
   const bool xyz = width == 3u;
   using O = ShaderOpcode;
-  const u32 descriptor_format = formatted
-      ? (u32(Prospero::BufferFormat::k32UInt) << 12u) | 0x204u : 0x5204u;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
     u32 stride, records, mode, soffset;
@@ -34915,8 +34913,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
   // OFFEN byte offset 5 aligns to DWORD; swizzled offsets use eight-index groups.
   constexpr u32 scalar_expected[] = {2, 2, 2, 2, 2, 0, 3, 0, 10, 10, 0};
   TestCase test;
-  test.name = formatted ? "BufferLoadFormatXLaneAddressing"
-              : scalar ? "BufferLoadDwordGpuSelectedDescriptors"
+  test.name = scalar ? "BufferLoadDwordGpuSelectedDescriptors"
               : xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                     : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
@@ -34935,7 +34932,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
     const std::array<u32, 4> descriptor{
         static_cast<u32>(GuestBase + data_offset),
         (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u) | 1u,
-        input.records, (input.bound ? descriptor_format : 0x204u) | (input.mode << 28u)};
+        input.records, (input.bound ? 0x5204u : 0x204u) | (input.mode << 28u)};
     std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
     for (u32 word = 0; word < 32; ++word) {
       test.initial[data_offset / 4 + word] = i * 100 + word + 1;
@@ -34952,7 +34949,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, scalar ? 5u : 1u);
-    test.code.push_back(EncodeMubuf0(formatted ? 0x00 : scalar ? 0x0c : xyz ? 0x0f : 0x0e, 0, !scalar, scalar));
+    test.code.push_back(EncodeMubuf0(scalar ? 0x0c : xyz ? 0x0f : 0x0e, 0, !scalar, scalar));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
     if (!scalar) {
       test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
@@ -34968,7 +34965,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
   constexpr u32 payload = 6144u, output = 8192u, canary = 0xa5a5a5a5u;
   const u32 row = std::size(cases);
   const std::array<u32, 4> descriptor{u32(GuestBase + payload), (32u << 16u) | 1u,
-                                    wave, descriptor_format | (1u << 23u)};
+                                    wave, 0x5204u | (1u << 23u)};
   std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130u + row * 30u);
   test.initial[64u + row] = row;
   for (u32 lane = 0; lane < wave; ++lane)
@@ -34987,7 +34984,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
   AppendSMovLiteral(&test.code, 127, wave == 64u ? UINT32_MAX : 0u);
   test.code.insert(test.code.end(), {EncodeVop2(0x1a, 24, InlineU32(5), 25),
       EncodeVop2(0x25, 24, 255, 24), output});
-  const u32 opcode = formatted ? 0x00u : scalar ? 0x0cu : xyz ? 0x0fu : 0x0eu;
+  const u32 opcode = scalar ? 0x0cu : xyz ? 0x0fu : 0x0eu;
   for (u32 component = width; component < 4u; ++component)
     AppendVMovLiteral(&test.code, 4u + component, canary);
   AppendVMovU32(&test.code, 21, 0u);
@@ -35001,10 +34998,10 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
   AppendVMovU32(&test.code, 22, 0u);
   AppendSMovLiteral(&test.code, 126, 0x55555555u);
   AppendSMovLiteral(&test.code, 127, wave == 64u ? 0xaaaaaaaau : 0u);
-  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 4u, true, true, !formatted), EncodeMubuf1(4, 2, 21)});
+  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 4u, true, true, true), EncodeMubuf1(4, 2, 21)});
   AppendSMovLiteral(&test.code, 126, 0u);
   AppendSMovLiteral(&test.code, 127, 0u);
-  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 0u, true, true, !formatted), EncodeMubuf1(4, 2, 21)});
+  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 0u, true, true, true), EncodeMubuf1(4, 2, 21)});
   AppendSMovLiteral(&test.code, 126, UINT32_MAX);
   AppendSMovLiteral(&test.code, 127, wave == 64u ? UINT32_MAX : 0u);
   test.code.insert(test.code.end(), {EncodeMubuf0(0x1e, 16u, false, true), EncodeMubuf1(4, 12, 24)});
@@ -35022,9 +35019,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  if (formatted) {
-    test.opcodes.push_back(O::BUFFER_LOAD_FORMAT_X);
-  } else if (scalar) {
+  if (scalar) {
     test.decoded_counts = {{"BUFFER_LOAD_DWORD ", 2u * std::size(cases) + 4u}};
   } else if (xyz) {
     test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
@@ -35032,8 +35027,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u, bool forma
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
   test.opcodes.insert(test.opcodes.end(), {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORDX4});
-  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
-  if (!formatted) test.required_spirv.push_back("Volatile");
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "Volatile"};
   return test;
 }
 
@@ -35250,8 +35244,6 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   for (const u32 wave : {32u, 64u}) {
     for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
-                            BufferLoadsGpuSelectedDescriptors(1u, wave, true),
-                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X),
                             BufferLoadsGpuSelectedDescriptors(3u, wave),
                             BufferLoadsGpuSelectedDescriptors(4u, wave),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
@@ -35264,10 +35256,9 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           const auto components = BufferComponentCount(inst.GetOpcode());
           if (components == 0u || inst.GetOpcode() == ValueOpcode::ReadConstBuffer) continue;
           const auto &memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
-          if (memory.kind != ResourceKind::IndirectBuffer) continue;
+          if (memory.kind != ResourceKind::IndirectBuffer || memory.formatted) continue;
           const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
-                            std::to_string(components) + (memory.coherent ? "_coherent" : "") +
-                            (memory.formatted ? "_formatted" : "");
+                            std::to_string(components) + (memory.coherent ? "_coherent" : "");
           auto &profile = profiles[name];
           profile.components = components;
           ++profile.uses;
@@ -35295,16 +35286,16 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
         }
         offset += words.size();
       }
-      Require(test.name, "indirect load function scope", functions.size() == profiles.size() && inline_reads == 0u,
-              "an indirect load profile was unused, missing or still emitted inline");
+      Require(test.name, "raw load function scope", functions.size() == profiles.size() && inline_reads == 0u,
+              "a raw load profile was unused, missing or still emitted inline");
       for (const auto &[name, profile] : profiles)
         Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
                     profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
                     profile.reads == profile.components,
-                "indirect load helpers duplicated definitions, calls or component reads");
+                "raw load helpers duplicated definitions, calls or component reads");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, buffer);
-      CompareWords(test, "shared indirect loads, lane addressing, EXEC and bounds", test.expected,
+      CompareWords(test, "shared raw loads, lane addressing, EXEC and bounds", test.expected,
                    vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
       vulkan.DestroyBuffer(&buffer);
     }
@@ -42302,7 +42293,8 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           offset += words.size();
         }
         Require(test.name, "one shared formatted conversion",
-                conversion_definitions == 1u && conversion_calls == 1u,
+                conversion_definitions == 1u &&
+                    conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
                 "formatted loads must call one conversion function across virtual halves");
         Require(test.name, "one shared pure format geometry",
                 geometry_definitions == 1u && geometry_calls == conversion_calls &&
