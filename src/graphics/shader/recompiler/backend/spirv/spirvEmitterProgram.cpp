@@ -731,7 +731,6 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
-	DefineIndirectBufferFormats(ctx);
 	DefineBvhIntersect(state);
 	DefineTrinityFunctions(state);
 	if (program.info.uses_swizzle) {
