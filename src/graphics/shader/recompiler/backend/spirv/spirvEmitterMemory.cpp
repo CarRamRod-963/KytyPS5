@@ -1922,8 +1922,10 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 }
 
 void DefineGetBdaPointer(EmitterState& state) {
-	// Loads and stores read the page table inline (LoadBdaDwords, ResolveBdaStore).
-	if (!state.program.info.uses_dma || !state.program.info.bvh) {
+	// Loads and stores read the page table inline (LoadBdaDwords, ResolveBdaStore); only the BVH
+	// node fetches of both intersection forms call this function.
+	const auto& info = state.program.info;
+	if (!info.uses_dma || !(info.bvh || info.bvh8)) {
 		return;
 	}
 	const auto type            = TypeU64(state);
