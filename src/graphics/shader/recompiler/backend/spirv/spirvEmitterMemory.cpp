@@ -1533,12 +1533,11 @@ uint32_t DecodeIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAcce
 	});
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                uint32_t active) {
+	auto& state = ctx.state;
 	// Everything but the load is arithmetic, so an inactive lane computes it and drops it: one
 	// select instead of a branch around every formatted load.
-	const auto buffer   = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), true);
 	const auto geometry = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
 	                          state.indirect_format_geometry_function, buffer.format);
@@ -1644,10 +1643,9 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 
 // A D16 formatted X load through a GPU-selected V#: the selected component is decoded with the
 // run-time format's layout and converted to its 16-bit VGPR form.
-uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& state = ctx.state;
-	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), true);
+uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                   uint32_t active) {
+	return EmitValueOrZeroIfCondition(ctx.state, active, [&]() {
 		return DecodeIndirectFormatted(ctx, buffer, buffer.selector, true);
 	});
 }
@@ -1655,15 +1653,11 @@ uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IR::Inst& inst) 
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
-	if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted) {
-		return mem.data_bits == 16u ? LoadIndirectFormattedD16X(ctx, inst)
-		                            : LoadIndirectFormattedX(ctx, inst);
-	}
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		// The function reads zero for an inactive lane; a branch around every call would give the
 		// driver one more region per inlined copy.
 		const auto function = state.indirect_buffer_load_functions.at(
-		    {mem.data_bits, components, uint32_t(mem.coherent)});
+		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
 		const auto            args   = IndirectBufferArgs(ctx, inst);
 		const auto            result = state.builder.AllocateId();
 		std::vector<uint32_t> words {spv::OpFunctionCall, TypeU32Composite(state, components),
@@ -1768,19 +1762,20 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto&      state = ctx.state;
-	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 3>> {
+	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 4>> {
 		const auto components = IR::BufferComponentCount(inst.GetOpcode());
 		if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
 			return std::nullopt;
 		}
 		const auto& memory = ctx.Memory(inst);
-		if (memory.kind != IR::ResourceKind::IndirectBuffer || memory.formatted ||
+		if (memory.kind != IR::ResourceKind::IndirectBuffer ||
 		    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 			return std::nullopt;
 		}
-		return std::array {memory.data_bits, components, uint32_t(memory.coherent)};
+		return std::array {memory.data_bits, components, uint32_t(memory.coherent),
+		                   uint32_t(memory.formatted)};
 	};
-	std::map<std::array<uint32_t, 3>, uint32_t> calls;
+	std::map<std::array<uint32_t, 4>, uint32_t> calls;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
 			if (const auto found = key(inst)) calls[*found] += state.lane_count;
@@ -1793,6 +1788,11 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(*found, 0u);
 			if (!inserted) continue;
 			const auto& memory     = ctx.Memory(inst);
+			// The formatted X load converts through these; its D16 form decodes from the table.
+			if (memory.formatted && memory.data_bits != 16u &&
+			    state.indirect_format_function == 0u) {
+				DefineIndirectBufferFormats(ctx);
+			}
 			const auto  components = (*found)[1];
 			const auto function = entry->second = state.builder.AllocateId();
 			const auto type = TypeU32(state);
@@ -1801,7 +1801,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			    state.builder.Type(spv::OpTypeFunction, result_type, type, type, type, type, type,
 			                       type, type, type, TypeBool(state));
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
-			                  std::to_string(components) + (memory.coherent ? "_coherent" : "");
+			                  std::to_string(components) + (memory.coherent ? "_coherent" : "") +
+			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			// NVIDIA inlines every call, and its compile time grows faster than the program: a
 			// shader with hundreds of GPU-selected loads took minutes. From OutlinedLoadCalls call
@@ -1818,9 +1819,12 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto active = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpFunctionParameter, TypeBool(state), active);
 			EmitLabel(state, state.builder.AllocateId());
+			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
 			const auto result =
-			    LoadIndirectBuffer(ctx, PrepareIndirectBuffer(state, args, false), memory.data_bits,
-			                       components, memory.coherent, active);
+			    !memory.formatted ? LoadIndirectBuffer(ctx, buffer, memory.data_bits, components,
+			                                           memory.coherent, active)
+			    : memory.data_bits == 16u ? LoadIndirectFormattedD16X(ctx, buffer, active)
+			                              : LoadIndirectFormattedX(ctx, buffer, active);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}
@@ -1829,15 +1833,6 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
-	const auto needed = std::ranges::any_of(state.program.blocks, [&](const IR::Block* block) {
-		return std::ranges::any_of(*block, [&](const IR::Inst& inst) {
-			if (inst.GetOpcode() != IR::ValueOpcode::LoadBufferU32) return false;
-			const auto& memory = ctx.Memory(inst);
-			return memory.kind == IR::ResourceKind::IndirectBuffer && memory.formatted;
-		});
-	});
-	if (!needed) return;
-
 	const auto type = TypeU32(state);
 	constexpr auto format_count =
 	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
