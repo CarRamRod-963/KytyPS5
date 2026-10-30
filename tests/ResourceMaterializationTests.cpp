@@ -598,6 +598,39 @@ void TestResourceLookahead() {
   Check(stats.planned == 8u &&
             stats.outcomes[static_cast<size_t>(Outcome::Adopted)] == 3u,
         "lookahead statistics are wrong");
+
+  // A new run (the stream resumes, or passed the packet its scan stopped at)
+  // keeps an unreached job it plans again for the same command, plan and
+  // inputs, with its walk; a job it plans with other inputs is walked again,
+  // and one it passes is dropped.
+  planned({{&commands[0], plan_a.get()},
+           {&commands[1], plan_a.get()},
+           {&commands[2], plan_a.get()}});
+  (void)lookahead.TakeStats();
+  lookahead.BeginRun(&stream);
+  lookahead.Plan(&stream, &commands[1], plan_a, inputs);
+  lookahead.Plan(&stream, &commands[2], plan_a, other);
+  lookahead.Kick();
+  const auto replanned = lookahead.TakeStats();
+  Check(replanned.kept == 1u && replanned.planned == 1u,
+        "a new run did not keep the job it planned again");
+  lookahead.WaitIdle();
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::NotPlanned,
+        "a job the new run passed was kept");
+  Check(adopt(&commands[1], plan_a.get(), inputs) == Outcome::Adopted &&
+            snapshot.flattened_srt == std::vector<uint32_t>{first[2], first[1]},
+        "the kept job was not adopted");
+  Check(adopt(&commands[2], plan_a.get(), other) == Outcome::Adopted &&
+            snapshot.flattened_srt ==
+                std::vector<uint32_t>{second[0], second[1]},
+        "the job planned again with other inputs was not adopted");
+  // Jobs the new run does not plan again are dropped once it is kicked.
+  planned({{&commands[3], plan_a.get()}});
+  lookahead.BeginRun(&stream);
+  lookahead.Kick();
+  lookahead.Plan(&stream, &commands[3], plan_a, inputs);
+  Check(lookahead.TakeStats().kept == 0u,
+        "a job of an earlier run was kept after the kick");
 }
 
 // The owner's in-place check (LookaheadMemory::same) of a walk whose two reads
