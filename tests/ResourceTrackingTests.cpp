@@ -541,6 +541,90 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "a descriptor read sharing its memory index entered the table plan");
 }
 
+// An image heap's candidates are kept between walks of a plan and normalized
+// again only at the DWORD starts that read a changed DWORD: after any change
+// the walk equals the walk of a plan that never saw the heap.
+void TestImageHeapCandidateUpdates() {
+  auto fixture = MakeIndirectImageFixture(false, 1u, 0u, 0u, false);
+  fixture->PlanAndTrack();
+  const auto warm = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                  << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  // A 128-byte table (32 DWORD starts, enumerated) at 0x2000.
+  std::array<uint32_t, 16> data{0x3000u, 4u << 16u,  0x100000u, 0u,
+                                0x2000u, 64u << 16u, 2u,        0u};
+  std::copy_n(data.begin(), 4u, data.begin() + 12u);
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  constexpr size_t table_word = (0x2000u - 0x1000u) / 4u;
+  constexpr size_t table_words = 32u;
+  const auto put = [&](size_t word, uint32_t identity) {
+    auto value = descriptor;
+    value[0] += identity;
+    for (size_t i = 0; i < value.size() && word + i < table_words; ++i)
+      memory.words[table_word + word + i] = value[i];
+  };
+  put(4u, 0u);
+  put(16u, 1u);
+  SrtRuntime runtime{.user_data = data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  uint32_t state = 12345u;
+  const auto next = [&] {
+    state = state * 1664525u + 1013904223u;
+    return state >> 8u;
+  };
+  uint32_t enumerated = 0;
+  for (uint32_t round = 0; round < 300u; ++round) {
+    // One to three changes per round: a T# at a DWORD start, a zeroed DWORD or
+    // another DWORD value.
+    for (uint32_t change = 0, changes = 1u + next() % 3u; change < changes;
+         ++change) {
+      const auto word = next() % table_words;
+      switch (next() % 3u) {
+      case 0:
+        put(word, next() % 4u);
+        break;
+      case 1:
+        memory.words[table_word + word] = 0u;
+        break;
+      default:
+        memory.words[table_word + word] = next();
+        break;
+      }
+    }
+    const auto cold = ExtractResourcePlan(fixture->program);
+    ResourceSnapshot warm_snapshot, cold_snapshot;
+    ResourceSpecialization warm_specialization, cold_specialization;
+    const bool warm_done =
+        MaterializeResources(warm, runtime, warm_snapshot, warm_specialization);
+    const bool cold_done =
+        MaterializeResources(cold, runtime, cold_snapshot, cold_specialization);
+    Check(warm_done == cold_done &&
+              (!warm_done ||
+               (warm_snapshot.images == cold_snapshot.images &&
+                warm_snapshot.flattened_srt == cold_snapshot.flattened_srt &&
+                warm_snapshot.bindless_uses.size() ==
+                    cold_snapshot.bindless_uses.size() &&
+                warm_specialization == cold_specialization)),
+          ("an image heap walked again after a change differs from a first "
+           "walk (round " +
+           std::to_string(round) + ")")
+              .c_str());
+    enumerated += warm_done && warm_snapshot.images.size() > 2u ? 1u : 0u;
+  }
+  Check(enumerated > 100u,
+        "the image heap fixture enumerated too few candidates");
+}
+
 // An image heap that holds the fixture table of MakeIndirectImageFixture(false, 48u, 0u, 16u)
 // (base 0x2000, 144 bytes) resident.
 struct FakeImageHeap final : ImageHeapSource {
@@ -10890,6 +10974,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
+    Run("image heap candidate updates", TestImageHeapCandidateUpdates);
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
     Run("lookahead resident image heap", TestLookaheadResidentImageHeap);
