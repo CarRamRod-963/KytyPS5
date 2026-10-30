@@ -331,7 +331,10 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	SettleLabelAccess(dst, (write_one_address ? 1u : dw_num) * sizeof(uint32_t));
+	const uint64_t bytes = (write_one_address ? 1u : dw_num) * sizeof(uint32_t);
+	SettleLabelAccess(dst, bytes);
+	// What a write fault would do, without taking one: the caches stop watching the bytes.
+	(void)m_renderer.InvalidateMemory(reinterpret_cast<uint64_t>(dst), bytes);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
