@@ -97,12 +97,15 @@ public:
 
 	[[nodiscard]] uint32_t HelperCount() const { return static_cast<uint32_t>(m_helpers.size()); }
 
-	// Owner thread. A stream starts a run of commands it plans ahead; jobs it planned before are
-	// dropped. Streams are told apart by an opaque key (one per command processor).
+	// Owner thread. A stream starts a run of commands it plans ahead; the jobs it planned before
+	// and has not reached are dropped, except those the new run plans again for the same command,
+	// plan and inputs (in the same order), which keep their walk. Streams are told apart by an
+	// opaque key (one per command processor).
 	void BeginRun(const void* stream);
 	void Plan(const void* stream, const void* command, std::shared_ptr<LookaheadPlan> plan,
 	          const LookaheadInputs& inputs);
-	// Hands the jobs planned since the last call to the helpers.
+	// Hands the jobs planned since the last call to the helpers and drops the jobs of the last
+	// runs that were not planned again.
 	void Kick();
 	// Waits until the helpers finished every job handed to them.
 	void WaitIdle();
@@ -113,10 +116,11 @@ public:
 	                 ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
 	                 ShaderRecompiler::IR::ResourceSpecialization& specialization);
 
-	// Owner thread: outcomes and planned jobs since the last call.
+	// Owner thread: outcomes, planned jobs (new walks) and jobs a new run kept since the last call.
 	struct Stats {
 		std::array<uint64_t, static_cast<size_t>(Outcome::Count)> outcomes {};
 		uint64_t                                                  planned = 0;
+		uint64_t                                                  kept    = 0;
 	};
 	Stats TakeStats();
 
@@ -157,6 +161,10 @@ private:
 		const void*       key = nullptr;
 		std::vector<Job*> jobs;
 		size_t            next = 0;
+		// The jobs the last run had not reached when this one began, in plan order; Plan takes
+		// over those it plans again, Kick drops the rest.
+		std::vector<Job*> carried;
+		size_t            carried_next = 0;
 	};
 	struct Helper {
 		std::mutex              mutex;
@@ -177,6 +185,9 @@ private:
 	bool    Unchanged(const Job& job, Outcome& outcome);
 	bool    SameHeapViews(const Job& job);
 	Job*    NewJob();
+	Job*    TakeCarried(Stream& stream, const void* command, const LookaheadPlan* plan,
+	                    const LookaheadInputs& inputs);
+	void    DropCarried(Stream& stream);
 	void    Retire(Job* job);
 	void    Reclaim();
 	Stream& FindStream(const void* key);
