@@ -39,6 +39,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandBuffer;
 class CommandScheduler;
+class ResourceLookahead;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -188,6 +189,9 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
+
+	// The helpers' jobs (tests); null when the lookahead is off.
+	[[nodiscard]] ResourceLookahead* Lookahead() const;
 
 	// A graphics pipeline whose first build runs on the background queue; its handle is null.
 	struct PendingBuild {

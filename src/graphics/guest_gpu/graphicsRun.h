@@ -16,6 +16,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -99,6 +100,8 @@ private:
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	std::atomic_int m_done_num = 0;
+	// The command buffers queued behind the submission Process runs (SetLookaheadQueue).
+	std::vector<std::span<const uint32_t>> m_lookahead_queue;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
