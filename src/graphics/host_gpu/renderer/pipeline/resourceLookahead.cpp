@@ -174,29 +174,77 @@ void ResourceLookahead::Reclaim() {
 	});
 }
 
+void ResourceLookahead::DropCarried(Stream& stream) {
+	for (size_t i = stream.carried_next; i < stream.carried.size(); ++i) {
+		Retire(stream.carried[i]);
+	}
+	stream.carried.clear();
+	stream.carried_next = 0;
+}
+
 void ResourceLookahead::BeginRun(const void* stream_key) {
 	auto& stream = FindStream(stream_key);
-	for (size_t i = stream.next; i < stream.jobs.size(); ++i) {
-		Retire(stream.jobs[i]);
-	}
+	DropCarried(stream);
+	// A run usually begins where the last one is still valid (a stream resumes after a wait, or
+	// passed the packet its last scan stopped at): the unreached jobs wait for the new scan.
+	stream.carried.assign(stream.jobs.begin() + static_cast<ptrdiff_t>(stream.next),
+	                      stream.jobs.end());
 	stream.jobs.clear();
 	stream.next = 0;
+}
+
+// The carried job for this command, plan and inputs among the next few in plan order (the new
+// scan meets the commands in the same order; a command it plans with other inputs or does not
+// reach leaves its jobs behind), else null. Jobs the scan passed are dropped. A failed walk is
+// not taken over: the data it lacked may be written by now.
+ResourceLookahead::Job* ResourceLookahead::TakeCarried(Stream& stream, const void* command,
+                                                       const LookaheadPlan*   plan,
+                                                       const LookaheadInputs& inputs) {
+	constexpr size_t Window = 8;
+	const size_t     end    = std::min(stream.carried.size(), stream.carried_next + Window);
+	for (size_t i = stream.carried_next; i < end; ++i) {
+		Job* job = stream.carried[i];
+		if (job->command != command || job->plan.get() != plan || !(job->inputs == inputs)) {
+			continue;
+		}
+		const auto state = job->state.load(std::memory_order_acquire);
+		if (state != State::Queued && state != State::Running && state != State::Done) {
+			return nullptr;
+		}
+		for (size_t k = stream.carried_next; k < i; ++k) {
+			Retire(stream.carried[k]);
+		}
+		stream.carried_next = i + 1;
+		return job;
+	}
+	return nullptr;
 }
 
 void ResourceLookahead::Plan(const void* stream_key, const void* command,
                              std::shared_ptr<LookaheadPlan> plan, const LookaheadInputs& inputs) {
 	if (m_helpers.empty() || plan == nullptr) return;
+	auto& stream = FindStream(stream_key);
+	if (!stream.carried.empty()) {
+		if (auto* kept = TakeCarried(stream, command, plan.get(), inputs)) {
+			stream.jobs.push_back(kept);
+			m_stats.kept++;
+			return;
+		}
+	}
 	auto* job         = NewJob();
 	job->command      = command;
 	job->inputs       = inputs;
 	const auto helper = plan->Helper() % m_helpers.size();
 	job->plan         = std::move(plan);
-	FindStream(stream_key).jobs.push_back(job);
+	stream.jobs.push_back(job);
 	m_helpers[helper]->staged.push_back(job);
 	m_stats.planned++;
 }
 
 void ResourceLookahead::Kick() {
+	for (auto& stream: m_streams) {
+		DropCarried(stream);
+	}
 	for (auto& helper: m_helpers) {
 		if (helper->staged.empty()) continue;
 		{
