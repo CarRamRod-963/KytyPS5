@@ -540,7 +540,23 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
-	if (submission.type == SubmissionType::Graphics || submission.type == SubmissionType::Compute) {
+	const bool commands =
+	    submission.type == SubmissionType::Graphics || submission.type == SubmissionType::Compute;
+	if (commands) {
+		// The submissions this processor runs next continue its register state; a flip or a
+		// suspend point ends what the scan may assume.
+		m_lookahead_queue.clear();
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			for (const auto& queued: m_queues[submission.queue_id]) {
+				if (queued.type != SubmissionType::Graphics &&
+				    queued.type != SubmissionType::Compute) {
+					break;
+				}
+				m_lookahead_queue.push_back(queued.commands);
+			}
+		}
+		cp.SetLookaheadQueue(m_lookahead_queue);
 		cp.PlanLookahead(submission.execution, submission.commands);
 	}
 
@@ -571,6 +587,7 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 	}
 
+	if (commands) cp.SetLookaheadQueue({});
 	return complete;
 }
 
@@ -639,14 +656,29 @@ void CommandProcessor::PlanLookahead(const Pm4Execution&       execution,
 	const auto saved_draw_base     = m_draw_indirect_args_base_addr;
 	const auto saved_dispatch_base = m_dispatch_indirect_args_base_addr;
 	m_lookahead_saved_deferred.assign(m_deferred_indirect.begin(), m_deferred_indirect.end());
+	m_lookahead_budget = UINT32_MAX;
+	bool to_end        = true;
 	if (execution.m_buffer_stack.empty()) {
-		(void)ScanLookahead(commands, 0);
+		to_end = ScanLookahead(commands, 0);
 	} else {
 		for (auto level = execution.m_buffer_stack.rbegin();
-		     level != execution.m_buffer_stack.rend(); ++level) {
-			if (!ScanLookahead(level->commands.subspan(level->offset_dw), 0)) break;
+		     level != execution.m_buffer_stack.rend() && to_end; ++level) {
+			to_end = ScanLookahead(level->commands.subspan(level->offset_dw), 0);
 		}
 	}
+	// Into the queued submissions: the parser settles a submission's buffer before it reads it
+	// (Process), so one holding GPU writes ends the scan.
+	m_lookahead_budget = LookaheadQueuedCommands;
+	for (const auto queued: m_lookahead_queued) {
+		if (!to_end || m_lookahead_budget == 0) break;
+		if (queued.empty()) continue;
+		if (LibKernel::Memory::HasGpuDirtyBytes(reinterpret_cast<uint64_t>(queued.data()),
+		                                        queued.size_bytes())) {
+			break;
+		}
+		to_end = ScanLookahead(queued, 0);
+	}
+	m_lookahead_budget                 = UINT32_MAX;
 	m_sh_ctx                           = saved_sh;
 	m_draw_indirect_args_base_addr     = saved_draw_base;
 	m_dispatch_indirect_args_base_addr = saved_dispatch_base;
@@ -698,6 +730,8 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 				break;
 			case Pm4::IT_DISPATCH_DIRECT:
 				if (size != 5u) return Stop(packet);
+				if (m_lookahead_budget == 0) return false;
+				m_lookahead_budget--;
 				m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(packet[4]));
 				pipelines.PlanLookaheadDispatch(
 				    this, packet, m_sh_ctx.GetCs(), packet[1], packet[2], packet[3],
@@ -710,6 +744,8 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 			case Pm4::IT_DRAW_INDEX_INDIRECT:
 			case Pm4::IT_DRAW_INDIRECT_MULTI:
 			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+				if (m_lookahead_budget == 0) return false;
+				m_lookahead_budget--;
 				pipelines.PlanLookaheadDraw(this, packet, m_sh_ctx.GetVs(), m_sh_ctx.GetPs());
 				break;
 			case Pm4::IT_DISPATCH_INDIRECT: {
@@ -724,6 +760,8 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 				} else {
 					return Stop(packet);
 				}
+				if (m_lookahead_budget == 0) return false;
+				m_lookahead_budget--;
 				m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 				// Thread dimensions are read from the arguments when the dispatch runs.
 				if (args != 0 && (args & 3u) == 0 &&

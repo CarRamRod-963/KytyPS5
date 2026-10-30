@@ -145,8 +145,17 @@ public:
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	// Before a run of the stream: plans the resource walks of the compute dispatches ahead, up to
 	// the first command that is not written yet or whose effect depends on memory (see
-	// ResourceLookahead). `commands` is the submission's buffer when the run starts it.
+	// ResourceLookahead). `commands` is the submission's buffer when the run starts it. A scan
+	// that reaches the end of the submission continues into the queued ones (SetLookaheadQueue).
 	void PlanLookahead(const Pm4Execution& execution, std::span<const uint32_t> commands);
+	// The command buffers of the submissions queued behind the running one on this processor's
+	// queue, in order, while it runs; they stay valid while queued. Empty between runs.
+	void SetLookaheadQueue(std::span<const std::span<const uint32_t>> queued) {
+		m_lookahead_queued = queued;
+	}
+	// Commands the scan plans at most in the queued submissions: their first commands are reached
+	// right after the submission starts, before helpers could walk them.
+	static constexpr uint32_t LookaheadQueuedCommands = 8;
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
@@ -214,6 +223,9 @@ private:
 	// The packet the last lookahead plan stopped at, if any.
 	const uint32_t* m_lookahead_stop   = nullptr;
 	bool            m_lookahead_active = false;
+	// See SetLookaheadQueue; and the commands the scan may still plan in those submissions.
+	std::span<const std::span<const uint32_t>> m_lookahead_queued;
+	uint32_t                                   m_lookahead_budget = UINT32_MAX;
 	// Memory the scanned packets write before the commands after them run: end-of-pipe labels
 	// (which a WAIT_REG_MEM on them continues behind, see WaitRegMem) and CP data writes.
 	struct LookaheadWrite {
