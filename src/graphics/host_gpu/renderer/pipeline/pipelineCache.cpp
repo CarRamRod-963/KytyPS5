@@ -2624,6 +2624,10 @@ bool PipelineCache::LookaheadEnabled() const {
 	return m_program_cache->lookahead != nullptr;
 }
 
+ResourceLookahead* PipelineCache::Lookahead() const {
+	return m_program_cache->lookahead.get();
+}
+
 void PipelineCache::BeginLookaheadRun(const void* stream) {
 	m_program_cache->lookahead->BeginRun(stream);
 }
