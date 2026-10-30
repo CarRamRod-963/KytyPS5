@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -1345,9 +1346,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		// Thread dimensions are converted to workgroups on the host, so the arguments are read
 		// here, after the work recorded before this packet.
-		vk::DispatchIndirectCommand args;
-		SettleMemoryRead(reinterpret_cast<const void*>(args_addr), sizeof(args));
-		LibKernel::Memory::ReadGuestMemory(args_addr, &args, sizeof(args));
+		// Settled, the backing holds them; the guest mapping of the page may still fault on
+		// other GPU-written bytes.
+		SettleMemoryRead(reinterpret_cast<const void*>(args_addr),
+		                 sizeof(vk::DispatchIndirectCommand));
+		vk::DispatchIndirectCommand args {};
+		if (!LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
+			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		}
 		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
