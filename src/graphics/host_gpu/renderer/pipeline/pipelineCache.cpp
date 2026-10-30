@@ -882,13 +882,21 @@ struct PipelineCache::ProgramCache {
 		return (shader_address << 2u) | static_cast<uint64_t>(slot);
 	}
 
-	// The program last used at a shader address: planned walks of that address use its plan, and
-	// its user data starts with the same words before the user SGPRs.
+	// The programs last used at a shader address: planned walks of that address use their plans,
+	// and their user data starts with the same words before the user SGPRs.
 	void PublishLookahead(ShaderType stage, const ShaderParams& params, const SourceEntry& entry) {
 		auto& target = lookahead_targets[LookaheadKey(SlotOf(stage), params.Base())];
-		if (target.plan != entry.lookahead) target.plan = entry.lookahead;
-		target.user_data_count = params.user_data_count;
-		std::copy_n(params.user_data.begin(), target.prefix.size(), target.prefix.begin());
+		target.uses++;
+		auto& uses = target.programs;
+		// Most recent first; a program new to the address replaces the older one.
+		if (uses[0].plan != entry.lookahead) {
+			std::swap(uses[0], uses[1]);
+			if (uses[0].plan != entry.lookahead) uses[0].plan = entry.lookahead;
+		}
+		auto& use           = uses[0];
+		use.last_use        = target.uses;
+		use.user_data_count = params.user_data_count;
+		std::copy_n(params.user_data.begin(), use.prefix.size(), use.prefix.begin());
 	}
 
 	// Takes the helper's snapshot for this command when ResourceLookahead allows it.
@@ -914,20 +922,27 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
-	// Plans the walk of the program at `shader_address` with these user SGPRs, if one was used.
+	// Plans the walk of the programs used at `shader_address` with these user SGPRs: the last one,
+	// and the one before it while the two alternate (the scan cannot tell which one a command
+	// uses; the job of the other one is dropped at the next command).
 	void PlanLookahead(const void* stream, const void* command, LookaheadSlot slot,
 	                   uint64_t shader_address, std::span<const uint32_t> user_sgprs,
 	                   LookaheadInputs& inputs) {
 		const auto target = lookahead_targets.find(LookaheadKey(slot, shader_address));
-		if (target == lookahead_targets.end() || target->second.user_data_count < user_sgprs.size())
-			return;
-		const auto prefix = target->second.user_data_count - user_sgprs.size();
-		if (prefix > target->second.prefix.size()) return;
-		inputs.shader_base     = shader_address;
-		inputs.user_data_count = target->second.user_data_count;
-		std::copy_n(target->second.prefix.begin(), prefix, inputs.user_data.begin());
-		std::ranges::copy(user_sgprs, inputs.user_data.begin() + static_cast<ptrdiff_t>(prefix));
-		lookahead->Plan(stream, command, target->second.plan, inputs);
+		if (target == lookahead_targets.end()) return;
+		constexpr uint64_t AlternateUses = 16;
+		for (const auto& use: target->second.programs) {
+			if (use.plan == nullptr || target->second.uses - use.last_use > AlternateUses) break;
+			if (use.user_data_count < user_sgprs.size()) continue;
+			const auto prefix = use.user_data_count - user_sgprs.size();
+			if (prefix > use.prefix.size()) continue;
+			inputs.shader_base     = shader_address;
+			inputs.user_data_count = use.user_data_count;
+			std::copy_n(use.prefix.begin(), prefix, inputs.user_data.begin());
+			std::ranges::copy(user_sgprs,
+			                  inputs.user_data.begin() + static_cast<ptrdiff_t>(prefix));
+			lookahead->Plan(stream, command, use.plan, inputs);
+		}
 	}
 
 	static bool SameBacking(uint64_t address, const void* data, uint64_t size, bool mapped) {
@@ -982,10 +997,15 @@ struct PipelineCache::ProgramCache {
 
 	// Compute dispatches ahead of the GPU thread: the program last used at each shader address
 	// with its registers, and the command the next GetComputeProgram belongs to.
-	struct LookaheadTarget {
+	struct LookaheadUse {
 		std::shared_ptr<LookaheadPlan> plan;
 		uint32_t                       user_data_count = 0;
 		std::array<uint32_t, 8>        prefix {};
+		uint64_t                       last_use = 0;
+	};
+	struct LookaheadTarget {
+		std::array<LookaheadUse, 2> programs; // most recent first
+		uint64_t                    uses = 0;
 	};
 	std::unique_ptr<ResourceLookahead>            lookahead;
 	std::unordered_map<uint64_t, LookaheadTarget> lookahead_targets;
