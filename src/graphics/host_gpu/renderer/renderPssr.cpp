@@ -191,7 +191,8 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	         source_view.base_layer == destination_view.base_layer));
 
 	buffer.EndRendering();
-	const auto command = buffer.Handle();
+	// Binds its own pipeline: the next guest dispatch or draw must bind its pipeline again.
+	const auto command = buffer.PipelineHandle();
 	const auto range   = [](const ImageViewInfo& view) {
 		return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
 	};
@@ -279,7 +280,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	                      0, sizeof(parameters), &parameters);
 	command.dispatch((parameters.output_size[0] + 7) / 8,
 	                 (parameters.output_size[1] + 7) / 8, 1);
-	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderWriteBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 
