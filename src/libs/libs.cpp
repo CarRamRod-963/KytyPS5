@@ -4,6 +4,13 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 namespace Libs {
 
 namespace LibContentDelete {

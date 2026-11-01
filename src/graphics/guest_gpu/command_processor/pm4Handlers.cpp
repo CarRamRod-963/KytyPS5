@@ -1,11 +1,16 @@
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
+#include "common/queueTrace.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -16,6 +21,11 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <tuple>
+#include <mutex>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -54,10 +64,32 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint32_t RegisterSelectorMask = 0x70000000u;
+constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
+constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
+constexpr uint32_t GcrGl1Invalidate         = 1u << 3u;
+constexpr uint32_t GcrGl2Unshared           = 1u << 4u;
+constexpr uint32_t GcrGl2Invalidate         = 1u << 8u;
+constexpr uint32_t GcrGl2Writeback          = 1u << 9u;
+constexpr uint32_t GcrOrder012              = 1u << 10u;
+constexpr uint32_t GcrOrder210              = 2u << 10u;
+constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate |
+                                              GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
+                                              GcrGl2Writeback | GcrOrder012 | GcrOrder210;
+constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
+	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
+}
+
+void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
+	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
+	if (unknown != 0) {
+		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
+	}
 }
 
 } // namespace
@@ -261,6 +293,34 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
                                       [[maybe_unused]] uint32_t value) {}
 
+// DB_ALPHA_TO_MASK (upstream 13b291f99) and PA_CL_UCP_* (upstream feed075a9) are implemented below; their former
+// ignore helpers are gone.
+
+// KYTY_TRACE_OBJPRIM=1: every new value of the two ObjPrimID registers (the first 32), with the context they land in.
+static void TraceObjprimRegister(const char* name, uint32_t value) {
+	static const bool trace = [] {
+		const char* env = std::getenv("KYTY_TRACE_OBJPRIM");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (!trace) return;
+	static std::atomic_uint lines {0};
+	static std::atomic_uint last_payload {UINT32_MAX};
+	static std::atomic_uint last_objprim {UINT32_MAX};
+	auto& last = name[0] == 'V' ? last_payload : last_objprim;
+	if (last.exchange(value) == value || lines.fetch_add(1) >= 32u) return;
+	std::fprintf(stderr, "OBJPRIM_REG %s=0x%x\n", name, value);
+}
+
+static void HwCtxSetDrawPayloadControlValue(CommandProcessor& cp, uint32_t value) {
+	TraceObjprimRegister("VGT_DRAW_PAYLOAD_CNTL", value);
+	cp.GetCtx().SetDrawPayloadControl(value);
+}
+
+static void HwCtxSetObjprimIdControlValue(CommandProcessor& cp, uint32_t value) {
+	TraceObjprimRegister("PA_CL_OBJPRIM_ID_CNTL", value);
+	cp.GetCtx().SetObjprimIdControl(value);
+}
+
 static void HwCtxIgnorePrimitiveIdReset([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreVtxControl([[maybe_unused]] uint32_t value) {}
@@ -406,13 +466,21 @@ KYTY_HW_CTX_PARSER(HwCtxSetPointState) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetDrawPayloadControl) {
-	cp.GetCtx().SetDrawPayloadControl(buffer[0]);
-	return KYTY_PM4_LEN(cmd_id) - 2u;
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+
+	// Only the first value is VGT_DRAW_PAYLOAD_CNTL; the following registers stay ignored as before.
+	if (num_values != 0) HwCtxSetDrawPayloadControlValue(cp, buffer[0]);
+
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetObjprimIdControl) {
-	cp.GetCtx().SetObjprimIdControl(buffer[0]);
-	return KYTY_PM4_LEN(cmd_id) - 2u;
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+
+	// Only the first value is PA_CL_OBJPRIM_ID_CNTL; the following registers stay ignored as before.
+	if (num_values != 0) HwCtxSetObjprimIdControlValue(cp, buffer[0]);
+
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPrimitiveIdReset) {
@@ -943,9 +1011,9 @@ KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	return reg_num;
 }
 
-static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
-	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
-
+// The decode of one compute SH register write (pm4Dispatch.h): shared with the resolve thread
+// register state, which must not exit on a register the processor does not know. False: unknown register.
+bool HwShApplyCsRegister(HW::CsStageRegisters& cs_regs, uint32_t cmd_offset, uint32_t value) {
 	switch (cmd_offset) {
 		case Pm4::COMPUTE_PGM_LO:
 			cs_regs.data_addr &= 0xFFFFFF00000000FFull;
@@ -1008,9 +1076,17 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_RESOURCE_LIMITS:
 		case Pm4::COMPUTE_TMPRING_SIZE:
 		case Pm4::COMPUTE_PACE_ID: HwShIgnoreComputeRegister(cmd_offset, value); break;
-		default:
-			EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
-			     value);
+		default: return false;
+	}
+	return true;
+}
+
+static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
+
+	if (!HwShApplyCsRegister(cs_regs, cmd_offset, value)) {
+		EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
+		     value);
 	}
 
 	cp.GetShCtx().SetCsShader(cs_regs);
@@ -1046,8 +1122,9 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1062,8 +1139,9 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1078,8 +1156,9 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1094,8 +1173,9 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i]);
+		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
+	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1248,6 +1328,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, true)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
@@ -1264,6 +1345,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, true)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
@@ -1285,19 +1367,11 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
 
 	const auto buffer_size = buffer[0];
-	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
+	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
-	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
-	// samples. A non-zero dword 0 then marks the report complete.
-	if (dst != nullptr && buffer_size >= 64) {
-		const auto slots = std::min((buffer_size - 64) / 8, 256u);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			dst[16 + slot * 2]     = slot << 24u;
-			dst[16 + slot * 2 + 1] = 15u << 24u;
-		}
-		dst[0] = 1;
+	if (dst != nullptr && buffer_size != 0) {
+		cp.WriteLodStats(dst, buffer_size);
 	}
 
 	return 4;
@@ -1327,7 +1401,7 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0005900);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0x81000000u) != 0);
 
-	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0);
+	cp.WaitForRewind((cp.ReadDecisionValue<uint32_t>(buffer) & 0x80000000u) != 0);
 
 	return 1;
 }
@@ -1364,6 +1438,83 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	return payload_dw;
 }
 
+// A COND_EXEC block of waits holds the stream and does nothing else, so running it where the console would skip it only
+// delays the stream (the queue waits). Its packets: WAIT_REG_MEM / WAIT_REG_MEM_64 on memory, the AGC wait's
+// internal-data SET_UCONFIG_REG packets around them (libs/agc.cpp, AgcDcbWaitRegMem), push/pop debug markers, plain NOPs
+// and one-dword fillers. Everything else has effects: the custom NOPs are commands here (R_RELEASE_MEM writes a label,
+// R_FLIP flips, R_CONTEXT_STATE pushes state), a plain NOP carrying a "hu" marker can flip or set user-data state, other
+// SET_UCONFIG_REG packets write registers, and draws, dispatches, writes and buffer calls are work.
+CondExecBlock ClassifyCondExecBlock(const uint32_t* block, uint32_t size_dw) {
+	bool has_wait = false;
+	for (uint32_t i = 0; i < size_dw;) {
+		const uint32_t header = block[i];
+		// One-dword packets, which ProcessPm4 steps over too.
+		if (header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u) {
+			i++;
+			continue;
+		}
+		if ((header >> 30u) != 3u) {
+			return CondExecBlock::Other;
+		}
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len > size_dw - i) {
+			return CondExecBlock::Other;
+		}
+		const uint32_t* payload = block + i + 1;
+		switch ((header >> 8u) & 0xffu) {
+			case Pm4::IT_WAIT_REG_MEM:
+			case Pm4::IT_WAIT_REG_MEM_64:
+				// A label in memory; a register wait is not a cross-queue wait (and the CP does not implement it).
+				if ((payload[0] & 0x10u) == 0) {
+					return CondExecBlock::Other;
+				}
+				has_wait = true;
+				break;
+			case Pm4::IT_NOP: {
+				const uint32_t r          = KYTY_PM4_R(header);
+				const bool     plain      = r == Pm4::R_ZERO && (payload[0] & 0xffff0000u) != 0x68750000u;
+				const bool     debug_mark = r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+				if (!plain && !debug_mark) {
+					return CondExecBlock::Other;
+				}
+				break;
+			}
+			case Pm4::IT_SET_UCONFIG_REG:
+				if (!Gen5::AgcIsInternalDataPacket(header, payload)) {
+					return CondExecBlock::Other;
+				}
+				break;
+			default: return CondExecBlock::Other;
+		}
+		i += len;
+	}
+	return has_wait ? CondExecBlock::WaitOnly : CondExecBlock::Empty;
+}
+
+// The packets of a COND_EXEC block for logs: type-3 opcodes in order (first 32), NOPs with their custom code (/r).
+static std::string CondExecBlockOps(const uint32_t* block, uint32_t size_dw) {
+	std::string ops;
+	for (uint32_t i = 0, k = 0; i < size_dw && k < 32u; k++) {
+		const uint32_t header = block[i];
+		char           text[24];
+		if ((header >> 30u) != 3u || Pm4::PacketSizeDw(header) == 1u) {
+			std::snprintf(text, sizeof(text), " t%u", header >> 30u);
+			ops += text;
+			i++;
+			continue;
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		if (op == Pm4::IT_NOP) {
+			std::snprintf(text, sizeof(text), " %02x/%02x", op, static_cast<uint32_t>(KYTY_PM4_R(header)));
+		} else {
+			std::snprintf(text, sizeof(text), " %02x", op);
+		}
+		ops += text;
+		i += KYTY_PM4_LEN(header);
+	}
+	return ops;
+}
+
 KYTY_CP_OP_PARSER(CpOpCondExec) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1382,7 +1533,69 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	// A block of waits runs without its GPU-written predicate being read;
+	// the stream remembers it for the liveness guard (CommandProcessor::ResolveAssumedCondBlock). A block with effects
+	// of its own still needs its predicate (read below).
+	{
+		const auto kind = ClassifyCondExecBlock(buffer + payload_dw, exec_count);
+		// The first block of each predicate address (first 32) with effects of its own: it reads its predicate, which can
+		// wait for the GPU. GPU thread only.
+		if (kind == CondExecBlock::Other) {
+			static std::vector<uint64_t> logged;
+			if (logged.size() < 32u && std::find(logged.begin(), logged.end(), addr) == logged.end()) {
+				logged.push_back(addr);
+				std::fprintf(stderr, "QUEUE_WAITS cond_exec addr=0x%llx exec_dw=%u kind=other ops=[%s ]\n",
+				             static_cast<unsigned long long>(addr), exec_count,
+				             CondExecBlockOps(buffer + payload_dw, exec_count).c_str());
+			}
+		}
+		if (kind == CondExecBlock::WaitOnly) {
+			// The block starts right after this packet: (num_dw - dw) is this packet's offset in the buffer.
+			cp.EnterAssumedCondBlock(addr, (num_dw - dw) + 1u + payload_dw + exec_count);
+			return payload_dw;
+		}
+		if (kind == CondExecBlock::Empty) {
+			return payload_dw + exec_count;
+		}
+	}
+
+	const uint32_t predicate = cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr));
+	// BDA sync epoch: the block depends on guest memory the guest may have written.
+	cp.PublishDirtyRegions();
+	// KYTY_TRACE_COND_EXEC=1: for each predicate address (first 32), the packets of the conditional
+	// block (type-3 opcodes in order, first 32) and the predicate values seen (every 64th use).
+	static constinit Common::OnceValue<bool> trace_once;
+	const bool trace = trace_once.Get([&] { return std::getenv("KYTY_TRACE_COND_EXEC") != nullptr; });
+	if (trace) {
+		static std::map<uint64_t, uint64_t> uses;
+		auto&                               n = uses[addr];
+		if (uses.size() <= 32u && (n++ % 64u) == 0) {
+			std::string ops;
+			for (uint32_t i = payload_dw, k = 0; i < payload_dw + exec_count && k < 32u; k++) {
+				const uint32_t header = buffer[i];
+				if ((header >> 30u) != 3u) {
+					ops += " t" + std::to_string(header >> 30u);
+					i++;
+					continue;
+				}
+				char op[16];
+				std::snprintf(op, sizeof(op), " %02x", (header >> 8u) & 0xffu);
+				ops += op;
+				i += KYTY_PM4_LEN(header);
+			}
+			std::fprintf(stderr, "COND_EXEC addr=0x%llx use=%llu value=%u exec_dw=%u ops=[%s ]\n",
+			             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(n), predicate, exec_count,
+			             ops.c_str());
+			if (n == 1) {
+				std::fprintf(stderr, "COND_EXEC_RAW addr=0x%llx", static_cast<unsigned long long>(addr));
+				for (uint32_t i = 0; i < exec_count && i < 64u; i++) {
+					std::fprintf(stderr, " %08x", buffer[payload_dw + i]);
+				}
+				std::fprintf(stderr, "\n");
+			}
+		}
+	}
+	if (predicate == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -1416,7 +1629,9 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr), reference, mask, function);
+	// BDA sync epoch: the branch taken depends on guest memory the guest may have written.
+	cp.PublishDirtyRegions();
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1535,6 +1750,7 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, false)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
 
@@ -1574,19 +1790,37 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	return 1;
 }
 
+// KYTY_TRACE_INDIRECT_SGPR=1: the user-SGPR destinations an indirect draw packet names for the
+// per-draw vertex/instance/first-index offsets (words 1-3), first 40 distinct packets.
+static void TraceIndirectSgprDestinations(const char* name, uint32_t w1, uint32_t w2, uint32_t w3) {
+	static constinit Common::OnceValue<bool> enabled_once;
+	const bool enabled = enabled_once.Get([&] { return std::getenv("KYTY_TRACE_INDIRECT_SGPR") != nullptr; });
+	if (!enabled) return;
+	static std::mutex                                            mutex;
+	static std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
+	std::scoped_lock                                             lock(mutex);
+	const auto key = std::make_tuple(w1, w2, w3);
+	if (std::find(seen.begin(), seen.end(), key) != seen.end() || seen.size() >= 40u) return;
+	seen.push_back(key);
+	std::fprintf(stderr, "INDIRECT_SGPR %s w1=0x%08x w2=0x%08x w3=0x%08x vertex_loc=0x%x instance_loc=0x%x index_loc=0x%x\n",
+	             name, w1, w2, w3, w1 & 0xffffu, w2 & 0xffffu, w1 >> 16u);
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, false)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0032400 && cmd_id != 0xc0032500);
 
 	const auto data_offset    = buffer[0];
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
-	// The native indexed packet enables the high-half first-index destination in word 3.
+	TraceIndirectSgprDestinations(indexed ? "DrawIndexIndirect" : "DrawIndirect", buffer[1], buffer[2], buffer[3]);
+
+	// The indexed packet enables the high-half first-index destination with word 2 bit 28.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
-
+	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
 	return 4;
@@ -1594,6 +1828,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, false)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
 
@@ -1605,25 +1840,27 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3. Word 4
-	// bit 31 enables the subdraw index, written to the register in its low half.
-	const IndirectDrawRegisters registers {
-	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
-	    (buffer[3] >> 31u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
+	TraceIndirectSgprDestinations(indexed ? "DrawIndexIndirectMulti" : "DrawIndirectMulti", buffer[1], buffer[2], buffer[3]);
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
-	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     registers, draw_initiator, indexed);
+	// Multi-draw moves the first-index enable to word 3; the destinations stay in words 1/2.
+	// Word 3 also names the draw-index destination (bits 15:0, DRAW_INDEX_ENABLE bit 31).
+	const IndirectDrawRegisters registers {
+	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP,
+	    (buffer[3] & (1u << 31u)) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP};
+	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes, registers,
+	                     draw_initiator, indexed);
 
 	return 9;
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, false)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
 
@@ -1642,6 +1879,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	KYTY_PROFILER_FUNCTION();
+	if (PassCensus::Packet(&cp, false)) return KYTY_PM4_LEN(cmd_id) - 1; // KYTY_DIAG_CEILING_FREE_PASSES
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
 
@@ -1679,6 +1917,24 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	return packet_size_dw - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0038300);
+
+	auto  offset = buffer[0];
+	auto  dw_num = buffer[1];
+	auto* dst = reinterpret_cast<uint32_t*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
+
+	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
+	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.DumpConstRam(dst, offset, dw_num);
+
+	return 4;
+}
+
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1699,25 +1955,88 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	return packet_size_dw - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0044700);
+
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t event_write_dest   = ((buffer[0] >> 23u) & 0x10u) | ((buffer[2] >> 16u) & 0x01u);
+	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
+	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
+	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
+	auto*    dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
+	uint64_t value = (buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
+
+	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+
+	return 5;
+}
+
+KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0034802);
+
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t event_write_dest   = 0;
+	uint32_t eop_event_type     = (buffer[0]) & 0x3fu;
+	uint32_t cache_action       = (buffer[0] >> 12u) & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t event_write_source = ((buffer[2] >> 29u) & 0x7u);
+	uint32_t interrupt_selector = (buffer[2] >> 24u) & 0x7u;
+
+	auto* dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
+	uint32_t value = buffer[3];
+
+	cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+
+	return 4;
+}
+
 KYTY_CP_OP_PARSER(CpOpFlip) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
-	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	CommandProcessor::FlipInfo f;
+
+	f.handle    = static_cast<int>(buffer[0]);
+	f.index     = static_cast<int>(buffer[1]);
+	f.flip_mode = static_cast<int>(buffer[2]);
+	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
+
+	cp.SetFlip(f);
+	cp.Flip();
 	return 5;
 }
 
-KYTY_CP_OP_PARSER(CpOpPssr) {
+KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	KYTY_PROFILER_FUNCTION();
 
-	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
-	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
-	Pssr::Request request {};
-	std::memcpy(&request, buffer, sizeof(request));
-	cp.ProcessPssr(request);
-	return packet_dw;
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008400);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
+
+	cp.IncrementCe();
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008500);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 0);
+
+	cp.IncrementDe();
+
+	return 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexType) {
@@ -1831,6 +2150,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	cp.WaitForPendingWrites(indirect_buffer, uint64_t {indirect_num_dw} * 8u);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1901,7 +2221,36 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	cp.WaitForPendingWrites(indirect_buffer, uint64_t {indirect_num_dw} * 8u);
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+
+	// KYTY_TRACE_SH_INDIRECT=1 (diagnostic): register blocks that set COMPUTE_PGM_LO to 0, and blocks whose bytes
+	// differ from the backing store (GPU-written, not yet synced to guest memory), are logged with their pairs.
+	static constinit Common::OnceValue<bool> trace_sh_once;
+	const bool trace_sh = trace_sh_once.Get([&] { return std::getenv("KYTY_TRACE_SH_INDIRECT") != nullptr; });
+	if (trace_sh) {
+		bool     pgm_zero = false;
+		uint32_t pgm_lo   = 0xffffffffu;
+		for (uint32_t i = 0; i < indirect_num_dw; i++) {
+			if (NormalizeRegisterOffset(indirect_buffer[i * 2]) == Pm4::COMPUTE_PGM_LO) {
+				pgm_lo   = indirect_buffer[i * 2 + 1];
+				pgm_zero = pgm_lo == 0;
+			}
+		}
+		std::vector<uint32_t> synced(indirect_num_dw * 2u);
+		const bool ok = Libs::LibKernel::Memory::TryReadBufferBacking(indirect_address, synced.data(), synced.size() * 4u);
+		const bool differs = ok && std::memcmp(synced.data(), indirect_buffer, synced.size() * 4u) != 0;
+		static std::atomic<uint32_t> logged {0};
+		if ((pgm_zero || differs) && logged.fetch_add(1) < 64u) {
+			std::fprintf(stderr, "SH_INDIRECT addr=0x%llx regs=%u pgm_lo=0x%08x synced_ok=%d differs=%d frame=%u\n",
+			             static_cast<unsigned long long>(indirect_address), indirect_num_dw, pgm_lo, ok ? 1 : 0,
+			             differs ? 1 : 0, DebugPresentCount().load());
+			for (uint32_t i = 0; i < indirect_num_dw && i < 16u; i++) {
+				std::fprintf(stderr, "  [%u] off=0x%08x val=0x%08x synced off=0x%08x val=0x%08x\n", i, indirect_buffer[i * 2],
+				             indirect_buffer[i * 2 + 1], ok ? synced[i * 2] : 0u, ok ? synced[i * 2 + 1] : 0u);
+			}
+		}
+	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -1964,6 +2313,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	cp.WaitForPendingWrites(indirect_buffer, uint64_t {indirect_num_dw} * 8u);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2001,12 +2351,50 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
+KYTY_CP_OP_PARSER(CpOpMarker) {
+	KYTY_PROFILER_FUNCTION();
+
+	uint32_t len_dw = ((cmd_id >> 16u) & 0x3fffu);
+
+	switch (buffer[0]) {
+		case 0x68750004: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
+		case 0x6875000d: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
+		case 0x68750777: {
+			cp.Flip();
+			break;
+		}
+		case 0x68750778: {
+			auto* addr =
+			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+			uint32_t value = buffer[3];
+			cp.Flip(addr, value);
+			break;
+		}
+		case 0x68750781: {
+			auto* addr =
+			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+			uint32_t value          = buffer[3];
+			uint32_t eop_event_type = buffer[4];
+			uint32_t cache_action   = buffer[5];
+			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
+			break;
+		}
+		// NOP payloads are caller-owned data; only complete known marker tags execute.
+		default: break;
+	}
+
+	return len_dw + 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpNop) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto r = KYTY_PM4_R(cmd_id);
 
 	if (r == Pm4::R_ZERO) {
+		if ((buffer[0] & 0xffff0000u) == 0x68750000u) {
+			return CpOpMarker(cp, cmd_id, buffer, dw, num_dw);
+		}
 		return KYTY_PM4_LEN(cmd_id) - 1;
 	}
 
@@ -2036,6 +2424,8 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
+	if (DebugMarkersEnabled()) DebugMarkerPop();
+	PassCensus::Marker(&cp, nullptr); // KYTY_TRACE_PASS_CENSUS
 	static std::atomic<uint32_t> pop_marker_log_count {0};
 	if (pop_marker_log_count.fetch_add(1) < 64) {
 		LOGF("Pop marker\n");
@@ -2051,6 +2441,8 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 	const char* str = reinterpret_cast<const char*>(buffer);
 
+	if (DebugMarkersEnabled()) DebugMarkerPush(str);
+	PassCensus::Marker(&cp, str); // KYTY_TRACE_PASS_CENSUS
 	static std::atomic<uint32_t> push_marker_log_count {0};
 	if (push_marker_log_count.fetch_add(1) < 128) {
 		LOGF("Push marker: %s\n", str);
@@ -2062,14 +2454,118 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
-	// The event type, cache actions and destination cache only order GPU work, which the renderer's
-	// resource barriers already order.
-	cp.ReleaseMem(
-	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
-	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
-	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
+	uint32_t eop_event_type     = buffer[0] & 0x3fu;
+	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
+	uint32_t gcr_cntl           = (buffer[0] >> 12u) & 0xfffu;
+	uint32_t release_dst        = (buffer[1] >> 16u) & 0x3u;
+	uint32_t event_write_dest   = 0;
+	uint32_t data_sel           = (buffer[1] >> 29u) & 0x7u;
+	uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
+	auto*    dst_gpu_addr =
+	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
+	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
+	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+
+	constexpr uint32_t ReleaseMemDstMemory = 0;
+	constexpr uint32_t ReleaseMemDstTcL2   = 1;
+	EXIT_NOT_IMPLEMENTED(release_dst != ReleaseMemDstMemory && release_dst != ReleaseMemDstTcL2);
+	EXIT_NOT_IMPLEMENTED(data_sel != 0 && data_sel != 1 && data_sel != 2 && data_sel != 3 &&
+	                     data_sel != 5);
+
+	LogUnknownReleaseMemGcr(gcr_cntl);
+
+	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
+
+	auto trigger_interrupt = [&]() {
+		switch (interrupt_selector) {
+			case 0x00:
+			case 0x03: break;
+			case 0x01:
+			case 0x02:
+			case 0x04:
+				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				cp.BufferFlushForInterrupt();
+				break;
+			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+	};
+
+	if (data_sel == 0 || interrupt_selector == 4) {
+		cp.EmitGlobalBarrier();
+
+		trigger_interrupt();
+
+		return 7;
+	}
+
+	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
+		cp.EmitGlobalBarrier();
+
+		trigger_interrupt();
+
+		return 7;
+	}
+
+	cp.EmitGlobalBarrier();
+
+	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
+	cache_policy      = 0;
+
+	if (data_sel == 1) {
+		eop_event_type    = 0x2f;
+		event_index       = 6;
+		auto event_source = 2u;
+
+		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
+		                      interrupt_selector, interrupt_context_id);
+		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
+			cp.BufferFlushForInterrupt();
+		}
+
+		return 7;
+	}
+
+	if (data_sel == 5) {
+		if (gl2_writeback) {
+			cache_action = 0;
+		}
+
+		eop_event_type    = 0x2f;
+		event_index       = 6;
+		auto event_source = 1u;
+
+		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
+		                      interrupt_selector, interrupt_context_id);
+		if (interrupt_selector == 0x01) {
+			cp.BufferFlushForInterrupt();
+		}
+
+		return 7;
+	}
+
+	const bool keep_native_event_index =
+	    (eop_event_type == 0x04 && cache_action == 0x00) ||
+	    (eop_event_type == 0x2f && event_index == 0x06 && cache_action == 0x38);
+
+	if (data_sel == 2) {
+		if (!keep_native_event_index) {
+			event_index = 0;
+		}
+	} else {
+		EXIT_IF(data_sel != 3);
+		if (!keep_native_event_index) {
+			event_index = 0;
+		}
+		data_sel = 4;
+	}
+
+	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
+	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
 
 	return 7;
 }
@@ -2303,6 +2799,42 @@ KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 	KYTY_PROFILER_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
+}
+
+KYTY_CP_OP_PARSER(CpOpWaitOnCeCounter) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008600);
+	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
+
+	cp.WaitCe();
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpWaitOnDeCounterDiff) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008800);
+
+	cp.WaitDeDiff(buffer[0]);
+
+	return 1;
+}
+
+KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
+	KYTY_PROFILER_FUNCTION();
+
+	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	auto offset = buffer[0];
+
+	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
+	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.WriteConstRam(offset, buffer + 1, dw_num);
+
+	return 1 + dw_num;
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
@@ -2799,7 +3331,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetTfParam(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_DRAW_PAYLOAD_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetDrawPayloadControl(value);
+		HwCtxSetDrawPayloadControlValue(cp, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_PRIMITIVEID_RESET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePrimitiveIdReset(value);
@@ -2808,7 +3340,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetShaderZFormat(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_CL_OBJPRIM_ID_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		cp.GetCtx().SetObjprimIdControl(value);
+		HwCtxSetObjprimIdControlValue(cp, value);
 	};
 
 	for (auto cmd_offset = Pm4::PA_SC_CLIPRECT_RULE; cmd_offset < Pm4::PA_SC_CLIPRECT_0_TL + 8u;
@@ -3264,7 +3796,9 @@ void GraphicsInitJmpTablesShIndirect() {
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetCsUserSgpr(cmd_offset - Pm4::COMPUTE_USER_DATA_0, value);
+			auto sgpr = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
+			cp.GetShCtx().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		};
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
@@ -3275,15 +3809,21 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t slot = 0; slot < 32; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetPsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
+			    cp.GetShCtx().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
+			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
+			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
+			    cp.GetShCtx().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {

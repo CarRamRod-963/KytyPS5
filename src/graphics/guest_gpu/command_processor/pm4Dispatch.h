@@ -10,7 +10,16 @@ namespace Libs::Graphics {
 
 class CommandProcessor;
 
-using hw_ctx_parser_func_t   = uint32_t (*)(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
+namespace HW {
+struct CsStageRegisters;
+} // namespace HW
+
+// One compute SH register write applied to a CsStageRegisters, as the processor decodes it (HwShSetCsRegister).
+// Returns false for a register the processor does not know (it exits there); used by the resolve thread's
+// shadow register state, which must not.
+bool HwShApplyCsRegister(HW::CsStageRegisters& cs_regs, uint32_t cmd_offset, uint32_t value);
+
+using hw_ctx_parser_func_t  = uint32_t (*)(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                             uint32_t);
 using hw_uc_parser_func_t    = uint32_t (*)(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                             uint32_t);
@@ -133,16 +142,23 @@ uint32_t CpOpWriteData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
 uint32_t CpOpIndirectBuffer(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpCopyData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpEventWrite(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpMemSemaphore(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpEventWriteEop(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpEventWriteEos(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDmaData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpAcquireMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpMemSemaphore(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetContextReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetShaderReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetUconfigReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectCxRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectShRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectUcRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpWriteConstRam(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpDumpConstRam(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpIncrementCeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpIncrementDeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpWaitOnCeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpWaitOnDeCounterDiff(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpGetLodStats(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDispatchReset(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem32(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
@@ -151,7 +167,12 @@ uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, 
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpPssr(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+
+// What the `size_dw` dwords a COND_EXEC guards hold: only waits and packets without effect (the queue waits runs
+// such a block without reading its predicate), no wait at all, or anything else.
+enum class CondExecBlock { WaitOnly, Empty, Other };
+CondExecBlock ClassifyCondExecBlock(const uint32_t* block, uint32_t size_dw);
 
 } // namespace Libs::Graphics
 

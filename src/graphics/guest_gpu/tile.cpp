@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 
 #include <algorithm>
+#include <memory>
 #include <array>
 #include <bit>
 
@@ -1263,10 +1264,9 @@ bool TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t
 	return true;
 }
 
-void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
-                        uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
-                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
-	KYTY_PROFILER_FUNCTION();
+static void TileGetTextureSizeUncached(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                                       uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
+                                       TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
 
 	EXIT_IF(levels == 0 || levels > 16);
 
@@ -1315,6 +1315,44 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 		EXIT("unknown format:\nformat = %u\nwidth  = %u\nheight = %u\nlevels = %u\ntile   = %u\n",
 		     static_cast<uint32_t>(format), width, height, levels, static_cast<uint32_t>(tile));
 	}
+}
+
+// A pure function of its inputs, called ~6 times per draw or dispatch (10M calls in 40 s on the
+// flyover): a small per-thread direct-mapped memo of complete results.
+void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                        uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
+                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+	struct Entry {
+		bool                  valid  = false;
+		Prospero::BufferFormat format {};
+		uint32_t              width  = 0;
+		uint32_t              height = 0;
+		uint32_t              levels = 0;
+		Prospero::TileMode    tile {};
+		TileSizeAlign         total {};
+		TileSizeOffset        level_sizes[16] {};
+		TilePaddedSize        padded[16] {};
+	};
+	constexpr uint32_t                 Entries = 256;
+	thread_local std::unique_ptr<Entry[]> memo = std::make_unique<Entry[]>(Entries);
+	const uint64_t key  = (uint64_t {static_cast<uint32_t>(format)} * 0x9E3779B97F4A7C15ull) ^
+	                      (uint64_t {width} << 1u) ^ (uint64_t {height} * 0xC2B2AE3D27D4EB4Full) ^
+	                      (uint64_t {levels} << 40u) ^ (uint64_t {static_cast<uint32_t>(tile)} << 48u);
+	auto&          slot = memo[(key ^ (key >> 29u)) % Entries];
+	if (!slot.valid || slot.format != format || slot.width != width || slot.height != height ||
+	    slot.levels != levels || slot.tile != tile) {
+		slot        = Entry {};
+		TileGetTextureSizeUncached(format, width, height, levels, tile, &slot.total, slot.level_sizes, slot.padded);
+		slot.valid  = true;
+		slot.format = format;
+		slot.width  = width;
+		slot.height = height;
+		slot.levels = levels;
+		slot.tile   = tile;
+	}
+	if (total_size != nullptr) *total_size = slot.total;
+	if (level_sizes != nullptr) std::copy_n(slot.level_sizes, levels, level_sizes);
+	if (padded_size != nullptr) std::copy_n(slot.padded, levels, padded_size);
 }
 
 void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,

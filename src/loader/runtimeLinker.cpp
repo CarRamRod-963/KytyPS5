@@ -4,17 +4,19 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envRead.h"
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/overlayStats.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -26,6 +28,9 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <map>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -33,6 +38,8 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#include <mutex>
+#include <vector>
 #include <memory>
 #include <vector>
 
@@ -210,6 +217,10 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 		}
 	}
 	return 0;
+}
+
+uint32_t UnresolvedImportStubCalls() {
+	return g_unresolved_stub_call_log_count.load(std::memory_order_relaxed);
 }
 
 constexpr uint64_t SYSTEM_RESERVED  = 0x800000000u;
@@ -669,14 +680,123 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
-			return true;
+		// KYTY_TRACE_CPU_WRITE_WATCH=<hex address>:<hex size>[,...]: guest writes that fault inside the
+		// ranges (the first write to a GPU-tracked page after each GPU use) are logged once per
+		// instruction with registers and the top of the stack; 4 KiB of code around the instruction is
+		// saved to <KYTY_TRACE_FRAME_DIR>/cpuwrite_<rip>.bin (8-byte base + bytes, for guestdis.py).
+		if (access == GpuAccess::Write) {
+			static const std::vector<std::pair<uint64_t, uint64_t>> watch = [] {
+				std::vector<std::pair<uint64_t, uint64_t>> list;
+				const char* value = std::getenv("KYTY_TRACE_CPU_WRITE_WATCH");
+				while (value != nullptr && *value != 0) {
+					char*      end  = nullptr;
+					const auto addr = std::strtoull(value, &end, 16);
+					uint64_t   size = 0x1000;
+					if (end != nullptr && *end == ':') size = std::strtoull(end + 1, &end, 16);
+					list.emplace_back(addr, size);
+					if (end == nullptr || *end != ',') break;
+					value = end + 1;
+				}
+				return list;
+			}();
+			const auto fault = info->access_violation_vaddr;
+			if (std::ranges::any_of(watch, [&](const auto& w) { return fault >= w.first && fault - w.first < w.second; })) {
+				static std::mutex              mutex;
+				static std::vector<uint64_t>   seen;
+				std::scoped_lock               lock(mutex);
+				const auto rip = static_cast<uint64_t>(info->exception_address);
+				if (seen.size() < 64u && std::ranges::find(seen, rip) == seen.end()) {
+					seen.push_back(rip);
+					std::printf("CPU_WRITE_WATCH addr=0x%016" PRIx64 " rip=0x%016" PRIx64 " rax=%016" PRIx64 " rbx=%016" PRIx64
+					            " rcx=%016" PRIx64 " rdx=%016" PRIx64 " rsi=%016" PRIx64 " rdi=%016" PRIx64 " r8=%016" PRIx64
+					            " r9=%016" PRIx64 " rsp=%016" PRIx64 "\n",
+					            fault, rip, info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->r8, info->r9,
+					            info->rsp);
+					if (IsReadableRange(info->rsp, 24 * sizeof(uint64_t))) {
+						const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+						std::printf("CPU_WRITE_WATCH stack");
+						for (int i = 0; i < 24; ++i) std::printf(" %016" PRIx64, stack[i]);
+						std::printf("\n");
+					}
+					const uint64_t base = (rip & ~uint64_t {0xfff}) - 0x1000u;
+					if (const char* dir = Common::EnvRead::FrameDir(); dir != nullptr && IsReadableRange(base, 0x3000)) {
+						char name[512];
+						std::snprintf(name, sizeof(name), "%s/cpuwrite_%016" PRIx64 ".bin", dir, rip);
+						if (FILE* file = std::fopen(name, "wb")) {
+							std::fwrite(&base, sizeof(base), 1, file);
+							std::fwrite(reinterpret_cast<const void*>(base), 1, 0x3000, file);
+							std::fclose(file);
+						}
+					}
+					std::fflush(stdout);
+				}
+			}
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
-			return true;
+		if (Common::OverlayStats::Enabled()) {
+			Common::OverlayStats::Add(Common::OverlayStats::Counter::GpuMemoryFault); // KYTY_OVERLAY
+		}
+		// The faulting instruction runs again when this handler returns.
+		const Libs::Graphics::RetriedFaultScope retried_fault;
+		const Libs::Graphics::FaultSiteScope fault_site(static_cast<uint64_t>(info->exception_address));
+		// KYTY_TRACE_FAULT_SITES=1: GPU-memory faults that reach the synchronizing handler are grouped by
+		// access, thread (GPU thread or not), faulting instruction and the first three return addresses in
+		// the emulator executable (offsets from its base, resolve with the link map), with the time spent
+		// in the handler; the top sites are printed every 4096 faults.
+		static const bool trace_sites = [] {
+			const char* value = std::getenv("KYTY_TRACE_FAULT_SITES");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (trace_sites) {
+			const auto start   = std::chrono::steady_clock::now();
+			const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+			const auto nanos   = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+			const auto exe = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+			std::array<uint64_t, 5> key {};
+			key[0] = (access == GpuAccess::Write ? 1u : 0u) | (Libs::Graphics::GuestGpu::IsGpuThread() ? 2u : 0u);
+			const auto rip = static_cast<uint64_t>(info->exception_address);
+			key[1] = rip > exe && rip < exe + 0x10000000ull ? rip - exe : rip;
+			if (IsReadableRange(info->rsp, 256 * sizeof(uint64_t))) {
+				const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+				for (int i = 0, found = 0; i < 256 && found < 3; ++i) {
+					if (stack[i] > exe && stack[i] < exe + 0x10000000ull) key[2 + found++] = stack[i] - exe;
+				}
+			}
+			struct Site {
+				uint64_t count = 0;
+				uint64_t nanos = 0;
+			};
+			static std::mutex                            mutex;
+			static std::map<std::array<uint64_t, 5>, Site> sites;
+			static uint64_t                              total = 0;
+			std::scoped_lock                             lock(mutex);
+			auto&                                        site = sites[key];
+			site.count++;
+			site.nanos += nanos;
+			if ((++total & 0xfffu) == 0) {
+				std::vector<std::pair<std::array<uint64_t, 5>, Site>> top(sites.begin(), sites.end());
+				std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.nanos > b.second.nanos; });
+				std::fprintf(stderr, "FAULT_SITES total=%llu exe_base=0x%llx", static_cast<unsigned long long>(total),
+				             static_cast<unsigned long long>(exe));
+				for (size_t i = 0; i < top.size() && i < 16u; ++i) {
+					const auto& k = top[i].first;
+					std::fprintf(stderr, " [%s%s rip=+0x%llx ret=+0x%llx,+0x%llx,+0x%llx n=%llu ms=%llu]",
+					             (k[0] & 1u) ? "W" : "R", (k[0] & 2u) ? "gpu" : "cpu", static_cast<unsigned long long>(k[1]),
+					             static_cast<unsigned long long>(k[2]), static_cast<unsigned long long>(k[3]),
+					             static_cast<unsigned long long>(k[4]), static_cast<unsigned long long>(top[i].second.count),
+					             static_cast<unsigned long long>(top[i].second.nanos / 1000000u));
+				}
+				std::fprintf(stderr, "\n");
+			}
+			if (handled) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
+		} else {
+			if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
@@ -1713,7 +1833,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
-	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
+	// (Upstream 0a140911a charges the segments to the flexible pool; the game's 156 MiB pool is not charged here.)
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -1905,7 +2025,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
-		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 

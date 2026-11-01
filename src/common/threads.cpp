@@ -14,9 +14,14 @@
 #include <ctime>
 #endif
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -251,6 +256,39 @@ std::string Thread::GetThreadId() {
 	return ss.str();
 }
 
+void Thread::SetCurrentName(const char* name) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (name == nullptr || name[0] == '\0') return;
+	// Windows 10 1607+; looked up so older kernels and SDK targets still run.
+	using SetThreadDescriptionFunc = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+	static const auto set_description = reinterpret_cast<SetThreadDescriptionFunc>(
+	    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
+	if (set_description == nullptr) return;
+	const std::string  narrow(name);
+	const std::wstring wide(narrow.begin(), narrow.end());
+	set_description(GetCurrentThread(), wide.c_str());
+#else
+	(void)name;
+#endif
+}
+
+std::string Thread::GetCurrentName() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	using GetThreadDescriptionFunc = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+	static const auto get_description = reinterpret_cast<GetThreadDescriptionFunc>(
+	    reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+	if (get_description == nullptr) return {};
+	PWSTR wide = nullptr;
+	if (FAILED(get_description(GetCurrentThread(), &wide)) || wide == nullptr) return {};
+	std::string name;
+	for (const wchar_t* c = wide; *c != 0; ++c) name.push_back(static_cast<char>(*c < 128 ? *c : '?'));
+	LocalFree(wide);
+	return name;
+#else
+	return {};
+#endif
+}
+
 Mutex::Mutex(): m_mutex(std::make_unique<MutexPrivate>()) {}
 
 Mutex::~Mutex() {
@@ -376,6 +414,89 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+uint64_t CurrentThreadCpuNs() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FILETIME creation {}, exit {}, kernel {}, user {};
+	if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user) == 0) return 0;
+	const auto ticks = [](const FILETIME& t) { return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime; };
+	return (ticks(kernel) + ticks(user)) * 100u;
+#else
+	return 0;
+#endif
+}
+
+void Thread::RaiseCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+void Thread::PinCurrent(int logical_cpu) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (logical_cpu >= 0 && logical_cpu < 64) {
+		const auto mask = DWORD_PTR {1} << static_cast<uint32_t>(logical_cpu);
+		::SetThreadAffinityMask(::GetCurrentThread(), mask);
+		::SetThreadIdealProcessor(::GetCurrentThread(), static_cast<DWORD>(logical_cpu));
+	}
+#else
+	(void)logical_cpu;
+#endif
+}
+
+std::string Thread::ReserveCores(std::span<const int> logical_cpus, size_t min_other_cores) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	if (length == 0) {
+		return "no CPU set information";
+	}
+	std::vector<uint8_t> buffer(length);
+	auto* const          first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (!::GetSystemCpuSetInformation(first, length, &length, ::GetCurrentProcess(), 0)) {
+		return "no CPU set information";
+	}
+	const auto for_each_set = [&](auto&& func) {
+		for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+			const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation) {
+				func(info->CpuSet);
+			}
+			offset += info->Size;
+		}
+	};
+	// The physical cores (group, core index) of the reserved logical processors.
+	std::vector<std::pair<WORD, BYTE>> reserved;
+	for_each_set([&](const auto& set) {
+		for (const auto cpu: logical_cpus) {
+			if (set.Group == 0 && cpu >= 0 && set.LogicalProcessorIndex == cpu) {
+				reserved.emplace_back(set.Group, set.CoreIndex);
+			}
+		}
+	});
+	std::vector<ULONG>                 others;
+	std::vector<std::pair<WORD, BYTE>> other_cores;
+	for_each_set([&](const auto& set) {
+		const std::pair core {set.Group, set.CoreIndex};
+		if (std::ranges::find(reserved, core) == reserved.end()) {
+			others.push_back(set.Id);
+			if (std::ranges::find(other_cores, core) == other_cores.end()) {
+				other_cores.push_back(core);
+			}
+		}
+	});
+	// Smaller processors keep every core for the guest.
+	if (reserved.empty() || other_cores.size() < min_other_cores) {
+		return "not reserved, other cores " + std::to_string(other_cores.size());
+	}
+	const BOOL ok = ::SetProcessDefaultCpuSets(::GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()));
+	return (ok ? "reserved, other cores " : "reservation failed, other cores ") + std::to_string(other_cores.size());
+#else
+	(void)logical_cpus;
+	(void)min_other_cores;
+	return "unsupported";
+#endif
 }
 
 } // namespace Common

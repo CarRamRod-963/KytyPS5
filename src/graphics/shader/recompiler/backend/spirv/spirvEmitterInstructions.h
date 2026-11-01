@@ -41,7 +41,9 @@ uint32_t              EmitCompositeExtractU64(EmitterState& state, uint32_t arg0
 uint32_t              EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value arg1);
 inline constexpr auto EmitCompositeExtractU32x3 = EmitCompositeExtractU32x2;
 inline constexpr auto EmitCompositeExtractU32x4 = EmitCompositeExtractU32x2;
-inline constexpr auto EmitPackHalf2x16 = EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
+// Exact IEEE conversion (subnormals kept, round to nearest even) instead of
+// GLSL PackHalf2x16, which a driver may flush; see spirvEmitterAluHelpers.cpp.
+uint32_t              EmitPackHalf2x16(EmitterState& state, uint32_t pair);
 inline constexpr auto EmitPackSnorm2x16 =
     EmitGlsl<GLSLstd450PackSnorm2x16, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitPackUnorm2x16 =
@@ -137,7 +139,7 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+		return flush ? EmitFlushF32InputUnlessHost(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }
@@ -169,9 +171,13 @@ EMIT_NATIVE(FPIsNan32, OpIsNan, U1, uint32_t)
 EMIT_NATIVE(FPIsNan64, OpIsNan, U1, uint32_t)
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 inline constexpr auto EmitFPCmpClass16 = EmitClassMaskF16;
-EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
+template <spv::Op opcode>
+uint32_t EmitFPArith32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitNative<opcode, IR::Type::F32, uint32_t, uint32_t>(state, arg0, arg1);
+}
+inline constexpr auto EmitFPAdd32 = EmitFPArith32<spv::OpFAdd>;
+inline constexpr auto EmitFPSub32 = EmitFPArith32<spv::OpFSub>;
+inline constexpr auto EmitFPMul32 = EmitFPArith32<spv::OpFMul>;
 EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
@@ -186,6 +192,18 @@ uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+// Two packed halves per U32 (spirvEmitterAluHelpers.cpp).
+uint32_t EmitHalfPkAdd(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitHalfPkMul(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitHalfPkFma(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitHalfPkMin(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitHalfPkMax(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitHalfPkMinTri(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitHalfPkMaxTri(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitHalfPkMedTri(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitHalfPkSaturate(EmitterState& state, uint32_t arg0);
+uint32_t EmitHalfToF32Arith(EmitterState& state, uint32_t arg0);
+uint32_t EmitF32ToHalfArith(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0);
@@ -233,6 +251,8 @@ uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitLiveMask(EmitterState& state);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
+// KYTY_DIAG_WATERFALL_RECORD0_CENSUS (spirvEmitterFlow.cpp).
+void                  EmitWaterfallRecord0Census(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);

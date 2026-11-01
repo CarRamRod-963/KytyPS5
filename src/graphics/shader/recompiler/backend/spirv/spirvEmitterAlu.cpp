@@ -125,10 +125,10 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	// a = EmitFlushF32DenormToSignedZero(state, a);
 	// b = EmitFlushF32DenormToSignedZero(state, b);
 	// c = EmitFlushF32DenormToSignedZero(state, c);
-	const auto product = EmitFPMul32(state, a, b);
+	const auto product = EmitNative<spv::OpFMul, IR::Type::F32, uint32_t, uint32_t>(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
 	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
-	const auto sum = EmitFPAdd32(state, product, c);
+	const auto sum = EmitNative<spv::OpFAdd, IR::Type::F32, uint32_t, uint32_t>(state, product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
 	// return EmitFlushF32DenormToSignedZero(state, sum);
 	return sum;
@@ -143,10 +143,7 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
-	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
+	return EmitF32ToF16Bits(state, arg0);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
@@ -197,16 +194,51 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (const auto native = EmitPackF16RtzNative(state, arg0, arg1); native != 0) return native;
+	// The low half's upper 16 bits are zero, so one bit-field insert packs the pair (upstream 10a852c2a).
 	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
 	    state, EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg0)),
 	    EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg1)),
 	    ConstantU32(state, 16), ConstantU32(state, 16));
 }
 
+void ClampNanCheck(EmitterState& state, uint32_t is_nan, uint32_t counter) {
+	if (state.fault_buffer_variable == 0) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1) < 16u) {
+			std::fprintf(stderr, "FIX_CLAMP_NAN check hash=%016llx: no fault buffer, counts not recorded\n",
+			             static_cast<unsigned long long>(state.program.shader_hash));
+		}
+		return;
+	}
+	EmitIfCondition(state, is_nan, [&] {
+		(void)FaultDiagAdd(state, IR::ClampNanDiagWord + counter, ConstantU32(state, 1));
+		const auto slot = FaultDiagAdd(state, IR::ClampNanDiagWord + 2, ConstantU32(state, 1));
+		const auto room = Binary(state, spv::OpULessThan, TypeBool(state), slot, ConstantU32(state, IR::ClampNanDiagSlots));
+		EmitIfCondition(state, room, [&] {
+			const auto hash = state.program.shader_hash;
+			FaultDiagStore(state, IR::ClampNanDiagWord + 3, slot, 2, 0, ConstantU32(state, static_cast<uint32_t>(hash)));
+			FaultDiagStore(state, IR::ClampNanDiagWord + 3, slot, 2, 1,
+			               ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+		});
+	});
+}
+
+// The `.clamp` output modifier (ApplyF32ResultModifiers) and every other f32 saturate. KYTY_FIX_CLAMP_NAN=1 with
+// DX10_CLAMP: NClamp, whose NMax(NaN, 0) is 0 (GLSL.std.450: NMax returns the other operand for a NaN), as the GCN
+// clamp; equal to FClamp for every other input. DX10_CLAMP=0 keeps today's FClamp.
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	// The clamp modifier runs in DX10 clamp mode: NaN becomes 0, as NClamp's NMax step does.
-	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
-	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	// Upstream 4f1f3b1bb makes this NClamp unconditionally; here it is KYTY_FIX_CLAMP_NAN=1 (M124, with the DX10_CLAMP
+	// check), which stays the switch for that behaviour.
+	const int  mode  = IR::ClampNanModeFor(state.program.shader_hash);
+	const bool dx10  = mode != 0 && ProgramDx10Clamp(state);
+	const auto clamp = mode == 1 && dx10 ? GLSLstd450NClamp : GLSLstd450FClamp;
+	const auto result =
+	    EmitExt(state, TypeF32(state), clamp, {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	if (mode == 2 && dx10) {
+		ClampNanCheck(state, Unary(state, spv::OpIsNan, TypeBool(state), result), 0);
+	}
+	return result;
 }
 
 uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1) {
@@ -268,7 +300,7 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 }
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	const auto source = EmitFlushF32InputUnlessHost(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -284,22 +316,22 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
-	// A denormal input already rounds to 1.0, the result for its flushed zero.
+	// A denormal input already rounds to 1.0, the result for its flushed zero (upstream 93071ebdf).
 	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {

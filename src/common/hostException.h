@@ -39,6 +39,12 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Diagnostics (the KYTY_TRACE_PERF_SAMPLE stack unwinder): while on, the calling thread's access violations skip the
+// emulator's handler and reach the thread's own __except.
+void PassAccessViolations(bool pass);
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

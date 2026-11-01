@@ -2,11 +2,13 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/diagFastPath.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
+#include "common/startupTrace.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
@@ -27,8 +29,12 @@
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
+#include <atomic>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 #include <thread>
 
 namespace Emulator {
@@ -93,12 +99,23 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
                  Common::Subsystems& subsystems) {
 	EXIT_IF(!Common::Thread::IsMainThread());
 
+	// KYTY_TRACE_STARTUP: its reporter starts here, before anything it measures.
+	(void)Common::StartupTrace::Enabled();
+	// Before any thread draws, so the diagnostic hooks' flag word is decided from the start.
+	Common::DiagFastPath::Init();
+	Common::InstallAbortReporters();
+
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
+		// The game's flexible pool from param.json (Ghost of Yotei: 156 MiB); upstream 09753bf8f sizes it elsewhere.
+		if (const auto flexible_memory_size = Loader::SystemContentGetMemoryParams().flexible_size;
+		    flexible_memory_size != 0) {
+			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
+		}
 	}
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
@@ -133,6 +150,45 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// --precompile-only: set by "quit" or "stop" on stdin (the launcher's Stop), Ctrl+C or Ctrl+Break. The running
+// compiles finish, the driver cache is saved, the process exits. The end of stdin is not a stop (a script may start it
+// without input).
+static std::atomic<bool> g_precompile_stop {false};
+
+static void PrecompileStopSignal(int /*signal*/) {
+	g_precompile_stop.store(true);
+}
+
+// --precompile-only (after Init: the window, here hidden, the Vulkan device and the renderer are made as for the game,
+// so the pipelines are those the game asks for): the guest is not loaded; the recorded shader journals are compiled
+// into the driver cache (PipelineCache::RunPrecompileOnly), which is saved; then the process exits with its code.
+[[noreturn]] static void RunPrecompileOnly() {
+	PrintSystemInfo();
+	std::string title_id;
+	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("Title ID: {} (precompile only)\n", title_id));
+	}
+	EXIT_NOT_IMPLEMENTED(at_quick_exit(Common::Subsystems::EmergencyShutdownActive) != 0);
+	std::signal(SIGINT, PrecompileStopSignal);
+#ifdef SIGBREAK
+	std::signal(SIGBREAK, PrecompileStopSignal);
+#endif
+	std::thread([] {
+		char line[128];
+		while (std::fgets(line, sizeof(line), stdin) != nullptr) {
+			const std::string_view text(line);
+			if (text.starts_with("quit") || text.starts_with("stop")) {
+				g_precompile_stop.store(true);
+				return;
+			}
+		}
+	}).detach();
+	const int code = Libs::Graphics::WindowPrecompileOnly(Config::GetPrecompileThreads(), g_precompile_stop);
+	std::fflush(stdout);
+	std::fflush(stderr);
+	std::quick_exit(code);
+}
+
 static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
@@ -157,6 +213,10 @@ void Run(const RunOptions& options) {
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
+
+	if (options.config.precompile_only) {
+		RunPrecompileOnly();
+	}
 
 	PrintSystemInfo();
 	std::string title_id;

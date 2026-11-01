@@ -1,5 +1,7 @@
 #include "libs/controller.h"
 
+#include "graphics/host_gpu/renderer/debugSample.h"
+
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/common.h"
@@ -968,6 +970,72 @@ void GameController::GetConnectionInfo(bool* flag, int* count) {
 	*count = m_connected_count;
 }
 
+// KYTY_TEST_PAD_SCRIPT=<first>-<last>:<axis>=<value>[,<axis>=<value>...][|...] (test tool): during the listed presented
+// frames the pad state the game reads has those axes overridden (LX, LY, RX, RY, L2, R2; 0-255, sticks centred at
+// 128, LY=0 = left stick fully forward) and a pad is reported connected, so unattended runs can move the character
+// the same way every time.
+struct PadScriptSegment {
+	uint32_t                                       first = 0;
+	uint32_t                                       last  = 0;
+	std::array<int, static_cast<int>(Axis::AxisMax)> axes {-1, -1, -1, -1, -1, -1};
+};
+
+static const std::vector<PadScriptSegment>& PadScript() {
+	static const std::vector<PadScriptSegment> script = [] {
+		std::vector<PadScriptSegment> list;
+		const char*                   value = std::getenv("KYTY_TEST_PAD_SCRIPT");
+		if (value == nullptr) return list;
+		static constexpr std::array<const char*, static_cast<int>(Axis::AxisMax)> names {"LX", "LY", "RX",
+		                                                                                 "RY", "L2", "R2"};
+		const std::string text(value);
+		size_t            start = 0;
+		while (start < text.size()) {
+			const auto end  = std::min(text.find('|', start), text.size());
+			const auto item = text.substr(start, end - start);
+			start           = end + 1;
+			PadScriptSegment segment;
+			unsigned         first = 0, last = 0;
+			const auto       colon = item.find(':');
+			if (colon == std::string::npos || std::sscanf(item.c_str(), "%u-%u", &first, &last) != 2) continue;
+			segment.first = first;
+			segment.last  = last;
+			size_t pos    = colon + 1;
+			while (pos < item.size()) {
+				const auto next  = std::min(item.find(',', pos), item.size());
+				const auto entry = item.substr(pos, next - pos);
+				pos              = next + 1;
+				const auto eq    = entry.find('=');
+				if (eq == std::string::npos) continue;
+				for (size_t a = 0; a < names.size(); a++) {
+					if (entry.substr(0, eq) == names[a]) {
+						segment.axes[a] = std::clamp(std::atoi(entry.c_str() + eq + 1), 0, 255);
+					}
+				}
+			}
+			list.push_back(segment);
+			std::fprintf(stderr, "TEST_PAD_SCRIPT frames %u-%u: %s\n", first, last, item.c_str() + colon + 1);
+		}
+		return list;
+	}();
+	return script;
+}
+
+// True while a script segment covers the current presented frame; its axes are applied to the state.
+static bool ApplyPadScript(ControllerState& state) {
+	const auto& script = PadScript();
+	if (script.empty()) return false;
+	const auto frame = Libs::Graphics::DebugPresentCount().load();
+	for (const auto& segment: script) {
+		if (frame < segment.first || frame > segment.last) continue;
+		for (size_t a = 0; a < segment.axes.size(); a++) {
+			if (segment.axes[a] >= 0) state.axes[a] = segment.axes[a];
+		}
+		state.time = LibKernel::KernelGetProcessTime();
+		return true;
+	}
+	return false;
+}
+
 void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -978,6 +1046,10 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
+	if (ApplyPadScript(*state)) {
+		*flag  = true;
+		*count = std::max(*count, 1);
+	}
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {
@@ -992,6 +1064,14 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	*count = m_connected_count;
 
 	int ret_num = 0;
+
+	// KYTY_TEST_PAD_SCRIPT: one fresh scripted state per read while a segment is active.
+	if (ControllerState scripted = m_state; ApplyPadScript(scripted)) {
+		*flag     = true;
+		*count    = std::max(*count, 1);
+		states[0] = scripted;
+		return 1;
+	}
 
 	if (m_connected) {
 		if (m_states_num != 0) {

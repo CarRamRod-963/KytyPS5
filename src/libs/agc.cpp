@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -19,12 +20,13 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "loader/systemContent.h"
+#include "loader/runtimeLinker.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +35,8 @@
 #include <cstddef>
 #include <cstring>
 #include <mutex>
+#include <set>
+#include <unordered_map>
 #include <vector>
 
 #ifdef min
@@ -840,8 +844,8 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
-static bool is_trinity_mode() {
-	return Loader::SystemContentIsTrinityMode();
+static constexpr bool is_trinity_mode() {
+	return false;
 }
 
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
@@ -2028,7 +2032,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	const uint32_t packet_action      = static_cast<uint32_t>(action) & 0x3fu;
 	const uint32_t packet_event_index = (action >= 0x2fu ? 6u : 5u);
 
-	cmd[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0);
+	cmd[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
 	cmd[1] = packet_action | (packet_event_index << 8u) | ((packet_gcr_cntl & 0xfffu) << 12u) |
 	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 	cmd[2] = ((static_cast<uint32_t>(dst) & 0x3u) << 16u) |
@@ -2481,9 +2485,6 @@ static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG       = 0xc8020000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
-static constexpr uint32_t AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG    = 0xc9010000u;
-static constexpr uint32_t AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG      = 0xc9020000u;
-static constexpr uint32_t AGC_MEM_SEMAPHORE_END_TAG             = 0xc9000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
 static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
@@ -2493,8 +2494,107 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[2] = tag;
 }
 
+// KYTY_TRACE_DRAW_CALLERS=<text>[|<text>...] (diagnostic): the debug marker path of each command buffer is tracked as the
+// guest records it (push/pop from guest code), and draws recorded while that path contains one of the texts log, once
+// per caller, the path, the draw kind and the guest call chain (stack scan) as <module>+<offset>.
+static const std::vector<std::string>& DrawCallerFilters() {
+	static const std::vector<std::string> filters = [] {
+		std::vector<std::string> list;
+		const char*              value = std::getenv("KYTY_TRACE_DRAW_CALLERS");
+		if (value == nullptr) return list;
+		std::string text(value);
+		size_t      start = 0;
+		while (start <= text.size()) {
+			const auto end  = text.find('|', start);
+			auto       item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (!item.empty()) list.push_back(item);
+			if (end == std::string::npos) break;
+			start = end + 1;
+		}
+		return list;
+	}();
+	return filters;
+}
+
+static std::mutex& RecordMarkerMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+static std::unordered_map<const void*, std::vector<std::string>>& RecordMarkers() {
+	static std::unordered_map<const void*, std::vector<std::string>> markers;
+	return markers;
+}
+
+static bool IsGuestCode(uint64_t address) {
+	return Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(address) != nullptr;
+}
+
+static std::string GuestCallChain(uint64_t ret, uint64_t frame) {
+	auto*      linker   = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto describe = [&](uint64_t value) -> std::string {
+		auto* program = linker->FindProgramByAddr(value);
+		if (program == nullptr) return {};
+		return fmt::format("{}+0x{:x}", Common::PathToString(program->file_name.filename()), value - program->base_vaddr);
+	};
+	std::string chain = describe(ret);
+	for (uint32_t i = 0; i < 256u; i++) {
+		const auto addr = frame + uint64_t {i} * 8u;
+		if (!Graphics::HostMemoryIsReadable(addr)) break;
+		const auto value = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
+		const auto text  = describe(value);
+		if (!text.empty()) chain += fmt::format(" [{}]{}", i, text);
+	}
+	return chain;
+}
+
+static void RecordMarkerPush(const void* buf, const char* str, uint64_t ret) {
+	if (DrawCallerFilters().empty() || buf == nullptr || !IsGuestCode(ret)) return;
+	std::scoped_lock lock(RecordMarkerMutex());
+	RecordMarkers()[buf].emplace_back(str != nullptr ? str : "");
+}
+
+static void RecordMarkerPop(const void* buf, uint64_t ret) {
+	if (DrawCallerFilters().empty() || buf == nullptr || !IsGuestCode(ret)) return;
+	std::scoped_lock lock(RecordMarkerMutex());
+	auto& stack = RecordMarkers()[buf];
+	if (!stack.empty()) stack.pop_back();
+}
+
+static void TraceDrawCaller(const void* buf, const char* kind, uint64_t ret, uint64_t frame) {
+	const auto& filters = DrawCallerFilters();
+	if (filters.empty() || buf == nullptr) return;
+	std::string path;
+	{
+		std::scoped_lock lock(RecordMarkerMutex());
+		const auto       it = RecordMarkers().find(buf);
+		if (it == RecordMarkers().end()) return;
+		for (const auto& marker: it->second) {
+			if (!path.empty()) path += '>';
+			path += marker;
+		}
+	}
+	if (std::none_of(filters.begin(), filters.end(),
+	                 [&](const std::string& f) { return path.find(f) != std::string::npos; })) {
+		return;
+	}
+	static std::mutex         mutex;
+	static std::set<uint64_t> seen;
+	{
+		std::scoped_lock lock(mutex);
+		if (seen.size() >= 64u || !seen.insert(ret).second) return;
+	}
+	std::fprintf(stderr, "DRAW_CALLER marker=[%s] kind=%s ret=%s\n", path.c_str(), kind,
+	             GuestCallChain(ret, frame).c_str());
+}
+
+#define KYTY_TRACE_DRAW_CALLER(kind)                                                                                   \
+	TraceDrawCaller(buf, kind, reinterpret_cast<uint64_t>(__builtin_return_address(0)),                                 \
+	                reinterpret_cast<uint64_t>(__builtin_frame_address(0)))
+
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
                                         const volatile void* index_addr, uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndex");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
@@ -2532,6 +2632,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
                                                       const volatile void* index_addr,
                                                       const volatile void* object_ids,
                                                       uint32_t instance_count, uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndexMultiInstanced");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
@@ -2606,6 +2707,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
                                             uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndexAuto");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
@@ -2633,6 +2735,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
                                               uint32_t index_count, uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndexOffset");
 	PRINT_NAME();
 
 	AgcTrace("\t index_offset = 0x%" PRIx32 "\n"
@@ -2687,6 +2790,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndexIndirect");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
@@ -2714,6 +2818,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndirect");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
@@ -2743,6 +2848,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
                                                 uint32_t             max_count_or_count,
                                                 const volatile void* count_addr,
                                                 uint32_t stride_in_bytes, uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndirectMulti");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
@@ -2804,6 +2910,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
                                                      uint32_t             max_count_or_count,
                                                      const volatile void* count_addr,
                                                      uint32_t stride_in_bytes, uint64_t modifier) {
+	KYTY_TRACE_DRAW_CALLER("DrawIndexIndirectMulti");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
@@ -3079,42 +3186,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
-}
-
-uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
-                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
-	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
-
-	auto* cmd =
-	    buf->AllocateDW(AGC_WAIT_USER_DATA_BEGIN_DW + AGC_INTERNAL_DATA_PACKET_SIZE_DW + 4u);
-	if (cmd == nullptr) {
-		return nullptr;
-	}
-
-	const auto address_value = reinterpret_cast<uint64_t>(address);
-	const bool signal        = (op == 6u);
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
-	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
-	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
-	cmd[3] = static_cast<uint32_t>(address_value);
-
-	// A signal pads with a NOP header where a wait ends with its end marker.
-	auto* semaphore = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
-	if (signal) {
-		semaphore[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_NOP, 0u);
-		semaphore += AGC_INTERNAL_DATA_PACKET_SIZE_DW;
-	}
-	semaphore[0] = KYTY_PM4(4, Pm4::IT_MEM_SEMAPHORE, 0u);
-	semaphore[1] = static_cast<uint32_t>(address_value) & ~0x7u;
-	semaphore[2] = static_cast<uint32_t>(address_value >> 32u);
-	semaphore[3] = (static_cast<uint32_t>(op) << 29u) | ((signal_type & 0x1u) << 20u) |
-	               ((mailbox & 0x1u) << 16u);
-	if (!signal) {
-		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG);
-	}
-
-	return cmd;
 }
 
 uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
@@ -3550,7 +3621,13 @@ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication
 int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
 	PRINT_NAME();
 
+	const auto size = AgcGetPacketSize(packet);
+
 	packet[0] = (packet[0] & 0xffff0003u) | (Pm4::IT_NOP << 8u);
+	// Prevent the disabled payload from being treated as an executable marker.
+	if (size > 1 && (packet[1] & 0xffff0000u) == 0x68750000u) {
+		packet[1] &= 0xffffu;
+	}
 
 	return OK;
 }
@@ -3812,21 +3889,27 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
                                                       const volatile Label* address) {
 	PRINT_NAME();
 
+	// Not sure
+
 	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
 	         "\t address = 0x%016" PRIx64 "\n",
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
-	}
+	auto vaddr = reinterpret_cast<uint64_t>(address);
+	auto op    = (cmd[0] >> 8u) & 0xffu;
 
-	// A kSendIntCtx release has no address.
-	if (((cmd[2] >> 24u) & 0x7u) != 4u) {
-		const auto vaddr = reinterpret_cast<uint64_t>(address);
-		cmd[3]           = (cmd[3] & 0x3u) | (static_cast<uint32_t>(vaddr) & ~0x3u);
-		cmd[4]           = static_cast<uint32_t>(vaddr >> 32u);
+	if ((op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM) ||
+	    op == Pm4::IT_RELEASE_MEM) {
+		cmd[3] = static_cast<uint32_t>(vaddr & 0xffffffffu);
+		cmd[4] = static_cast<uint32_t>((vaddr >> 32u) & 0xffffffffu);
+	} else if (op == Pm4::IT_EVENT_WRITE_EOP) {
+		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
+		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
+	} else {
+		EXIT("unsupported queueEndOfPipeAction packet for address patch: 0x%08" PRIx32 "\n",
+		     cmd[0]);
 	}
 
 	return OK;
@@ -3841,7 +3924,10 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data)
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
+	const auto op             = (cmd[0] >> 8u) & 0xffu;
+	const bool is_release_mem = op == Pm4::IT_RELEASE_MEM ||
+	                            (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM);
+	if (!is_release_mem) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
@@ -3880,12 +3966,11 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	const auto size_dw = KYTY_PM4_LEN(cmd_id);
 	if (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW) {
 		const auto tag = payload[1] & 0xffff0000u;
-		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG ||
-		       tag == AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG || tag == AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG;
+		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG;
 	}
 
 	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
-	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG || payload[1] == AGC_MEM_SEMAPHORE_END_TAG ||
+	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG ||
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
 }
@@ -3978,7 +4063,59 @@ uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	}
 }
 
+// KYTY_TRACE_MARKER_CALLERS=<text>[|<text>...] (diagnostic): a debug marker whose text contains one of the texts logs,
+// once per (marker, caller), the guest return address and the code addresses found on the caller's stack (a
+// stack-scan backtrace, so some entries are stale) as <module>+<offset>, to find the game code that issues a pass.
+static void TraceMarkerCaller(const char* str, uint64_t ret, uint64_t frame) {
+	static const std::vector<std::string> filters = [] {
+		std::vector<std::string> list;
+		const char*              value = std::getenv("KYTY_TRACE_MARKER_CALLERS");
+		if (value == nullptr) return list;
+		std::string text(value);
+		size_t      start = 0;
+		while (start <= text.size()) {
+			const auto end  = text.find('|', start);
+			auto       item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (!item.empty()) list.push_back(item);
+			if (end == std::string::npos) break;
+			start = end + 1;
+		}
+		return list;
+	}();
+	if (filters.empty() || str == nullptr) return;
+	auto* linker = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	if (linker->FindProgramByAddr(ret) == nullptr) return;
+	const std::string marker(str);
+	if (std::none_of(filters.begin(), filters.end(),
+	                 [&](const std::string& f) { return marker.find(f) != std::string::npos; })) {
+		return;
+	}
+	static std::mutex                                 mutex;
+	static std::set<std::pair<std::string, uint64_t>> seen;
+	{
+		std::scoped_lock lock(mutex);
+		if (seen.size() >= 64u || !seen.insert({marker, ret}).second) return;
+	}
+	const auto describe = [&](uint64_t value) -> std::string {
+		auto* program = linker->FindProgramByAddr(value);
+		if (program == nullptr) return {};
+		return fmt::format("{}+0x{:x}", Common::PathToString(program->file_name.filename()), value - program->base_vaddr);
+	};
+	std::string chain = describe(ret);
+	for (uint32_t i = 0; i < 256u; i++) {
+		const auto addr = frame + uint64_t {i} * 8u;
+		if (!Graphics::HostMemoryIsReadable(addr)) break;
+		const auto value = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
+		const auto text  = describe(value);
+		if (!text.empty()) chain += fmt::format(" [{}]{}", i, text);
+	}
+	std::fprintf(stderr, "MARKER_CALLER marker=[%s] ret=%s\n", str, chain.c_str());
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t /*color*/) {
+	RecordMarkerPush(buf, str, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -4004,18 +4141,26 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, ui
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbPushMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbSetMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+	RecordMarkerPush(buf, str, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbPushMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
+	RecordMarkerPop(buf, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -4033,6 +4178,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
+	RecordMarkerPop(buf, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	return AgcDcbPopMarker(buf);
 }
 
@@ -4141,7 +4287,7 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
+	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {

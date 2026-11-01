@@ -1,0 +1,195 @@
+{
+ "id": "PPSA26344",
+ "version": "01.512.000",
+ "process": "eboot.bin",
+ "ladder_description": "The game's own quality steps for when it is overloaded: a shorter detail distance (LOD) and fewer sun shadow views. Draws per frame on our route: 5,180 at full quality, 4,456 at level 4, 3,747 at 8, 2,370 at 11, 1,070 at 15. Higher levels are faster and plainer.",
+ "mods": [
+  {
+   "key": "ladder4",
+   "name": "Scalability ladder level 4 (the game's own overload level: LOD 0.7, 3 sun shadow views)",
+   "title": "Level 4",
+   "gain": "+13% fps",
+   "description": "LOD 0.7, 3 sun shadow views",
+   "memory": [
+    {
+     "offset": "0x00e64e1b",
+     "off": "48c7054a0d280400000000",
+     "on": "48c7054a0d280404000000"
+    }
+   ],
+   "group": "ladder"
+  },
+  {
+   "key": "ladder8",
+   "name": "Scalability ladder level 8 (LOD 0.4, 3 sun shadow views)",
+   "title": "Level 8",
+   "gain": "+17% fps",
+   "description": "LOD 0.4, 3 sun shadow views",
+   "memory": [
+    {
+     "offset": "0x00e64e1b",
+     "off": "48c7054a0d280400000000",
+     "on": "48c7054a0d280408000000"
+    }
+   ],
+   "group": "ladder"
+  },
+  {
+   "key": "ladder11",
+   "name": "Scalability ladder level 11 (LOD 0.2, 2 sun shadow views)",
+   "title": "Level 11",
+   "gain": "+59% fps",
+   "description": "LOD 0.2, 2 sun shadow views",
+   "memory": [
+    {
+     "offset": "0x00e64e1b",
+     "off": "48c7054a0d280400000000",
+     "on": "48c7054a0d28040b000000"
+    }
+   ],
+   "group": "ladder"
+  },
+  {
+   "key": "ladder15",
+   "name": "Scalability ladder level 15 (LOD 0.1, 1 sun shadow view - the lowest level the game uses)",
+   "title": "Level 15",
+   "gain": "+79% fps",
+   "description": "LOD 0.1, 1 sun shadow view",
+   "memory": [
+    {
+     "offset": "0x00e64e1b",
+     "off": "48c7054a0d280400000000",
+     "on": "48c7054a0d28040f000000"
+    }
+   ],
+   "group": "ladder"
+  },
+  {
+   "key": "render1080",
+   "name": "Render 1080p (dynamic-resolution index locked at 15 = 1920x1080, also in cutscenes)",
+   "title": "Render at 1080p",
+   "gain": "not measured on the route (mostly lightens the graphics card, e.g. in cutscenes)",
+   "description": "The game renders at 1920x1080, also in cutscenes (less load on the graphics card).",
+   "memory": [
+    {
+     "offset": "0x00e5e33c",
+     "off": "8b8b48783200",
+     "on": "b90f00000090"
+    }
+   ]
+  },
+  {
+   "key": "sun3",
+   "name": "Sun shadows: 3 views instead of 4 (one cascade less, as the game's own overload levels 4-8)",
+   "title": "Sun shadows: 3 views",
+   "gain": "not measured yet",
+   "description": "One sun shadow cascade less: distant shadows softer, water without shadows.",
+   "memory": [
+    {
+     "offset": "0x0209bfc0",
+     "off": "000000000000803f000000000000000000000000010000000000803f000000000000000000000000",
+     "on": "000000000000803fffffffff0000000000000000010000000000803f000000000000000000000000"
+    }
+   ]
+  },
+  {
+   "key": "local2",
+   "name": "Local light shadows: at most 2 spot-light shadow maps per frame (instead of 8)",
+   "title": "Lamp shadows: at most 2",
+   "gain": "not measured yet (all lamp shadows off: +4% fps)",
+   "description": "Lamps, fires and torches: at most 2 cast shadows at once (instead of 8).",
+   "memory": [
+    {
+     "offset": "0x01446b8c",
+     "off": "41bf0800000083f808",
+     "on": "41bf0200000083f802"
+    }
+   ]
+  },
+  {
+   "key": "noparticleshadow",
+   "name": "No particle shadows (Particle Finalize and particle draws skipped in shadow views; smoke/fire cast no shadow)",
+   "title": "No particle shadows",
+   "gain": "+0% fps",
+   "description": "Smoke, fire and mist cast no shadows.",
+   "memory": [
+    {
+     "offset": "0x0145adf1",
+     "off": "740f488d3d761375054c",
+     "on": "eb0f488d3d761375054c"
+    },
+    {
+     "offset": "0x01439794",
+     "off": "0f84d3000000488d3d2f2e240348",
+     "on": "e9d400000090488d3d2f2e240348"
+    }
+   ]
+  },
+  {
+   "key": "mist14",
+   "name": "Mist and translucent particles always at 1/4 resolution (the game's own lowest level)",
+   "title": "Mist at 1/4 resolution",
+   "gain": "no gain measured",
+   "description": "Mist and see-through particles always at the game's lowest resolution (softer mist).",
+   "memory": [
+    {
+     "offset": "0x012d211b",
+     "off": "8b15879c8d058d720189357e9c8d0585d20f8ec0000000",
+     "on": "41c786c047000002000000e9c70000000f1f8000000000"
+    }
+   ]
+  },
+  {
+   "key": "nograssshadow",
+   "name": "No grass in shadow views (the call of the grass pass in the shadow-view builder left out)",
+   "title": "No grass shadows",
+   "gain": "+2% fps (within noise)",
+   "description": "Grass casts no shadows.",
+   "memory": [
+    {
+     "offset": "0x0145aff3",
+     "off": "e868f2a1ff",
+     "on": "0f1f440000"
+    }
+   ]
+  },
+  {
+   "key": "actors05",
+   "name": "Actors (people, animals) LOD scale fixed at 0.5 (shorter detail/draw distance for actors)",
+   "title": "Shorter detail for people and animals",
+   "gain": "+2% fps (within noise)",
+   "description": "People and animals switch to simpler models closer to the camera.",
+   "memory": [
+    {
+     "offset": "0x016bc665",
+     "off": "7206c706cdcc4c3d",
+     "on": "9090c7060000003f"
+    }
+   ]
+  },
+  {
+   "key": "cull005",
+   "name": "Small shadow casters culled (ladder row 0 small-caster cull 0 -> 0.05)",
+   "title": "Small shadow casters culled",
+   "gain": "+4% fps",
+   "description": "Very small objects cast no shadows.",
+   "memory": [
+    {
+     "offset": "0x0209bfc0",
+     "off": "000000000000803f000000000000000000000000010000000000803f000000000000000000000000",
+     "on": "000000000000803f00000000cdcc4c3d00000000010000000000803f000000000000000000000000"
+    }
+   ]
+  },
+  {
+   "key": "noparticles",
+   "name": "No particle simulation (the particle compute shaders - emit, update, finalize - skipped by the emulator)",
+   "title": "No particles",
+   "gain": "+5% fps",
+   "description": "Smoke, mist, wind waves, sparks and leaves disappear (emulator setting, no game memory change).",
+   "env": {
+    "KYTY_DIAG_SKIP_CS_HASHES": "142383a7de1e5111,525a55d3242304c9,d96ad85984ac34b8,68beec32ff5a4bab,01025cd5c3102c4c,b629e5773956d33c,1dd50834d0980aa4,b74bf13aec182bfb"
+   }
+  }
+ ]
+}

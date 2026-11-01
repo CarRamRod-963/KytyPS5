@@ -104,6 +104,7 @@ uint32_t Builder::DeclareConstant(spv::Op opcode, std::vector<uint32_t> key) {
 	const auto id = AllocateId();
 	AppendInstruction(m_declarations, opcode, key[1], id,
 	                  std::span<const uint32_t>(key).subspan(2));
+	if (opcode == spv::OpConstant && key.size() == 3u) m_constant_words.emplace(id, key[2]);
 	m_declaration_ids.emplace(std::move(key), id);
 	return id;
 }

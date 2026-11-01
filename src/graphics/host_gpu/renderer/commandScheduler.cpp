@@ -1,15 +1,111 @@
+#include "common/threads.h"
+#include "common/profiler.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
+#include "common/overlayStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <type_traits>
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <vector>
 #include <cstdio>
 #include <optional>
 
+#include "graphics/host_gpu/renderer/perfCounters.h"
+#include "graphics/host_gpu/renderer/gpuTimer.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
+#include "graphics/host_gpu/renderer/virtualGpuClock.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/recordPackets.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stageFTrace.h"
+#include "graphics/host_gpu/renderer/debugSample.h"
+
+#include "graphics/host_gpu/queueLockSite.h"
 namespace Libs::Graphics {
+
+// KYTY_TRACE_OPEN_FLUSH=1 (diagnostic, default off): a GPU-thread wait for the open command buffer (it is submitted
+// and waited for at once: a read of GPU-written data recorded in it) - how many draws/dispatches the buffer held, how
+// long it had been open, and how long the GPU had already been idle while it was being recorded (checked at each
+// draw/dispatch). Idle time while the buffer filled is what an earlier submission could have used. One OPEN_FLUSH line
+// every ~5 s, per frame. Nothing else changes.
+namespace OpenFlushTrace {
+[[nodiscard]] bool Enabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_OPEN_FLUSH");
+		const bool  e     = value != nullptr && value[0] == '1';
+		if (e) std::fprintf(stderr, "TRACE_OPEN_FLUSH enabled\n");
+		return e;
+	}();
+	return on;
+}
+using Clock = std::chrono::steady_clock;
+Clock::time_point g_open_since {};
+Clock::time_point g_idle_since {};
+bool              g_idle_seen = false;
+struct Totals {
+	uint64_t flushes = 0, commands = 0, wait_us = 0, age_us = 0, idle_us = 0, hideable_us = 0, idle_flushes = 0;
+	uint64_t by_commands[5] {}; // 0, 1-4, 5-16, 17-48, >48
+};
+Totals                 g_totals;
+Clock::time_point      g_last_report = Clock::now();
+uint32_t               g_last_frame  = 0;
+[[nodiscard]] uint64_t Us(Clock::duration d) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+}
+void Report() {
+	const auto now = Clock::now();
+	if (now - g_last_report < std::chrono::seconds(5)) return;
+	const uint32_t frame  = DebugPresentCount().load();
+	const double   frames = frame > g_last_frame ? static_cast<double>(frame - g_last_frame) : 1.0;
+	g_last_report         = now;
+	g_last_frame          = frame;
+	auto& t               = g_totals;
+	std::fprintf(stderr,
+	             "OPEN_FLUSH frames=%.0f per_frame flushes=%.2f commands_avg=%.1f wait_ms=%.2f open_ms=%.2f "
+	             "gpu_idle_while_open_ms=%.2f hideable_ms=%.2f idle_flushes=%.2f by_commands[0/1-4/5-16/17-48/48+]="
+	             "%.2f/%.2f/%.2f/%.2f/%.2f\n",
+	             frames, t.flushes / frames, t.flushes != 0 ? static_cast<double>(t.commands) / t.flushes : 0.0,
+	             t.wait_us / frames / 1e3, t.age_us / frames / 1e3, t.idle_us / frames / 1e3, t.hideable_us / frames / 1e3,
+	             t.idle_flushes / frames, t.by_commands[0] / frames, t.by_commands[1] / frames, t.by_commands[2] / frames,
+	             t.by_commands[3] / frames, t.by_commands[4] / frames);
+	t = {};
+}
+} // namespace OpenFlushTrace
+
+// KYTY_TRACE_PERF_SAMPLE_IDLE (perfCounters.h): the main scheduler's semaphore and the last tick handed to vkQueueSubmit.
+static std::atomic<MasterSemaphore*> g_idle_master {nullptr};
+static std::atomic<uint64_t>         g_idle_submitted {0};
+
+bool PerfSampleIdleEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_PERF_SAMPLE_IDLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+void PerfSampleIdleNoteSubmitted(void* master, uint64_t tick) {
+	g_idle_master.store(static_cast<MasterSemaphore*>(master), std::memory_order_release);
+	g_idle_submitted.store(tick, std::memory_order_release);
+}
+
+bool PerfSampleGpuIdleNow() {
+	auto* master = g_idle_master.load(std::memory_order_acquire);
+	if (master == nullptr) return false;
+	const uint64_t submitted = g_idle_submitted.load(std::memory_order_acquire);
+	return master->QueryTickRaw() >= submitted;
+}
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -28,6 +124,86 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
 }
+
+// One vkQueueSubmit of a render command buffer that signals `tick` (with the waits and signals of `submit`), under
+// the queue lock. Called by the recording thread, or by the recorder's worker.
+vk::Result QueueSubmitLocked(GraphicContext& graphics, vk::CommandBuffer buffer, SubmitInfo& submit) {
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &buffer;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::QueueSubmit);
+	QueueLockGuard lock(graphics.queue_mutex, "commandScheduler.cpp:152");
+	return graphics.queue.submit(1, &submit_info, nullptr);
+}
+
+// What the recorder's worker needs to submit an ended render buffer.
+struct AsyncSubmitPacket {
+	GraphicContext*   graphics = nullptr;
+	vk::CommandBuffer buffer;
+	SubmitInfo        submit;
+	uint64_t          tick         = 0;
+	uint32_t          debug_op     = 0;
+	uint64_t          debug_submit = 0;
+	uint32_t          debug_arg[4] {};
+	uint64_t          debug_arg4 = 0;
+	MasterSemaphore*  master     = nullptr; // KYTY_TRACE_PERF_SAMPLE_IDLE
+};
+static_assert(std::is_trivially_copyable_v<AsyncSubmitPacket>);
+
+void AsyncSubmitOnWorker(const void* blob) {
+	auto packet = *static_cast<const AsyncSubmitPacket*>(blob);
+	if (GpuTimer::Enabled()) GpuTimer::NoteQueueSubmit(packet.tick); // KYTY_TRACE_GPU_TIMELINE
+	const auto result = QueueSubmitLocked(*packet.graphics, packet.buffer, packet.submit);
+	if (packet.master != nullptr && result == vk::Result::eSuccess) {
+		PerfSampleIdleNoteSubmitted(packet.master, packet.tick); // KYTY_TRACE_PERF_SAMPLE_IDLE
+	}
+	if (result != vk::Result::eSuccess) {
+		GpuCheckpoints::Dump(packet.graphics->queue);
+		ReportVulkanFatal("vkQueueSubmit (record thread)", result, packet.tick, packet.debug_op, packet.debug_submit,
+		                  packet.debug_arg[0], packet.debug_arg[1], packet.debug_arg[2], packet.debug_arg[3],
+		                  packet.debug_arg4);
+		EXIT("vkQueueSubmit failed on the record thread\n");
+	}
+}
+
+// Submission batching: fewer submissions while the GPU still runs work it was handed. A submission
+// gives the GPU work; while the GPU is busy with earlier work, it gives it nothing it lacks and costs the
+// recording thread a vkQueueSubmit (~28 us at the 4K test scene) plus the end of the rendering instance and
+// the re-binding of all state in the next command buffer. Three rules, all from the GPU's state (no timing
+// constant decides whether to batch):
+//  - SubmitEvery boundary: submitted when the GPU is idle there; while it is busy the batch
+//    goes on and is submitted at the first draw/dispatch that finds the GPU idle, at the latest after
+//    BatchMaxBatches times the boundary.
+//  - RELEASE_MEM interrupt: submitted at once when the GPU is idle. While it is busy the interrupt could
+//    not fire before the GPU finished the earlier work anyway, so the submission waits for the first packet
+//    that finds the GPU idle; what is recorded meanwhile delays the interrupt, so it is also forced after
+//    BatchInterruptPackets packets or BatchInterruptUs microseconds. The end of every command-processor
+//    slice still submits.
+//  - Idle early: when the GPU had run dry before this command buffer's first draw/dispatch after a slice
+//    end, wait, flip or other non-batch submission (or a wait for the newest submitted tick drained it while
+//    this buffer was open), the buffer is
+//    submitted once it holds BatchIdleCommands (4x inside a rendering
+//    instance) draws/dispatches and the GPU is still idle: at most one extra submission per such
+//    event, never in the steady draw stream.
+// Only submission points move; what each command buffer records and the order of all GPU work are unchanged.
+constexpr uint32_t SubmitEvery           = 128; // the open buffer is submitted every so many draws/dispatches
+constexpr uint32_t BatchMaxBatches       = 8;
+constexpr uint32_t BatchInterruptPackets = 256;
+constexpr uint32_t BatchInterruptUs      = 1000;
+constexpr uint32_t BatchIdleCommands     = 8;
 
 } // namespace
 
@@ -126,7 +302,13 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(CurrentTick() - 1); }
+	// The last buffer was ended and submitted above; the recording thread has
+	// nothing left and is stopped.
+	if (CommandRecorder::Enabled() && &m_context.GetCommandScheduler() == this) {
+		CommandRecorder::Shutdown();
+		RecordPackets::Shutdown(); // the record packets: the recording thread's descriptor heap (it has stopped)
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -154,6 +336,9 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	if (m_command.IsInvalid()) {
 		BeginNext();
 	}
+	// Upstream 4644c5292 (ported): the BDA page table and the fault buffer are zeroed in the render scheduler's first
+	// command buffer, before any buffer registration writes into the table (device memory starts undefined).
+	if (&m_context.GetCommandScheduler() == this) m_context.GetBufferCache().ClearDeviceTablesOnce();
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
@@ -178,34 +363,118 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
-	m_master.Wait(tick);
+	{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(tick); }
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::Finish); // KYTY_TRACE_SYNC_TIMELINE
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(CurrentTick() - 1); }
 	BeginNext();
 	PopPendingOperations();
 }
 
+// KYTY_TRACE_WAIT_CALLERS=1: fence waits are attributed to their caller (return address relative
+// to the executable base) with the time spent; the top callers are printed every 2048 waits.
+static void TraceWaitCaller(uint64_t caller, uint64_t micros) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_WAIT_CALLERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!on) return;
+	static std::mutex mutex;
+	std::scoped_lock  lock(mutex);
+	struct Entry {
+		uint64_t caller;
+		uint64_t count;
+		uint64_t micros;
+	};
+	static std::vector<Entry> entries;
+	static uint64_t           total = 0;
+	auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry& e) { return e.caller == caller; });
+	if (it == entries.end()) {
+		entries.push_back({caller, 0, 0});
+		it = entries.end() - 1;
+	}
+	it->count++;
+	it->micros += micros;
+	// Also every ~10 s: at ~2 fps a run sees far fewer than 2048 waits.
+	static auto last_report = std::chrono::steady_clock::now();
+	const auto  now         = std::chrono::steady_clock::now();
+	if ((++total & 0x7ffu) == 0 || now - last_report > std::chrono::seconds(10)) {
+		last_report = now;
+		std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.micros > b.micros; });
+		std::fprintf(stderr, "WAIT_CALLERS total=%llu", static_cast<unsigned long long>(total));
+		for (size_t i = 0; i < entries.size() && i < 10; ++i) {
+			std::fprintf(stderr, " [rva=0x%llx n=%llu ms=%llu]", static_cast<unsigned long long>(entries[i].caller - 0x140000000ull),
+			             static_cast<unsigned long long>(entries[i].count),
+			             static_cast<unsigned long long>(entries[i].micros / 1000u));
+		}
+		std::fprintf(stderr, "\n");
+	}
+}
+
+
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("Scheduler::Wait");
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	const auto start  = std::chrono::steady_clock::now();
+	struct Report {
+		uint64_t                              caller;
+		std::chrono::steady_clock::time_point start;
+		~Report() {
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+			TraceWaitCaller(caller, us);
+		}
+	} report {caller, start};
 	EXIT_IF(tick > CurrentTick());
+	// KYTY_TRACE_SYNC_TIMELINE: the caller of a wait outside the tagged sites, and whether it submitted the open
+	// command buffer.
+	const bool timeline = SyncTimeline::Enabled();
+	if (timeline) SyncTimeline::NoteCaller(caller);
 	if (tick == CurrentTick()) {
 		CheckActive();
+		// KYTY_TRACE_OPEN_FLUSH: what the open buffer held and how long the GPU had been idle meanwhile.
+		const bool open_trace = OpenFlushTrace::Enabled() && PerfIsGpuThread();
+		const auto open_now   = std::chrono::steady_clock::now();
+		const auto commands   = m_commands_since_submit;
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		if (timeline) SyncTimeline::NoteOpenFlush();
+		{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(tick); }
+		if (open_trace) {
+			namespace T          = OpenFlushTrace;
+			auto&          t     = T::g_totals;
+			const uint64_t wait  = T::Us(std::chrono::steady_clock::now() - open_now);
+			const uint64_t idle  = T::g_idle_seen ? T::Us(open_now - T::g_idle_since) : 0u;
+			t.flushes++;
+			t.commands += commands;
+			t.wait_us += wait;
+			t.age_us += T::Us(open_now - T::g_open_since);
+			t.idle_us += idle;
+			t.hideable_us += std::min(wait, idle);
+			t.idle_flushes += T::g_idle_seen ? 1u : 0u;
+			t.by_commands[commands == 0 ? 0 : commands <= 4 ? 1 : commands <= 16 ? 2 : commands <= 48 ? 3 : 4]++;
+			T::Report();
+		}
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		// Waiting for the newest submitted work, not known finished, drains the GPU while the open buffer holds more; that
+		// buffer may then be submitted early (NoteGpuCommandBatched).
+		if (PerfIsGpuThread() && tick + 1u == CurrentTick() && !m_master.IsFree(tick)) {
+			m_batch_idle_armed = true;
+		}
+		{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(tick); }
 	}
+	if (timeline) SyncTimeline::NoteCaller(0);
 }
 
 void CommandScheduler::PopPendingOperations() {
@@ -261,6 +530,7 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	if (SyncTimeline::Enabled()) SyncTimeline::MarkPriorityThread();
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -276,7 +546,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(operation.tick); }
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -299,12 +569,24 @@ void CommandScheduler::DrainPriorityOperations() {
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
-		const bool queued_before_or_at =
-		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
-		return !active_before_or_at && !queued_before_or_at;
-	});
+	const auto       done = [this, tick] {
+        const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+        const bool queued_before_or_at =
+            !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+        return !active_before_or_at && !queued_before_or_at;
+	};
+	if (done()) return;
+	// Blocked on a deferred priority operation (another thread's publish / callback): visible in Tracy.
+	KYTY_PROFILER_BLOCK("Scheduler::WaitPriorityOps");
+	SyncTimeline::WaitScope timeline(SyncTimeline::Site::PriorityOps, 0, 0, 0); // KYTY_TRACE_SYNC_TIMELINE
+	m_operation_available.wait(lock, done);
+}
+
+bool CommandScheduler::PriorityOperationsDone(uint64_t tick) {
+	std::lock_guard lock(m_operation_mutex);
+	const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+	const bool queued_before_or_at = !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	return !active_before_or_at && !queued_before_or_at;
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -322,70 +604,247 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+bool CommandScheduler::GpuIdle() {
+	return IsFree(CurrentTick() - 1);
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	EXIT_IF(m_command.IsInvalid());
+	// Upstream 4644c5292 checks only for an open command buffer here, so the buffer cache's constructor can record
+	// its table clears before Begin. Ours records them at the first Begin (BufferCache::ClearDeviceTablesOnce), so
+	// Current() keeps requiring an active scheduler.
+	CheckActive();
 	return m_command;
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
+	const StageF::Zone stagef_submit(StageF::Sub::Submit); // KYTY_TRACE_STAGEF
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	// Routed before it is begun, so the begin is a packet too (the worker owns the
+	// pool while it records the previous buffers).
+	const bool routed_async = CommandRecorder::AsyncSubmit() && &m_context.GetCommandScheduler() == this;
+	if (routed_async) {
+		CommandRecorder::Route(m_command.m_buffer);
+	}
 	m_command.Begin();
+	// From here until vkEndCommandBuffer (CommandBuffer::End in Submit, which first waits for
+	// the recording thread), the commands recorded into this buffer are copied into a ring and recorded by that thread.
+	// Only the render scheduler's buffers; the presentation scheduler's are recorded and submitted as before.
+	if (!routed_async && CommandRecorder::Enabled() && &m_context.GetCommandScheduler() == this) {
+		CommandRecorder::Route(m_command.m_buffer);
+	}
+	if (OpenFlushTrace::Enabled() && &m_context.GetCommandScheduler() == this) { // KYTY_TRACE_OPEN_FLUSH
+		OpenFlushTrace::g_open_since = std::chrono::steady_clock::now();
+		OpenFlushTrace::g_idle_seen  = false;
+	}
+	if (GpuTimer::Enabled()) GpuTimer::BeginCommandBuffer(*this, m_command.m_buffer);
+	if (VirtualGpuClock::Enabled()) VirtualGpuClock::BeginCommandBuffer(*this, m_command.m_buffer); // KYTY_FIX_VIRTUAL_GPU_CLOCK
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_BLOCK("Scheduler::Submit");
+	const StageF::Zone stagef_submit(StageF::Sub::Submit); // KYTY_TRACE_STAGEF
 	EXIT_IF(m_command.IsInvalid());
+	if (m_pre_submit_hook && !m_in_pre_submit_hook) { // D4b step 1 (append windows)
+		m_in_pre_submit_hook = true;
+		m_pre_submit_hook();
+		m_in_pre_submit_hook = false;
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (GpuTimer::Enabled()) GpuTimer::EndCommandBuffer(m_command.m_buffer);
+	// The host reads finished GPU writes straight from mapped buffers.
+	// KYTY_PERF_DIRECT_RANGES: and from guest memory (direct buffers) once the submission finished.
+	m_command.EndRendering();
+	vk::MemoryBarrier host {};
+	host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                                   &host, 0, nullptr, 0, nullptr);
+	if (VirtualGpuClock::Enabled()) VirtualGpuClock::EndCommandBuffer(m_command.m_buffer); // KYTY_FIX_VIRTUAL_GPU_CLOCK
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
-	vk::Result result;
-	uint64_t   tick;
-	{
-		Common::LockGuard lock(graphics.queue_mutex);
+	vk::Result result = vk::Result::eSuccess;
+	uint64_t   tick   = 0;
+	if (CommandRecorder::AsyncSubmit() && &m_context.GetCommandScheduler() == this) {
+		// The buffer was ended by a packet (CommandBuffer::End above); the worker
+		// submits it after that, in tick order (only this thread takes ticks of this scheduler).
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		AsyncSubmitPacket packet;
+		packet.graphics     = &graphics;
+		packet.buffer       = buffer;
+		packet.submit       = submit;
+		packet.tick         = tick;
+		packet.debug_op     = m_command.m_debug_op;
+		packet.debug_submit = m_command.m_debug_submit_id;
+		packet.debug_arg[0] = m_command.m_debug_arg0;
+		packet.debug_arg[1] = m_command.m_debug_arg1;
+		packet.debug_arg[2] = m_command.m_debug_arg2;
+		packet.debug_arg[3] = m_command.m_debug_arg3;
+		packet.debug_arg4   = m_command.m_debug_arg4;
+		packet.master       = PerfSampleIdleEnabled() ? &m_master : nullptr; // KYTY_TRACE_PERF_SAMPLE_IDLE
+		CommandRecorder::EnqueueCall(&AsyncSubmitOnWorker, &packet, sizeof(packet));
+	} else {
+		QueueLockGuard lock(graphics.queue_mutex, "commandScheduler.cpp:781");
+		tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), tick);
+		result = QueueSubmitLocked(graphics, buffer, submit);
+		if (PerfSampleIdleEnabled() && result == vk::Result::eSuccess && &m_context.GetCommandScheduler() == this) {
+			PerfSampleIdleNoteSubmitted(&m_master, tick); // KYTY_TRACE_PERF_SAMPLE_IDLE
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		GpuCheckpoints::Dump(graphics.queue);
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (GpuTimer::Enabled()) GpuTimer::Submitted(buffer, tick);
+	if (VirtualGpuClock::Enabled()) VirtualGpuClock::Submitted(buffer, tick); // KYTY_FIX_VIRTUAL_GPU_CLOCK
+	if (SyncTimeline::Enabled()) SyncTimeline::NoteSubmit(tick);
 
-	m_command.m_buffer = nullptr;
+	m_command.m_buffer      = nullptr;
+	m_commands_since_submit = 0;
+	// What was recorded belongs to the submitted command buffer (KYTY_DIAG_DRAW_STATE_FILTER).
+	m_command.InvalidateGraphicsState();
+	// KYTY_TRACE_PERF: the submission by reason, and how long a deferred interrupt
+	// waited for it.
+	if (PerfEnabled()) {
+		m_perf_submits[static_cast<uint32_t>(m_submit_reason)].fetch_add(1, std::memory_order_relaxed);
+		if (m_batch_interrupt_pending) {
+			const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                          std::chrono::steady_clock::now() - m_batch_interrupt_since)
+			                                          .count());
+			m_perf_interrupt_delay_us.fetch_add(us, std::memory_order_relaxed);
+			m_perf_interrupt_delays.fetch_add(1, std::memory_order_relaxed);
+			auto max = m_perf_interrupt_delay_max_us.load(std::memory_order_relaxed);
+			while (us > max && !m_perf_interrupt_delay_max_us.compare_exchange_weak(max, us, std::memory_order_relaxed)) {
+			}
+		}
+	}
+	// Everything recorded, deferred interrupts included, is submitted now.
+	m_last_submit_reason      = m_submit_reason;
+	m_submit_reason           = SubmitReason::Other;
+	m_batch_interrupt_pending = false;
+	m_batch_idle_armed        = false;
 	return tick;
+}
+
+void CommandScheduler::FlushFor(SubmitReason reason) {
+	m_submit_reason = reason;
+	Flush();
+}
+
+void CommandScheduler::NoteGpuCommand() {
+	// KYTY_TRACE_OPEN_FLUSH: the first draw/dispatch of the open buffer that found the GPU idle.
+	if (OpenFlushTrace::Enabled() && !OpenFlushTrace::g_idle_seen && Active() && !m_command.IsInvalid() &&
+	    m_commands_since_submit != 0 && GpuIdle()) {
+		OpenFlushTrace::g_idle_seen  = true;
+		OpenFlushTrace::g_idle_since = std::chrono::steady_clock::now();
+	}
+	if (!Active() || m_command.IsInvalid()) return;
+	NoteGpuCommandBatched();
+}
+
+// Called before each draw/dispatch is recorded; m_commands_since_submit counts it, so `count - 1` draws/dispatches are
+// already in the open buffer.
+void CommandScheduler::NoteGpuCommandBatched() {
+	const auto count = ++m_commands_since_submit;
+	if (count == 1 && !m_batch_idle_armed && m_last_submit_reason == SubmitReason::Other) {
+		// The buffer's first draw/dispatch after a slice end, wait or flip: did the GPU run dry before it?
+		// After a batch submission (periodic, interrupt, idle early) the GPU was just handed work, and an
+		// idle GPU there only means the recording is the bottleneck, which more submissions would slow.
+		m_batch_idle_armed = GpuIdle();
+	}
+	if (m_batch_idle_armed && count > (m_command.IsRendering() ? BatchIdleCommands * 4u : BatchIdleCommands)) {
+		if (GpuIdle()) {
+			FlushFor(SubmitReason::IdleEarly);
+			return;
+		}
+	}
+	if (count <= SubmitEvery) return;
+	const bool boundary = count == SubmitEvery + 1u;
+	if (GpuIdle()) {
+		FlushFor(boundary ? SubmitReason::Periodic : SubmitReason::PeriodicLate);
+		return;
+	}
+	if (boundary && PerfEnabled()) {
+		m_perf_deferred_periodic.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (uint64_t {count} > uint64_t {SubmitEvery} * BatchMaxBatches) {
+		FlushFor(SubmitReason::PeriodicBound);
+	}
+}
+
+void CommandScheduler::FlushForInterrupt() {
+	if (GpuIdle()) {
+		FlushFor(SubmitReason::Interrupt);
+		return;
+	}
+	if (PerfEnabled()) {
+		m_perf_deferred_interrupts.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (!m_batch_interrupt_pending) {
+		m_batch_interrupt_pending = true;
+		m_batch_interrupt_packets = 0;
+		m_batch_interrupt_since   = std::chrono::steady_clock::now();
+	}
+}
+
+void CommandScheduler::NoteDeferredPacket() {
+	if (GpuIdle()) {
+		FlushFor(SubmitReason::InterruptLate);
+		return;
+	}
+	if (++m_batch_interrupt_packets >= BatchInterruptPackets ||
+	    std::chrono::steady_clock::now() - m_batch_interrupt_since >= std::chrono::microseconds(BatchInterruptUs)) {
+		FlushFor(SubmitReason::InterruptBound);
+	}
+}
+
+void CommandScheduler::ReportSubmitPerf() {
+	if (!PerfEnabled()) return;
+	const auto take = [](std::atomic<uint64_t>& value) {
+		return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed));
+	};
+	unsigned long long submits[static_cast<uint32_t>(SubmitReason::Count)];
+	unsigned long long total = 0;
+	for (uint32_t i = 0; i < static_cast<uint32_t>(SubmitReason::Count); i++) {
+		submits[i] = take(m_perf_submits[i]);
+		total += submits[i];
+	}
+	const auto delays   = take(m_perf_interrupt_delays);
+	const auto delay_us = take(m_perf_interrupt_delay_us);
+	// Submissions by reason (periodic and interrupt: at once / deferred, then GPU idle / deferred, then bound),
+	// boundaries and interrupts deferred, and the wait of deferred interrupts for their submission (avg/max us).
+	std::fprintf(stderr,
+	             "PERF submit total=%llu other=%llu periodic=%llu/%llu/%llu interrupt=%llu/%llu/%llu "
+	             "idle_early=%llu deferred_periodic=%llu deferred_interrupts=%llu interrupt_delay_us=%llu/%llu\n",
+	             total, submits[static_cast<uint32_t>(SubmitReason::Other)],
+	             submits[static_cast<uint32_t>(SubmitReason::Periodic)],
+	             submits[static_cast<uint32_t>(SubmitReason::PeriodicLate)],
+	             submits[static_cast<uint32_t>(SubmitReason::PeriodicBound)],
+	             submits[static_cast<uint32_t>(SubmitReason::Interrupt)],
+	             submits[static_cast<uint32_t>(SubmitReason::InterruptLate)],
+	             submits[static_cast<uint32_t>(SubmitReason::InterruptBound)],
+	             submits[static_cast<uint32_t>(SubmitReason::IdleEarly)], take(m_perf_deferred_periodic),
+	             take(m_perf_deferred_interrupts), delays != 0 ? delay_us / delays : 0ull,
+	             take(m_perf_interrupt_delay_max_us));
 }
 
 void CommandScheduler::BeginNext() {

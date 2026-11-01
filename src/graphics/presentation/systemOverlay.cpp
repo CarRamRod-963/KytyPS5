@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/presentation/systemOverlay.h"
 
 #include "common/assert.h"
@@ -9,6 +10,8 @@
 #include "gpu_blit_shaders/gpu_imgui_hdr_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
+#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
@@ -21,6 +24,7 @@
 #include "loader/systemContent.h"
 #include "stb_image.h"
 
+#include "graphics/host_gpu/queueLockSite.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
@@ -246,6 +250,10 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// The emulator's loading screen (Figma "LoadingScreen", light theme): from the start to the game's first image (the
+// splash period, sceSystemServiceHideSplashScreen), faded out as the splash; it takes the place of the game's splash
+// images (drawn as before when its art cannot be loaded).
+std::atomic<bool>                    g_loading_active {false};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -630,6 +638,13 @@ void CheckVulkanResult(VkResult result) {
 	EXIT_IF(result != VK_SUCCESS);
 }
 
+// The in-game shader badge (Figma "ShaderBadge"): shown only while the shader precompile compiles in the background.
+bool ShaderBadgeVisible() {
+	if (!ShaderPrecompiler::Enabled()) return false;
+	const auto progress = GetPrecompileProgress();
+	return progress.started && !progress.done && progress.queued != 0;
+}
+
 } // namespace
 
 void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
@@ -648,6 +663,7 @@ void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
 	g_splash_active.store(Common::File::IsFileExisting(g_splash_paths[0]) &&
 	                          Common::File::IsFileExisting(g_splash_paths[1]),
 	                      std::memory_order_release);
+	g_loading_active.store(true, std::memory_order_release);
 }
 
 void HideSplashScreen() {
@@ -672,6 +688,7 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 }
 
 void ShutdownSystemOverlayInput() {
+	StopPerfOverlay(); // KYTY_OVERLAY: its sampler reads guest memory and process counters
 	g_splash_active.store(false, std::memory_order_release);
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
@@ -708,12 +725,15 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
+	const bool loading       = g_loading_active.load(std::memory_order_acquire);
+	const bool badge         = ShaderBadgeVisible();
 	const auto cursor        = GetHostInputTouchPadVisualState();
-	return {core.active || dialog.active || system.active || trophy_active || splash ||
+	return {core.active || dialog.active || system.active || trophy_active || splash || loading || badge ||
 	            (cursor.enabled && cursor.cursor_visible),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	            (splash ? 2u : 0u) + (loading ? 4u : 0u) +
+	            (badge ? static_cast<decltype(core.revision)>(GetPrecompileProgress().finished) + 8u : 0u) +
+	            static_cast<decltype(core.revision)>(cursor.revision) + PerformanceOverlayRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -881,6 +901,9 @@ struct SystemOverlay::Impl {
 			if (hand_cursor_image) {
 				ImGui::UnregisterUserTexture(hand_cursor_image.get());
 			}
+			if (loading_art) {
+				ImGui::UnregisterUserTexture(loading_art.get());
+			}
 			if (drawing_cursor_image) {
 				ImGui::UnregisterUserTexture(drawing_cursor_image.get());
 			}
@@ -917,6 +940,198 @@ struct SystemOverlay::Impl {
 		style.ItemSpacing    = {8.0f, 8.0f};
 		hand_cursor_image    = LoadTouchCursorImage("hand.png");
 		drawing_cursor_image = LoadTouchCursorImage("drawing.png");
+		// The loading screen's and the shader badge's fonts (the launcher's; default font when missing).
+		ui_font    = LoadUiFont(io, "Manrope-Regular.ttf");
+		mono_font  = LoadUiFont(io, "JetBrainsMono-Regular.ttf");
+		brand_font = LoadUiFont(io, "CormorantGaramond-SemiBold.ttf");
+	}
+
+	static ImFont* LoadUiFont(ImGuiIO& io, const char* name) {
+		const char* base_path = SDL_GetBasePath();
+		if (base_path == nullptr) return nullptr;
+		const auto      path = std::filesystem::path(base_path) / "assets" / "fonts" / name;
+		std::error_code error;
+		if (!std::filesystem::is_regular_file(path, error)) return nullptr;
+		ImFontConfig config;
+		config.Flags = ImFontFlags_NoLoadError;
+		return io.Fonts->AddFontFromFileTTF(Common::PathToString(path).c_str(), 0.0f, &config);
+	}
+
+	// The loading screen's art (assets/images/loading-valley.jpg); null when missing (the game's splash is then drawn).
+	std::unique_ptr<ImTextureData> LoadLoadingArt() {
+		const char* base_path = SDL_GetBasePath();
+		if (base_path == nullptr) return nullptr;
+		const auto   path = std::filesystem::path(base_path) / "assets" / "images" / "loading-valley.jpg";
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) return nullptr;
+		const auto encoded = file.ReadWholeBuffer();
+		if (encoded.empty() || encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return nullptr;
+		int   width  = 0;
+		int   height = 0;
+		auto* pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(encoded.data()),
+		                                     static_cast<int>(encoded.size()), &width, &height, nullptr, 4);
+		if (pixels == nullptr || width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+			stbi_image_free(pixels);
+			return nullptr;
+		}
+		auto texture = std::make_unique<ImTextureData>();
+		texture->Create(ImTextureFormat_RGBA32, width, height);
+		std::memcpy(texture->Pixels, pixels, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+		texture->UseColors = true;
+		stbi_image_free(pixels);
+		ImGui::RegisterUserTexture(texture.get());
+		return texture;
+	}
+
+	// The loading screen (Figma node 21:510; 1280x720 design, scaled to the window): art under a paper tint, a
+	// vignette and a centre wash; the fork's name, a gold bar and the stage (shader cache loading, shaders being
+	// prepared with their share, the game starting); the version at the bottom. False when it is not shown.
+	bool DrawLoadingScreen(vk::Extent2D frame_extent, Clock::time_point now) {
+		if (!g_loading_active.load(std::memory_order_acquire)) return false;
+		if (!loading_art_tried) {
+			loading_art_tried = true;
+			loading_art       = LoadLoadingArt();
+		}
+		if (!loading_art) {
+			g_loading_active.store(false, std::memory_order_release);
+			return false;
+		}
+		const auto  hidden = g_splash_hidden_at.load(std::memory_order_acquire);
+		const float fade   = hidden == 0 ? 0.0f
+		                                 : std::chrono::duration<float>(now.time_since_epoch() - Clock::duration {hidden})
+		                                           .count() /
+		                                       0.3f;
+		const float alpha = 1.0f - std::clamp(fade, 0.0f, 1.0f);
+		if (alpha == 0.0f) {
+			g_loading_active.store(false, std::memory_order_release);
+			g_splash_active.store(false, std::memory_order_release); // the game's splash is not drawn after it
+			return false;
+		}
+		const auto   a      = [alpha](int r, int g, int b, float o) {
+            return IM_COL32(r, g, b, static_cast<int>(255.0f * o * alpha));
+		};
+		const ImVec2 screen {static_cast<float>(frame_extent.width), static_cast<float>(frame_extent.height)};
+		const float  s    = std::min(screen.x / 1280.0f, screen.y / 720.0f);
+		auto*        draw = ImGui::GetBackgroundDrawList();
+		// Art (cover), paper tint #ece8e0 at 50%.
+		const float art_w = static_cast<float>(loading_art->Width);
+		const float art_h = static_cast<float>(loading_art->Height);
+		const float cover = std::max(screen.x / art_w, screen.y / art_h);
+		const ImVec2 art_size {art_w * cover, art_h * cover};
+		const ImVec2 art_pos {(screen.x - art_size.x) * 0.5f, (screen.y - art_size.y) * 0.5f};
+		draw->AddRectFilled({0, 0}, screen, a(236, 232, 224, 1.0f));
+		draw->AddImage(loading_art->GetTexRef(), art_pos, {art_pos.x + art_size.x, art_pos.y + art_size.y}, {0, 0}, {1, 1},
+		               a(255, 255, 255, 1.0f));
+		draw->AddRectFilled({0, 0}, screen, a(236, 232, 224, 0.5f));
+		// Vignette (paper, 0 in the middle to 65% at the edges) and the centre wash (80% in the middle), as rings.
+		const ImVec2 centre {screen.x * 0.5f, screen.y * 0.5f};
+		constexpr int rings = 24;
+		for (int i = rings; i >= 1; --i) {
+			const float t = static_cast<float>(i) / rings; // 1 at the edge
+			const float o = t < 0.6f ? 0.1f * t / 0.6f : 0.1f + 0.55f * (t - 0.6f) / 0.4f;
+			draw->AddEllipseFilled(centre, {screen.x * 0.5f * t * 1.42f, screen.y * 0.5f * t * 1.42f},
+			                       a(236, 232, 224, o / rings * 2.0f), 0.0f, 64);
+		}
+		for (int i = rings; i >= 1; --i) {
+			const float t = static_cast<float>(i) / rings;
+			const float o = t < 0.6f ? 0.8f - 0.4f * t / 0.6f : 0.4f * (1.0f - (t - 0.6f) / 0.4f);
+			draw->AddEllipseFilled(centre, {480.0f * s * t, 200.0f * s * t}, a(236, 232, 224, o / rings * 2.0f), 0.0f,
+			                       64);
+		}
+		// Stage and progress.
+		const auto  progress = GetPrecompileProgress();
+		float       value    = 0.0f;
+		std::string stage;
+		if (!ShaderPrecompiler::Enabled() || (progress.started && (progress.done || progress.queued == 0))) {
+			stage = "Starting game…";
+			value = 1.0f;
+		} else if (!progress.started) {
+			stage = "Loading shader cache…";
+		} else {
+			value = static_cast<float>(std::min(progress.finished, progress.queued)) / static_cast<float>(progress.queued);
+			stage = fmt::format("Preparing shaders… {}%", static_cast<int>(value * 100.0f));
+		}
+		// Name 32 px (Cormorant Garamond SemiBold, #171513), 24 px gap, bar 320x4, 24 px gap, stage 14 px (#6f6a62).
+		const char* name      = "KytyPS5 · Yōtei fork";
+		const float name_size = 32.0f * s;
+		const float bar_w     = 320.0f * s;
+		const float bar_h     = std::max(1.0f, 4.0f * s);
+		const float body_size = 14.0f * s;
+		const float gap       = 24.0f * s;
+		ImFont*     brand     = brand_font != nullptr ? brand_font : ImGui::GetFont();
+		ImFont*     body      = ui_font != nullptr ? ui_font : ImGui::GetFont();
+		const auto  name_dim  = brand->CalcTextSizeA(name_size, std::numeric_limits<float>::max(), 0.0f, name);
+		const auto  stage_dim = body->CalcTextSizeA(body_size, std::numeric_limits<float>::max(), 0.0f, stage.c_str());
+		const float block_h   = 38.0f * s + gap + bar_h + gap + 20.0f * s;
+		float       y         = centre.y - block_h * 0.5f;
+		draw->AddText(brand, name_size, {centre.x - name_dim.x * 0.5f, y}, a(0x17, 0x15, 0x13, 1.0f), name);
+		y += 38.0f * s + gap;
+		DrawGoldBar(draw, {centre.x - bar_w * 0.5f, y}, {bar_w, bar_h}, value, alpha);
+		y += bar_h + gap;
+		draw->AddText(body, body_size, {centre.x - stage_dim.x * 0.5f, y + (20.0f * s - stage_dim.y) * 0.5f},
+		              a(0x6f, 0x6a, 0x62, 1.0f), stage.c_str());
+		// Version, 12 px, 48 px from the bottom.
+		const char* version     = "v0.1";
+		const float small_size  = 12.0f * s;
+		const auto  version_dim = body->CalcTextSizeA(small_size, std::numeric_limits<float>::max(), 0.0f, version);
+		draw->AddText(body, small_size, {centre.x - version_dim.x * 0.5f, screen.y - 48.0f * s},
+		              a(0x6f, 0x6a, 0x62, 1.0f), version);
+		return true;
+	}
+
+	// ProgressBarGold: track #6f6a62, fill #e0a526, rounded.
+	static void DrawGoldBar(ImDrawList* draw, ImVec2 pos, ImVec2 size, float value, float alpha) {
+		const auto  o      = static_cast<int>(255.0f * alpha);
+		const float radius = std::min(size.y * 0.5f, 6.0f);
+		draw->AddRectFilled(pos, {pos.x + size.x, pos.y + size.y}, IM_COL32(0x6f, 0x6a, 0x62, o), radius);
+		if (value > 0.0f) {
+			draw->AddRectFilled(pos, {pos.x + size.x * std::clamp(value, 0.0f, 1.0f), pos.y + size.y},
+			                    IM_COL32(0xe0, 0xa5, 0x26, o), radius);
+		}
+	}
+
+	// The shader badge (Figma node 20:99): top-right, 24 px from the edges at 1080p (48 px at 2160p); translucent ink
+	// #171513 at 88%, "Preparing shaders ·" (Manrope 12 px, #ece8e0) and "62% · 17 840 / 28 700" (JetBrains Mono 12 px,
+	// #c9c6bf), padding 12x8, 8 px gap, a 3 px gold bar along the bottom edge.
+	void DrawShaderBadge(vk::Extent2D frame_extent) {
+		if (!ShaderBadgeVisible()) return;
+		const auto  progress = GetPrecompileProgress();
+		const auto  done     = std::min(progress.finished, progress.queued);
+		const float value    = static_cast<float>(done) / static_cast<float>(progress.queued);
+		const auto  group    = [](uint32_t n) {
+            std::string text = std::to_string(n);
+            for (int i = static_cast<int>(text.size()) - 3; i > 0; i -= 3) text.insert(static_cast<size_t>(i), " ");
+            return text;
+		};
+		const std::string label   = "Preparing shaders ·";
+		const std::string details = fmt::format("{}% · {} / {}", static_cast<int>(value * 100.0f), group(done),
+		                                        group(progress.queued));
+		const float s         = static_cast<float>(frame_extent.height) / 1080.0f;
+		const float text_size = 12.0f * s;
+		const float pad_x     = 12.0f * s;
+		const float pad_y     = 8.0f * s;
+		const float gap       = 8.0f * s;
+		const float bar_h     = std::max(1.0f, 3.0f * s);
+		const float margin    = 24.0f * s;
+		ImFont*     ui        = ui_font != nullptr ? ui_font : ImGui::GetFont();
+		ImFont*     mono      = mono_font != nullptr ? mono_font : ImGui::GetFont();
+		const auto  label_dim = ui->CalcTextSizeA(text_size, std::numeric_limits<float>::max(), 0.0f, label.c_str());
+		const auto  det_dim   = mono->CalcTextSizeA(text_size, std::numeric_limits<float>::max(), 0.0f, details.c_str());
+		const float line_h    = 16.0f * s;
+		const float width     = pad_x + label_dim.x + gap + det_dim.x + pad_x;
+		const float height    = pad_y + line_h + pad_y + bar_h;
+		const ImVec2 pos {static_cast<float>(frame_extent.width) - margin - width, margin};
+		auto*        draw   = ImGui::GetForegroundDrawList();
+		const float  radius = 6.0f * s;
+		draw->AddRectFilled(pos, {pos.x + width, pos.y + height}, IM_COL32(0x17, 0x15, 0x13, 224), radius);
+		const float text_y = pos.y + pad_y + (line_h - label_dim.y) * 0.5f;
+		draw->AddText(ui, text_size, {pos.x + pad_x, text_y}, IM_COL32(0xec, 0xe8, 0xe0, 255), label.c_str());
+		draw->AddText(mono, text_size, {pos.x + pad_x + label_dim.x + gap, text_y}, IM_COL32(0xc9, 0xc6, 0xbf, 255),
+		              details.c_str());
+		// The bar along the bottom edge, inside the rounded corners.
+		draw->PushClipRect(pos, {pos.x + width, pos.y + height}, true);
+		DrawGoldBar(draw, {pos.x, pos.y + height - bar_h}, {width, bar_h}, value, 1.0f);
+		draw->PopClipRect();
 	}
 
 	void PlayTrophySound() {
@@ -1037,12 +1252,25 @@ struct SystemOverlay::Impl {
 		return texture;
 	}
 
+	// The splash images stop being drawn now, but frames already submitted may still read them. They are released
+	// after image_count + 1 more frames (PrepareFrame): before reusing a frame slot the swapchain waits for the
+	// submission that last used it (Swapchain::AcquireNextImage), and the ticks of one queue complete in order, so by
+	// then every frame that drew the splash has finished. (A queue.waitIdle under the queue lock here deadlocked a cold
+	// start on 27.10: the recording thread could not submit the work the GPU was waiting for.)
 	void FinishSplash() {
 		g_splash_active.store(false, std::memory_order_release);
 		if (splash_dds[0] || splash_dds[1]) {
-			Common::LockGuard lock(graphics.queue_mutex);
-			RequireVulkanSuccess(graphics.queue.waitIdle(), "retire splash images");
-			splash_dds = {};
+			splash_retired       = std::move(splash_dds);
+			splash_dds           = {};
+			splash_retire_frames = splash_image_count + 1u;
+		}
+	}
+
+	// Once per frame (PrepareFrame): counts down the frames until the retired splash images are unused.
+	void RetireSplashImages(uint32_t image_count) {
+		splash_image_count = image_count;
+		if (splash_retire_frames != 0u && --splash_retire_frames == 0u) {
+			splash_retired = {};
 		}
 	}
 
@@ -1794,11 +2022,15 @@ struct SystemOverlay::Impl {
 	}
 
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
+		RetireSplashImages(image_count);
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
+		PerfOverlayTick(graphics);                      // KYTY_OVERLAY=1/2: sampler and GPU heaps
+		const bool perf_overlay = PerfOverlayVisible(); // KYTY_OVERLAY
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire) &&
+		    !g_splash_active.load(std::memory_order_acquire) && !g_loading_active.load(std::memory_order_acquire) &&
+		    !ShaderBadgeVisible() && !perf_overlay &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
 			return false;
 		}
@@ -1829,7 +2061,13 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		DrawSplash(frame_extent);
+		if (!DrawLoadingScreen(frame_extent, now)) {
+			DrawSplash(frame_extent);
+			DrawShaderBadge(frame_extent);
+		}
+		if (perf_overlay) {
+			DrawPerfOverlay(graphics, frame_extent); // below the dialogs and toasts drawn after it
+		}
 		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
 		GetOverlaySnapshot(&snapshot);
 		if (has_overlay && snapshot.session == prepared_session) {
@@ -1866,7 +2104,8 @@ struct SystemOverlay::Impl {
 		rendering.pColorAttachments    = &color;
 		command.beginRendering(rendering);
 		{
-			Common::LockGuard queue_lock(graphics.queue_mutex);
+			CommandRecorder::SyncQueue(); // before the queue lock
+			QueueLockGuard queue_lock(graphics.queue_mutex, "systemOverlay.cpp:1879");
 			ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
 			                                static_cast<VkCommandBuffer>(command));
 		}
@@ -1878,7 +2117,9 @@ struct SystemOverlay::Impl {
 			return;
 		}
 		ImGui::SetCurrentContext(imgui_context);
-		splash_dds = {};
+		splash_dds           = {};
+		splash_retired       = {};
+		splash_retire_frames = 0;
 		ImGui_ImplVulkan_Shutdown();
 		vulkan_initialized = false;
 	}
@@ -1895,6 +2136,11 @@ struct SystemOverlay::Impl {
 	ImVec2                                right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	std::unique_ptr<ImTextureData>              loading_art; // the loading screen's art (LoadLoadingArt)
+	bool                                        loading_art_tried = false;
+	ImFont*                                     ui_font    = nullptr; // Manrope (loading screen, shader badge)
+	ImFont*                                     mono_font  = nullptr; // JetBrains Mono (shader badge)
+	ImFont*                                     brand_font = nullptr; // Cormorant Garamond (loading screen name)
 	std::unique_ptr<ImTextureData>              hand_cursor_image;
 	std::unique_ptr<ImTextureData>              drawing_cursor_image;
 	bool                                        cursor_initialized = false;
@@ -1912,6 +2158,9 @@ struct SystemOverlay::Impl {
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
 	std::array<std::unique_ptr<DdsImage>, 2>      splash_dds;
+	std::array<std::unique_ptr<DdsImage>, 2>      splash_retired;           // FinishSplash: kept until unused
+	uint32_t                                      splash_retire_frames = 0; // frames left until splash_retired goes
+	uint32_t                                      splash_image_count   = 3; // the swapchain's, from PrepareFrame
 	Clock::time_point                             splash_born;
 	SDL_AudioStream*                            trophy_sound_stream      = nullptr;
 	uint8_t*                                    trophy_sound_data        = nullptr;

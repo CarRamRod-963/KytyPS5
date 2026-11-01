@@ -1,6 +1,15 @@
+#include <unordered_map>
+#include <mutex>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/envDefaults.h"
+#include "common/envRead.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -8,8 +17,11 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debugSample.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -17,6 +29,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -25,6 +38,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -38,6 +52,8 @@
 #define KYTY_ENABLE_DEBUG_PRINTF
 
 namespace Libs::Graphics {
+
+
 
 struct VulkanExtensions {
 	bool enable_validation_layers = false;
@@ -58,6 +74,7 @@ vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noe
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.samplerMirrorClampToEdge  = VK_TRUE;
+	features.samplerFilterMinmax       = VK_TRUE;
 	features.timelineSemaphore         = VK_TRUE;
 	features.shaderOutputLayer         = VK_TRUE;
 	features.shaderOutputViewportIndex = VK_TRUE;
@@ -312,6 +329,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.descriptorBindingPartiallyBound);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
+		check_feature(robustness2.robustBufferAccess2, "robustBufferAccess2");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
@@ -444,11 +462,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -548,9 +566,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension && conditional_rendering.conditionalRendering == VK_TRUE;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	// Optional. No module declares the Vulkan memory model now; the device keeps the features so that its creation, which
+	// the driver's pipeline cache may depend on, stays as it was.
+	const bool vulkan_memory_model = supported_features12.vulkanMemoryModel == VK_TRUE &&
+	                                 supported_features12.vulkanMemoryModelDeviceScope == VK_TRUE;
+	features12.vulkanMemoryModel            = vulkan_memory_model ? VK_TRUE : VK_FALSE;
+	features12.vulkanMemoryModelDeviceScope = vulkan_memory_model ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -567,14 +593,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    features12.shaderSharedInt64Atomics != VK_FALSE,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
-	// Indirect mesh draws launch their records' groups from a task shader.
-	graphics.mesh_shader_enabled =
-	    mesh_extension && supported_mesh.meshShader && supported_mesh.taskShader;
+	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// KYTY_BINDLESS=1: bindless image arrays (BindlessTable).
+	// Default from Common::EnvDefaults; =0 turns it off.
+	const char* bindless_env = Common::EnvOrDefault("KYTY_BINDLESS");
+	graphics.bindless_enabled =
+	    bindless_env != nullptr && bindless_env[0] == '1' &&
+	    supported_features12.runtimeDescriptorArray == VK_TRUE &&
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
+	    supported_features12.descriptorBindingPartiallyBound == VK_TRUE &&
+	    supported_features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE &&
+	    supported_features12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+	if (graphics.bindless_enabled) {
+		features12.runtimeDescriptorArray                       = VK_TRUE;
+		features12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+		features12.descriptorBindingPartiallyBound              = VK_TRUE;
+		features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+		features12.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+	}
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	properties12.pNext = &subgroup_size_control;
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
-	properties11.pNext = &subgroup_size_control;
+	properties11.pNext = &properties12;
 
 	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
 	robustness2_properties.pNext = &properties11;
@@ -589,6 +632,72 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 
+	// KYTY_TRACE_TEXWIN (stage S0 of notes\TEKSTURY-STREAMING-PROJEKT.md, for S2b): what the device offers for sparse
+	// residency images (the features and properties queried above) and whether the graphics family binds sparse memory.
+	if (TexWin::Enabled()) {
+		const auto& features = supported_features2.features;
+		const auto& sparse   = properties2.properties.sparseProperties;
+		const auto  families = physical_device.getQueueFamilyProperties();
+		const bool  queue_sparse =
+		    queue_family < families.size() &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		std::fprintf(stderr,
+		             "TEXWIN sparse binding=%d residency_buffer=%d residency_image2d=%d residency_image3d=%d "
+		             "residency_aliased=%d std2d_block_shape=%d std3d_block_shape=%d aligned_mip_size=%d "
+		             "nonresident_strict=%d queue_sparse=%d device=%s\n",
+		             features.sparseBinding ? 1 : 0, features.sparseResidencyBuffer ? 1 : 0,
+		             features.sparseResidencyImage2D ? 1 : 0, features.sparseResidencyImage3D ? 1 : 0,
+		             features.sparseResidencyAliased ? 1 : 0, sparse.residencyStandard2DBlockShape ? 1 : 0,
+		             sparse.residencyStandard3DBlockShape ? 1 : 0, sparse.residencyAlignedMipSize ? 1 : 0,
+		             sparse.residencyNonResidentStrict ? 1 : 0, queue_sparse ? 1 : 0,
+		             properties2.properties.deviceName.data());
+	}
+
+	// Exact half <-> float conversions in hardware (spirvEmitterAluHelpers.cpp): shaderFloat16 and
+	// the 16-bit RoundingModeRTE and SignedZeroInfNanPreserve modes, which the modules declare without declaring 32-bit
+	// (or 64-bit) modes, and shaderDenormPreserveFloat16 as the sign that the device keeps f16 subnormals (the modules do
+	// not declare DenormPreserve 16: on NVIDIA it stops the f32 denormal flush of the whole module). Without that mode the
+	// f16 subnormals are the driver's default, measured exact only on NVIDIA (RTX 5070 Ti, half_check tests), so other
+	// vendors keep the integer conversions until measured. Otherwise the conversions stay integer arithmetic.
+	{
+		using Independence = vk::ShaderFloatControlsIndependence;
+		constexpr uint32_t VendorNvidia = 0x10deu;
+		const bool         float16 =
+		    properties2.properties.vendorID == VendorNvidia && supported_features12.shaderFloat16 == VK_TRUE &&
+		    float_controls.shaderDenormPreserveFloat16 == VK_TRUE &&
+		    float_controls.shaderRoundingModeRTEFloat16 == VK_TRUE &&
+		    float_controls.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE &&
+		    float_controls.denormBehaviorIndependence != Independence::eNone &&
+		    float_controls.roundingModeIndependence != Independence::eNone;
+		const bool float16_with_float64 = float16 && float_controls.denormBehaviorIndependence == Independence::eAll &&
+		                                  float_controls.roundingModeIndependence == Independence::eAll;
+		if (float16) features12.shaderFloat16 = VK_TRUE;
+		ShaderRecompiler::Spirv::SetHostFloatFeatures({.exact_half = float16, .exact_half_float64 = float16_with_float64});
+		LOGF("Vulkan exact f16 conversions in hardware: %s (shaderFloat16=%d denormPreserve16=%d rte16=%d nanPreserve16=%d "
+		     "denormIndependence=%d roundingIndependence=%d)\n",
+		     float16 ? (float16_with_float64 ? "true" : "true (not with float64)") : "false",
+		     supported_features12.shaderFloat16 == VK_TRUE, float_controls.shaderDenormPreserveFloat16 == VK_TRUE,
+		     float_controls.shaderRoundingModeRTEFloat16 == VK_TRUE,
+		     float_controls.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE,
+		     static_cast<int>(float_controls.denormBehaviorIndependence),
+		     static_cast<int>(float_controls.roundingModeIndependence));
+	}
+
+	// The bindless set's image arrays count against both the pipeline-layout limit and the per-stage limit.
+	graphics.bindless_set_sampled_images_limit   = properties12.maxDescriptorSetUpdateAfterBindSampledImages;
+	graphics.bindless_stage_sampled_images_limit = properties12.maxPerStageDescriptorUpdateAfterBindSampledImages;
+	graphics.bindless_max_sampled_images =
+	    graphics.bindless_enabled ? std::min(graphics.bindless_set_sampled_images_limit,
+	                                         graphics.bindless_stage_sampled_images_limit)
+	                              : 0u;
+	graphics.bindless_max_samplers =
+	    graphics.bindless_enabled
+	        ? std::min(properties12.maxDescriptorSetUpdateAfterBindSamplers,
+	                   properties12.maxPerStageDescriptorUpdateAfterBindSamplers)
+	        : 0u;
+	LOGF("Vulkan bindless images: %s (update-after-bind sampled images %u)\n",
+	     graphics.bindless_enabled ? "enabled" : "unsupported",
+	     graphics.bindless_max_sampled_images);
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
@@ -618,8 +727,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
-	graphics.conditional_rendering_enabled =
-	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -648,7 +755,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderStorageImageMultisample        =
 	    supported_features2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.shaderResourceMinLod                 = VK_TRUE;
+	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
+	// KYTY_MIN_LOD_FEATURE=0: the feature stays disabled (bisecting).
+	const char* min_lod_switch = std::getenv("KYTY_MIN_LOD_FEATURE");
+	const bool  shader_resource_min_lod =
+	    supported_features2.features.shaderResourceMinLod == VK_TRUE &&
+	    (min_lod_switch == nullptr || min_lod_switch[0] != '0');
+	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
+	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
+	     shader_resource_min_lod ? "true" : "false");
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
@@ -669,10 +785,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.sample_rate_shading_enabled                 = true;
 	// Occlusion queries reset their queries from the host and count samples exactly where they can.
-	graphics.occlusion_queries_enabled =
-	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
+	// KYTY_FIX_OCCLUSION_QUERIES (default on, occlusionQueries.cpp) or upstream's --occlusion-queries.
+	graphics.occlusion_queries_enabled = (Config::OcclusionQueriesEnabled() || OcclusionQueriesRequested()) &&
+	                                     supported_features12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =
 	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
+	graphics.occlusion_query_precise = graphics.occlusion_query_precise_enabled;
 	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
@@ -682,6 +800,39 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
 	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
+	// KYTY_FIX_OCCLUSION_QUERIES=1: host occlusion queries back the guest's occlusion counters with exact sample
+	// counts (the PS5 counts every sample; a ratio of two queries needs the exact numbers).
+	if (OcclusionQueriesRequested()) {
+		device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+		graphics.occlusion_query_precise      = device_features.occlusionQueryPrecise == VK_TRUE;
+		LOGF("Vulkan occlusionQueryPrecise: %s\n", graphics.occlusion_query_precise ? "true" : "false");
+	}
+	// Indirect draws execute from GPU memory (vkCmdDraw[Indexed]Indirect[Count] and SPIR-V draw parameters).
+	vk::PhysicalDeviceVulkan12Features indirect_features12 {};
+	vk::PhysicalDeviceVulkan11Features indirect_features11 {};
+	indirect_features11.pNext = &indirect_features12;
+	vk::PhysicalDeviceFeatures2 indirect_query {};
+	indirect_query.pNext = &indirect_features11;
+	physical_device.getFeatures2(&indirect_query);
+	graphics.gpu_indirect_draw_enabled =
+	    indirect_query.features.multiDrawIndirect == VK_TRUE &&
+	    indirect_query.features.drawIndirectFirstInstance == VK_TRUE &&
+	    indirect_features11.shaderDrawParameters == VK_TRUE &&
+	    indirect_features12.drawIndirectCount == VK_TRUE;
+	if (graphics.gpu_indirect_draw_enabled) {
+		device_features.multiDrawIndirect         = VK_TRUE;
+		device_features.drawIndirectFirstInstance = VK_TRUE;
+		features11.shaderDrawParameters           = VK_TRUE;
+		features12.drawIndirectCount              = VK_TRUE;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "DIAG_GPU_INDIRECT host features: multiDrawIndirect={} drawIndirectFirstInstance={} "
+	    "shaderDrawParameters={} drawIndirectCount={} -> GPU indirect draws {}\n",
+	    indirect_query.features.multiDrawIndirect != VK_FALSE,
+	    indirect_query.features.drawIndirectFirstInstance != VK_FALSE,
+	    indirect_features11.shaderDrawParameters != VK_FALSE,
+	    indirect_features12.drawIndirectCount != VK_FALSE,
+	    graphics.gpu_indirect_draw_enabled ? "enabled" : "unavailable (CPU expansion)"));
 	// if (device_features.shaderFloat64 && !float_controls.shaderDenormPreserveFloat64) {
 	// 	Log::WriteToConsoleAndLog(
 	// 	    "WARNING: Vulkan device does not guarantee FP64 denormal preservation; "
@@ -736,6 +887,36 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext                         = const_cast<void*>(create_info.pNext);
+		conditional_rendering.inheritedConditionalRendering = VK_FALSE;
+		create_info.pNext                                   = &conditional_rendering;
+	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
+	if (graphics.pipeline_stats_enabled) {
+		executable_properties.pipelineExecutableInfo = VK_TRUE;
+		executable_properties.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                            = &executable_properties;
+	}
+	// VK_EXT_device_fault: the feature is enabled only when the driver reports it.
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	std::vector<const char*>           enabled_extensions = device_extensions;
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+		vk::PhysicalDeviceFeatures2        fault_query {};
+		fault_query.pNext = &supported_fault;
+		physical_device.getFeatures2(&fault_query);
+		if (supported_fault.deviceFault == VK_TRUE) {
+			fault_features.deviceFault = VK_TRUE;
+			fault_features.pNext       = const_cast<void*>(create_info.pNext);
+			create_info.pNext          = &fault_features;
+		} else {
+			GpuCheckpoints::FaultEnabledFlag() = false;
+			std::erase_if(enabled_extensions, [](const char* name) {
+				return std::strcmp(name, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0;
+			});
+		}
+	}
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
@@ -744,10 +925,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &shader_clock;
 	}
-	if (graphics.conditional_rendering_enabled) {
-		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext = &conditional_rendering;
-	}
+	// Conditional rendering is chained once, above (upstream b54057942 chained it here a second time).
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
 	// depth- or stencil-writing fragment shader needs an epilog.
@@ -759,8 +937,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
-	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
-	create_info.ppEnabledExtensionNames = device_extensions.data();
+	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
+	create_info.ppEnabledExtensionNames = enabled_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;
@@ -769,6 +947,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
+	}
+	if (GpuCheckpoints::FaultEnabledFlag().load()) {
+		GpuCheckpoints::FaultDevice() = device;
 	}
 
 	return device;
@@ -900,6 +1081,24 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	// KYTY_VALIDATION_NONFATAL=1 (diagnostic): validation errors are logged (first 8 per message
+	// id) to stderr instead of ending the process.
+	static const bool nonfatal = [] {
+		const char* value = std::getenv("KYTY_VALIDATION_NONFATAL");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (error && nonfatal) {
+		static std::mutex mutex;
+		static std::unordered_map<std::string, uint32_t> counts;
+		const std::string id = callback_data->pMessageIdName != nullptr ? callback_data->pMessageIdName : "?";
+		std::scoped_lock lock(mutex);
+		const auto n = counts[id]++;
+		if (n < 8u || (n < 100000u && (n % 1000u) == 0u)) {
+			std::fprintf(stderr, "VALIDATION_ERROR #%u [%s]: %s\n", n, id.c_str(), callback_data->pMessage);
+			std::fflush(stderr);
+		}
+		return VK_FALSE;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -983,7 +1182,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
@@ -993,6 +1192,11 @@ void WindowContext::CreateVulkan() {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eDebugPrintf;
 	}
 #endif
+	// KYTY_VALIDATION_SYNC=1 (diagnostic): synchronization validation (missing barriers, hazards).
+	if (const char* sync = std::getenv("KYTY_VALIDATION_SYNC"); sync != nullptr && sync[0] == '1') {
+		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eSynchronizationValidation;
+		std::printf("Vulkan synchronization validation is enabled\n");
+	}
 	if (Config::GpuAssistedValidationEnabled()) {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eGpuAssisted;
 		LOGF("Vulkan GPU-assisted validation is enabled; expect a large slowdown\n");
@@ -1114,6 +1318,15 @@ void WindowContext::CreateVulkan() {
 	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info);
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
+	{
+		const auto r8_srgb = graphic_ctx.physical_device.getFormatProperties(vk::Format::eR8Srgb);
+		const bool sampled = static_cast<bool>(r8_srgb.optimalTilingFeatures &
+		                                       vk::FormatFeatureFlagBits::eSampledImage) &&
+		                     static_cast<bool>(r8_srgb.optimalTilingFeatures &
+		                                       vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+		SampledR8SrgbSupported().store(sampled);
+		LOGF("R8_SRGB sampled view support: %s\n", sampled ? "Yes" : "No");
+	}
 
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
@@ -1123,10 +1336,41 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		// KYTY_PERF_DIRECT_RANGES (A1 stage 2): guest memory imported as the memory of BufferCache buffers.
+		if (Common::EnvRead::DirectRanges() && HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			std::fprintf(stderr, "PERF_DIRECT_RANGES: VK_EXT_external_memory_host enabled\n");
+		}
+		if (GpuCheckpoints::Requested() &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			GpuCheckpoints::EnabledFlag() = true;
+			std::fprintf(stderr, "TRACE_GPU_CHECKPOINTS enabled\n");
+		}
+		if (GpuCheckpoints::Requested() &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			GpuCheckpoints::FaultEnabledFlag() = true;
+			std::fprintf(stderr, "TRACE_GPU_CHECKPOINTS device fault reports enabled\n");
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// KYTY_DIAG_DCC_GPU_CLEAR_CHECK / KYTY_PERF_DCC_GPU_ALL: conditional rendering for the GPU-side DCC clear
+		// check; the default device stays identical without the switches.
+		if ((Common::EnvRead::DccGpuClearCheck() != 0u || Common::EnvRead::DccGpuAll() != 0) &&
+		    HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+		}
+		if (std::getenv("KYTY_TRACE_PIPELINE_STATS") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_stats_enabled = true;
+			std::fprintf(stderr, "TRACE_PIPELINE_STATS enabled\n");
+		}
+		// VK_EXT_robustness2 is required (device_extensions above, upstream). VK_EXT_conditional_rendering is enabled
+		// only above, by the DCC clear-check switches (upstream b54057942 listed it here unconditionally).
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -1154,6 +1398,8 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// After the other dispatcher wrappers, so it calls them.
+	CommandRecorder::Install();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 

@@ -197,15 +197,27 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// The BDA fallback: the backing offset of [vaddr, vaddr + size) when one mapping holds all of it.
+	bool BackingOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (!IsAvailable() || offset == nullptr) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		MapEntry         entry {};
+		if (!FindContainingUnlocked(vaddr, size, &entry)) {
+			return false;
+		}
+		*offset = entry.backing_offset + (vaddr - entry.vaddr);
+		return RangeOk(*offset, size);
+	}
+
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		Common::StartupTrace::Scope trace_scope(Common::StartupTrace::Counter::MemZero, size);
+		std::lock_guard             lock(m_mutex);
 		std::memset(m_backing_base + backing_offset, 0, size);
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		g_test_backing_bytes_zeroed += size;
-#endif
 		return true;
 	}
 
@@ -214,8 +226,18 @@ public:
 			return false;
 		}
 
+		uint64_t offset = 0;
+		if (TryCachedOffset(vaddr, size, &offset)) {
+			std::memcpy(m_backing_base + offset, data, size);
+			return true;
+		}
+
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
+		if (SlotOffsetUnlocked(vaddr, size, &offset)) {
+			std::memcpy(m_backing_base + offset, data, size);
+			return true;
+		}
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -232,12 +254,24 @@ public:
 			return false;
 		}
 
+		uint64_t offset = 0;
+#if !defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (TryCachedOffset(vaddr, size, &offset)) {
+			std::memcpy(data, m_backing_base + offset, size);
+			return true;
+		}
+#endif
+
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
 			g_test_backing_read(vaddr, size);
 		}
 #endif
+		if (SlotOffsetUnlocked(vaddr, size, &offset)) {
+			std::memcpy(data, m_backing_base + offset, size);
+			return true;
+		}
 		const auto end   = vaddr + size;
 		auto       first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
@@ -270,6 +304,62 @@ public:
 		return true;
 	}
 
+	// Compares ranges of the backing store with expected bytes in place (no copy), the
+	// reads TryReadBacking would make, under ONE shared lock for the whole batch.
+	struct CompareSpan {
+		uint64_t       vaddr    = 0;
+		const uint8_t* expected = nullptr;
+		uint64_t       size     = 0;
+	};
+	enum class CompareResult {
+		Equal,     // every span lies in one mapping and holds exactly the expected bytes
+		Different, // span `*first_bad` lies in one mapping and holds other bytes (the earlier spans are equal)
+		Unknown,   // span `*first_bad` is not a plain single-mapping range (TryReadBacking might still serve or refuse it)
+	};
+
+	CompareResult CompareBackingBatch(const CompareSpan* spans, size_t count, size_t* first_bad) {
+		*first_bad = 0;
+		if (count == 0) {
+			return CompareResult::Equal;
+		}
+		if (!IsAvailable()) {
+			return CompareResult::Unknown;
+		}
+		std::shared_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			KYTY_PROFILER_BLOCK("AddressSpace::LockWait");
+			lock.lock();
+		}
+		MapEntry mapping {}; // the mapping the previous span lay in (neighbouring spans nearly always share it)
+		bool     have_mapping = false;
+		for (size_t i = 0; i < count; ++i) {
+			const auto& span = spans[i];
+			*first_bad       = i;
+			if (span.expected == nullptr || span.size == 0 || UINT64_MAX - span.vaddr < span.size) {
+				return CompareResult::Unknown;
+			}
+			const auto end = span.vaddr + span.size;
+			if (!have_mapping || span.vaddr < mapping.vaddr || span.vaddr - mapping.vaddr >= mapping.size) {
+				have_mapping = FindSlotUnlocked(span.vaddr, &mapping);
+				if (!have_mapping) {
+					return CompareResult::Unknown;
+				}
+			}
+			// As TryReadBacking's single-mapping case; a span that crosses mappings is left to TryReadBacking.
+			if (end > mapping.vaddr + mapping.size) {
+				return CompareResult::Unknown;
+			}
+			const auto offset = mapping.backing_offset + span.vaddr - mapping.vaddr;
+			if (!RangeOk(offset, span.size)) {
+				return CompareResult::Unknown;
+			}
+			if (std::memcmp(m_backing_base + offset, span.expected, static_cast<size_t>(span.size)) != 0) {
+				return CompareResult::Different;
+			}
+		}
+		return CompareResult::Equal;
+	}
+
 	template <typename Gap>
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
@@ -282,24 +372,13 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
+		// KYTY_TRACE_TEXWIN (TW2): AddressSpace::CopySparseMemory<false> counts the gap bytes its callback zero-fills.
 		CopySparseRange(m_maps, vaddr, data, size,
 		                [this](const auto& entry, uint64_t start) {
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
 		                },
 		                gap);
 		return true;
-	}
-
-	bool ProtectViews(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::shared_lock lock(m_mutex);
-		bool             ok = true;
-		ForEachSparseRange(
-		    m_maps, vaddr, size,
-		    [&](const auto&, uint64_t start, uint64_t bytes) {
-			    ok = ok && VirtualMemory::Protect(start, bytes, mode);
-		    },
-		    [&](uint64_t, uint64_t) { ok = false; });
-		return ok;
 	}
 
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -323,6 +402,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			m_maps_generation++;
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -334,14 +414,19 @@ public:
 		}
 		RemoveMappingsUnlocked(vaddr, size);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		m_maps_generation++;
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size) {
+	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
+		}
+
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = false;
 		}
 
 		const auto            end = vaddr + size;
@@ -361,36 +446,42 @@ public:
 			}
 		}
 
-		size_t removed  = 0;
-		auto   rollback = [&] {
-			while (removed != 0) {
-				const auto& previous = targets[--removed];
-				EXIT_IF(!MapFixed(previous.vaddr, previous.size, previous.backing_offset,
-				                  previous.mode));
-			}
-		};
+		std::vector<MapEntry> removed;
+		removed.reserve(targets.size());
 		for (const auto& entry: targets) {
-			if (!UnmapOne(entry.vaddr, entry.size)) {
-				rollback();
+			bool part_placeholder_preserved = false;
+			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
+				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+					EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
+				}
+				if (placeholder_preserved != nullptr) {
+					*placeholder_preserved = false;
+				}
 				return false;
 			}
-			++removed;
+			EXIT_IF(!part_placeholder_preserved);
+			removed.push_back(entry);
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
 		// records this contiguous guest span as one free range, so normalize fragmented backing
 		// views into one placeholder before publishing it there.
-		if (removed > 1 && !CoalescePlaceholders(vaddr, size)) {
-			rollback();
+		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
+			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+				EXIT_IF(!MapFixed(it->vaddr, it->size, it->backing_offset, it->mode));
+			}
 			return false;
 		}
 #endif
 
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
+		}
 		return true;
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size) {
+	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
 			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -411,6 +502,7 @@ public:
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 					m_maps.erase(entry);
+					m_maps_generation++;
 #endif
 				}
 			}
@@ -431,9 +523,12 @@ public:
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
+				m_maps_generation++;
 				return false;
 			}
-
+			if (placeholder_preserved != nullptr) {
+				*placeholder_preserved = true;
+			}
 			return true;
 		}
 
@@ -454,6 +549,9 @@ public:
 				     ok;
 			}
 			if (ok) {
+				if (placeholder_preserved != nullptr) {
+					*placeholder_preserved = true;
+				}
 				return true;
 			}
 
@@ -470,6 +568,7 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
+		m_maps_generation++;
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -481,6 +580,9 @@ public:
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
 
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
+		}
 		return true;
 #endif
 	}
@@ -490,7 +592,12 @@ public:
 			return false;
 		}
 
-		std::shared_lock lock(m_mutex);
+		// Readers (lookups and backing copies) share the lock; only map changes take it exclusively.
+		std::shared_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			KYTY_PROFILER_BLOCK("AddressSpace::LockWait");
+			lock.lock();
+		}
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
 
@@ -519,6 +626,7 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
+		m_maps_generation++;
 		const auto end = vaddr + size;
 		auto       it = m_maps.upper_bound(vaddr);
 		if (it != m_maps.begin()) {
@@ -562,6 +670,68 @@ private:
 		}
 
 		return false;
+	}
+
+	// Every backing read/write (GPU threads, fault threads) walked m_maps (std::map::upper_bound) under the lock.
+	// Each thread now keeps the mapping it last found per 64 KB of guest addresses (1024 direct-mapped slots, as TheCruZ's
+	// fork 2a1dc4486), tagged with m_maps_generation, which every m_maps change moves under the exclusive lock. The slot is
+	// only used under the same lock as before and only while the generation is unchanged, so it is the entry the map walk
+	// would find.
+	struct BackingSlot {
+		const GuestBackingStore* owner      = nullptr;
+		uint64_t                 generation = 0;
+		MapEntry                 entry {};
+	};
+	static constexpr uint32_t BackingSlotCount = 1024;
+
+	static BackingSlot& SlotFor(uint64_t vaddr) {
+		thread_local std::unique_ptr<std::array<BackingSlot, BackingSlotCount>> slots;
+		if (slots == nullptr) {
+			slots = std::make_unique<std::array<BackingSlot, BackingSlotCount>>();
+		}
+		return (*slots)[(vaddr >> 16u) & (BackingSlotCount - 1u)];
+	}
+
+	// FindContainingUnlocked(vaddr, 1, out) through the thread's slot memo (m_mutex held, shared or exclusive).
+	bool FindSlotUnlocked(uint64_t vaddr, MapEntry* out) {
+		BackingSlot& slot = SlotFor(vaddr);
+		if (slot.owner == this && slot.generation == m_maps_generation && vaddr >= slot.entry.vaddr &&
+		    vaddr - slot.entry.vaddr < slot.entry.size) {
+			*out = slot.entry;
+			return true;
+		}
+		const bool found = FindContainingUnlocked(vaddr, 1, out);
+		if (found) {
+			slot = BackingSlot {this, m_maps_generation, *out};
+		}
+		return found;
+	}
+
+	// The single-mapping case of TryReadBacking/TryWriteBacking: the backing offset of [vaddr, vaddr + size) when one
+	// mapping holds all of it and the range is inside the backing store. False: the map walk decides.
+	// The GPU threads stream thousands of small buffers per frame: the mapping they found last, without the lock, while
+	// no mapping changed. A slot and its generation were written together under m_mutex and every change of m_maps moves
+	// the generation under it, so seeing it unchanged (acquire) means no change completed since. A change racing with
+	// the transfer orders as if it followed it: the backing alias stays mapped for the store's lifetime.
+	// Based on TheCruZ/KytyPS5-GTA c88eadcad (memoryAddressSpace.inc), GPL-2.0.
+	bool TryCachedOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		const BackingSlot& slot = SlotFor(vaddr);
+		if (slot.owner != this || slot.generation != m_maps_generation.load(std::memory_order_acquire) ||
+		    vaddr < slot.entry.vaddr || vaddr - slot.entry.vaddr >= slot.entry.size ||
+		    vaddr + size > slot.entry.vaddr + slot.entry.size) {
+			return false;
+		}
+		*offset = slot.entry.backing_offset + (vaddr - slot.entry.vaddr);
+		return RangeOk(*offset, size);
+	}
+
+	bool SlotOffsetUnlocked(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		MapEntry entry {};
+		if (!FindSlotUnlocked(vaddr, &entry) || vaddr + size > entry.vaddr + entry.size) {
+			return false;
+		}
+		*offset = entry.backing_offset + (vaddr - entry.vaddr);
+		return RangeOk(*offset, size);
 	}
 
 	[[nodiscard]] bool RangeOk(uint64_t backing_offset, uint64_t size) const {
@@ -631,6 +801,8 @@ private:
 
 	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
+
 	static int GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PROT_READ;
@@ -676,6 +848,8 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Moves at every m_maps change (under the exclusive lock; read by the backing slots).
+	std::atomic<uint64_t>        m_maps_generation {1};
 };
 
 class GuestAddressSpace {
@@ -736,6 +910,9 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	bool BackingOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		return m_backing->BackingOffset(vaddr, size, offset);
+	}
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);
@@ -755,7 +932,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
@@ -775,6 +952,13 @@ public:
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
+	using BackingCompareSpan   = GuestBackingStore::CompareSpan;
+	using BackingCompareResult = GuestBackingStore::CompareResult;
+
+	BackingCompareResult CompareBackingBatch(const BackingCompareSpan* spans, size_t count, size_t* first_bad) {
+		return m_backing->CompareBackingBatch(spans, count, first_bad);
+	}
+
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || !Owns(vaddr, size)) {
@@ -786,7 +970,8 @@ public:
 				return false;
 			}
 		}
-		return m_backing->TryReadSparseBacking(
+		[[maybe_unused]] uint64_t zeroed = 0; // KYTY_TRACE_TEXWIN (TW2), copy_private == false only
+		const bool copied = m_backing->TryReadSparseBacking(
 		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
 			    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
 				    std::memset(output, 0, length);
@@ -800,9 +985,15 @@ public:
 				                    },
 				                    zero);
 			    } else {
+				    zeroed += bytes;
 				    zero(start, destination, bytes);
 			    }
 		    });
+		if constexpr (!copy_private) {
+			// KYTY_TRACE_TEXWIN (TW2): bytes zero-filled for this image upload (pages without guest memory).
+			if (copied && Graphics::TexWin::Enabled()) Graphics::TexWin::NoteSparseRead(vaddr, size, zeroed);
+		}
+		return copied;
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
@@ -811,23 +1002,41 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::unique_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			KYTY_PROFILER_BLOCK("AddressSpace::LockWait");
+			lock.lock();
+		}
+		KYTY_PROFILER_BLOCK("AddressSpace::Protect");
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
-	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+
+		// The GPU tracker's protections (the only caller, through PageManager) take the address-space lock shared.
+		// ProtectMappedUnlocked only reads the mapping list, which map/unmap change under the exclusive lock, so a shared
+		// holder still never protects a range being remapped; two tracker protections of one page are already ordered by
+		// the PageManager region lock held across this call (every PageManager::Protect runs inside UpdateRegionWatchers
+		// under the region's SpinGuard, and a protected range never crosses a region). Write faults on game threads and
+		// the GPU thread's protections then do not serialize on this lock (nor block the address-space lookups that take
+		// it shared, e.g. Contains).
+		std::shared_lock shared(m_mutex, std::try_to_lock);
+		if (!shared.owns_lock()) {
+			KYTY_PROFILER_BLOCK("AddressSpace::LockWait");
+			shared.lock();
+		}
+		KYTY_PROFILER_BLOCK("AddressSpace::Protect");
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
-		std::lock_guard lock(m_mutex);
+		Common::StartupTrace::Scope trace_scope(Common::StartupTrace::Counter::MemView, size);
+		std::lock_guard             lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -855,11 +1064,16 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
+		Common::StartupTrace::Scope trace_scope(Common::StartupTrace::Counter::MemUnview, size);
+		std::lock_guard             lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
-		if (!m_backing->Unmap(vaddr, size)) {
+		bool placeholder_preserved = false;
+		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
+			return false;
+		}
+		if (!placeholder_preserved) {
 			return false;
 		}
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
@@ -867,13 +1081,12 @@ public:
 		return true;
 	}
 
-	// Reservations live in VirtualRanges; these free-range checks only read the host placeholders.
 	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 		if (size == 0) {
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment != 0 ? alignment : PageSize(), PageSize());
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		if (search_addr == 0) {
 			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
 			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
@@ -890,7 +1103,7 @@ public:
 			return 0;
 		}
 		alignment = std::max<uint64_t>(alignment, PageSize());
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
@@ -898,24 +1111,25 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
+		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
+		Common::StartupTrace::Scope trace_scope(Common::StartupTrace::Counter::MemHostCommit, size);
+		std::lock_guard             lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -950,7 +1164,8 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		Common::StartupTrace::Scope trace_scope(Common::StartupTrace::Counter::MemHostRelease, size);
+		std::lock_guard             lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
@@ -1033,6 +1248,10 @@ private:
 		return (value & (PageSize() - 1u)) == 0;
 	}
 
+	[[nodiscard]] bool IsGranularityAligned(uint64_t value) const {
+		return (value & (m_granularity - 1u)) == 0;
+	}
+
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
@@ -1043,20 +1262,8 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start >= range_end) {
-				continue;
-			}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			// Rollback can split a backing view without changing the owner interval.
-			// Windows protection calls must stay within each actual view.
-			if (region.type == MappingType::Backing) {
-				if (!m_backing->ProtectViews(range_start, range_end - range_start, mode)) {
-					return false;
-				}
-				continue;
-			}
-#endif
-			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (range_start < range_end &&
+			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
 		}
@@ -1312,21 +1519,12 @@ private:
 	}
 
 	uint64_t FindFreeAlignedUnlocked(uint64_t search_start, uint64_t search_end, uint64_t size,
-	                                 uint64_t alignment) const {
+	                                 uint64_t alignment) {
 		if (search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		// Include the predecessor because search_start can lie inside a free range.
-		auto it = m_free.upper_bound(search_start);
-		if (it != m_free.begin()) {
-			--it;
-		}
-		for (; it != m_free.end() && it->first < search_end; ++it) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-			g_test_free_range_visits.fetch_add(1, std::memory_order_relaxed);
-#endif
-			const auto& [base, range_size] = *it;
-			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
+		for (const auto& [base, range_size]: m_free) {
+			const auto candidate = AlignUp(std::max(base, search_start), alignment);
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;
@@ -1340,8 +1538,9 @@ private:
 		if (next == m_free.begin()) {
 			return m_free.end();
 		}
-		auto it = std::prev(next);
-		return GuestFreeRangeContains(it->first, it->second, vaddr, size) ? it : m_free.end();
+		auto it  = std::prev(next);
+		auto end = it->first + it->second;
+		return (vaddr >= it->first && vaddr + size <= end ? it : m_free.end());
 	}
 
 	bool SplitUnlocked(std::map<uint64_t, uint64_t>::iterator it, uint64_t vaddr, uint64_t size) {

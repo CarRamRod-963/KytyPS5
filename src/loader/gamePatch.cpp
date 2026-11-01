@@ -83,6 +83,10 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 		const auto name = mod["name"].get<std::string>();
 		plan->mod_names.push_back(name);
+		// A mod without memory writes (the launcher's emulator-setting mods, which it passes as environment variables).
+		if (!mod.contains("memory")) {
+			continue;
+		}
 		for (const auto& entry: mod["memory"]) {
 			Write write;
 			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);

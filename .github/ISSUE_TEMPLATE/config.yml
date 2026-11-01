@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Other games
+    url: https://github.com/KytyPS5/KytyPS5/issues
+    about: This fork supports Ghost of Yōtei only. Report problems with other games to upstream KytyPS5.

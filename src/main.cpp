@@ -87,7 +87,8 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --tessellation                      Draw tessellation patches (default).\n");
+	::printf("  --no-tessellation                   Skip tessellation patches.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -113,6 +114,17 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --precompile-only                    Compile the recorded shaders of --game into the pipeline\n"
+	         "                                       cache and exit without starting the game. Progress lines\n"
+	         "                                       (PRECOMPILE_*) go to stdout; \"quit\" on stdin or Ctrl+C\n"
+	         "                                       stops it and keeps what is done.\n");
+	::printf("  --precompile-threads <1-64>          Workers of --precompile-only. Default: the\n"
+	         "                                       KYTY_SHADER_PRECOMPILE_THREADS setting (6).\n");
+	::printf("  --export-hints <file>                Write the recorded shaders of --game as a hints file\n"
+	         "                                       (no game code) and exit. Implies --precompile-only.\n");
+	::printf("  --import-hints <file>                Find the code of a hints file in the --game folder, add\n"
+	         "                                       the shaders found to the recorded ones, then precompile.\n"
+	         "                                       Implies --precompile-only.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -219,9 +231,11 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
+    {"--precompile-only", &ConfigOptions::precompile_only},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
@@ -248,7 +262,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 
 		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
-			options.config.*flag->field = flag->value;
+			bool value = flag->value;
+			// The command line before upstream's value-less flags gave boolean options a true/false value (our test
+			// runners, run-game*.ps1, and the launcher of the installed builds): an explicit value is still accepted.
+			if (i + 1 < argc && (std::string_view(argv[i + 1]) == "true" || std::string_view(argv[i + 1]) == "false")) {
+				value = (std::string_view(argv[++i]) == "true") == flag->value;
+			}
+			options.config.*flag->field = value;
 			continue;
 		}
 
@@ -423,6 +443,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--precompile-threads") {
+			if (!ParseUint32(value, options.config.precompile_threads) || options.config.precompile_threads == 0 ||
+			    options.config.precompile_threads > 64) {
+				::printf("invalid precompile thread count (1-64): %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--export-hints") {
+			options.config.precompile_export_hints = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.precompile_only         = true;
+		} else if (arg == "--import-hints") {
+			value           = Common::FixFilenameSlash(value);
+			const auto path = Common::PathFromUtf8(value);
+			if (!Common::File::IsFileExisting(path)) {
+				::printf("--import-hints must point to an existing file: %s\n", value.c_str());
+				return false;
+			}
+			options.config.precompile_import_hints = path;
+			options.config.precompile_only         = true;
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -434,6 +472,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
 		}
+	}
+
+	options.config.game_dir = options.app0_dir;
+	if (!options.config.precompile_export_hints.empty() && !options.config.precompile_import_hints.empty()) {
+		::printf("--export-hints and --import-hints cannot be used together\n");
+		return false;
 	}
 
 	if (options.config.gpu_assisted_validation_enabled) {

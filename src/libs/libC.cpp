@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
@@ -14,11 +15,13 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -641,11 +644,48 @@ void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 	return ::memset(s, c, n);
 }
 
+// KYTY_TRACE_GUEST_COPY=1 (diagnostic, 28.10): the game's large copies through this library (256 KiB or more, not
+// overlapping): GUEST_COPY_CENSUS lines every 5 s with their count, bytes and the bytes whose 4 KiB destination page
+// already held the source's bytes (what a copy that writes only differing pages - chenxiao's Demon's Souls patch -
+// would leave untouched: no write fault, no upload).
+static void GuestCopyCensus(const void* dest, const void* src, size_t n) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_GUEST_COPY");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!on || n < 256u * 1024u) return;
+	const auto d = reinterpret_cast<uint64_t>(dest), s = reinterpret_cast<uint64_t>(src);
+	if (d < s + n && s < d + n) return;
+	static std::atomic<uint64_t> calls {0}, bytes {0}, same {0};
+	static std::atomic<int64_t>  last {0};
+	uint64_t                      equal = 0;
+	for (uint64_t at = 0; at < n;) {
+		const uint64_t next = std::min<uint64_t>(n, ((d + at) / 4096u + 1u) * 4096u - d);
+		if (std::memcmp(reinterpret_cast<const void*>(d + at), reinterpret_cast<const void*>(s + at), next - at) == 0) {
+			equal += next - at;
+		}
+		at = next;
+	}
+	calls.fetch_add(1, std::memory_order_relaxed);
+	bytes.fetch_add(n, std::memory_order_relaxed);
+	same.fetch_add(equal, std::memory_order_relaxed);
+	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto       prev = last.load(std::memory_order_relaxed);
+	if (now - prev >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count() &&
+	    last.compare_exchange_strong(prev, now, std::memory_order_relaxed)) {
+		std::fprintf(stderr, "GUEST_COPY_CENSUS calls=%llu MiB=%llu same_MiB=%llu\n",
+		             static_cast<unsigned long long>(calls.load()), static_cast<unsigned long long>(bytes.load() >> 20u),
+		             static_cast<unsigned long long>(same.load() >> 20u));
+	}
+}
+
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
+	GuestCopyCensus(dest, src, n);
 	return ::memcpy(dest, src, n);
 }
 
 void* KYTY_SYSV_ABI memmove(void* dest, const void* src, size_t n) {
+	GuestCopyCensus(dest, src, n);
 	return ::memmove(dest, src, n);
 }
 

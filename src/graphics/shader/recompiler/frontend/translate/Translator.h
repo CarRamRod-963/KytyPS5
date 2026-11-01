@@ -10,15 +10,25 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, bool graphics_compute)
+	           bool flush_f32_inputs, bool graphics_compute,
+	           const std::array<IR::U32, 2>* present_lanes = nullptr)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {
+		if (present_lanes != nullptr) {
+			present_mask = *present_lanes;
+			mask_exec_present = true;
+		}
+	}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
 	                        IR::Block& info);
+	// KYTY_DIAG_PROBE_NTH (diagnostic): per-lane execution counter in v<counter> (bumped under EXEC when `bump`);
+	// copies s<source>/v<source> into v<destination> only in the active lanes whose counter equals `nth`.
+	// Touches no SGPR, VCC or EXEC of the guest program.
+	void ProbeCopyNth(uint32_t counter, uint32_t destination, uint32_t source, bool scalar, uint32_t nth, bool bump);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -34,6 +44,7 @@ private:
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
 	IR::U1                 ThreadBit(const std::array<IR::U32, 2>& mask);
+	std::array<IR::U32, 2> PresentExec(const std::array<IR::U32, 2>& mask);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
@@ -90,6 +101,7 @@ private:
 	void          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
+	IR::U32 DsAddress(const Decoder::Instruction& inst, IR::U32 address);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
 	void FLAT_STORE(const Decoder::Instruction& inst);
@@ -263,7 +275,10 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
-	bool            graphics_compute;
+	// Lanes present in the host subgroup (entry ballot).
+	std::array<IR::U32, 2> present_mask {};
+	bool                   mask_exec_present = false;
+	bool                   graphics_compute;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

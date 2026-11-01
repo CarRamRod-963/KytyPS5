@@ -22,7 +22,9 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
 
+
 private:
+	void ReportDiagTail(const uint32_t* tail); // KYTY_DIAG_RT_TRIPS
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;
@@ -30,6 +32,8 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	// KYTY_RECORD_KEYED_VERIFY: the record-keyed frame when the previous pass was recorded (its work started there).
+	uint64_t                                   m_rk_pass_frame = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;

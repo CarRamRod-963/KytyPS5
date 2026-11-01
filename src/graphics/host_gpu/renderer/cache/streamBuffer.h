@@ -32,13 +32,32 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
     vk::BufferUsageFlagBits::eIndirectBuffer;
 
+// Guest-memory buffers live in device-local memory the CPU can map (resizable BAR) and stay mapped, so finished GPU
+// writes are read back without a GPU copy (BufferCache).
+
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// KYTY_PERF_DIRECT_RANGES (A1 stage 2): tag of the constructor of a buffer whose memory is the guest memory itself.
+// `failed` (D6 step K4): when set, a refused import (buffer creation, memory type, allocation) sets *failed and leaves
+// an empty buffer (no handle) instead of stopping the emulator; the caller counts it and does without the import.
+struct GuestDirectTag {
+	bool* failed = nullptr;
+};
+
 class Buffer {
 public:
+	// A "direct" buffer: its memory is guest memory at [cpu_address, cpu_address + size) imported as Vulkan memory
+	// (VK_EXT_external_memory_host); the host GPU reads and writes the guest's bytes in place. Only after
+	// CanImportGuestMemory() said yes for the same range.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, GuestDirectTag, uint64_t cpu_address, uint64_t size);
+	[[nodiscard]] static bool CanImportGuestMemory(GraphicContext& graphics, uint64_t cpu_address, uint64_t size);
+	[[nodiscard]] bool        IsDirect() const noexcept { return m_direct_memory != nullptr; }
+
+	// prefer_host: a MemoryUsage::Stream buffer lives in host memory (like Upload) instead of
+	// device memory, which on a discrete GPU is write-combined resizable-BAR memory (BufferCache stream ring).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool prefer_host = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -69,9 +88,12 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
+	bool     is_deleted     = false;
+	int      stream_score   = 0;
+	size_t   lru_id         = 0;
+	// BufferCache::TouchBuffer: the GC tick of the buffer's last LRU touch (or registration); a touch
+	// at the same tick changes nothing. ~0: not registered yet.
+	uint64_t lru_touch_tick = ~uint64_t {0};
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -89,6 +111,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory              m_direct_memory = nullptr; // KYTY_PERF_DIRECT_RANGES: imported guest memory
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
@@ -97,7 +120,7 @@ private:
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, bool prefer_host = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

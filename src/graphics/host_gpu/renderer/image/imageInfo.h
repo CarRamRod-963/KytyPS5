@@ -17,6 +17,10 @@
 
 namespace Libs::Graphics {
 
+// KYTY_DIAG_MIP_TAIL_SLICES=1 (textureCache.cpp): a single-level image inside the mip-tail block
+// of a container slice is that container's mip of the same extent, whatever its offset in the block.
+bool MipTailSlicesEnabled();
+
 enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Rotate2_10_10_10 };
 
 enum class VideoOutCompression : uint8_t {
@@ -44,6 +48,11 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	// Lexicographic above is the overlap rules' order (ExpandImage). As a capacity, levels and layers are independent: 7 levels
+	// of 9 layers hold no 12 layers.
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {
@@ -75,7 +84,7 @@ struct ImageInfo {
 	GuestRange                   data;
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
-	bool                         htile_initial_clear = true;
+	uint64_t                     htile_clear_mask = UINT64_MAX;
 	vk::Format                   pixel_format     = vk::Format::eUndefined;
 	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
 	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
@@ -94,11 +103,20 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	// UpdateSize without the per-thread memo of its results.
+	void                                           UpdateSizeUncached();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
+	// Host copies of the first `levels` (0: all) levels; levels the host image lacks (HostLevels) are left out.
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
 	                                                            uint32_t levels        = 0) const;
+	// Mip levels of the host image. resources.levels is the guest resource's count (T# MAX_MIP + 1, or the view's
+	// last level), which may exceed the complete chain of the extent: the hardware keeps halving down to 1x1, so
+	// the extra levels are 1x1 and keep their place in the guest layout (mip_layout, data.size). Vulkan allows
+	// no more levels than the complete chain (VUID-VkImageCreateInfo-mipLevels-00958): the host image stops at its
+	// 1x1 level.
+	[[nodiscard]] uint32_t HostLevels() const noexcept;
 
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;
@@ -110,6 +128,33 @@ struct ImageInfo {
 			default: return ColorTransform::None;
 		}
 	}
+	// D6 step K5 (the scalar-read check): the guest bytes of level `level`, layers [base_layer, base_layer +
+	// layer_count) in the layout UpdateSize computed: emit(address, size) per layer. Tiled surfaces keep every layer's
+	// mip chain together (tiled_slice_stride apart, level 0 last; the levels in the mip tail share the tail block, which
+	// is returned whole); linear ones keep a layer's levels linear_slice_stride apart; a volume's level is returned
+	// whole (all its depth slices).
+	template <class Emit>
+	void ForEachLevelLayerBytes(uint32_t level, uint32_t base_layer, uint32_t layer_count, Emit&& emit) const {
+		if (level >= resources.levels || level >= mip_layout.size() || data.size == 0) return;
+		const auto& mip = mip_layout[level];
+		if (IsVolume()) {
+			emit(data.address + mip.offset, mip.size);
+			return;
+		}
+		const uint32_t layers = std::max(resources.layers, 1u);
+		const uint64_t per_layer = IsTiled() ? mip.size / layers : mip.linear_size;
+		const uint64_t stride    = IsTiled() ? tiled_slice_stride : linear_slice_stride;
+		const uint64_t offset    = IsTiled() ? mip.offset : mip.linear_offset;
+		const uint32_t last      = std::min(layers, base_layer + std::max(layer_count, 1u));
+		for (uint32_t layer = base_layer; layer < last; ++layer) {
+			emit(data.address + offset + static_cast<uint64_t>(layer) * stride, per_layer);
+		}
+	}
+	// Becomes the array of the layers [base_layer, base_layer + layer_count) alone - its address that of layer base_layer
+	// - when every one of them is stored at the same guest bytes as in the whole array (ForEachLevelLayerBytes); false
+	// (unchanged) otherwise. Single-level arrays only: a sub-range inside an array the texture cache holds is then a
+	// slice view of it (SliceOf), never a second image over the same bytes.
+	bool ViewLayersAlone(uint32_t base_layer, uint32_t layer_count);
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -145,7 +190,79 @@ struct ImageInfo {
 		}
 		return -1;
 	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
+	// An uncompressed image whose element size equals the block size of a block-compressed container it lies in (a compute
+	// shader writing BC blocks as R32G32B32A32/R32G32 texels) is that container's subresource, its extent counted in
+	// blocks; it binds as a block-texel view of the container.
+	[[nodiscard]] bool BlockTexelAliasOf(const ImageInfo& container) const noexcept {
+		return container.IsBlock() && !IsBlock() && !IsDepth() &&
+		       bytes_per_block == container.bytes_per_block && samples == container.samples &&
+		       GetColorTransform() == ColorTransform::None &&
+		       container.GetColorTransform() == ColorTransform::None;
+	}
+	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
+		const bool block_alias = BlockTexelAliasOf(container);
+		if (!(IsCompatible(container) || block_alias) || tile_mode != container.tile_mode ||
+		    type != container.type ||
+		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
+		    container.resources.layers == 0 || mip < 0 ||
+		    static_cast<uint32_t>(mip) >= container.resources.levels ||
+		    container.resources.levels > container.mip_layout.size() ||
+		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
+		    data.End() > container.data.End()) {
+			return -1;
+		}
+		if (HasStencil() != container.HasStencil() ||
+		    (HasStencil() && (stencil.address < container.stencil.address ||
+		                      stencil.End() > container.stencil.End()))) {
+			return -1;
+		}
+
+		const auto  level  = static_cast<uint32_t>(mip);
+		const auto& layout = container.mip_layout[level];
+		// A block-texel alias has one texel per block of the container level.
+		const auto block_shift = block_alias ? 2u : 0u;
+		const auto block_round = (1u << block_shift) - 1u;
+		if (extent.width != (std::max(container.extent.width >> level, 1u) + block_round) >> block_shift ||
+		    extent.height != (std::max(container.extent.height >> level, 1u) + block_round) >> block_shift ||
+		    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
+		    mip_layout[0].height != layout.height || layout.size == 0 ||
+		    layout.size % container.resources.layers != 0 ||
+		    container.data.size % container.resources.layers != 0 ||
+		    data.size % resources.layers != 0) {
+			return -1;
+		}
+
+		// PS5 block slices contain the entire reversed mip chain.
+		const auto slice_stride = container.data.size / container.resources.layers;
+		const auto child_stride = data.size / resources.layers;
+		if (child_stride != layout.size / container.resources.layers ||
+		    layout.offset >= slice_stride || child_stride > slice_stride - layout.offset ||
+		    (resources.layers > 1 && child_stride != slice_stride)) {
+			return -1;
+		}
+		const auto address_delta = data.address - container.data.address;
+		if (address_delta < layout.offset) {
+			return -1;
+		}
+		if ((address_delta - layout.offset) % slice_stride != 0) {
+			// PS5 packs the smallest levels into one tail block per slice at offsets of their own;
+			// the container layout lists them all at the block start. The extent names the level.
+			const bool tail_level =
+			    (level > 0 && container.mip_layout[level - 1].offset == layout.offset) ||
+			    (level + 1 < container.resources.levels && container.mip_layout[level + 1].offset == layout.offset);
+			const auto in_slice = (address_delta - layout.offset) % slice_stride;
+			if (!MipTailSlicesEnabled() || !tail_level || resources.layers != 1 ||
+			    in_slice >= layout.size / container.resources.layers) {
+				return -1;
+			}
+		}
+		const auto layer = (address_delta - layout.offset) / slice_stride;
+		if (layer > INT32_MAX || layer >= container.resources.layers ||
+		    resources.layers > container.resources.layers - layer) {
+			return -1;
+		}
+		return static_cast<int32_t>(layer);
+	}
 };
 
 struct ImageViewInfo {
@@ -413,6 +530,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 10> VIDEO_OUT_FORMAT_POLICIES 
 		                            (mantissa << 13u));
 	};
 	switch (format) {
+		// upstream ff6dffe2: packed unsigned float CMASK register clears.
 		case vk::Format::eB10G11R11UfloatPack32:
 			next.float32[0] = float16((packed & 0x7ffu) << 4u);
 			next.float32[1] = float16(((packed >> 11u) & 0x7ffu) << 4u);
@@ -533,6 +651,102 @@ inline constexpr std::array<VideoOutFormatPolicy, 10> VIDEO_OUT_FORMAT_POLICIES 
 		return true;
 	}
 	return DecodePackedColorClear(format, uint64_t {packed} | (uint64_t {packed} << 32u), clear);
+}
+
+// KYTY_FIX_DCC_KEY_0X10 (textureCache.cpp): the color of a DCC block whose key is 0x10, which reads as the block's
+// first element: the first `bytes` (the surface's bytes per element) little-endian bytes of `element`, as stored in
+// memory. Elements of 2 or 4 bytes in the formats a register clear word describes decode as one; wider formats and
+// integer formats decode per channel. False for any other format or a size that does not match the format.
+[[nodiscard]] inline bool DecodeDccElementClear(vk::Format format, const std::array<uint32_t, 4>& element,
+                                                uint32_t bytes, vk::ClearColorValue& clear) {
+	const auto half = [](uint32_t value) {
+		const auto sign     = (value & 0x8000u) << 16u;
+		const auto exponent = (value >> 10u) & 0x1fu;
+		const auto mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f, std::bit_cast<float>(sign));
+		}
+		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) | (mantissa << 13u));
+	};
+	const auto u8  = [&](uint32_t i) { return (element[i / 4u] >> ((i % 4u) * 8u)) & 0xffu; };
+	const auto u16 = [&](uint32_t i) { return (element[i / 2u] >> ((i % 2u) * 16u)) & 0xffffu; };
+	const auto s8  = [&](uint32_t i) { return static_cast<int32_t>(static_cast<int8_t>(u8(i))); };
+	const auto s16 = [&](uint32_t i) { return static_cast<int32_t>(static_cast<int16_t>(u16(i))); };
+	vk::ClearColorValue next {};
+	uint32_t            size = 0;
+	switch (format) {
+		case vk::Format::eR8Unorm: size = 1; next.float32[0] = static_cast<float>(u8(0)) / 255.0f; break;
+		case vk::Format::eR8Uint: size = 1; next.uint32[0] = u8(0); break;
+		case vk::Format::eR8G8Unorm:
+			size = 2;
+			for (uint32_t i = 0; i < 2; i++) next.float32[i] = static_cast<float>(u8(i)) / 255.0f;
+			break;
+		case vk::Format::eR8G8Uint:
+			size = 2;
+			for (uint32_t i = 0; i < 2; i++) next.uint32[i] = u8(i);
+			break;
+		case vk::Format::eR16Uint: size = 2; next.uint32[0] = u16(0); break;
+		case vk::Format::eR16Sint: size = 2; next.int32[0] = s16(0); break;
+		case vk::Format::eR16G16Uint:
+			size = 4;
+			for (uint32_t i = 0; i < 2; i++) next.uint32[i] = u16(i);
+			break;
+		case vk::Format::eR16G16Sint:
+			size = 4;
+			for (uint32_t i = 0; i < 2; i++) next.int32[i] = s16(i);
+			break;
+		case vk::Format::eR8G8B8A8Uint:
+			size = 4;
+			for (uint32_t i = 0; i < 4; i++) next.uint32[i] = u8(i);
+			break;
+		case vk::Format::eR8G8B8A8Sint:
+			size = 4;
+			for (uint32_t i = 0; i < 4; i++) next.int32[i] = s8(i);
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			size = 8;
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = half(u16(i));
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			size = 8;
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = static_cast<float>(u16(i)) / 65535.0f;
+			break;
+		case vk::Format::eR16G16B16A16Uint:
+			size = 8;
+			for (uint32_t i = 0; i < 4; i++) next.uint32[i] = u16(i);
+			break;
+		case vk::Format::eR16G16B16A16Sint:
+			size = 8;
+			for (uint32_t i = 0; i < 4; i++) next.int32[i] = s16(i);
+			break;
+		case vk::Format::eR32G32Sfloat:
+			size = 8;
+			for (uint32_t i = 0; i < 2; i++) next.float32[i] = std::bit_cast<float>(element[i]);
+			break;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+			size = 8;
+			for (uint32_t i = 0; i < 2; i++) next.uint32[i] = element[i];
+			break;
+		case vk::Format::eR32G32B32A32Sfloat:
+			size = 16;
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = std::bit_cast<float>(element[i]);
+			break;
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint:
+			size = 16;
+			for (uint32_t i = 0; i < 4; i++) next.uint32[i] = element[i];
+			break;
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR16Unorm:
+			return bytes == 2 && DecodePackedColorClear(format, element[0] & 0xffffu, clear);
+		default: return bytes == 4 && DecodePackedColorClear(format, element[0], clear);
+	}
+	if (bytes != size) {
+		return false;
+	}
+	clear = next;
+	return true;
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

@@ -27,6 +27,10 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Diagnostic: abort() / an uncaught exception (SIGABRT), an invalid CRT parameter and a pure virtual call print
+// FATAL_ABORT with the call stack (FATAL_FRAMES) before the process ends; without them it ends silently (0xC0000409).
+void InstallAbortReporters();
+
 } // namespace Common
 
 #define EXIT_HALT() (Common::DbgExit(321), 1)

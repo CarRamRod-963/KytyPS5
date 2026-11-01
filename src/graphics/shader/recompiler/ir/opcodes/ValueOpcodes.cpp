@@ -97,7 +97,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::DataCacheInvalidate:
-		case ValueOpcode::Barrier: return true;
+		case ValueOpcode::Barrier:
+		case ValueOpcode::WaterfallRecord0Census: return true;
 		default: return false;
 	}
 }

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
 #include <bit>
@@ -251,19 +252,36 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || ClampNanCheckBinding(state.program) ||
+	                                                 RtTripsCheckBinding(state.program); // KYTY_DIAG_RT_TRIPS
+	// KYTY_PERF_UNIFORM_CONST_BUFFERS: ReadConst reads FlattenedSrtUniform; the storage binding keeps the SRT mapping
+	// reads of GPU-selected descriptors (ValidateNativeProgram expects the same split).
+	const bool srt_uniform = info.uses_read_const && IR::ReadConstUniform(state.program.srt_reads.size());
+	const auto uses_mapping = [](const auto& resource) { return resource.indirect_root != UINT32_MAX; };
+	const bool srt_mapping  = std::ranges::any_of(info.buffers, uses_mapping) ||
+	                         std::ranges::any_of(info.images, uses_mapping) ||
+	                         std::ranges::any_of(info.samplers, uses_mapping);
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] = srt_uniform ? srt_mapping : info.uses_flattened_srt;
+	counts[static_cast<size_t>(Kind::FlattenedSrtUniform)] = srt_uniform;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+	// After the packed offsets, one dword per buffer binding holds its record stride.
+	if (buffer_count != 0u)
+		bindings.memory_stride_dword = bindings.memory_offset_dword + (buffer_count + 3u) / 4u;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
+	// The ObjPrimID write: the per-draw VGT_OBJECT_ID is a push constant dword even without push shader data.
+	const bool objprim_push = state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+	                          state.input_info.pixel->HasObjprimOutput();
+	// Upstream feed075a9: the user clip planes (DefineOutputs) are push constant dwords too. Upstream's
+	// object_primitive_id_variable (f7226ca7d) stays 0: the ObjPrimID write is the active ObjPrimID path.
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
+	    objprim_push || state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -293,19 +311,38 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers: {
 				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
 				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
+				// In a shader that writes no buffer or address memory (grass VS 58e7b882 + 50e56e7b ~7.2 -> <0.15 ms GPU per
+				// frame, GPU busy ~48 -> ~41 ms), only its cache-bypassing (GLC) accesses use a Coherent alias
+				// ("buffers_coherent"); every other access
+				// goes through the plain aliases and may hit L1. Before, one GLC read made the whole shader Coherent:
+				// the grass vertex shader 58e7b882 (one GLC read of 107 per vertex) got 4% L1 hits against 87% for the
+				// rest of the frame (Nsight GPU Trace, notes\PROJEKT-TRAWA-2026-10-16.md). Exact: with no
+				// buffer writes in the shader, no invocation of the command produces data a plain read could see early
+				// or late; earlier commands are made visible by the emulator's barriers; the guest's own non-GLC loads
+				// go through its non-coherent GL0/GL1 caches as well. The GLC accesses stay Coherent + Volatile.
+				const bool per_access_coherence = info.coherent_buffers && !info.buffer_writes && !info.coherent_narrow &&
+				                                  !state.program.has_address_writes;
 				for (uint32_t alias = 0; alias < used.size(); ++alias) {
 					if (!used[alias]) continue;
 					auto& buffer = state.storage_buffers[alias];
 					const auto type = StorageBufferType(state, buffer, 8u << alias);
 					buffer.variable = Define(ArrayType(type), names[alias]);
-					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
+					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics || per_access_coherence) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (info.coherent_buffers) {
+					if (info.coherent_buffers && !per_access_coherence) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 					}
+				}
+				if (per_access_coherence) {
+					auto& coherent = state.coherent_buffers_alias;
+					coherent        = state.storage_buffers[2];
+					coherent.pointer_type = coherent.element_pointer_type = 0;
+					coherent.variable = Define(ArrayType(coherent.type), "buffers_coherent");
+					state.builder.AddAnnotation(spv::OpDecorate, coherent.variable, spv::DecorationAliased);
+					state.builder.AddAnnotation(spv::OpDecorate, coherent.variable, spv::DecorationCoherent);
 				}
 				break;
 			}
@@ -318,8 +355,21 @@ void DefineDescriptors(EmitterState& state) {
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
+				if (IR::UniformConstBuffers()) {
+					// KYTY_PERF_UNIFORM_CONST_BUFFERS: every shader-data read is a constant dword index.
+					EXIT_IF(bindings.ShaderDataDwords() > IR::UniformBufferMaxBytes / 4u);
+					state.shader_data_uniform_variable =
+					    Define(UniformDwordBlockType(state, bindings.ShaderDataDwords()), "shader_data",
+					           spv::StorageClassUniform);
+					break;
+				}
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				break;
+			case IR::DescriptorBindingKind::FlattenedSrtUniform:
+				state.flattened_srt_uniform_variable =
+				    Define(UniformDwordBlockType(state, static_cast<uint32_t>(state.program.srt_reads.size())),
+				           "flattened_srt_uniform", spv::StorageClassUniform);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =
@@ -402,23 +452,47 @@ uint32_t GlslStd450(EmitterState& state) {
 	return state.builder.Import("GLSL.std.450");
 }
 
-Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
+VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
 	if ((state.program.stage != ShaderType::Vertex && state.program.stage != ShaderType::Local) ||
 	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
-		return Format::ComponentType::Float;
+		return VertexInputScalarKind::Float;
 	}
-	return Format::GetFormatComponentType(state.input_info.vertex->resources[location].Format());
+
+	switch (state.input_info.vertex->resources[location].Format()) {
+		case Prospero::BufferFormat::k8UInt:
+		case Prospero::BufferFormat::k16UInt:
+		case Prospero::BufferFormat::k8_8UInt:
+		case Prospero::BufferFormat::k32UInt:
+		case Prospero::BufferFormat::k16_16UInt:
+		case Prospero::BufferFormat::k8_8_8_8UInt:
+		case Prospero::BufferFormat::k32_32UInt:
+		case Prospero::BufferFormat::k16_16_16_16UInt:
+		case Prospero::BufferFormat::k32_32_32UInt:
+		case Prospero::BufferFormat::k32_32_32_32UInt: return VertexInputScalarKind::Uint;
+		case Prospero::BufferFormat::k8SInt:
+		case Prospero::BufferFormat::k16SInt:
+		case Prospero::BufferFormat::k8_8SInt:
+		case Prospero::BufferFormat::k32SInt:
+		case Prospero::BufferFormat::k16_16SInt:
+		case Prospero::BufferFormat::k8_8_8_8SInt:
+		case Prospero::BufferFormat::k32_32SInt:
+		case Prospero::BufferFormat::k16_16_16_16SInt:
+		case Prospero::BufferFormat::k32_32_32SInt:
+		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
+		default: return VertexInputScalarKind::Float;
+	}
 }
 
 uint32_t VertexParameterComponentCount(const InputBinding& input) {
 	return std::clamp(input.component_count, 1u, 4u);
 }
 
-uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind) {
+uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
 	switch (kind) {
-		case Format::ComponentType::Sint: return TypeI32(state);
-		case Format::ComponentType::Uint: return TypeU32(state);
+		case VertexInputScalarKind::Sint: return TypeI32(state);
+		case VertexInputScalarKind::Uint: return TypeU32(state);
+		case VertexInputScalarKind::Float:
 		default: return TypeF32(state);
 	}
 }
@@ -454,6 +528,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
 		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
 		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
+		case IR::StageInputKind::DrawIndex: return spv::BuiltInDrawIndex;
 		default: return UINT32_MAX;
 	}
 }
@@ -475,7 +550,14 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
-	if (state.lane_count == 2) {
+	if (const auto* indirect = IndirectDrawVariant(state); indirect != nullptr) {
+		add_builtin(IR::StageInputKind::BaseVertex, 1, "gl_BaseVertex");
+		add_builtin(IR::StageInputKind::BaseInstance, 1, "gl_BaseInstance");
+		if (indirect->draw_index != ShaderIndirectDrawInfo::NoSgpr) {
+			add_builtin(IR::StageInputKind::DrawIndex, 1, "gl_DrawID");
+		}
+	}
+	if (state.lane_count == 2 || state.wave_pair) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -506,7 +588,8 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId:
 			case IR::StageInputKind::BaseVertex:
-			case IR::StageInputKind::BaseInstance: type = TypeI32(state); break;
+			case IR::StageInputKind::BaseInstance:
+			case IR::StageInputKind::DrawIndex: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
@@ -544,6 +627,12 @@ void DefineInputs(EmitterState& state) {
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
+		// The ObjPrimID write: the fragment primitive index. SPIR-V enables PrimitiveId in a fragment shader through
+		// the Tessellation capability as well as Geometry; the device has tessellationShader, not geometryShader.
+		if (input.kind == IR::StageInputKind::PrimitiveId && state.program.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+			state.builder.RequireCapability(spv::CapabilityTessellation);
+		}
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (input.per_vertex) {
@@ -565,7 +654,14 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.wave_pair) {
+		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
+		                                              "gl_SubgroupID");
+		state.subgroup_id_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInSubgroupId);
+	}
+	if (state.program.info.subgroup_local_invocation_id || state.wave_pair) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -575,6 +671,7 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
+	// Upstream 5429888d4: the helper-invocation input of a pixel shader that reads the live mask.
 	if (state.program.info.helper_invocation) {
 		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
 		                                              "gl_HelperInvocation");
@@ -599,7 +696,7 @@ void DefineOutputs(EmitterState& state) {
 	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		return output.kind == IR::StageOutputKind::Position;
 	});
-	if (position && state.input_info.vertex->user_clip_planes != 0) {
+	if (position && state.input_info.vertex != nullptr && state.input_info.vertex->user_clip_planes != 0) {
 		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
 		EXIT_IF(clip_distance_count + cull_distance_count != 0);
 		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
@@ -669,6 +766,15 @@ void DefineOutputs(EmitterState& state) {
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
 				            spv::BuiltInSampleMask);
 				break;
+			case IR::StageOutputKind::ObjPrimId:
+				// The ObjPrimID write: one 32-bit unsigned value at the colour slot (location) the hardware writes.
+				binding.variable_id = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassOutput,
+				                                              binding.debug_name.c_str());
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id, spv::DecorationLocation,
+				                            binding.location);
+				state.objprim_output_variable = binding.variable_id;
+				break;
+			// Upstream f7226ca7d (RT7 object/primitive ID): inert, ShaderInfoCollection adds only ObjPrimId outputs.
 			case IR::StageOutputKind::ObjectPrimitiveId:
 				binding.variable_id = DefineInterfaceVariable(
 				    state, TypeU32(state), spv::StorageClassOutput, binding.debug_name.c_str());
@@ -678,15 +784,13 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				auto type = TypeF32Vector(state, 4);
-				if (binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel && binding.index < 8u) {
-					// Packed UNorm stores its encoded bits.
-					const auto bit = 1u << binding.index;
-					type = (state.input_info.pixel->target_packed_unorm_mask & bit) != 0u
-					           ? TypeU32Vector(state, 4)
-					           : MrtOutputType(state, binding.index);
-				}
+				const bool uint_output =
+				    binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel &&
+				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
+				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
+				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
+				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -708,6 +812,52 @@ void DefineOutputs(EmitterState& state) {
 
 } // namespace
 
+// KYTY_BINDLESS: set 1 (BindlessBindings.h) - one runtime array per bindless image type, aliasing
+// the binding of its dimension, plus the translation and feedback buffers.
+void DefineBindlessImages(EmitterState& state) {
+	for (const auto& image: state.program.info.images) {
+		if (!image.bindless) continue;
+		const auto type = ImageType(state, image);
+		if (state.bindless_image_variables.contains(type)) continue;
+		uint32_t binding = IR::BindlessImages2D;
+		if (image.cube) {
+			binding = IR::BindlessImagesCube;
+		} else if (image.dimension == ImageDimension::Dim3D) {
+			binding = IR::BindlessImages3D;
+		} else if (image.dimension == ImageDimension::Dim2DArray ||
+		           image.dimension == ImageDimension::Dim2DMsaaArray) {
+			binding = IR::BindlessImages2DArray;
+		}
+		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray, type);
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array), spv::StorageClassUniformConstant);
+		state.builder.AddName(variable, "bindless_images");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		state.bindless_image_variables[type] = variable;
+		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
+	if (state.bindless_image_variables.empty() || state.bindless_translation_variable != 0) return;
+	const auto Buffer = [&](const char* name, uint32_t binding) {
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, state.storage_buffers[2])),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		return variable;
+	};
+	state.bindless_translation_variable = Buffer("bindless_translation", IR::BindlessTranslation);
+	state.builder.AddAnnotation(spv::OpDecorate, state.bindless_translation_variable,
+	                            spv::DecorationNonWritable);
+	state.bindless_feedback_variable = Buffer("bindless_feedback", IR::BindlessFeedback);
+}
+
 void DefineModule(EmitterState& state) {
 	state.interface_variables.reserve(state.program.info.inputs.size() +
 	                                  state.program.info.outputs.size());
@@ -715,8 +865,20 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	DefineBindlessImages(state);
 	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
+	}
+	if (state.wave_pair) {
+		// Per guest wave: two parity slots x two halves x {value, sequence}.
+		const auto* cs      = ShaderWorkgroupInput(state.program.stage, state.input_info);
+		const auto  threads = std::max(cs->threads_num[0], 1u) * std::max(cs->threads_num[1], 1u) *
+		                     std::max(cs->threads_num[2], 1u);
+		state.pair_slots_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, (threads / 64u) * 8u),
+		    spv::StorageClassWorkgroup);
+		state.builder.AddName(state.pair_slots_variable, "wave_pair_slots");
+		state.pair_seq_variable = state.builder.AllocateId();
 	}
 	if (state.program.info.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -734,13 +896,6 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
-		if (state.input_info.vertex->indirect_draw) {
-			// The task shader's payload (gpu_mesh_indirect.task).
-			const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
-			state.mesh_payload = DefineInterfaceVariable(
-			    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
-			    spv::StorageClassTaskPayloadWorkgroupEXT, "payload");
-		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
@@ -790,19 +945,21 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0 ||
-	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0 ||
+	    InputVariableForKind(state, IR::StageInputKind::DrawIndex) != 0) {
+		// Core since SPIR-V 1.3; the host enables shaderDrawParameters for GPU indirect draws.
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
+	if (state.lane_count == 2 || state.wave_pair || state.program.info.subgroup_barrier ||
 	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
 	    state.program.info.subgroup_shuffle ||
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || state.wave_pair || state.program.info.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.program.info.subgroup_vote) {
@@ -811,7 +968,9 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (state.program.info.subgroup_arithmetic) {
+	if (state.program.info.ordered_lds_atomics || state.program.info.subgroup_arithmetic) {
+		// lane-ordered LDS atomics (EmitAtomic32); subgroup minima (upstream 302240da7)
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
@@ -855,6 +1014,11 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		if (state.wave_pair) {
+			// Guest invocation index = host subgroup id * 32 + subgroup lane (EmitLocalInvocationIndex).
+			local_x = local_x * local_y * local_z;
+			local_y = local_z = 1u;
+		}
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

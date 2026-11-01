@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -15,14 +16,225 @@
 #endif
 
 #include "common/assert.h"
+#include "common/envDefaults.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
+
+bool VramGcFixEnabled() {
+	static const bool on = [] {
+		// Default from Common::EnvDefaults; =0 turns it off.
+		const char* value   = Common::EnvOrDefault("KYTY_VRAM_GC_FIX");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		if (enabled) {
+			std::fprintf(stderr, "VRAM_GC_FIX enabled (texture collector scans past unfreeable images; GPU-written "
+			                     "color images are downloaded before they are freed)\n");
+		}
+		return enabled;
+	}();
+	return on;
+}
+
+bool VramBudgetEnabled() {
+	static const bool on = [] {
+		// Default from Common::EnvDefaults; =0 turns it off.
+		const char* value   = Common::EnvOrDefault("KYTY_VRAM_BUDGET");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		if (enabled) {
+			std::fprintf(stderr, "VRAM_BUDGET enforcement enabled (target = min(KYTY_VRAM_BUDGET_MB cap, driver budget "
+			                     "- 1 GiB), re-read every collector run; images are evicted before new ones are "
+			                     "created over it)\n");
+		}
+		return enabled;
+	}();
+	return on;
+}
+
+// KYTY_VRAM_BUDGET_MB=<n>: the caches size their garbage-collection thresholds for at most n MiB.
+static uint64_t VramBudgetCap() {
+	static const uint64_t cap = [] {
+		const char* value = std::getenv("KYTY_VRAM_BUDGET_MB"); // default 11264 (user limit: 11 GB); =0 turns the cap off
+		const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 11264ull;
+		if (mib != 0) std::fprintf(stderr, "VRAM_BUDGET cap=%lluMiB\n", static_cast<unsigned long long>(mib));
+		return mib << 20u;
+	}();
+	return cap;
+}
+
+// KYTY_TRACE_PERF (PERF device_memory): every vkAllocateMemory / vkFreeMemory of the allocator, timed ("slow runs",
+// 19.10: in 6 of 7 slow runs a 256 MiB VMA block was freed and allocated again every few seconds).
+namespace {
+struct DeviceMemoryCalls {
+	std::atomic<uint64_t> allocs {0}, alloc_bytes {0}, alloc_ns {0}, alloc_max_ns {0}, big_allocs {0};
+	std::atomic<uint64_t> frees {0}, free_ns {0}, big_frees {0};
+};
+DeviceMemoryCalls      g_memory_calls;
+PFN_vkAllocateMemory   g_real_allocate = nullptr;
+PFN_vkFreeMemory       g_real_free     = nullptr;
+constexpr VkDeviceSize BigBytes        = VkDeviceSize {128} << 20u;
+thread_local uint64_t  t_allocs        = 0; // this thread's vkAllocateMemory calls (which image creations allocated)
+// Images whose creation allocated device memory (dedicated or a new block): count per format/size/usage.
+std::mutex                                g_image_alloc_mutex;
+std::unordered_map<std::string, uint64_t> g_image_allocs;
+std::atomic<uint64_t>                     g_image_alloc_calls {0}, g_image_creates {0}, g_image_deletes {0};
+
+uint64_t NanosSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                                   const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+	const auto     start  = std::chrono::steady_clock::now();
+	const VkResult result = g_real_allocate(device, info, callbacks, memory);
+	const uint64_t ns     = NanosSince(start);
+	auto&          c      = g_memory_calls;
+	c.allocs.fetch_add(1, std::memory_order_relaxed);
+	t_allocs++;
+	c.alloc_bytes.fetch_add(info->allocationSize, std::memory_order_relaxed);
+	c.alloc_ns.fetch_add(ns, std::memory_order_relaxed);
+	if (info->allocationSize >= BigBytes) c.big_allocs.fetch_add(1, std::memory_order_relaxed);
+	uint64_t max = c.alloc_max_ns.load(std::memory_order_relaxed);
+	while (ns > max && !c.alloc_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+	const auto start = std::chrono::steady_clock::now();
+	g_real_free(device, memory, callbacks);
+	auto& c = g_memory_calls;
+	c.frees.fetch_add(1, std::memory_order_relaxed);
+	c.free_ns.fetch_add(NanosSince(start), std::memory_order_relaxed);
+}
+} // namespace
+
+namespace {
+// A deleted image (with its memory) is kept for up to 2 s (at most 32 images, 512 MiB) and handed to the next creation
+// with the same create info instead of destroying one and creating another (the game's 1080p depth buffer and its R32/S8
+// aliases are created and destroyed every frame). The contents of a new image are undefined either way (initial layout
+// Undefined).
+struct RecycleKey {
+	VkImageCreateFlags    flags   = 0;
+	VkImageType           type    = VK_IMAGE_TYPE_2D;
+	VkFormat              format  = VK_FORMAT_UNDEFINED;
+	VkExtent3D            extent  = {};
+	uint32_t              levels  = 0;
+	uint32_t              layers  = 0;
+	VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+	VkImageUsageFlags     usage   = 0;
+	bool operator==(const RecycleKey& o) const {
+		return flags == o.flags && type == o.type && format == o.format && extent.width == o.extent.width &&
+		       extent.height == o.extent.height && extent.depth == o.extent.depth && levels == o.levels &&
+		       layers == o.layers && samples == o.samples && usage == o.usage;
+	}
+};
+struct RecycledImage {
+	RecycleKey                            key;
+	VkImage                               image      = VK_NULL_HANDLE;
+	VmaAllocation                         allocation = nullptr;
+	uint64_t                              bytes      = 0;
+	std::chrono::steady_clock::time_point parked;
+};
+constexpr size_t   RecycleMaxImages = 32;
+constexpr uint64_t RecycleMaxBytes  = uint64_t {512} << 20u;
+constexpr auto     RecycleMaxAge    = std::chrono::seconds(2);
+std::mutex                                g_recycle_mutex;
+std::vector<RecycledImage>                g_recycled; // oldest first
+uint64_t                                  g_recycled_bytes = 0;
+std::unordered_map<VkImage, RecycleKey>   g_recyclable; // live images created through CreateImage with a plain create info
+std::atomic<uint64_t>                     g_recycle_hits {0}, g_recycle_parks {0}, g_recycle_destroys {0};
+
+// Only plain create infos (no pNext chain, exclusive, optimal tiling, undefined initial layout) are recycled.
+bool RecycleKeyOf(const vk::ImageCreateInfo& info, RecycleKey& key) {
+	if (info.pNext != nullptr || info.tiling != vk::ImageTiling::eOptimal ||
+	    info.sharingMode != vk::SharingMode::eExclusive || info.initialLayout != vk::ImageLayout::eUndefined) {
+		return false;
+	}
+	key.flags   = static_cast<VkImageCreateFlags>(info.flags);
+	key.type    = static_cast<VkImageType>(info.imageType);
+	key.format  = static_cast<VkFormat>(info.format);
+	key.extent  = info.extent;
+	key.levels  = info.mipLevels;
+	key.layers  = info.arrayLayers;
+	key.samples = static_cast<VkSampleCountFlagBits>(info.samples);
+	key.usage   = static_cast<VkImageUsageFlags>(info.usage);
+	return true;
+}
+
+// Destroys parked images past the age or count/byte limits (under g_recycle_mutex); `all` destroys every one.
+void TrimRecycled(VmaAllocator allocator, bool all) {
+	const auto now = std::chrono::steady_clock::now();
+	size_t     drop = 0;
+	uint64_t   bytes = g_recycled_bytes;
+	while (drop < g_recycled.size() &&
+	       (all || now - g_recycled[drop].parked > RecycleMaxAge || g_recycled.size() - drop > RecycleMaxImages ||
+	        bytes > RecycleMaxBytes)) {
+		bytes -= g_recycled[drop].bytes;
+		drop++;
+	}
+	if (drop == 0) return;
+	// A command in the ring may still name these images.
+	CommandRecorder::DrainBeforeDestroy();
+	for (size_t i = 0; i < drop; i++) {
+		vmaDestroyImage(allocator, g_recycled[i].image, g_recycled[i].allocation);
+		g_recycle_destroys.fetch_add(1, std::memory_order_relaxed);
+	}
+	g_recycled.erase(g_recycled.begin(), g_recycled.begin() + static_cast<std::ptrdiff_t>(drop));
+	g_recycled_bytes = bytes;
+}
+} // namespace
+
+std::string TakeDeviceMemoryCallStats() {
+	auto& c = g_memory_calls;
+	char  text[256];
+	std::snprintf(text, sizeof(text),
+	              "allocs=%llu alloc_MiB=%llu alloc_ms=%.1f alloc_max_ms=%.2f big_allocs=%llu frees=%llu free_ms=%.1f",
+	              static_cast<unsigned long long>(c.allocs.exchange(0)),
+	              static_cast<unsigned long long>(c.alloc_bytes.exchange(0) >> 20u),
+	              static_cast<double>(c.alloc_ns.exchange(0)) / 1e6, static_cast<double>(c.alloc_max_ns.exchange(0)) / 1e6,
+	              static_cast<unsigned long long>(c.big_allocs.exchange(0)), static_cast<unsigned long long>(c.frees.exchange(0)),
+	              static_cast<double>(c.free_ns.exchange(0)) / 1e6);
+	std::string line = text;
+	std::snprintf(text, sizeof(text), " image_creates=%llu image_deletes=%llu image_allocs=%llu top[",
+	              static_cast<unsigned long long>(g_image_creates.exchange(0)),
+	              static_cast<unsigned long long>(g_image_deletes.exchange(0)),
+	              static_cast<unsigned long long>(g_image_alloc_calls.exchange(0)));
+	line += text;
+	std::vector<std::pair<uint64_t, std::string>> top;
+	{
+		std::lock_guard lock(g_image_alloc_mutex);
+		for (const auto& [key, n]: g_image_allocs) top.emplace_back(n, key);
+		g_image_allocs.clear();
+	}
+	std::sort(top.begin(), top.end(), std::greater<>());
+	for (size_t i = 0; i < top.size() && i < 8u; ++i) {
+		line += (i == 0 ? "" : " ") + top[i].second + "x" + std::to_string(top[i].first);
+	}
+	line += "]";
+	{
+		std::lock_guard lock(g_recycle_mutex);
+		std::snprintf(text, sizeof(text), " recycle hits=%llu parks=%llu destroys=%llu parked=%zu/%lluMiB",
+		              static_cast<unsigned long long>(g_recycle_hits.exchange(0)),
+		              static_cast<unsigned long long>(g_recycle_parks.exchange(0)),
+		              static_cast<unsigned long long>(g_recycle_destroys.exchange(0)), g_recycled.size(),
+		              static_cast<unsigned long long>(g_recycled_bytes >> 20u));
+		line += text;
+	}
+	return line;
+}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -32,6 +244,12 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	g_real_allocate                 = VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory;
+	g_real_free                     = VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory;
+	if (g_real_allocate != nullptr && g_real_free != nullptr) {
+		functions.vkAllocateMemory = TimedAllocateMemory;
+		functions.vkFreeMemory     = TimedFreeMemory;
+	}
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
@@ -56,6 +274,11 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	{
+		std::lock_guard lock(g_recycle_mutex);
+		TrimRecycled(allocator, true);
+		g_recyclable.clear();
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -75,6 +298,84 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+}
+
+void GraphicContext::GetDeviceLocalMemoryStats(uint64_t& usage, uint64_t& budget, uint64_t& blocks,
+                                               uint64_t& allocated) const {
+	usage = budget = blocks = allocated = 0;
+	if (allocator == nullptr || physical_device == nullptr) {
+		return;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		if (!(properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+		usage += budgets[i].usage;
+		budget += budgets[i].budget;
+		blocks += budgets[i].statistics.blockBytes;
+		allocated += budgets[i].statistics.allocationBytes;
+	}
+}
+
+void GraphicContext::GetMemoryCounts(uint64_t& device_blocks, uint64_t& device_allocations,
+                                     uint64_t& host_block_bytes) const {
+	device_blocks = device_allocations = host_block_bytes = 0;
+	if (allocator == nullptr || physical_device == nullptr) {
+		return;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		if (properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			device_blocks += budgets[i].statistics.blockCount;
+			device_allocations += budgets[i].statistics.allocationCount;
+		} else {
+			host_block_bytes += budgets[i].statistics.blockBytes;
+		}
+	}
+}
+
+uint32_t GraphicContext::GetHeapBudgets(HeapBudget* out, uint32_t max) const {
+	if (allocator == nullptr || physical_device == nullptr || out == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto&    properties = GetPhysicalDeviceMemoryProperties();
+	const uint32_t count      = std::min(properties.memoryHeapCount, max);
+	for (uint32_t i = 0; i < count; i++) {
+		out[i].usage        = budgets[i].usage;
+		out[i].budget       = budgets[i].budget;
+		out[i].size         = properties.memoryHeaps[i].size;
+		out[i].allocations  = budgets[i].statistics.allocationCount;
+		out[i].blocks       = budgets[i].statistics.blockCount;
+		out[i].device_local = static_cast<bool>(properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+	}
+	return count;
+}
+
+void GraphicContext::GetVramBudgetState(uint64_t& target, uint64_t& effective) const {
+	uint64_t usage = 0, budget = 0, blocks = 0, allocated = 0;
+	GetDeviceLocalMemoryStats(usage, budget, blocks, allocated);
+	constexpr uint64_t GiB   = 1024ull * 1024 * 1024;
+	const uint64_t     cap   = VramBudgetCap();
+	const uint64_t     limit = budget > 2 * GiB ? budget - GiB : budget / 2;
+	target                   = budget == 0 ? 0 : cap != 0 ? std::min(limit, cap) : limit;
+	// Free space inside VMA blocks is reused by new allocations before any block is added: eviction cannot
+	// lower it, and counting it would make the collectors evict for nothing.
+	const uint64_t empty = blocks > allocated ? blocks - allocated : 0;
+	effective            = usage > empty ? usage - empty : 0;
+}
+
+uint64_t GraphicContext::GetAllocationSize(VmaAllocation allocation) const {
+	if (allocator == nullptr || allocation == nullptr) {
+		return 0;
+	}
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	return info.size;
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -138,8 +439,10 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 			usage += CanReportMemoryUsage() ? budgets[heap].usage : 0;
 		}
 	}
+	const uint64_t cap = VramBudgetCap();
 	if (discrete) {
-		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		const auto result = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		return cap != 0 ? std::min(result, cap) : result;
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
@@ -155,15 +458,51 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	const uint64_t    allocs_before = t_allocs; // KYTY_TRACE_PERF: PERF device_memory
+	RecycleKey        key {};
+	const bool        recyclable = RecycleKeyOf(image_info, key);
+	bool              reused     = false;
+	if (recyclable) {
+		std::lock_guard lock(g_recycle_mutex);
+		TrimRecycled(allocator, false);
+		for (size_t i = g_recycled.size(); i-- > 0;) {
+			if (g_recycled[i].key == key) {
+				native_image     = g_recycled[i].image;
+				image.allocation = g_recycled[i].allocation;
+				g_recycled_bytes -= g_recycled[i].bytes;
+				g_recycled.erase(g_recycled.begin() + static_cast<std::ptrdiff_t>(i));
+				g_recycle_hits.fetch_add(1, std::memory_order_relaxed);
+				reused = true;
+				break;
+			}
+		}
+	}
+	if (!reused) {
+		const auto result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		                   &native_image, &image.allocation, nullptr));
+		if (result != vk::Result::eSuccess) {
+			image.image = native_image;
+			LogMemoryBudget();
+			return false;
+		}
+	}
 	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	if (recyclable) {
+		std::lock_guard lock(g_recycle_mutex);
+		g_recyclable[native_image] = key;
 	}
 
+	g_image_creates.fetch_add(1, std::memory_order_relaxed);
+	if (t_allocs != allocs_before) {
+		g_image_alloc_calls.fetch_add(1, std::memory_order_relaxed);
+		char key[128];
+		std::snprintf(key, sizeof(key), "%s/%ux%ux%u/l%u/m%u/u%x/f%x", vk::to_string(image_info.format).c_str(),
+		              image_info.extent.width, image_info.extent.height, image_info.extent.depth, image_info.arrayLayers,
+		              image_info.mipLevels, static_cast<uint32_t>(image_info.usage), static_cast<uint32_t>(image_info.flags));
+		std::lock_guard lock(g_image_alloc_mutex);
+		g_image_allocs[key]++;
+	}
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;
@@ -182,6 +521,28 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	g_image_deletes.fetch_add(1, std::memory_order_relaxed);
+	{
+		// Parked, not destroyed (no drain: the image stays valid).
+		std::lock_guard lock(g_recycle_mutex);
+		const auto      found = g_recyclable.find(static_cast<VkImage>(image.image));
+		if (found != g_recyclable.end()) {
+			VmaAllocationInfo info {};
+			vmaGetAllocationInfo(allocator, image.allocation, &info);
+			g_recycled.push_back({found->second, static_cast<VkImage>(image.image), image.allocation, info.size,
+			                      std::chrono::steady_clock::now()});
+			g_recycled_bytes += info.size;
+			g_recyclable.erase(found);
+			g_recycle_parks.fetch_add(1, std::memory_order_relaxed);
+			TrimRecycled(allocator, false);
+			image.image      = nullptr;
+			image.allocation = nullptr;
+			return;
+		}
+	}
+	// A command in the ring may still name this image (VMA does not go through the
+	// dispatcher's destroy functions).
+	CommandRecorder::DrainBeforeDestroy();
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;

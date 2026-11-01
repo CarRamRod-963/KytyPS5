@@ -9,6 +9,8 @@
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/overlayStats.h"
+#include "common/startupTrace.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -418,6 +420,7 @@ bool IsOpenDescriptor(int d) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
+	const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::KernelOpen); // KYTY_TRACE_STARTUP
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -665,17 +668,22 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return static_cast<int64_t>(nbytes);
 	}
 
+	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::KernelRead); // KYTY_TRACE_STARTUP
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
 	const auto pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	{
+		const Common::StartupTrace::Scope invalidate_scope(Common::StartupTrace::Counter::KernelInvalidate);
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
+		                         std::min<uint64_t>(nbytes, remaining));
+	}
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	startup_scope.SetBytes(bytes_read);
 
 	file->mutex.Unlock();
 
@@ -711,6 +719,9 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
 	}
+
+	std::vector<uint8_t> scratch;
+	buf = Memory::GuestBytesForKernelRead(buf, nbytes, scratch);
 
 	if (::Libs::Network::Net::IsSocket(d)) {
 		const auto result = ::Libs::Network::Net::Send(d, buf, nbytes, 0);
@@ -751,6 +762,9 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tWrite %u bytes to: %s\n", bytes_written, Common::PathToString(file->real_name).c_str());
+	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
+		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1, bytes_written);
+	}
 
 	return bytes_written;
 }
@@ -791,6 +805,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::KernelRead); // KYTY_TRACE_STARTUP
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
@@ -798,12 +813,16 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	{
+		const Common::StartupTrace::Scope invalidate_scope(Common::StartupTrace::Counter::KernelInvalidate);
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
+		                         std::min<uint64_t>(nbytes, remaining));
+	}
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	startup_scope.SetBytes(bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -887,6 +906,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_EIO;
 	}
 
+	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::KernelRead); // KYTY_TRACE_STARTUP
 	const auto position  = file->f.Tell();
 	const auto file_size = file->f.Size();
 	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
@@ -902,11 +922,15 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 			continue;
 		}
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
-		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
+		{
+			const Common::StartupTrace::Scope invalidate_scope(Common::StartupTrace::Counter::KernelInvalidate);
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
+		}
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;
+		startup_scope.SetBytes(static_cast<uint64_t>(bytes_read));
 		remaining -= bytes;
 		if (bytes < count) {
 			break;
@@ -948,6 +972,9 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
+	std::vector<uint8_t> scratch;
+	buf = Memory::GuestBytesForKernelRead(buf, nbytes, scratch);
+
 	file->mutex.Lock();
 
 	bool     is_invalid    = file->f.IsInvalid();
@@ -970,6 +997,9 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
+	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
+		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1, bytes_written);
+	}
 
 	return bytes_written;
 }
@@ -1025,8 +1055,10 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 		if (buffer.iov_len == 0) {
 			continue;
 		}
-		uint32_t bytes = 0;
-		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		std::vector<uint8_t> scratch;
+		const void*          source = Memory::GuestBytesForKernelRead(buffer.iov_base, buffer.iov_len, scratch);
+		uint32_t             bytes  = 0;
+		file->f.Write(source, static_cast<uint32_t>(buffer.iov_len), &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileWriteBytes, bytes);
 		bytes_written += bytes;
 		if (bytes < buffer.iov_len) {
@@ -1041,6 +1073,10 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 
 	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRIu64 ", iovcnt = %d) to: %s\n", bytes_written,
 	     target, iovcnt, Common::PathToString(file->real_name).c_str());
+	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
+		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1,
+		                          static_cast<uint64_t>(bytes_written));
+	}
 	return bytes_written;
 }
 

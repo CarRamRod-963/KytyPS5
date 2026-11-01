@@ -1,8 +1,13 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "common/workaroundHits.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -322,6 +327,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// The host image stops at its 1x1 level (ImageInfo::HostLevels). The guest levels past it are 1x1 too; a view of
+	// them views the last host level, and a view that only extends past it is cut there (it differs only where the
+	// sampler selects such a level).
+	if (image.mip_levels < info.resources.levels && normalized.level_count != 0 &&
+	    (normalized.base_level >= image.mip_levels ||
+	     normalized.level_count > image.mip_levels - normalized.base_level)) {
+		normalized.base_level  = std::min(normalized.base_level, image.mip_levels - 1u);
+		normalized.level_count = std::min(normalized.level_count, image.mip_levels - normalized.base_level);
+		normalized.min_lod     = std::min(normalized.min_lod, (normalized.level_count - 1u) * 256u);
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
@@ -360,6 +375,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	// An R8_SRGB read view of an R8_UNORM image (descriptors.cpp, 8_SRGB T#): the format only supports sampling.
+	if (normalized.format == vk::Format::eR8Srgb && image.format != vk::Format::eR8Srgb) {
+		usage.usage = vk::ImageUsageFlagBits::eSampled;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

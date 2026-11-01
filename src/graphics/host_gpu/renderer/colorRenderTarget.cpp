@@ -3,21 +3,27 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/workaroundHits.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawRepeat.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -39,12 +45,31 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
+// The target replay: per color slot, the last resolved target is kept when FindImage found an existing image by the plain
+// search and did nothing else and the image has no metadata, depth or stencil (TextureCache::TakeLastFindImagePlain,
+// ImageReplayable). A later resolve of the slot with the same register bytes (CB_COLOR*), target mask, slice offset and
+// flags builds the same description; while the image-page epochs of its range sum to the same value the search picks the
+// same image, so only the LRU touch and access tick are replayed (ReplayImage), then BindRenderTarget as before.
+namespace {
+struct TargetReplaySlot {
+	bool            valid        = false;
+	bool            ignore_mask  = false;
+	bool            exact_format = false;
+	uint32_t        mask         = 0;
+	uint32_t        slice_offset = 0;
+	uint64_t        page_sum     = 0;
+	HW::RenderTarget rt {};
+	RenderColorInfo r;
+};
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
+	const StageF::Zone stagef_target(StageF::Sub::Target); // KYTY_TRACE_STAGEF
 	const auto& hw = buffer.GetRegisters();
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
@@ -55,6 +80,24 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	r             = {};
 	r.target_slot = rt_slot;
+
+	// The target replay
+	const bool                           replay = rt_slot < 8u;
+	static thread_local TargetReplaySlot replay_slots[8];
+	if (replay && rt.base.addr != 0 && mask != 0) {
+		const auto& memo = replay_slots[rt_slot];
+		if (memo.valid && memo.mask == mask && memo.slice_offset == render_target_slice_offset &&
+		    memo.ignore_mask == ignore_target_mask && memo.exact_format == exact_format &&
+		    std::memcmp(&memo.rt, &rt, sizeof(rt)) == 0 &&
+		    memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.r.desc.info.data.address, memo.r.desc.info.data.size)) {
+			if (const auto id = m_context.GetTextureCache().ReplayImage(memo.r.image_id)) {
+				r          = memo.r;
+				r.image_id = id;
+				BindRenderTarget(id);
+				return;
+			}
+		}
+	}
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -72,16 +115,9 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
-	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
-	if (approximate_eqaa) {
-		static std::atomic_bool logged = false;
-		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(
-			    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
-		}
-	}
-	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments && !approximate_eqaa)) {
+	// Upstream 5f29374d5 approximates 4-coverage/2-fragment EQAA (PPSA24156) with 2x MSAA; not taken (an approximation,
+	// SESJA-SYNC1): Yotei renders no EQAA target.
+	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
@@ -179,6 +215,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	height = rt.attrib2.height + 1;
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	// KYTY_TRACE_PERF (PERF workaround_hits fmt30): a target programmed COLOR_10_11_11 + UNORM (guest format 30), taken as
+	// packed unsigned floats by KYTY_DIAG_RT_11_11_10_FLOAT; its address is kept for the T#s that read it.
+	if (Common::WorkaroundHits::Enabled() &&
+	    Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type).buffer_format ==
+	        Prospero::BufferFormat::k11_11_10UNorm &&
+	    Prospero::Diagnostic111110UnormAsFloat()) {
+		Common::WorkaroundHits::NoteFmt30Target(rt.base.addr);
+	}
 	const auto bytes_per_element = target_format.bytes_per_element;
 	if (bytes_per_element == 0) {
 		EXIT("render-target format has no valid element size\n");
@@ -265,9 +309,28 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
+	const auto epoch           = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+	(void)TextureCache::TakeLastFindImagePlain();
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	const bool plain           = TextureCache::TakeLastFindImagePlain();
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	if (!replay) return;
+	auto& memo = replay_slots[rt_slot];
+	memo.valid = false;
+	if (plain && r.desc.info.metadata.kind == ImageMetadataKind::None && texture_cache.ImageReplayable(r.image_id)) {
+		const auto page_sum = DrawRepeat::ImagePageEpochSum(r.desc.info.data.address, r.desc.info.data.size);
+		if (DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == epoch) {
+			memo.valid        = true;
+			memo.ignore_mask  = ignore_target_mask;
+			memo.exact_format = exact_format;
+			memo.mask         = mask;
+			memo.slice_offset = render_target_slice_offset;
+			memo.page_sum     = page_sum;
+			memo.rt           = rt;
+			memo.r            = r;
+		}
+	}
 }
 
 } // namespace Libs::Graphics

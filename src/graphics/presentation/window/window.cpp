@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -457,6 +458,11 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	// KYTY_OVERLAY: F2 hide/show, Shift+F2 compact. Checked before the upstream performance panel's F2 so our
+	// overlay keeps the key while it is enabled; with KYTY_OVERLAY off F2 toggles the upstream panel.
+	if (ProcessPerfOverlayKey(*event)) {
+		return;
+	}
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {
@@ -795,7 +801,12 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	// --precompile-only: the window is never shown (the device and the swapchain are made as for the game, nothing is
+	// presented; the launcher shows the progress).
+	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled() && !Config::PrecompileOnly());
+	if (Config::PrecompileOnly()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
@@ -864,6 +875,12 @@ void WindowRun() {
 	g_window->Run();
 	Common::LockGuard lock(g_window->render_context->GetMutex());
 	g_window->render_context->GetPipelineCache().Save();
+}
+
+int WindowPrecompileOnly(uint32_t threads, const std::atomic<bool>& stop) {
+	EXIT_IF(g_window == nullptr);
+	auto& context = *g_window->render_context;
+	return context.GetPipelineCache().RunPrecompileOnly(threads, stop, context.GetMutex());
 }
 
 void WindowShutdown() {

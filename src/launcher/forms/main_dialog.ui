@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Layout of the Figma launcher design v1 (docs/launcher/DESIGN-SPEC.md): sidebar 248 px + pages Play, Display, Graphics, Shaders,
+     Advanced, First start. Widgets with a "textStyle" property get their font from styles/tokens.json (LauncherTheme). -->
 <ui version="4.0">
  <class>MainDialog</class>
  <widget class="QDialog" name="MainDialog">
@@ -6,169 +8,2051 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>428</width>
-    <height>454</height>
+    <width>1280</width>
+    <height>800</height>
    </rect>
   </property>
   <property name="minimumSize">
    <size>
-    <width>0</width>
-    <height>0</height>
+    <width>1120</width>
+    <height>740</height>
    </size>
   </property>
   <property name="windowTitle">
-   <string>KytyPS5 Launcher</string>
+   <string>KytyPS5 · Yōtei fork</string>
   </property>
   <property name="locale">
    <locale language="English" country="UnitedStates"/>
   </property>
-  <layout class="QGridLayout" name="gridLayout">
-   <item row="0" column="0">
-    <layout class="QVBoxLayout" name="verticalLayout_5">
-     <item>
-      <layout class="QHBoxLayout" name="horizontalLayout_3">
+  <layout class="QHBoxLayout" name="rootLayout">
+   <property name="spacing">
+    <number>0</number>
+   </property>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
+   <item>
+    <widget class="QFrame" name="sidebar">
+     <property name="minimumSize">
+      <size>
+       <width>248</width>
+       <height>0</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>248</width>
+       <height>16777215</height>
+      </size>
+     </property>
+     <layout class="QVBoxLayout" name="sidebarLayout">
+      <property name="spacing">
+       <number>0</number>
+      </property>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>32</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>32</number>
+      </property>
+      <item>
+       <layout class="QVBoxLayout" name="brandLayout">
+        <property name="spacing">
+         <number>4</number>
+        </property>
+        <property name="leftMargin">
+         <number>24</number>
+        </property>
+        <property name="rightMargin">
+         <number>24</number>
+        </property>
+        <property name="bottomMargin">
+         <number>32</number>
+        </property>
+        <item>
+         <widget class="QLabel" name="brand_wordmark">
+          <property name="text">
+           <string notr="true">KytyPS5</string>
+          </property>
+          <property name="textStyle" stdset="0">
+           <string notr="true">Brand/Wordmark</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="brand_fork">
+          <property name="text">
+           <string notr="true">Yōtei fork</string>
+          </property>
+          <property name="textStyle" stdset="0">
+           <string notr="true">Label/Eyebrow</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="NavButton" name="nav_play">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>46</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>Play</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="accent" stdset="0">
+         <bool>false</bool>
+        </property>
+        <property name="textStyle" stdset="0">
+         <string notr="true">Label/Nav</string>
+        </property>
+       </widget>
+      </item>
+<item><widget class="NavButton" name="nav_display"><property name="minimumSize"><size><width>0</width><height>46</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>46</height></size></property><property name="text"><string>Display</string></property><property name="accent" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Label/Nav</string></property></widget></item>
+<item><widget class="NavButton" name="nav_graphics"><property name="minimumSize"><size><width>0</width><height>46</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>46</height></size></property><property name="text"><string>Graphics</string></property><property name="accent" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Label/Nav</string></property></widget></item>
+      <item>
+       <widget class="NavButton" name="nav_shaders">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>46</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>Shaders</string>
+        </property>
+        <property name="accent" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="textStyle" stdset="0">
+         <string notr="true">Label/Nav</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+<widget class="NavButton" name="nav_mods"><property name="minimumSize"><size><width>0</width><height>46</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>46</height></size></property><property name="text"><string>Mods</string></property><property name="accent" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Label/Nav</string></property></widget></item>
+      <item>
+       <widget class="NavButton" name="nav_advanced">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>46</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>Advanced</string>
+        </property>
+        <property name="accent" stdset="0">
+         <bool>true</bool>
+        </property>
+        <property name="textStyle" stdset="0">
+         <string notr="true">Label/Nav</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="sidebarSpacer">
+        <property name="orientation">
+         <enum>Qt::Vertical</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>20</width>
+          <height>40</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <layout class="QVBoxLayout" name="footerLayout">
+        <property name="spacing">
+         <number>4</number>
+        </property>
+        <property name="leftMargin">
+         <number>24</number>
+        </property>
+        <property name="rightMargin">
+         <number>24</number>
+        </property>
+        <item>
+         <widget class="QLabel" name="footer_author">
+          <property name="text">
+           <string notr="true">by Erlou</string>
+          </property>
+          <property name="textStyle" stdset="0">
+           <string notr="true">Label/Caption</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="footer_version">
+          <property name="text">
+           <string notr="true"/>
+          </property>
+          <property name="textStyle" stdset="0">
+           <string notr="true">Label/Caption</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="footer_keys">
+          <property name="text">
+           <string>F2 overlay · Shift+F2 compact</string>
+          </property>
+          <property name="textStyle" stdset="0">
+           <string notr="true">Label/Caption</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QStackedWidget" name="pages">
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="page_play">
+      <layout class="QVBoxLayout" name="playPageLayout">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
        <item>
-        <layout class="QVBoxLayout" name="verticalLayout_3">
-         <item>
-          <widget class="ConfigurationListWidget" name="widget" native="true">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="MinimumExpanding" vsizetype="Preferred">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>400</width>
-             <height>300</height>
-            </size>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-      </layout>
-     </item>
-     <item>
-      <layout class="QVBoxLayout" name="verticalLayout_4">
-       <item>
-        <widget class="QLabel" name="label_settings_file">
-         <property name="text">
-          <string>TextLabel</string>
+        <widget class="ArtBackground" name="play_art" native="true">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
          </property>
+         <layout class="QVBoxLayout" name="playContentLayout">
+          <property name="spacing">
+           <number>12</number>
+          </property>
+          <property name="leftMargin">
+           <number>48</number>
+          </property>
+          <property name="topMargin">
+           <number>48</number>
+          </property>
+          <property name="rightMargin">
+           <number>48</number>
+          </property>
+          <property name="bottomMargin">
+           <number>32</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="play_eyebrow">
+            <property name="text">
+             <string>No game selected</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Label/Eyebrow</string>
+            </property>
+            <property name="tone" stdset="0">
+             <string notr="true">secondary</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="play_title">
+            <property name="text">
+             <string>Select your game</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Heading/Title</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="playHeaderGap">
+            <property name="orientation">
+             <enum>Qt::Vertical</enum>
+            </property>
+            <property name="sizeType">
+             <enum>QSizePolicy::Fixed</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>12</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="playCardsLayout">
+            <property name="spacing">
+             <number>24</number>
+            </property>
+            <item>
+             <widget class="QFrame" name="card_games">
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                <horstretch>1</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
+              </property>
+              <property name="card" stdset="0">
+               <bool>true</bool>
+              </property>
+              <layout class="QVBoxLayout" name="cardGamesLayout">
+               <property name="spacing">
+                <number>0</number>
+               </property>
+               <property name="leftMargin">
+                <number>16</number>
+               </property>
+               <property name="topMargin">
+                <number>16</number>
+               </property>
+               <property name="rightMargin">
+                <number>16</number>
+               </property>
+               <property name="bottomMargin">
+                <number>16</number>
+               </property>
+               <item>
+                <widget class="ConfigurationListWidget" name="widget" native="true">
+                 <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                   <horstretch>0</horstretch>
+                   <verstretch>0</verstretch>
+                  </sizepolicy>
+                 </property>
+                 <property name="minimumSize">
+                  <size>
+                   <width>360</width>
+                   <height>200</height>
+                  </size>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item alignment="Qt::AlignTop">
+<widget class="QFrame" name="card_checks"><property name="minimumSize"><size><width>320</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>320</width><height>16777215</height></size></property><property name="card" stdset="0"><bool>true</bool></property>
+<layout class="QVBoxLayout" name="card_checksLayout"><property name="spacing"><number>16</number></property><property name="leftMargin"><number>24</number></property><property name="topMargin"><number>24</number></property><property name="rightMargin"><number>24</number></property><property name="bottomMargin"><number>24</number></property>
+<item><widget class="QLabel" name="card_checks_title"><property name="text"><string>Checks</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Section</string></property>
+</widget></item>
+<item><widget class="QWidget" name="check_emulator_row"><layout class="QHBoxLayout" name="check_emulatorRow"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_emulator_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_emulatorText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_emulator"><property name="text"><string>Emulator not found</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_emulator_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></widget></item>
+<item><layout class="QHBoxLayout" name="check_folderRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_folder_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_folderText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_folder"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_folder_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QWidget" name="check_version_row"><layout class="QHBoxLayout" name="check_versionRow"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_version_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_versionText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_version"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_version_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></widget></item>
+<item><layout class="QHBoxLayout" name="check_gpuRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_gpu_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_gpuText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_gpu"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_gpu_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><layout class="QHBoxLayout" name="check_ramRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_ram_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_ramText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_ram"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_ram_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><layout class="QHBoxLayout" name="check_cacheRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="check_cache_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="check_cacheText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="check_cache"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="check_cache_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item></layout></widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <spacer name="playBottomSpacer">
+            <property name="orientation">
+             <enum>Qt::Vertical</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>0</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
         </widget>
        </item>
        <item>
-        <widget class="QLabel" name="label_Interpreter">
+        <widget class="QFrame" name="bottom_bar">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>84</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>84</height>
+          </size>
+         </property>
+         <layout class="QHBoxLayout" name="bottomBarLayout">
+          <property name="spacing">
+           <number>16</number>
+          </property>
+          <property name="leftMargin">
+           <number>48</number>
+          </property>
+          <property name="topMargin">
+           <number>0</number>
+          </property>
+          <property name="rightMargin">
+           <number>48</number>
+          </property>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="play_status">
+            <property name="text">
+             <string>No game selected</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Mono/Value</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="bottomBarSpacer">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>10</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="ArtButton" name="play_precompile_button">
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>40</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>16777215</width>
+              <height>40</height>
+             </size>
+            </property>
+            <property name="toolTip">
+             <string>Open the Shaders page and precompile the shaders of the selected game.</string>
+            </property>
+            <property name="text">
+             <string>Precompile shaders</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Label/Button</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="ArtButton" name="play_button">
+            <property name="minimumSize">
+             <size>
+              <width>220</width>
+              <height>48</height>
+             </size>
+            </property>
+            <property name="maximumSize">
+             <size>
+              <width>220</width>
+              <height>48</height>
+             </size>
+            </property>
+            <property name="toolTip">
+             <string>Start the selected game.</string>
+            </property>
+            <property name="text">
+             <string>PLAY</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Brand/Play</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+<widget class="QWidget" name="page_display"><layout class="QVBoxLayout" name="displayPageLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="ArtBackground" name="display_banner" native="true"><property name="minimumSize"><size><width>0</width><height>200</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>200</height></size></property>
+<layout class="QVBoxLayout" name="displayBannerLayout"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>48</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="QLabel" name="display_eyebrow"><property name="text"><string>Settings</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Label/Eyebrow</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><widget class="QLabel" name="display_title"><property name="text"><string>Display</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Title</string></property>
+</widget></item>
+<item><spacer name="displayBannerSpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></item>
+<item><widget class="QScrollArea" name="display_scroll"><property name="frameShape"><enum>QFrame::NoFrame</enum></property><property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAlwaysOff</enum></property><property name="widgetResizable"><bool>true</bool></property>
+<widget class="QWidget" name="display_body"><layout class="QVBoxLayout" name="displayBodyLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>32</number></property>
+<item><layout class="QHBoxLayout" name="rowResolution"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowResolution_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Resolution</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowResolutionControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QComboBox" name="display_resolution"><property name="minimumSize"><size><width>240</width><height>40</height></size></property>
+<property name="maximumSize"><size><width>240</width><height>40</height></size></property>
+<property name="select" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property></widget></item>
+<item><widget class="QLabel" name="row_resolution_description"><property name="text"><string>Size of the game image. Higher costs more GPU time.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_resolution_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowFullscreen"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowFullscreen_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Full screen</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowFullscreenControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QCheckBox" name="display_fullscreen"><property name="toggle" stdset="0"><bool>true</bool></property></widget></item>
+<item><widget class="QLabel" name="row_fullscreen_description"><property name="text"><string>Off keeps the game in a window.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_fullscreen_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowPresent"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowPresent_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Present mode</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowPresentControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QComboBox" name="display_present"><property name="minimumSize"><size><width>240</width><height>40</height></size></property>
+<property name="maximumSize"><size><width>240</width><height>40</height></size></property>
+<property name="select" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property></widget></item>
+<item><widget class="QLabel" name="row_present_description"><property name="text"><string>Fifo waits for the display (no tearing). Mailbox shows the newest frame without tearing. Immediate shows frames at once and can tear.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_present_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowOverlay"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowOverlay_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Overlay</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowOverlayControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QComboBox" name="display_overlay"><property name="minimumSize"><size><width>240</width><height>40</height></size></property>
+<property name="maximumSize"><size><width>240</width><height>40</height></size></property>
+<property name="select" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property></widget></item>
+<item><widget class="QLabel" name="row_overlay_description"><property name="text"><string>F2 shows or hides the overlay, Shift+F2 switches it to the compact one.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><spacer name="displayBodySpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></widget></item>
+</layout></widget>
+<widget class="QWidget" name="page_graphics"><layout class="QVBoxLayout" name="graphicsPageLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="ArtBackground" name="graphics_banner" native="true"><property name="minimumSize"><size><width>0</width><height>200</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>200</height></size></property>
+<layout class="QVBoxLayout" name="graphicsBannerLayout"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>48</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="QLabel" name="graphics_eyebrow"><property name="text"><string>Settings</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Label/Eyebrow</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><widget class="QLabel" name="graphics_title"><property name="text"><string>Graphics</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Title</string></property>
+</widget></item>
+<item><spacer name="graphicsBannerSpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></item>
+<item><widget class="QScrollArea" name="graphics_scroll"><property name="frameShape"><enum>QFrame::NoFrame</enum></property><property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAlwaysOff</enum></property><property name="widgetResizable"><bool>true</bool></property>
+<widget class="QWidget" name="graphics_body"><layout class="QVBoxLayout" name="graphicsBodyLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>32</number></property>
+<item><layout class="QHBoxLayout" name="rowTessellation"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowTessellation_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Tessellation</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowTessellationControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QCheckBox" name="graphics_tessellation"><property name="toggle" stdset="0"><bool>true</bool></property></widget></item>
+<item><widget class="QLabel" name="row_tessellation_description"><property name="text"><string>Adds surface detail to terrain, water and fog. Turning it off breaks fog and water.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_tessellation_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowGpu"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowGpu_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Graphics card</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowGpuControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QComboBox" name="graphics_gpu"><property name="minimumSize"><size><width>400</width><height>40</height></size></property>
+<property name="maximumSize"><size><width>400</width><height>40</height></size></property>
+<property name="select" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property></widget></item>
+<item><widget class="QLabel" name="row_gpu_description"><property name="text"><string>The card the game runs on.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><spacer name="graphicsBodySpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></widget></item>
+</layout></widget>
+     <widget class="QWidget" name="page_shaders">
+      <layout class="QVBoxLayout" name="shadersPageLayout">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="ArtBackground" name="shaders_banner" native="true">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>200</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>200</height>
+          </size>
+         </property>
+         <layout class="QVBoxLayout" name="shadersBannerLayout">
+          <property name="spacing">
+           <number>12</number>
+          </property>
+          <property name="leftMargin">
+           <number>48</number>
+          </property>
+          <property name="topMargin">
+           <number>48</number>
+          </property>
+          <property name="rightMargin">
+           <number>48</number>
+          </property>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="shaders_eyebrow">
+            <property name="text">
+             <string>Settings</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Label/Eyebrow</string>
+            </property>
+            <property name="tone" stdset="0">
+             <string notr="true">secondary</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="shaders_title">
+            <property name="text">
+             <string>Shaders</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Heading/Title</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="shadersBannerSpacer">
+            <property name="orientation">
+             <enum>Qt::Vertical</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>0</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QScrollArea" name="shaders_scroll">
          <property name="frameShape">
           <enum>QFrame::NoFrame</enum>
          </property>
-         <property name="frameShadow">
-          <enum>QFrame::Sunken</enum>
+         <property name="horizontalScrollBarPolicy">
+          <enum>Qt::ScrollBarAlwaysOff</enum>
          </property>
-         <property name="text">
-          <string>TextLabel</string>
+         <property name="widgetResizable">
+          <bool>true</bool>
          </property>
-        </widget>
-       </item>
-       <item>
-        <layout class="QHBoxLayout" name="versionLayout">
-         <item>
-          <widget class="QLabel" name="label_Version">
-           <property name="text">
-            <string>TextLabel</string>
+         <widget class="QWidget" name="shaders_body">
+          <layout class="QVBoxLayout" name="shadersBodyLayout">
+           <property name="spacing">
+            <number>0</number>
            </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QLabel" name="check_updates_link">
-           <property name="text">
-            <string>&lt;a href=&quot;check&quot;&gt;Check for updates&lt;/a&gt;</string>
+           <property name="leftMargin">
+            <number>48</number>
            </property>
-           <property name="textFormat">
-            <enum>Qt::RichText</enum>
+           <property name="topMargin">
+            <number>16</number>
            </property>
-          </widget>
-         </item>
-         <item>
-          <spacer name="versionSpacer">
-           <property name="orientation">
-            <enum>Qt::Horizontal</enum>
+           <property name="rightMargin">
+            <number>48</number>
            </property>
-           <property name="sizeHint" stdset="0">
-            <size>
-             <width>40</width>
-             <height>20</height>
-            </size>
+           <property name="bottomMargin">
+            <number>32</number>
            </property>
-          </spacer>
-         </item>
-        </layout>
-       </item>
-       <item>
-        <widget class="QCheckBox" name="check_updates_on_startup">
-         <property name="text">
-          <string>Check for updates on startup</string>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <widget class="QCheckBox" name="close_terminal">
-         <property name="text">
-          <string>Close terminal automatically</string>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <layout class="QHBoxLayout" name="themeLayout">
-         <item>
-          <widget class="QLabel" name="label_theme">
-           <property name="text">
-            <string>Theme:</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QComboBox" name="theme_combo">
            <item>
-            <property name="text">
-             <string>System</string>
-            </property>
+            <widget class="QLabel" name="shaders_section_precompile">
+             <property name="text">
+              <string>Precompile</string>
+             </property>
+             <property name="textStyle" stdset="0">
+              <string notr="true">Heading/Section</string>
+             </property>
+            </widget>
            </item>
            <item>
-            <property name="text">
-             <string>Dark</string>
-            </property>
+            <layout class="QHBoxLayout" name="rowPrecompile">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_precompile_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Precompile all shaders</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowPrecompileControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <layout class="QHBoxLayout" name="precompileButtons">
+                 <property name="spacing">
+                  <number>8</number>
+                 </property>
+                 <item>
+                  <widget class="QPushButton" name="precompile_button">
+                   <property name="toolTip">
+                    <string>Compile the recorded shaders of the selected game into the pipeline cache now, without starting the game. Stopping keeps what is done; the next run continues.</string>
+                   </property>
+                   <property name="text">
+                    <string>Precompile shaders</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="precompile_pause_button">
+                   <property name="toolTip">
+                    <string>Finishes the shaders being compiled (up to about a minute), saves and stops. Continue precompiling goes on from there.</string>
+                   </property>
+                   <property name="text">
+                    <string>Pause</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="hints_import_button">
+                   <property name="toolTip">
+                    <string>Load a shader hints file (.kyhints, from another player): the shaders it lists are taken from your own game files, added to the recorded ones and precompiled.</string>
+                   </property>
+                   <property name="text">
+                    <string>Import hints...</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="hints_export_button">
+                   <property name="toolTip">
+                    <string>Save the shaders recorded while you played as a hints file for other players. The file holds no game code: only shader sizes, checksums and settings.</string>
+                   </property>
+                   <property name="text">
+                    <string>Export hints...</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <spacer name="precompileButtonsSpacer">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>20</height>
+                    </size>
+                   </property>
+                  </spacer>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QProgressBar" name="precompile_progress">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>6</height>
+                  </size>
+                 </property>
+                 <property name="maximumSize">
+                  <size>
+                   <width>16777215</width>
+                   <height>6</height>
+                  </size>
+                 </property>
+                 <property name="value">
+                  <number>0</number>
+                 </property>
+                 <property name="textVisible">
+                  <bool>false</bool>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="precompileProgressLine">
+                 <property name="spacing">
+                  <number>16</number>
+                 </property>
+                 <item>
+                  <widget class="QLabel" name="precompile_count">
+                   <property name="text">
+                    <string notr="true"/>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Mono/Path</string>
+                   </property>
+                   <property name="tone" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <spacer name="precompileProgressLineSpacer">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>10</height>
+                    </size>
+                   </property>
+                  </spacer>
+                 </item>
+                 <item>
+                  <widget class="QLabel" name="precompile_eta">
+                   <property name="text">
+                    <string notr="true"/>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Mono/Path</string>
+                   </property>
+                   <property name="tone" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QLabel" name="precompile_status">
+                 <property name="text">
+                  <string/>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Mono/Path</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_precompile_description">
+                 <property name="text">
+                  <string>Translates every shader of the game for this graphics card once, so new effects do not stutter. Closing the launcher pauses it. Needed again after a driver update.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
            </item>
            <item>
-            <property name="text">
-             <string>Light</string>
-            </property>
+            <widget class="QFrame" name="row_precompile_divider">
+             <property name="divider" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
            </item>
-          </widget>
-         </item>
-         <item>
-          <spacer name="themeSpacer">
-           <property name="orientation">
-            <enum>Qt::Horizontal</enum>
-           </property>
-           <property name="sizeHint" stdset="0">
-            <size>
-             <width>40</width>
-             <height>20</height>
-            </size>
-           </property>
-          </spacer>
-         </item>
-        </layout>
+<item><layout class="QHBoxLayout" name="rowPrecompileOnStart"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowPrecompileOnStart_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Precompile on start</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowPrecompileOnStartControl"><property name="spacing"><number>8</number></property>
+<item><widget class="QCheckBox" name="precompile_on_start"><property name="toggle" stdset="0"><bool>true</bool></property></widget></item>
+<item><widget class="QLabel" name="row_precompile_on_start_description"><property name="text"><string>Shaders seen in earlier sessions are prepared in the background while the game loads. Off also stops recording new shaders for precompiling.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_precompile_on_start_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+           <item>
+            <layout class="QHBoxLayout" name="rowThreads">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_threads_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Precompile threads</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowThreadsControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <widget class="QSpinBox" name="precompile_threads">
+                 <property name="minimumSize">
+                  <size>
+                   <width>160</width>
+                   <height>40</height>
+                  </size>
+                 </property>
+                 <property name="maximumSize">
+                  <size>
+                   <width>160</width>
+                   <height>40</height>
+                  </size>
+                 </property>
+                 <property name="toolTip">
+                  <string>Compile threads. Default: the KYTY_SHADER_PRECOMPILE_THREADS setting (6).</string>
+                 </property>
+                 <property name="specialValueText">
+                  <string>Default</string>
+                 </property>
+                 <property name="minimum">
+                  <number>0</number>
+                 </property>
+                 <property name="maximum">
+                  <number>64</number>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Default</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_threads_description">
+                 <property name="text">
+                  <string>More threads finish sooner; fewer keep the PC responsive while you play.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="shaders_section_cache">
+             <property name="text">
+              <string>Cache</string>
+             </property>
+             <property name="textStyle" stdset="0">
+              <string notr="true">Heading/Section</string>
+             </property>
+             <property name="spaced" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="rowCache">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_cache_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Shader cache</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowCacheControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <layout class="QHBoxLayout" name="cacheSizeRow">
+                 <property name="spacing">
+                  <number>16</number>
+                 </property>
+                 <item>
+                  <widget class="QLabel" name="cache_size_key">
+                   <property name="minimumSize">
+                    <size>
+                     <width>172</width>
+                     <height>0</height>
+                    </size>
+                   </property>
+                   <property name="text">
+                    <string>Size on disk</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Body/Default</string>
+                   </property>
+                   <property name="tone" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QLabel" name="cache_size">
+                   <property name="text">
+                    <string notr="true">—</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Mono/Value</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <spacer name="cacheSizeSpacer">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>20</height>
+                    </size>
+                   </property>
+                  </spacer>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="cacheButtons">
+                 <property name="spacing">
+                  <number>8</number>
+                 </property>
+                 <item>
+                  <widget class="QPushButton" name="cache_open_button">
+                   <property name="text">
+                    <string>Open folder</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">secondary</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <widget class="QPushButton" name="cache_clear_button">
+                   <property name="text">
+                    <string>Clear cache</string>
+                   </property>
+                   <property name="kind" stdset="0">
+                    <string notr="true">danger</string>
+                   </property>
+                   <property name="textStyle" stdset="0">
+                    <string notr="true">Label/Button</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item>
+                  <spacer name="cacheButtonsSpacer">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>20</height>
+                    </size>
+                   </property>
+                  </spacer>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_cache_description">
+                 <property name="text">
+                  <string>The compiled shaders of every game, kept next to the emulator in _PipelineCache.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <spacer name="shadersBodySpacer">
+             <property name="orientation">
+              <enum>Qt::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>0</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </widget>
+        </widget>
        </item>
       </layout>
-     </item>
-    </layout>
+     </widget>
+     <widget class="QWidget" name="page_advanced">
+      <layout class="QVBoxLayout" name="advancedPageLayout">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="ArtBackground" name="advanced_banner" native="true">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>200</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>200</height>
+          </size>
+         </property>
+         <layout class="QVBoxLayout" name="advancedBannerLayout">
+          <property name="spacing">
+           <number>12</number>
+          </property>
+          <property name="leftMargin">
+           <number>48</number>
+          </property>
+          <property name="topMargin">
+           <number>48</number>
+          </property>
+          <property name="rightMargin">
+           <number>48</number>
+          </property>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="advanced_eyebrow">
+            <property name="text">
+             <string>Settings</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Label/Eyebrow</string>
+            </property>
+            <property name="tone" stdset="0">
+             <string notr="true">secondary</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="advanced_title">
+            <property name="text">
+             <string>Advanced</string>
+            </property>
+            <property name="textStyle" stdset="0">
+             <string notr="true">Heading/Title</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="advancedBannerSpacer">
+            <property name="orientation">
+             <enum>Qt::Vertical</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>0</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QScrollArea" name="advanced_scroll">
+         <property name="frameShape">
+          <enum>QFrame::NoFrame</enum>
+         </property>
+         <property name="horizontalScrollBarPolicy">
+          <enum>Qt::ScrollBarAlwaysOff</enum>
+         </property>
+         <property name="widgetResizable">
+          <bool>true</bool>
+         </property>
+         <widget class="QWidget" name="advanced_body">
+          <layout class="QVBoxLayout" name="advancedBodyLayout">
+           <property name="spacing">
+            <number>0</number>
+           </property>
+           <property name="leftMargin">
+            <number>48</number>
+           </property>
+           <property name="topMargin">
+            <number>16</number>
+           </property>
+           <property name="rightMargin">
+            <number>48</number>
+           </property>
+           <property name="bottomMargin">
+            <number>32</number>
+           </property>
+           <item>
+            <widget class="QLabel" name="advanced_section_folders">
+             <property name="text">
+              <string>Folders</string>
+             </property>
+             <property name="textStyle" stdset="0">
+              <string notr="true">Heading/Section</string>
+             </property>
+            </widget>
+           </item>
+<item><layout class="QHBoxLayout" name="rowGameFolder"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowGameFolder_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Game folder</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowGameFolderControl"><property name="spacing"><number>8</number></property>
+<item><layout class="QHBoxLayout" name="gameFolderLine"><property name="spacing"><number>8</number></property><item><widget class="QLabel" name="label_game_folder"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property><property name="text"><string></string></property><property name="textInteractionFlags"><set>Qt::TextSelectableByMouse</set></property><property name="textStyle" stdset="0"><string notr="true">Mono/Path</string></property><property name="field" stdset="0"><bool>true</bool></property></widget></item><item><widget class="QPushButton" name="game_folder_button"><property name="text"><string>Change…</string></property><property name="kind" stdset="0"><string notr="true">secondary</string></property><property name="textStyle" stdset="0"><string notr="true">Label/Button</string></property></widget></item></layout></item>
+<item><widget class="QLabel" name="row_game_folder_description"><property name="text"><string>The folder that contains eboot.bin and sce_sys.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_game_folder_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowLogFolder"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowLogFolder_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Log folder</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowLogFolderControl"><property name="spacing"><number>8</number></property>
+<item><layout class="QHBoxLayout" name="logFolderLine"><property name="spacing"><number>8</number></property><item><widget class="QLabel" name="label_log_folder"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property><property name="text"><string></string></property><property name="textInteractionFlags"><set>Qt::TextSelectableByMouse</set></property><property name="textStyle" stdset="0"><string notr="true">Mono/Path</string></property><property name="field" stdset="0"><bool>true</bool></property></widget></item><item><widget class="QPushButton" name="log_folder_button"><property name="text"><string>Open</string></property><property name="kind" stdset="0"><string notr="true">secondary</string></property><property name="textStyle" stdset="0"><string notr="true">Label/Button</string></property></widget></item></layout></item>
+<item><widget class="QLabel" name="row_log_folder_description"><property name="text"><string>A log is written here on every run (the last 10 are kept).</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QFrame" name="row_log_folder_divider"><property name="divider" stdset="0"><bool>true</bool></property></widget></item>
+           <item>
+            <layout class="QHBoxLayout" name="rowEmulator">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_emulator_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Emulator</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowEmulatorControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <widget class="QLabel" name="label_Interpreter">
+                 <property name="text">
+                  <string notr="true"/>
+                 </property>
+                 <property name="textInteractionFlags">
+                  <set>Qt::TextSelectableByMouse</set>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Mono/Path</string>
+                 </property>
+                 <property name="field" stdset="0">
+                  <bool>true</bool>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_emulator_description">
+                 <property name="text">
+                  <string>The emulator the launcher starts: next to the launcher or one folder up.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QFrame" name="row_emulator_divider">
+             <property name="divider" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="rowSettingsFile">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_settings_file_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Settings file</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowSettingsFileControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <widget class="QLabel" name="label_settings_file">
+                 <property name="text">
+                  <string notr="true"/>
+                 </property>
+                 <property name="textInteractionFlags">
+                  <set>Qt::TextSelectableByMouse</set>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Mono/Path</string>
+                 </property>
+                 <property name="field" stdset="0">
+                  <bool>true</bool>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_settings_file_description">
+                 <property name="text">
+                  <string>Game folders and the settings of each game are kept here.</string>
+                 </property>
+                 <property name="wordWrap">
+                  <bool>true</bool>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </item>
+<item><widget class="QLabel" name="advanced_section_support"><property name="text"><string>Support</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Section</string></property>
+<property name="spaced" stdset="0"><bool>true</bool></property></widget></item>
+<item><layout class="QHBoxLayout" name="rowBugReport"><property name="spacing"><number>24</number></property><property name="topMargin"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="QLabel" name="rowBugReport_label"><property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>280</width><height>16777215</height></size></property><property name="text"><string>Bug report</string></property><property name="textStyle" stdset="0"><string notr="true">Body/Strong</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="rowBugReportControl"><property name="spacing"><number>8</number></property>
+<item><layout class="QHBoxLayout" name="bugReportButtons"><property name="spacing"><number>8</number></property>
+<item><widget class="QPushButton" name="bug_report_button"><property name="text"><string>Export bug report</string></property><property name="kind" stdset="0"><string notr="true">secondary</string></property><property name="textStyle" stdset="0"><string notr="true">Label/Button</string></property></widget></item>
+<item><spacer name="bugReportButtonsSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item></layout></item>
+<item><widget class="QLabel" name="row_bug_report_description"><property name="text"><string>Saves logs, settings and system info into one zip on this PC. Nothing is sent: you attach it to a GitHub issue yourself.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+           <item>
+            <widget class="QWidget" name="updates_section" native="true">
+             <layout class="QVBoxLayout" name="updatesSectionLayout">
+              <property name="spacing">
+               <number>0</number>
+              </property>
+              <property name="leftMargin">
+               <number>0</number>
+              </property>
+              <property name="topMargin">
+               <number>0</number>
+              </property>
+              <property name="rightMargin">
+               <number>0</number>
+              </property>
+              <property name="bottomMargin">
+               <number>0</number>
+              </property>
+              <item>
+               <widget class="QLabel" name="advanced_section_updates">
+                <property name="text">
+                 <string>Updates</string>
+                </property>
+                <property name="textStyle" stdset="0">
+                 <string notr="true">Heading/Section</string>
+                </property>
+                <property name="spaced" stdset="0">
+                 <bool>true</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="rowUpdates">
+                <property name="spacing">
+                 <number>24</number>
+                </property>
+                <property name="topMargin">
+                 <number>12</number>
+                </property>
+                <item alignment="Qt::AlignTop">
+                 <widget class="QLabel" name="row_updates_label">
+                  <property name="minimumSize">
+                   <size>
+                    <width>280</width>
+                    <height>0</height>
+                   </size>
+                  </property>
+                  <property name="maximumSize">
+                   <size>
+                    <width>280</width>
+                    <height>16777215</height>
+                   </size>
+                  </property>
+                  <property name="text">
+                   <string>Updates</string>
+                  </property>
+                  <property name="textStyle" stdset="0">
+                   <string notr="true">Body/Strong</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <layout class="QVBoxLayout" name="rowUpdatesControl">
+                  <property name="spacing">
+                   <number>8</number>
+                  </property>
+                  <item>
+                   <widget class="QLabel" name="check_updates_link">
+                    <property name="text">
+                     <string>&lt;a href=&quot;check&quot;&gt;Check for updates&lt;/a&gt;</string>
+                    </property>
+                    <property name="textFormat">
+                     <enum>Qt::RichText</enum>
+                    </property>
+                    <property name="textStyle" stdset="0">
+                     <string notr="true">Body/Default</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QCheckBox" name="check_updates_on_startup">
+                    <property name="text">
+                     <string>Check for updates on startup</string>
+                    </property>
+                    <property name="textStyle" stdset="0">
+                     <string notr="true">Body/Default</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QLabel" name="row_updates_description">
+                    <property name="text">
+                     <string>Looks for a newer KytyPS5 release on GitHub.</string>
+                    </property>
+                    <property name="wordWrap">
+                     <bool>true</bool>
+                    </property>
+                    <property name="textStyle" stdset="0">
+                     <string notr="true">Body/Description</string>
+                    </property>
+                    <property name="tone" stdset="0">
+                     <string notr="true">secondary</string>
+                    </property>
+                   </widget>
+                  </item>
+                 </layout>
+                </item>
+               </layout>
+              </item>
+             </layout>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="advanced_section_about">
+             <property name="text">
+              <string>About</string>
+             </property>
+             <property name="textStyle" stdset="0">
+              <string notr="true">Heading/Section</string>
+             </property>
+             <property name="spaced" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="rowVersion">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_version_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Version</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <layout class="QVBoxLayout" name="rowVersionControl">
+               <property name="spacing">
+                <number>8</number>
+               </property>
+               <item>
+                <widget class="QLabel" name="label_Version">
+                 <property name="text">
+                  <string notr="true">KytyPS5 · Yōtei fork</string>
+                 </property>
+                 <property name="textInteractionFlags">
+                  <set>Qt::TextSelectableByMouse</set>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Mono/Value</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QLabel" name="row_version_description">
+                 <property name="text">
+                  <string notr="true">by Erlou</string>
+                 </property>
+                 <property name="textStyle" stdset="0">
+                  <string notr="true">Body/Description</string>
+                 </property>
+                 <property name="tone" stdset="0">
+                  <string notr="true">secondary</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QFrame" name="row_version_divider">
+             <property name="divider" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="rowLicence">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_licence_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Licence</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="licence_text">
+               <property name="text">
+                <string notr="true">GPL-2.0 (source code on GitHub)</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Default</string>
+               </property>
+              </widget>
+             </item>
+<item><widget class="QPushButton" name="source_code_button"><property name="text"><string>Source code</string></property><property name="kind" stdset="0"><string notr="true">secondary</string></property><property name="textStyle" stdset="0"><string notr="true">Label/Button</string></property></widget></item><item><spacer name="licenceSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QFrame" name="row_licence_divider">
+             <property name="divider" stdset="0">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="rowCredits">
+             <property name="spacing">
+              <number>24</number>
+             </property>
+             <property name="topMargin">
+              <number>12</number>
+             </property>
+             <item alignment="Qt::AlignTop">
+              <widget class="QLabel" name="row_credits_label">
+               <property name="minimumSize">
+                <size>
+                 <width>280</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>280</width>
+                 <height>16777215</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>Credits</string>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Strong</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="credits_text">
+               <property name="text">
+                <string notr="true">Based on Kyty (InoriRus) and KytyPS5; parts based on chenxiao07's fork</string>
+               </property>
+               <property name="wordWrap">
+                <bool>true</bool>
+               </property>
+               <property name="textStyle" stdset="0">
+                <string notr="true">Body/Description</string>
+               </property>
+               <property name="tone" stdset="0">
+                <string notr="true">secondary</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <spacer name="advancedBodySpacer">
+             <property name="orientation">
+              <enum>Qt::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>0</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+<widget class="QWidget" name="page_mods"><layout class="QVBoxLayout" name="modsPageLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="ArtBackground" name="mods_banner" native="true"><property name="minimumSize"><size><width>0</width><height>200</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>200</height></size></property>
+<layout class="QVBoxLayout" name="modsBannerLayout"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>48</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="QLabel" name="mods_eyebrow"><property name="text"><string>Game</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Label/Eyebrow</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><widget class="QLabel" name="mods_title"><property name="text"><string>Mods</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Title</string></property>
+</widget></item>
+<item><spacer name="modsBannerSpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></item>
+<item><widget class="QScrollArea" name="mods_scroll"><property name="frameShape"><enum>QFrame::NoFrame</enum></property><property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAlwaysOff</enum></property><property name="widgetResizable"><bool>true</bool></property>
+<widget class="QWidget" name="mods_body"><layout class="QVBoxLayout" name="modsBodyLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>16</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>32</number></property>
+<item><widget class="QLabel" name="mods_intro"><property name="text"><string>Game patches that trade a little picture quality for speed. Each one shows the frame-rate gain we measured on our test route. Changes apply on the next Play.</string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><layout class="QVBoxLayout" name="modsRows"><property name="spacing"><number>0</number></property></layout></item>
+<item><spacer name="modsBodySpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property></spacer></item>
+</layout></widget></widget></item>
+</layout></widget>
+<widget class="QWidget" name="page_first_start"><layout class="QVBoxLayout" name="firstStartPageLayout"><property name="spacing"><number>0</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item><widget class="ArtBackground" name="first_start_art" native="true">
+<layout class="QVBoxLayout" name="firstStartContentLayout"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>48</number></property><property name="topMargin"><number>48</number></property><property name="rightMargin"><number>48</number></property><property name="bottomMargin"><number>32</number></property>
+<item><widget class="QLabel" name="first_start_eyebrow"><property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Maximum"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property><property name="text"><string>First start</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Label/Eyebrow</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><widget class="QLabel" name="first_start_title"><property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Maximum"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property><property name="text"><string>Select your game</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Title</string></property>
+</widget></item>
+<item><widget class="QLabel" name="first_start_lead"><property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Maximum"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property><property name="minimumSize"><size><width>0</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>520</width><height>16777215</height></size></property><property name="text"><string>The launcher needs the folder with your game's files. It only reads them; nothing is changed or uploaded.</string></property><property name="wordWrap"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Lead</string></property><property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item><spacer name="firstStartGap"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeType"><enum>QSizePolicy::Fixed</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>12</height></size></property></spacer></item>
+<item><layout class="QHBoxLayout" name="firstStartCards"><property name="spacing"><number>24</number></property>
+<item alignment="Qt::AlignTop"><widget class="QFrame" name="card_game_folder"><property name="minimumSize"><size><width>540</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>540</width><height>16777215</height></size></property><property name="card" stdset="0"><bool>true</bool></property>
+<layout class="QVBoxLayout" name="card_game_folderLayout"><property name="spacing"><number>16</number></property><property name="leftMargin"><number>24</number></property><property name="topMargin"><number>24</number></property><property name="rightMargin"><number>24</number></property><property name="bottomMargin"><number>24</number></property>
+<item><widget class="QLabel" name="card_game_folder_title"><property name="text"><string>Game folder</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Section</string></property>
+</widget></item><item><layout class="QHBoxLayout" name="first_folder_checkRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="first_folder_check_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="first_folder_checkText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="first_folder_check"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="first_folder_check_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><widget class="QLabel" name="first_folder_path"><property name="text"><string>No folder selected</string></property><property name="field" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Mono/Path</string></property><property name="tone" stdset="0"><string notr="true">secondary</string></property></widget></item>
+<item alignment="Qt::AlignLeft"><widget class="ArtButton" name="first_folder_button"><property name="minimumSize"><size><width>0</width><height>40</height></size></property>
+<property name="maximumSize"><size><width>16777215</width><height>40</height></size></property><property name="toolTip"><string>Pick the folder of your game (or a folder with several games).</string></property><property name="text"><string>Choose game folder</string></property><property name="textStyle" stdset="0"><string notr="true">Label/Button</string></property></widget></item></layout></widget></item>
+<item alignment="Qt::AlignTop"><widget class="QFrame" name="card_system"><property name="minimumSize"><size><width>372</width><height>0</height></size></property>
+<property name="maximumSize"><size><width>372</width><height>16777215</height></size></property><property name="card" stdset="0"><bool>true</bool></property>
+<layout class="QVBoxLayout" name="card_systemLayout"><property name="spacing"><number>16</number></property><property name="leftMargin"><number>24</number></property><property name="topMargin"><number>24</number></property><property name="rightMargin"><number>24</number></property><property name="bottomMargin"><number>24</number></property>
+<item><widget class="QLabel" name="card_system_title"><property name="text"><string>System</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Heading/Section</string></property>
+</widget></item>
+<item><widget class="QWidget" name="system_emulator_row"><layout class="QHBoxLayout" name="system_emulatorRow"><property name="spacing"><number>12</number></property><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="system_emulator_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="system_emulatorText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="system_emulator"><property name="text"><string>Emulator not found</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="system_emulator_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></widget></item>
+<item><layout class="QHBoxLayout" name="system_gpuRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="system_gpu_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="system_gpuText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="system_gpu"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="system_gpu_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item>
+<item><layout class="QHBoxLayout" name="system_ramRow"><property name="spacing"><number>12</number></property>
+<item alignment="Qt::AlignTop"><widget class="StatusIcon" name="system_ram_status" native="true"/></item>
+<item><layout class="QVBoxLayout" name="system_ramText"><property name="spacing"><number>2</number></property>
+<item><widget class="QLabel" name="system_ram"><property name="text"><string>—</string></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property>
+</widget></item>
+<item><widget class="QLabel" name="system_ram_description"><property name="text"><string></string></property>
+<property name="wordWrap"><bool>true</bool></property>
+<property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
+<property name="tone" stdset="0"><string notr="true">secondary</string></property>
+</widget></item>
+</layout></item></layout></item></layout></widget></item>
+<item><spacer name="firstStartCardsSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+</layout></item>
+<item><spacer name="firstStartSpacer"><property name="orientation"><enum>Qt::Vertical</enum></property><property name="sizeHint" stdset="0"><size><width>20</width><height>40</height></size></property></spacer></item>
+</layout></widget></item>
+</layout></widget>
+    </widget>
    </item>
   </layout>
  </widget>
- <layoutdefault spacing="6" margin="11"/>
  <customwidgets>
   <customwidget>
    <class>ConfigurationListWidget</class>
@@ -176,10 +2060,29 @@
    <header>configurationListWidget.h</header>
    <container>1</container>
   </customwidget>
+  <customwidget>
+   <class>ArtBackground</class>
+   <extends>QWidget</extends>
+   <header>launcherWidgets.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ArtButton</class>
+   <extends>QPushButton</extends>
+   <header>launcherWidgets.h</header>
+  </customwidget>
+  <customwidget>
+   <class>NavButton</class>
+   <extends>QPushButton</extends>
+   <header>launcherWidgets.h</header>
+  </customwidget>
+  <customwidget>
+   <class>StatusIcon</class>
+   <extends>QWidget</extends>
+   <header>launcherWidgets.h</header>
+   <container>0</container>
+  </customwidget>
  </customwidgets>
  <resources/>
  <connections/>
- <buttongroups>
-  <buttongroup name="buttonGroup_Console"/>
- </buttongroups>
 </ui>

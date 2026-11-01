@@ -2,6 +2,7 @@
 #define KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_
 
 #include <cstddef>
+#include <cstdint>
 
 namespace Loader::X64InstructionEmulator {
 

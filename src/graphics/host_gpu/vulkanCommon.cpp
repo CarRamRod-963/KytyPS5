@@ -72,8 +72,9 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k32_32_32_32UInt, vk::Format::eR32G32B32A32Uint},
     {Prospero::BufferFormat::k32_32_32_32SInt, vk::Format::eR32G32B32A32Sint},
     {Prospero::BufferFormat::k32_32_32_32Float, vk::Format::eR32G32B32A32Sfloat},
-    // Narrow-channel sRGB formats are optional in Vulkan. Keep a same-width fallback until
-    // sampler-aware sRGB emulation is available.
+    // Narrow-channel sRGB formats are optional in Vulkan, so these are the UNorm backing formats: an 8 sRGB read gets
+    // an R8_SRGB view where the device samples it (descriptors.cpp), an 8_8 sRGB read is decoded in the shader
+    // (RemapTextureFormat -> k8_8UNorm, spirvEmitterImage.cpp SrgbToLinear). Writes store the guest's UNorm bytes.
     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},
@@ -131,6 +132,17 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	vk::ShaderModule module = nullptr;
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
+	return module;
+}
+
+vk::ShaderModule TryCompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	vk::ShaderModuleCreateInfo create_info {};
+	create_info.codeSize    = code.size_bytes();
+	create_info.pCode       = code.data();
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&create_info, nullptr, &module) != vk::Result::eSuccess) {
+		return nullptr;
+	}
 	return module;
 }
 

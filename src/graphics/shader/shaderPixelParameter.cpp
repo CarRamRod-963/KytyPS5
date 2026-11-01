@@ -1,6 +1,10 @@
 #include "graphics/shader/shader.h"
 
 #include "common/assert.h"
+#include "common/shaderEnv.h"
+
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 

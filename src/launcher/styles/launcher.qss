@@ -1,7 +1,351 @@
-/* The views get their transparent background from their own styleSheet in
-   configuration_list_widget.ui: Breeze paints black behind the scrollbars of views without one. */
-QTreeWidget#cfgs_list,
-QListView#cfgs_grid {
+/* Launcher style (Figma design v1, docs/launcher/DESIGN-SPEC.md). An at-sign before a palette or colour name of
+   styles/tokens.json is replaced by its value (LauncherTheme). Fonts come from the "textStyle" property, not from
+   this file. Gold marks one thing per
+   screen: the Play button on Play, the active page in the sidebar elsewhere. Lines are 1 px hairlines, no shadows. */
+
+QToolTip {
+    background: @ink;
+    color: @paper;
+    border: none;
+    padding: 6px 8px;
+}
+
+/* ---- Sidebar ---- */
+
+QFrame#sidebar {
+    background: @bg-sidebar;
+    border: none;
+}
+
+QLabel#brand_wordmark,
+QLabel#footer_author {
+    color: @text-on-dark;
+}
+
+QLabel#brand_fork,
+QLabel#footer_version,
+QLabel#footer_keys {
+    color: @text-on-dark-muted;
+}
+
+/* ---- Pages ---- */
+
+QWidget#page_play,
+QWidget#page_display,
+QWidget#page_graphics,
+QWidget#page_first_start,
+QWidget#display_body,
+QWidget#graphics_body,
+QWidget#page_shaders,
+QWidget#page_advanced,
+QWidget#shaders_body,
+QWidget#advanced_body,
+QWidget#updates_section {
+    background: @bg-page;
+}
+
+QScrollArea#display_scroll,
+QScrollArea#graphics_scroll,
+QScrollArea#shaders_scroll,
+QScrollArea#advanced_scroll {
+    background: @bg-page;
+    border: none;
+}
+
+QLabel {
+    color: @text-primary;
+}
+
+QLabel[tone="secondary"] {
+    color: @text-secondary;
+}
+
+QLabel[spaced="true"] {
+    padding-top: 24px;
+}
+
+QFrame[card="true"] {
+    background: @bg-card;
+    border: 1px solid @border-default;
+    border-radius: 10px;
+}
+
+QFrame[divider="true"] {
+    background: @border-default;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+    margin-top: 12px;
+}
+
+QLabel[field="true"] {
+    background: @bg-field;
+    border: 1px solid @border-default;
+    border-radius: 8px;
+    padding: 0 12px;
+    min-height: 38px;
+    max-width: 608px;
+}
+
+/* ---- Play: bottom bar ---- */
+
+QFrame#bottom_bar {
+    background: @bg-bar;
+    border: none;
+}
+
+QLabel#play_status {
+    color: @text-on-dark-muted;
+}
+
+/* ---- Buttons (Figma Button kind=secondary / danger) ---- */
+
+QPushButton[kind="secondary"] {
+    background: transparent;
+    color: @text-primary;
+    border: 1px solid @border-strong;
+    border-radius: 8px;
+    padding: 0 16px;
+    min-height: 38px;
+}
+
+QPushButton[kind="secondary"]:hover {
+    background: @bg-card;
+}
+
+QPushButton[kind="secondary"]:pressed {
+    background: @mist;
+}
+
+QPushButton[kind="secondary"]:disabled {
+    color: rgba(23, 21, 19, 102);
+    border-color: rgba(23, 21, 19, 102);
+}
+
+QPushButton[kind="danger"] {
+    background: transparent;
+    color: @text-error;
+    border: 1px solid @border-error;
+    border-radius: 8px;
+    padding: 0 16px;
+    min-height: 38px;
+}
+
+QPushButton[kind="danger"]:hover {
+    background: @bg-card;
+}
+
+QPushButton[kind="danger"]:disabled {
+    color: rgba(154, 59, 44, 102);
+    border-color: rgba(154, 59, 44, 102);
+}
+
+QLabel[field="true"][error="true"] {
+    color: @text-error;
+    border-color: @border-error;
+}
+
+/* ---- Controls ---- */
+
+/* Figma Select: paper-light field, 1 px mist border (ink when open), chevron. */
+QComboBox[select="true"] {
+    background: @bg-field;
+    color: @text-primary;
+    border: 1px solid @border-default;
+    border-radius: 8px;
+    padding: 0 12px;
+}
+
+QComboBox[select="true"]:on,
+QComboBox[select="true"]:focus {
+    border-color: @border-strong;
+}
+
+QComboBox[select="true"]:disabled {
+    color: @text-secondary;
+}
+
+QComboBox[select="true"]::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border: none;
+}
+
+QComboBox[select="true"]::down-arrow {
+    image: url(:/icons/chevron-down.svg);
+    width: 10px;
+    height: 6px;
+}
+
+QComboBox[select="true"] QAbstractItemView {
+    background: @bg-field;
+    color: @text-primary;
+    border: 1px solid @border-strong;
+    outline: 0;
+    selection-background-color: @mist;
+    selection-color: @text-primary;
+}
+
+QProgressBar#precompile_progress {
+    background: @track-bg;
+    border: none;
+    border-radius: 3px;
+}
+
+QProgressBar#precompile_progress::chunk {
+    background: @track-fill;
+    border-radius: 3px;
+}
+
+QSpinBox#precompile_threads {
+    background: @bg-field;
+    color: @text-primary;
+    border: 1px solid @border-default;
+    border-radius: 8px;
+    padding: 0 8px 0 12px;
+    selection-background-color: @mist;
+    selection-color: @text-primary;
+}
+
+QSpinBox#precompile_threads:focus {
+    border-color: @border-strong;
+}
+
+QSpinBox#precompile_threads:disabled {
+    color: @text-secondary;
+}
+
+QSpinBox#precompile_threads::up-button,
+QSpinBox#precompile_threads::down-button {
+    subcontrol-origin: border;
+    width: 24px;
+    border: none;
+    background: transparent;
+}
+
+QSpinBox#precompile_threads::up-button {
+    subcontrol-position: top right;
+}
+
+QSpinBox#precompile_threads::down-button {
+    subcontrol-position: bottom right;
+}
+
+QSpinBox#precompile_threads::up-arrow {
+    image: url(:/icons/chevron-up.svg);
+    width: 10px;
+    height: 6px;
+}
+
+QSpinBox#precompile_threads::down-arrow {
+    image: url(:/icons/chevron-down.svg);
+    width: 10px;
+    height: 6px;
+}
+
+QCheckBox#check_updates_on_startup {
+    color: @text-primary;
+    spacing: 12px;
+}
+
+QCheckBox[toggle="true"]::indicator,
+QCheckBox#check_updates_on_startup::indicator {
+    width: 36px;
+    height: 20px;
+}
+
+QCheckBox[toggle="true"]::indicator:unchecked,
+QCheckBox#check_updates_on_startup::indicator:unchecked {
+    image: url(:/icons/toggle-off.svg);
+}
+
+QCheckBox[toggle="true"]::indicator:checked,
+QCheckBox#check_updates_on_startup::indicator:checked {
+    image: url(:/icons/toggle-on.svg);
+}
+
+QCheckBox[toggle="true"]::indicator:unchecked:disabled,
+QCheckBox#check_updates_on_startup::indicator:unchecked:disabled {
+    image: url(:/icons/toggle-off-disabled.svg);
+}
+
+QCheckBox[toggle="true"]::indicator:checked:disabled,
+QCheckBox#check_updates_on_startup::indicator:checked:disabled {
+    image: url(:/icons/toggle-on-disabled.svg);
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: @mist;
+    border-radius: 4px;
+    min-height: 40px;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: none;
+    height: 0;
+}
+
+/* ---- Play over the selected game's picture (ink layer): paper text, cards as dark glass ---- */
+
+QWidget#play_art[dark="true"] QLabel {
+    color: @text-on-dark;
+}
+
+QWidget#play_art[dark="true"] QLabel[tone="secondary"] {
+    color: @text-on-dark-muted;
+}
+
+QWidget#play_art[dark="true"] QFrame[card="true"] {
+    background: rgba(23, 21, 19, 150);
+    border: 1px solid rgba(236, 232, 224, 46);
+}
+
+QWidget#play_art[dark="true"] QLineEdit#search_line_edit {
+    background: rgba(23, 21, 19, 120);
+    border: 1px solid rgba(236, 232, 224, 70);
+    color: @text-on-dark;
+    selection-background-color: @stone;
+    selection-color: @paper;
+}
+
+QWidget#play_art[dark="true"] QLineEdit#search_line_edit:focus {
+    border-color: @mist;
+}
+
+QWidget#play_art[dark="true"] QToolButton:hover {
+    background: rgba(236, 232, 224, 26);
+    border-color: rgba(236, 232, 224, 50);
+}
+
+QWidget#play_art[dark="true"] QToolButton:pressed {
+    background: rgba(236, 232, 224, 40);
+}
+
+QWidget#play_art[dark="true"] QScrollBar::handle:vertical {
+    background: rgba(201, 198, 191, 110);
+}
+
+/* ---- Game tiles (GameTileView, Play; painted in gameTileView.cpp) ---- */
+
+GameTileView#tiles {
+    background: transparent;
+    border: none;
+}
+
+/* ---- Game list table (ConfigurationListWidget; shown only in --local mode) ---- */
+
+GameListTreeWidget#cfgs_list {
+    background: transparent;
     border: 1px solid palette(mid);
     color: palette(text);
     outline: 0;
@@ -30,7 +374,7 @@ QTreeWidget#cfgs_list QHeaderView::section {
 QLineEdit#search_line_edit {
     background: palette(base);
     border: 1px solid palette(mid);
-    border-radius: 4px;
+    border-radius: 8px;
     color: palette(text);
     padding: 5px 8px;
     selection-background-color: palette(highlight);
@@ -38,10 +382,9 @@ QLineEdit#search_line_edit {
 }
 
 QLineEdit#search_line_edit:focus {
-    border-color: palette(highlight);
+    border-color: @border-strong;
 }
 
-QToolButton#grid_view_button,
 QToolButton#refresh_button,
 QToolButton#global_settings_button,
 QToolButton#input_mapping_button,
@@ -50,11 +393,10 @@ QToolButton#trophy_overview_button,
 QToolButton#delete_button {
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 5px;
+    border-radius: 6px;
     padding: 3px;
 }
 
-QToolButton#grid_view_button:hover,
 QToolButton#refresh_button:hover,
 QToolButton#global_settings_button:hover,
 QToolButton#input_mapping_button:hover,
@@ -65,8 +407,6 @@ QToolButton#delete_button:hover {
     border-color: palette(mid);
 }
 
-QToolButton#grid_view_button:checked,
-QToolButton#grid_view_button:pressed,
 QToolButton#refresh_button:pressed,
 QToolButton#global_settings_button:pressed,
 QToolButton#input_mapping_button:pressed,
@@ -117,4 +457,28 @@ QLineEdit#game_comment_editor:focus {
 QLabel#game_status_indicator {
     border: 1px solid palette(base);
     border-radius: 6px;
+}
+
+/* ---- Bug report dialog (bugReport.cpp) ---- */
+
+QDialog#bug_report_dialog {
+    background: @bg-page;
+}
+
+QTreeWidget#bug_report_files,
+QPlainTextEdit#bug_report_preview {
+    background: @bg-card;
+    border: 1px solid @border-default;
+    border-radius: 8px;
+    color: @text-primary;
+    selection-background-color: @mist;
+    selection-color: @text-primary;
+}
+
+QTreeWidget#bug_report_files QHeaderView::section {
+    background: @bg-card;
+    color: @text-secondary;
+    border: 0;
+    border-bottom: 1px solid @border-default;
+    padding: 4px 6px;
 }

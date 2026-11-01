@@ -1,17 +1,44 @@
 <RCC>
  <qresource prefix="/icons">
+  <file alias="add-game.svg">icons/add-game.svg</file>
   <file alias="edit-configuration.svg">icons/edit-configuration.svg</file>
   <file alias="global-settings.svg">icons/global-settings.svg</file>
   <file alias="input-mapping.svg">icons/input-mapping.svg</file>
   <file alias="refresh.svg">icons/refresh.svg</file>
-  <file alias="grid-view.svg">icons/grid-view.svg</file>
   <file alias="remove-configuration.svg">icons/remove-configuration.svg</file>
   <file alias="trophy.svg">icons/trophy.svg</file>
-  <file alias="kyty.svg">icons/kyty.svg</file>
-  <file alias="kyty-small.svg">icons/kyty-small.svg</file>
   <file alias="hidden-trophy.png">../../assets/images/hidden-trophy.png</file>
+  <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+  <file alias="chevron-up.svg">icons/chevron-up.svg</file>
+  <file alias="toggle-on.svg">icons/toggle-on.svg</file>
+  <file alias="toggle-off.svg">icons/toggle-off.svg</file>
+  <file alias="toggle-on-disabled.svg">icons/toggle-on-disabled.svg</file>
+  <file alias="toggle-off-disabled.svg">icons/toggle-off-disabled.svg</file>
+  <file alias="status-ok-glyph.svg">icons/status-ok-glyph.svg</file>
+  <file alias="status-warn-glyph.svg">icons/status-warn-glyph.svg</file>
+  <file alias="status-error-glyph.svg">icons/status-error-glyph.svg</file>
+ </qresource>
+ <qresource prefix="/images">
+  <file alias="ukiyoe-play.jpg">images/ukiyoe-play.jpg</file>
+  <file alias="ukiyoe-display.jpg">images/ukiyoe-display.jpg</file>
+  <file alias="ukiyoe-graphics.jpg">images/ukiyoe-graphics.jpg</file>
+  <file alias="ukiyoe-first-start.jpg">images/ukiyoe-first-start.jpg</file>
+  <file alias="ukiyoe-shaders.jpg">images/ukiyoe-shaders.jpg</file>
+  <file alias="ukiyoe-advanced.jpg">images/ukiyoe-advanced.jpg</file>
+ </qresource>
+ <qresource prefix="/fonts">
+  <file alias="CormorantGaramond-SemiBold.ttf">fonts/CormorantGaramond-SemiBold.ttf</file>
+  <file alias="CormorantGaramond-Bold.ttf">fonts/CormorantGaramond-Bold.ttf</file>
+  <file alias="Manrope-Regular.ttf">fonts/Manrope-Regular.ttf</file>
+  <file alias="Manrope-Medium.ttf">fonts/Manrope-Medium.ttf</file>
+  <file alias="Manrope-SemiBold.ttf">fonts/Manrope-SemiBold.ttf</file>
+  <file alias="JetBrainsMono-Regular.ttf">fonts/JetBrainsMono-Regular.ttf</file>
  </qresource>
  <qresource prefix="/styles">
   <file alias="launcher.qss">styles/launcher.qss</file>
+  <file alias="tokens.json">styles/tokens.json</file>
+ </qresource>
+ <qresource prefix="/mods">
+  <file alias="PPSA26344.json">mods/PPSA26344.json</file>
  </qresource>
 </RCC>

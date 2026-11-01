@@ -1,6 +1,5 @@
 #include "configurationListWidget.h"
 
-#include "additionalContentDialog.h"
 #include "cheatFile.h"
 #include "common/archive.h"
 #include "compatibilityDatabase.h"
@@ -10,6 +9,7 @@
 #include "gameContent.h"
 #include "gameViews.h"
 #include "inputMappingDialog.h"
+#include "launcherTheme.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
 #include "trophyViewerDialog.h"
@@ -25,38 +25,29 @@
 #include <QDialog>
 #include <QDir>
 #include <QFile>
-#include <QFileDialog>
 #include <QFileInfo>
-#include <QFutureWatcher>
 #include <QHeaderView>
 #include <QIcon>
-#include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QKeySequence>
 #include <QLineEdit>
-#include <QListView>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPalette>
 #include <QPointer>
 #include <QProcess>
-#include <QProgressDialog>
-#include <QPromise>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QSaveFile>
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
-#include <QSlider>
 #include <QStyle>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
-#include <QtConcurrentRun>
 #include <QtCore>
 
 #ifdef __linux__
@@ -65,7 +56,6 @@
 #include <QDBusPendingCallWatcher>
 #endif
 
-#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -78,8 +68,7 @@ constexpr char CONF_SECTION_NAME[] = "GameConfigurations";
 constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
-constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
-constexpr char CONF_ADDCONT[]      = "AdditionalContent";
+constexpr char CONF_LAST_GAME[]    = "last_game";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
 
@@ -142,6 +131,19 @@ static QStringList SettingsStringList(const QVariant& value) {
 	return text.isEmpty() ? QStringList() : QStringList({text});
 }
 
+static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
+	ui->cfgs_list->setAlternatingRowColors(false);
+	ui->cfgs_list->setAllColumnsShowFocus(true);
+	ui->cfgs_list->setIndentation(0);
+	ui->cfgs_list->setMouseTracking(false);
+	ui->cfgs_list->setSelectionBehavior(QAbstractItemView::SelectRows);
+	ui->cfgs_list->setSelectionMode(QAbstractItemView::SingleSelection);
+	ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
+	ui->cfgs_list->header()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+	ui->cfgs_list->header()->setHighlightSections(false);
+	ui->cfgs_list->header()->setStretchLastSection(true);
+}
+
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
                            const QString& title_id) {
 	const auto path = QDir(root).filePath(
@@ -196,6 +198,16 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
 
+	// Play shows the games as tiles on the list's model and selection; the table only in --local mode, where the
+	// compatibility status and comment are edited.
+	m_ui->tiles->setModel(m_ui->cfgs_list->model());
+	auto* own_selection = m_ui->tiles->selectionModel();
+	m_ui->tiles->setSelectionModel(m_ui->cfgs_list->selectionModel());
+	delete own_selection;
+	m_ui->tiles->setModelColumn(GAME_NAME_COLUMN);
+	m_ui->tiles->setVisible(!m_compatibility->IsLocal());
+	m_ui->cfgs_list->setVisible(m_compatibility->IsLocal());
+
 	m_ui->refresh_action->setShortcuts(QKeySequence::Refresh);
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
 	addAction(m_ui->refresh_action);
@@ -242,44 +254,19 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	connect(m_ui->cfgs_list, &QTreeWidget::itemDoubleClicked, this,
 	        &ConfigurationListWidget::list_itemDoubleClicked);
 	connect(m_ui->cfgs_list, &QTreeWidget::customContextMenuRequested, this,
-	        [this](const QPoint& pos) { ShowContextMenu(m_ui->cfgs_list->itemAt(pos)); });
-	connect(m_ui->cfgs_grid, &QListView::doubleClicked, this, [this](const QModelIndex& index) {
-		list_itemDoubleClicked(m_ui->cfgs_list->itemFromIndex(index), GAME_NAME_COLUMN);
+	        &ConfigurationListWidget::show_context_menu);
+	connect(m_ui->tiles, &QAbstractItemView::doubleClicked, this, [this](const QModelIndex& index) {
+		list_itemDoubleClicked(m_ui->cfgs_list->ItemFromIndex(index), GAME_NAME_COLUMN);
 	});
-	connect(m_ui->cfgs_grid, &QListView::customContextMenuRequested, this,
-	        [this](const QPoint& pos) {
-		        ShowContextMenu(m_ui->cfgs_list->itemFromIndex(m_ui->cfgs_grid->indexAt(pos)));
-	        });
-	connect(m_ui->grid_view_button, &QToolButton::toggled, this, [this](bool grid) {
-		m_ui->grid_size_slider->setVisible(grid);
-		auto* view = grid ? static_cast<QAbstractItemView*>(m_ui->cfgs_grid) : m_ui->cfgs_list;
-		m_ui->game_views->setCurrentWidget(view);
-		view->setCurrentIndex(view->currentIndex().siblingAtColumn(GAME_NAME_COLUMN));
-		view->scrollTo(view->currentIndex());
-		view->setFocus();
-	});
-	connect(m_ui->grid_view_button, &QToolButton::clicked, this,
-	        &ConfigurationListWidget::WriteSettings);
-	connect(m_ui->cfgs_list->model(), &QAbstractItemModel::layoutChanged, this, [this]() {
-		filter_configurations(m_ui->search_line_edit->text());
-	});
+	connect(m_ui->tiles, &QWidget::customContextMenuRequested, this,
+	        &ConfigurationListWidget::show_context_menu);
+	connect(m_ui->add_game_button, &QToolButton::clicked, this, &ConfigurationListWidget::AddGameFolder);
 	connect(m_ui->search_line_edit, &QLineEdit::textChanged, this,
 	        &ConfigurationListWidget::filter_configurations);
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
 
 	ReadSettings();
-	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
-	const int grid_size = m_ui->grid_size_slider->value();
-	m_ui->cfgs_grid->setIconSize(QSize(grid_size, grid_size));
-	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this](int width) {
-		m_ui->cfgs_grid->setIconSize(QSize(width, width));
-		if (!m_ui->grid_size_slider->isSliderDown()) {
-			WriteSettings();
-		}
-	});
-	connect(m_ui->grid_size_slider, &QSlider::sliderReleased, this,
-	        &ConfigurationListWidget::WriteSettings);
 	if (m_compatibility->IsLocal()) {
 		m_compatibility->Load();
 	}
@@ -301,9 +288,19 @@ void ConfigurationListWidget::changeEvent(QEvent* event) {
 	}
 }
 
+void ConfigurationListWidget::SetDark(bool dark) {
+	m_dark = dark;
+	m_ui->tiles->SetDark(dark);
+	auto palette = m_ui->search_line_edit->palette();
+	palette.setColor(QPalette::PlaceholderText,
+	                 LauncherTheme::Color(dark ? QStringLiteral("text/on-dark-muted") : QStringLiteral("text/secondary")));
+	m_ui->search_line_edit->setPalette(palette);
+	UpdateToolbarIcons();
+}
+
 void ConfigurationListWidget::UpdateToolbarIcons() {
-	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
-	                                                                      : QColor(Qt::black);
+	// Ink on the paper card, paper on the dark glass over a game's picture (Play).
+	const auto color = LauncherTheme::Color(m_dark ? QStringLiteral("text/on-dark") : QStringLiteral("text/primary"));
 	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
 		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
 		QPainter painter(&pixmap);
@@ -314,12 +311,12 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 
 	set_icon(m_ui->refresh_button, QStringLiteral(":/icons/refresh.svg"));
 	m_ui->refresh_action->setIcon(m_ui->refresh_button->icon());
+	set_icon(m_ui->add_game_button, QStringLiteral(":/icons/add-game.svg"));
 	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
 	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
 	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
-	set_icon(m_ui->grid_view_button, QStringLiteral(":/icons/grid-view.svg"));
 }
 
 void ConfigurationListWidget::WriteSettings() {
@@ -343,9 +340,7 @@ void ConfigurationListWidget::WriteSettings() {
 	s->beginGroup(CONF_LAUNCHER);
 	m_game_dirs = NormalizeGameDirectories(m_game_dirs);
 	s->setValue(CONF_GAME_DIRS, m_game_dirs);
-	s->setValue(CONF_ADDONS_DIR, m_addons_dir);
-	s->setValue("grid_view", m_ui->grid_view_button->isChecked());
-	s->setValue("grid_icon_width", m_ui->grid_size_slider->value());
+	s->setValue(CONF_LAST_GAME, m_last_game);
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
@@ -393,14 +388,11 @@ void ConfigurationListWidget::ReadSettings() {
 	ConfigurationEditDialog::ReadSettings(*s);
 
 	s->beginGroup(CONF_LAUNCHER);
-	m_ui->grid_view_button->setChecked(s->value("grid_view", false).toBool());
-	m_ui->grid_size_slider->setValue(
-	    s->value("grid_icon_width", m_ui->grid_size_slider->value()).toInt());
 	m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIRS)));
 	if (m_game_dirs.isEmpty()) {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
-	m_addons_dir = NormalizeGameDirectory(s->value(CONF_ADDONS_DIR).toString());
+	m_last_game = s->value(CONF_LAST_GAME).toString();
 	s->endGroup();
 
 	m_addcont.clear();
@@ -472,8 +464,6 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 		info->elf = custom->elf;
 	}
 	info->host_input_mapping = m_global_info.host_input_mapping;
-	info->addons_dir         = m_addons_dir;
-	info->addcont            = m_addcont.value(item.GetInfo().title_id.trimmed().toUpper());
 	return info;
 }
 
@@ -564,13 +554,7 @@ static GameMetadata GetGameMetadata(const QByteArray& param_data, const QString&
 		ret.title_name = title;
 	}
 
-	ret.title_id = GetJsonString(root, QStringLiteral("titleId"));
-	if (ret.title_id.isEmpty()) {
-		const auto content_id = GetJsonString(root, QStringLiteral("contentId"));
-		if (content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
-			ret.title_id = content_id.mid(7, 9);
-		}
-	}
+	ret.title_id    = GetJsonString(root, QStringLiteral("titleId"));
 	ret.gameVersion = GetJsonString(root, QStringLiteral("appVersion"));
 	if (ret.gameVersion.isEmpty()) {
 		ret.gameVersion = GetJsonString(root, QStringLiteral("contentVersion"));
@@ -616,25 +600,70 @@ static Configuration* FindCustomInfo(QMap<QString, Configuration*>* custom_infos
 	return info;
 }
 
-bool ConfigurationListWidget::EnsureGameDirectory() {
-	if (HasValidGameDirectory()) {
-		return true;
+Configuration* ConfigurationListWidget::EditableConfiguration() {
+	if (m_selected_item != nullptr) {
+		if (auto* custom = m_custom_infos.value(m_selected_item->GetInfo().game_path); custom != nullptr) {
+			return custom;
+		}
 	}
-
-	QMessageBox::information(this, tr("Game folders"),
-	                         tr("Add at least one game folder in global settings."));
-	edit_global_settings();
-
-	return HasValidGameDirectory();
+	return &m_global_info;
 }
 
-bool ConfigurationListWidget::HasValidGameDirectory() const {
-	for (const auto& dir: m_game_dirs) {
-		if (!dir.isEmpty() && QDir(dir).exists()) {
+bool ConfigurationListWidget::EditsGameSettings() const {
+	return m_selected_item != nullptr && m_custom_infos.contains(m_selected_item->GetInfo().game_path);
+}
+
+void ConfigurationListWidget::CommitSettings() {
+	WriteSettings();
+	emit Select();
+}
+
+int ConfigurationListWidget::GameCount() const {
+	return m_ui->cfgs_list->topLevelItemCount();
+}
+
+QStringList ConfigurationListWidget::UserNames() const {
+	QStringList names {m_global_info.user_name};
+	for (const auto* info: m_custom_infos) {
+		names.append(info->user_name);
+	}
+	return names;
+}
+
+bool ConfigurationListWidget::AddGameDirectory(const QString& dir) {
+	const auto normalized = NormalizeGameDirectory(dir);
+	const auto key        = PathKey(normalized);
+	if (normalized.isEmpty() || !QDir(normalized).exists()) {
+		return false;
+	}
+	const auto old_dirs = m_game_dirs;
+	bool       known    = false;
+	for (const auto& existing: m_game_dirs) {
+		known = known || PathKey(existing) == key;
+	}
+	if (!known) {
+		m_game_dirs.append(normalized);
+	}
+	ScanGameDirectory();
+
+	// The first game inside the folder (the folder itself, or one below it).
+	const auto prefix = key.endsWith(QLatin1Char('/')) ? key : key + QLatin1Char('/');
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto*      item     = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		const auto game_key = PathKey(item->GetInfo().game_path);
+		if (game_key == key || game_key.startsWith(prefix)) {
+			m_ui->search_line_edit->clear();
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			WriteSettings();
 			return true;
 		}
 	}
 
+	if (!known) {
+		m_game_dirs = old_dirs;
+		ScanGameDirectory();
+	}
 	return false;
 }
 
@@ -764,6 +793,12 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		}
 
 		scan_archives(root, root);
+		if (root.exists(eboot_name)) {
+			// The game's own folder (First start: "the folder that contains eboot.bin and sce_sys").
+			add_game(root.absolutePath(), NormalizeGameDirectory(root.absolutePath()), QStringLiteral("."),
+			         root.dirName(), false);
+			continue;
+		}
 		QList<QDir> pending_dirs;
 		const auto  root_subdirs =
 		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
@@ -797,13 +832,24 @@ void ConfigurationListWidget::ScanGameDirectory() {
 	}
 	filter_configurations(m_ui->search_line_edit->text());
 
+	// Keep the selection; at start select the last selected game, or the only game.
+	const auto wanted_path = selected_path.isEmpty() ? m_last_game : selected_path;
 	ConfigurationItem* selected_item = nullptr;
+	int                shown         = 0;
+	ConfigurationItem* only_item     = nullptr;
 	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
 		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
-		if (!item->isHidden() && item->GetInfo().game_path == selected_path) {
-			selected_item = item;
-			break;
+		if (item->isHidden()) {
+			continue;
 		}
+		shown++;
+		only_item = item;
+		if (!wanted_path.isEmpty() && item->GetInfo().game_path == wanted_path) {
+			selected_item = item;
+		}
+	}
+	if (selected_item == nullptr && selected_path.isEmpty() && shown == 1) {
+		selected_item = only_item;
 	}
 	m_ui->cfgs_list->setCurrentItem(selected_item);
 	SelectItem(selected_item);
@@ -817,7 +863,7 @@ void ConfigurationListWidget::edit_configuration() {
 
 	auto                    info = CreateConfiguration(*item);
 	ConfigurationEditDialog dlg(*info, this);
-	dlg.setWindowTitle(tr("Edit game config"));
+	dlg.setWindowTitle(tr("Edit game settings"));
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
 
@@ -841,8 +887,8 @@ void ConfigurationListWidget::delete_configuartion() {
 		return;
 	}
 
-	if (QMessageBox::Yes == QMessageBox::question(this, tr("Clear game config"),
-	                                              tr("Clear this game's config and use global settings?"))) {
+	if (QMessageBox::Yes == QMessageBox::question(this, tr("Clear custom settings"),
+	                                              tr("Do you want to clear custom settings?"))) {
 		delete m_custom_infos.take(item->GetInfo().game_path);
 		item->GetInfo().custom_settings = false;
 		WriteSettings();
@@ -859,13 +905,9 @@ void ConfigurationListWidget::edit_global_settings() {
 
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
-	dlg.SetGlobalSettings(m_game_dirs, m_addons_dir);
+	dlg.SetGlobalSettings(m_game_dirs);
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
-	connect(&dlg, &ConfigurationEditDialog::ImportGameSettings, this,
-	        [this, &dlg]() { ImportGameSettings(&dlg); });
-	connect(&dlg, &ConfigurationEditDialog::ExportGameSettings, this,
-	        [this, &dlg]() { ExportGameSettings(&dlg); });
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
@@ -873,143 +915,16 @@ void ConfigurationListWidget::edit_global_settings() {
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;
-		m_addons_dir                 = NormalizeGameDirectory(dlg.GetAddonsDirectory());
 		WriteSettings();
 		if (game_dirs_changed) {
 			ScanGameDirectory();
 		}
 	}
-	SelectItem(m_ui->cfgs_list->currentItem());
-}
-
-static bool IsGameSettingsTitleId(const QString& title_id) {
-	static const QRegularExpression pattern(QStringLiteral("\\APPSA[0-9]{5}\\z"));
-	return pattern.match(title_id).hasMatch();
-}
-
-void ConfigurationListWidget::ImportGameSettings(QWidget* parent) {
-	const auto path = QFileDialog::getOpenFileName(parent, tr("Import game configs"), {},
-	                                               tr("JSON files (*.json)"));
-	if (path.isEmpty()) {
-		return;
-	}
-	QFile file(path);
-	if (!file.open(QIODevice::ReadOnly)) {
-		QMessageBox::warning(parent, tr("Import failed"), file.errorString());
-		return;
-	}
-	const auto document = QJsonDocument::fromJson(file.readAll());
-	if (!document.isObject() || document.object().isEmpty()) {
-		QMessageBox::warning(
-		    parent, tr("Import failed"),
-		    tr("Expected a JSON object containing game configs keyed by PPSA code."));
-		return;
-	}
-	const auto settings = document.object();
-	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		Configuration info;
-		QString       error;
-		if (!IsGameSettingsTitleId(it.key()) || !it.value().isObject() ||
-		    it.value().toObject().isEmpty() ||
-		    !info.SetGameSettings(it.value().toObject(), error)) {
-			QMessageBox::warning(parent, tr("Import failed"),
-			                     tr("Invalid game config for %1. %2").arg(it.key(), error));
-			return;
-		}
-	}
-	struct ImportedGame {
-		ConfigurationItem*             item;
-		std::unique_ptr<Configuration> info;
-	};
-	std::vector<ImportedGame> imported;
-	auto                      unmatched = settings.keys();
-	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); ++index) {
-		auto*      item     = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
-		const auto title_id = item->GetInfo().title_id.trimmed().toUpper();
-		if (!settings.contains(title_id)) {
-			continue;
-		}
-		auto    info = CreateConfiguration(*item);
-		QString error;
-		if (!info->SetGameSettings(settings.value(title_id).toObject(), error)) {
-			QMessageBox::warning(parent, tr("Import failed"),
-			                     tr("Invalid game config for %1. %2").arg(title_id, error));
-			return;
-		}
-		info->custom_settings = true;
-		imported.push_back({item, std::move(info)});
-		unmatched.removeAll(title_id);
-	}
-	auto message = imported.empty() ? tr("No matching games found in the library.")
-	                                : tr("Configs will be updated for the following games:\n");
-	for (const auto& game: imported) {
-		message += tr("\n%1 — %2").arg(game.info->title_id.trimmed().toUpper(), game.info->name);
-	}
-	if (!unmatched.isEmpty()) {
-		message += tr("\nGames not found: %1").arg(unmatched.join(QStringLiteral(", ")));
-	}
-	if (imported.empty()) {
-		QMessageBox::information(parent, tr("Import game configs"), message);
-		return;
-	}
-	QMessageBox confirmation(QMessageBox::Question, tr("Import game configs"), message,
-	                         QMessageBox::Apply | QMessageBox::Cancel, parent);
-	confirmation.setTextFormat(Qt::PlainText);
-	confirmation.setDefaultButton(QMessageBox::Cancel);
-	if (confirmation.exec() != QMessageBox::Apply) {
-		return;
-	}
-	for (auto& [item, info]: imported) {
-		const auto game_path = info->game_path;
-		delete m_custom_infos.take(game_path);
-		m_custom_infos.insert(game_path, info.release());
-		item->GetInfo().custom_settings = true;
-		item->Update();
-	}
-	WriteSettings();
-}
-
-void ConfigurationListWidget::ExportGameSettings(QWidget* parent) const {
-	QMap<QString, const ConfigurationItem*> games;
-	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); ++index) {
-		const auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
-		const auto& game = item->GetInfo();
-		const auto  title_id = game.title_id.trimmed().toUpper();
-		if (m_custom_infos.contains(game.game_path) && IsGameSettingsTitleId(title_id)) {
-			games.insert(tr("%1 — %2 (%3)").arg(title_id, game.name, game.game_path), item);
-		}
-	}
-	if (games.isEmpty()) {
-		QMessageBox::information(parent, tr("Export game config"),
-		                         tr("No game configs with a PPSA code were found."));
-		return;
-	}
-	bool       accepted = false;
-	const auto selected = QInputDialog::getItem(parent, tr("Export game config"), tr("Game:"),
-	                                            games.keys(), 0, false, &accepted);
-	if (!accepted) {
-		return;
-	}
-	const auto& game     = games.value(selected)->GetInfo();
-	const auto  title_id = game.title_id.trimmed().toUpper();
-	const auto  path =
-	    QFileDialog::getSaveFileName(parent, tr("Export game config"),
-	                                 title_id + QStringLiteral(".json"), tr("JSON files (*.json)"));
-	if (path.isEmpty()) {
-		return;
-	}
-	const auto settings =
-	    QJsonObject::fromVariantMap(m_custom_infos.value(game.game_path)->GameSettings());
-	const auto data =
-	    QJsonDocument(QJsonObject {{title_id, settings}}).toJson(QJsonDocument::Indented);
-	QSaveFile file(path);
-	if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit()) {
-		QMessageBox::warning(parent, tr("Export failed"), file.errorString());
-	}
+	emit Select();
 }
 
 void ConfigurationListWidget::edit_input_mapping() {
-	InputMappingDialog dialog(m_global_info.host_input_mapping, m_controller_preview, this);
+	InputMappingDialog dialog(m_global_info.host_input_mapping, this);
 	if (dialog.exec() == QDialog::Accepted) {
 		m_global_info.host_input_mapping = dialog.Mapping();
 		WriteSettings();
@@ -1132,71 +1047,6 @@ void ConfigurationListWidget::remove_save_data() {
 	}
 }
 
-void ConfigurationListWidget::compress_game() {
-	auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
-	if (item == nullptr) {
-		return;
-	}
-
-	const auto base    = item->GetInfo().basedir;
-	const auto archive = base + QStringLiteral(".zar");
-	const auto title   = tr("Compress to ZAR");
-	if (QFileInfo::exists(archive)) {
-		QMessageBox::warning(this, title,
-		                     tr("%1 already exists.").arg(QDir::toNativeSeparators(archive)));
-		return;
-	}
-
-	// Cancel through a flag, not the future, so a pack that already succeeded keeps its result.
-	auto  canceled = std::make_shared<std::atomic_bool>(false);
-	auto* progress = new QProgressDialog(
-	    tr("Compressing %1...").arg(QDir::toNativeSeparators(base)), tr("Cancel"), 0, 1000, this);
-	auto* watcher  = new QFutureWatcher<bool>(this);
-	// Stay modal through finalization and fsync, which follow the last progress step.
-	progress->setAutoReset(false);
-	connect(progress, &QProgressDialog::canceled, this, [canceled] { *canceled = true; });
-	connect(watcher, &QFutureWatcher<bool>::progressValueChanged, progress,
-	        &QProgressDialog::setValue);
-	connect(watcher, &QFutureWatcher<bool>::finished, this,
-	        [this, progress, watcher, canceled, base, archive, title] {
-		        // finished can arrive inside the modal dialog's setValue event processing.
-		        progress->deleteLater();
-		        watcher->deleteLater();
-		        if (!watcher->result()) {
-			        if (!*canceled) {
-				        QMessageBox::warning(
-				            this, title,
-				            tr("Could not compress %1.").arg(QDir::toNativeSeparators(base)));
-			        }
-			        return;
-		        }
-		        if (QMessageBox::Yes ==
-		                QMessageBox::question(this, title,
-		                                      tr("Created %1.\n\nDelete the original folder %2?")
-		                                          .arg(QDir::toNativeSeparators(archive),
-		                                               QDir::toNativeSeparators(base)),
-		                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) &&
-		            !QDir(base).removeRecursively()) {
-			        QMessageBox::warning(
-			            this, title, tr("Could not remove %1.").arg(QDir::toNativeSeparators(base)));
-		        }
-		        ScanGameDirectory();
-	        });
-	progress->open();
-	watcher->setFuture(QtConcurrent::run(
-	    [directory = GameContent::ToPath(base), path = GameContent::ToPath(archive),
-	     canceled](QPromise<bool>& promise) {
-		    promise.setProgressRange(0, 1000);
-		    // A pack cancelled while queued must not touch a path a later pack may already own.
-		    promise.addResult(
-		        !*canceled &&
-		        Common::PackArchive(directory, path, [&](uint64_t done, uint64_t total) {
-			        promise.setProgressValue(static_cast<int>(done * 1000 / total));
-			        return !*canceled;
-		        }));
-	    }));
-}
-
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1212,12 +1062,22 @@ void ConfigurationListWidget::filter_configurations(const QString& text) {
 		                   item->text(GAME_NAME_COLUMN).contains(query, Qt::CaseInsensitive) ||
 		                   item->text(GAME_SERIAL_COLUMN).contains(query, Qt::CaseInsensitive);
 		item->setHidden(!match);
-		m_ui->cfgs_grid->setRowHidden(item_index, !match);
+		m_ui->tiles->setRowHidden(item_index, !match);
 
 		if (match && item == m_selected_item) {
 			selection_is_shown = true;
 		}
 	}
+
+	if (GameCount() == 0) {
+		m_ui->tiles->SetEmptyText(tr("No games yet"),
+		                          tr("Add a game folder with the folder button above: the folder that contains "
+		                             "eboot.bin and sce_sys, or a folder of games."));
+	} else {
+		m_ui->tiles->SetEmptyText(tr("No game matches “%1”").arg(query),
+		                          tr("The search looks at game names and serials."));
+	}
+	m_ui->tiles->updateGeometry();
 
 	if (m_selected_item != nullptr && !selection_is_shown) {
 		m_ui->cfgs_list->clearSelection();
@@ -1230,7 +1090,6 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	auto* item = static_cast<ConfigurationItem*>(witem);
 	if (item == nullptr) {
 		m_selected_item = nullptr;
-		m_ui->game_views->SetBackgroundImage({});
 		m_ui->edit_button->setEnabled(false);
 		m_ui->delete_button->setEnabled(false);
 		emit Select();
@@ -1241,7 +1100,10 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	m_ui->edit_button->setEnabled(!item->IsRunning());
 
 	m_selected_item = item;
-	m_ui->game_views->SetBackgroundImage(item->GetInfo().basedir);
+	if (m_last_game != item->GetInfo().game_path) {
+		m_last_game = item->GetInfo().game_path;
+		WriteSettings();
+	}
 
 	emit Select();
 }
@@ -1253,8 +1115,11 @@ void ConfigurationListWidget::list_itemDoubleClicked(QTreeWidgetItem* witem, int
 	}
 }
 
-void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
-	auto* item = static_cast<ConfigurationItem*>(witem);
+void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
+	// pos is in the shown view: the tiles, or the table in --local mode.
+	auto* item = static_cast<ConfigurationItem*>(
+	    m_ui->tiles->isHidden() ? m_ui->cfgs_list->itemAt(pos)
+	                            : m_ui->cfgs_list->ItemFromIndex(m_ui->tiles->indexAt(pos)));
 
 	if (item != nullptr) {
 		m_ui->cfgs_list->setCurrentItem(item);
@@ -1284,39 +1149,16 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	        });
 	action_patches->setVisible(item != nullptr &&
 	                           Cheats::IsSupportedTitleId(item->GetInfo().title_id));
-	QAction* action_addcont = menu.addAction(
-	    style()->standardIcon(QStyle::SP_DirIcon), tr("Additional Content..."));
-	connect(action_addcont, &QAction::triggered, this,
-	        [this, item = QPointer<ConfigurationItem>(item)]() {
-		        if (item != nullptr) {
-			        const auto title_id = item->GetInfo().title_id.trimmed().toUpper();
-			        auto*      dialog   = new AdditionalContentDialog(
-			            item->GetInfo(), m_addons_dir, m_addcont.value(title_id),
-			            [this, title_id](const QStringList& entries) {
-				            if (entries.isEmpty()) {
-					            m_addcont.remove(title_id);
-				            } else {
-					            m_addcont.insert(title_id, entries);
-				            }
-				            WriteSettings();
-			            },
-			            this);
-			        dialog->show();
-		        }
-	        });
-	action_addcont->setEnabled(item != nullptr && !item->GetInfo().title_id.trimmed().isEmpty());
-	QAction* action_compress =
-	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
 	menu.addSeparator();
 	QAction* action_edit =
-	    menu.addAction(style()->standardIcon(QStyle::SP_FileIcon), tr("Edit game config..."),
+	    menu.addAction(style()->standardIcon(QStyle::SP_FileIcon), tr("Edit game settings..."),
 	                   this, SLOT(edit_configuration()));
 	QAction* action_delete =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
-	                   tr("Clear game config"), this, SLOT(delete_configuartion()));
+	                   tr("Clear custom settings"), this, SLOT(delete_configuartion()));
 
 	if (item == nullptr) {
 		menu.addSeparator();
@@ -1330,7 +1172,6 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
-		action_compress->setDisabled(item->IsRunning() || !QDir(base).exists());
 		action_remove_save_data->setDisabled(item->IsRunning() || save_data_dirs.isEmpty());
 		action_edit->setDisabled(item->IsRunning());
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
@@ -1338,7 +1179,6 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_run->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
-		action_compress->setDisabled(true);
 		action_remove_save_data->setDisabled(true);
 		action_edit->setDisabled(true);
 		action_delete->setDisabled(true);

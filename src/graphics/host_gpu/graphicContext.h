@@ -1,11 +1,13 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
+#include <string>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -19,6 +21,17 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+// KYTY_VRAM_GC_FIX=1 (default off, logged once): the texture collector scans past the images it cannot free
+// instead of stopping at them, and downloads GPU-written color images to guest memory before it frees them
+// (TextureCache::CollectGarbageFixed).
+[[nodiscard]] bool VramGcFixEnabled();
+// KYTY_VRAM_BUDGET=1 (default off, logged once): the caches keep the device-local memory they hold under a target
+// re-read at every collector run (GraphicContext::GetVramBudgetState), evicting old images before new ones are
+// created over it; implies the KYTY_VRAM_GC_FIX collector.
+[[nodiscard]] bool VramBudgetEnabled();
+// KYTY_TRACE_PERF: the allocator's vkAllocateMemory / vkFreeMemory calls since the last call (counts, MiB, ms).
+[[nodiscard]] std::string TakeDeviceMemoryCallStats();
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -28,19 +41,40 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// KYTY_TRACE_PIPELINE_STATS: VK_KHR_pipeline_executable_properties is enabled.
+	bool                               pipeline_stats_enabled                = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	// KYTY_DIAG_DCC_GPU_CLEAR_CHECK: VK_EXT_conditional_rendering is enabled.
+	bool                               conditional_rendering_enabled         = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;
-	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// GPU indirect draws: multiDrawIndirect, drawIndirectFirstInstance, drawIndirectCount and
+	// shaderDrawParameters are enabled, so indirect draws can run from GPU memory.
+	bool                               gpu_indirect_draw_enabled             = false;
+	// KYTY_FIX_OCCLUSION_QUERIES=1: occlusionQueryPrecise is enabled, so host occlusion queries count exact samples.
+	bool                               occlusion_query_precise               = false;
+	// Descriptor indexing for bindless images (BindlessTable): runtime arrays indexed
+	// non-uniformly, partially bound and updated after bind. From KytyPS5 PR #937.
+	bool                               bindless_enabled                      = false;
+	uint32_t                           bindless_max_sampled_images           = 0;
+	// The device's update-after-bind sampled image limits: per pipeline layout and per stage (bindless_max_sampled_images
+	// is the smaller one).
+	uint32_t                           bindless_set_sampled_images_limit     = 0;
+	uint32_t                           bindless_stage_sampled_images_limit   = 0;
+	uint32_t                           bindless_max_samplers                 = 0;
+	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
+	vk::DescriptorSet                  bindless_set                          = nullptr;
+	// Frames presented so far (bindless feedback is resolved at most once per frame).
+	std::atomic<uint64_t>              presented_frames {0};
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -105,6 +139,28 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// Device-local heaps: driver-reported usage and budget of this process, VMA block and allocation bytes.
+	void GetDeviceLocalMemoryStats(uint64_t& usage, uint64_t& budget, uint64_t& blocks, uint64_t& allocated) const;
+	// KYTY_TRACE_MEM_CENSUS: VkDeviceMemory blocks and VMA allocations in the device-local heaps, and VMA block
+	// bytes in the other (host) heaps.
+	void GetMemoryCounts(uint64_t& device_blocks, uint64_t& device_allocations, uint64_t& host_block_bytes) const;
+	// KYTY_OVERLAY: every memory heap's driver-reported usage and budget of this process and VMA's allocations and
+	// blocks in it (vmaGetHeapBudgets). Returns the number of heaps written (at most `max`).
+	struct HeapBudget {
+		uint64_t usage        = 0;
+		uint64_t budget       = 0;
+		uint64_t size         = 0; // the heap's size
+		uint64_t allocations  = 0;
+		uint64_t blocks       = 0;
+		bool     device_local = false;
+	};
+	uint32_t GetHeapBudgets(HeapBudget* out, uint32_t max) const;
+	// Bytes of one VMA allocation (0 for none).
+	[[nodiscard]] uint64_t GetAllocationSize(VmaAllocation allocation) const;
+	// KYTY_VRAM_BUDGET: target = min(KYTY_VRAM_BUDGET_MB cap, driver budget - 1 GiB) for the device-local heaps, read
+	// now (the driver budget moves with other processes; 0 when it reports none), and effective = the driver-reported
+	// usage minus the free space inside VMA blocks (what eviction can lower).
+	void GetVramBudgetState(uint64_t& target, uint64_t& effective) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 
 	struct HeapUsage {

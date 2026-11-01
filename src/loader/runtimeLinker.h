@@ -206,6 +206,8 @@ private:
 };
 
 uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
+// Calls of unresolved-import stubs (functions the emulator does not implement) so far (KYTY_OVERLAY: "missing HLE").
+[[nodiscard]] uint32_t UnresolvedImportStubCalls();
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();

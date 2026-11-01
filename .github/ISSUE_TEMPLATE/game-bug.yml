@@ -1,0 +1,121 @@
+name: Problem in the game
+description: Crash, freeze, graphics, performance, audio, input or save problem while running Ghost of Yōtei.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Issues are public.** Everything you write or attach here can be read by anyone.
+
+        - This fork supports **Ghost of Yōtei only**. For other games, use upstream KytyPS5.
+        - Search the existing issues first, and test with the latest version of this fork.
+        - Never attach game files, save files, shader dumps or anything taken from the game's code.
+
+  - type: input
+    id: fork-version
+    attributes:
+      label: Fork version
+      description: Shown in the launcher's footer and in About. If you built it yourself, add the commit.
+      placeholder: "Example: v0.1 (or v0.1, commit 1a2b3c4)"
+    validations:
+      required: true
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Game version (patch)
+      description: The version of your game dump.
+      placeholder: "Example: 01.512.000"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card and driver
+      description: Exact model, video memory and driver version.
+      placeholder: "Example: NVIDIA GeForce RTX 4080 16 GB, driver 581.xx"
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: CPU, RAM and Windows version
+      placeholder: "Example: AMD Ryzen 7 7800X3D, 32 GB, Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of problem
+      options:
+        - Crash or the emulator stops with a message
+        - Freeze or hang
+        - Graphics (missing, wrong or flickering image)
+        - Performance (low frame rate, stutter)
+        - Audio
+        - Controller or input
+        - Saves
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: location
+    attributes:
+      label: Where in the game
+      description: Region, place or quest, and what you were doing. A save point close to the problem helps (describe it; do not attach the save).
+      placeholder: "Example: riding north from the first village at night, rain started, image turned black for a second"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead. Does it happen every time?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Optional. The shortest way to see the problem again from starting the game.
+      placeholder: |
+        1. Load a save near ...
+        2. ...
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Changed settings
+      description: Optional. Launcher settings you changed (resolution, tessellation, overlay, shader precompile) and any KYTY_* environment variables you set.
+
+  - type: textarea
+    id: bug-report
+    attributes:
+      label: Bug report zip
+      description: |
+        In the launcher: Advanced → Support → **Export bug report**. It saves `kyty-bug-report-<date>.zip` on your computer with logs, settings and system information; your Windows user name, computer name and PS5 user name are replaced with placeholders. Check the file list and preview, then drag the zip here.
+      placeholder: Drag the zip here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or video
+      description: Optional, but very helpful for graphics problems.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I checked the bug report's file list, and I am not attaching game files, save files or anything from the game's code.
+          required: true

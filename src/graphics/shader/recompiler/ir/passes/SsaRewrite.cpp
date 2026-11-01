@@ -1,8 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "common/envRead.h"
+#include "common/shaderEnv.h"
 
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 #include <variant>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -163,6 +168,37 @@ Value InitialValue(M0Tag) {
 	return Value(0u);
 }
 
+// KYTY_DIAG_RT_TRIPS (diagnostic, default off): a phi's register goes into the unused high half of its flags (the
+// type uses the low half), so a loop watchdog report can name the loop header's values: bit 31 set, kind << 16 |
+// index (kind 1 SGPR, 2 VGPR, 3 thread-bit SGPR, 4 SGPR mask, 5 goto variable, 6 SCC, 7 EXEC, 8 EXEC_LO, 9 EXEC_HI,
+// 10 VCC, 11 VCC_LO, 12 VCC_HI, 13 M0).
+bool PhiRegisterTags() {
+	static const bool on = Common::EnvRead::RtTrips() != nullptr;
+	return on;
+}
+template <typename T>
+uint32_t PhiRegisterTag(T variable) {
+	if constexpr (std::is_same_v<T, ScalarReg>) return (1u << 16u) | RegIndex(variable);
+	else if constexpr (std::is_same_v<T, VectorReg>) return (2u << 16u) | RegIndex(variable);
+	else if constexpr (std::is_same_v<T, ThreadBitScalarReg>) return (3u << 16u) | RegIndex(variable.reg);
+	else if constexpr (std::is_same_v<T, ScalarMaskTag>) return (4u << 16u) | RegIndex(variable.reg);
+	else if constexpr (std::is_same_v<T, GotoVariable>) return (5u << 16u) | (variable.index & 0xffffu);
+	else if constexpr (std::is_same_v<T, SccTag>) return 6u << 16u;
+	else if constexpr (std::is_same_v<T, ExecTag>) return 7u << 16u;
+	else if constexpr (std::is_same_v<T, ExecLoTag>) return 8u << 16u;
+	else if constexpr (std::is_same_v<T, ExecHiTag>) return 9u << 16u;
+	else if constexpr (std::is_same_v<T, VccTag>) return 10u << 16u;
+	else if constexpr (std::is_same_v<T, VccLoTag>) return 11u << 16u;
+	else if constexpr (std::is_same_v<T, VccHiTag>) return 12u << 16u;
+	else return 13u << 16u;
+}
+template <typename T>
+void TagPhi(Inst& phi, T variable) {
+	if (!PhiRegisterTags()) return;
+	const uint64_t tag = (1u << 31u) | PhiRegisterTag(variable);
+	phi.SetFlags(phi.Flags<uint64_t>() | (tag << 32u));
+}
+
 enum class ReadStep { Start, SetValue, PushPhiArgument };
 
 struct ReadState {
@@ -208,6 +244,7 @@ public:
 					} else if (!block->IsSsaSealed()) {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
 						phi.SetFlags(InitialValue(variable).GetType());
+						TagPhi(phi, variable); // KYTY_DIAG_RT_TRIPS
 						incomplete_phis[block][Variable(variable)] = &phi;
 						state.result                               = Value(&phi);
 					} else if (const auto predecessors = block->ImmPredecessors();
@@ -218,6 +255,7 @@ public:
 					} else {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
 						phi.SetFlags(InitialValue(variable).GetType());
+						TagPhi(phi, variable); // KYTY_DIAG_RT_TRIPS
 						Write(variable, block, Value(&phi));
 						state.phi = &phi;
 						prepare_phi();

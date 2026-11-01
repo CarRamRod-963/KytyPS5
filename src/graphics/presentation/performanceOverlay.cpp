@@ -534,14 +534,14 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		Row("Flexible", Bytes(guest.flexible_used) + " / " + Bytes(guest.flexible_total));
 		Row("Extended", Bytes(guest.automatic_allocated));
 		// Past its total a side sees no page-table entries available.
-		const auto percent = std::max(guest.cpu_page_entries * 100 / guest.cpu_page_entries_total,
-		                              guest.gpu_page_entries * 100 / guest.gpu_page_entries_total);
+		const auto percent = std::max(guest.cpu_page_entries * 100 / guest.page_entries_total,
+		                              guest.gpu_page_entries * 100 / guest.page_entries_total);
 		Row("Page table (2 MB)",
 		    Fmt("CPU %llu / %llu  GPU %llu / %llu",
 		        static_cast<unsigned long long>(guest.cpu_page_entries),
-		        static_cast<unsigned long long>(guest.cpu_page_entries_total),
+		        static_cast<unsigned long long>(guest.page_entries_total),
 		        static_cast<unsigned long long>(guest.gpu_page_entries),
-		        static_cast<unsigned long long>(guest.gpu_page_entries_total)),
+		        static_cast<unsigned long long>(guest.page_entries_total)),
 		    LevelColor(static_cast<double>(percent), 90, 100));
 		ImGui::EndTable();
 	}

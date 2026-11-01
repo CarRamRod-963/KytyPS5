@@ -1,14 +1,18 @@
 #pragma once
 
 #include "common/assert.h"
+#include "common/envRead.h"
 #include "common/logging/log.h"
 #include "libs/ajm/decoder.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -243,6 +247,19 @@ public:
 
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
+		// KYTY_TRACE_AJM=1: failing or empty decodes.
+		static const bool trace_ajm = Common::EnvRead::Ajm();
+		if (trace_ajm && (result.result != OK || result.frames == 0)) {
+			static std::atomic_uint logged {0};
+			if (logged.fetch_add(1) < 64u) {
+				std::fprintf(stderr,
+				             "AJM_AT9_DECODE result=0x%x internal=%d frames=%u consumed=%zu written=%zu input=%zu "
+				             "output=%zu ch=%d streams=%zu\n",
+				             static_cast<uint32_t>(result.result), result.internal_result, result.frames,
+				             static_cast<size_t>(result.input_consumed), static_cast<size_t>(result.output_written),
+				             input_size, output_size, m_codec_info.channels, m_streams.size());
+			}
+		}
 		return result;
 	}
 
@@ -370,6 +387,13 @@ private:
 		                        ? m_codec_info.frameSamples * AjmBytesPerSample(m_sample_encoding)
 		                        : 0);
 
+		// KYTY_TRACE_AJM=1: the configuration of every ATRAC9 instance.
+		static const bool trace_ajm = Common::EnvRead::Ajm();
+		if (trace_ajm) {
+			std::fprintf(stderr, "AJM_AT9_CONFIG %02x%02x%02x%02x streams=%zu format_channels=%u -> %d ch %d Hz\n",
+			             m_config_data[0], m_config_data[1], m_config_data[2], m_config_data[3], m_streams.size(),
+			             m_channels, m_codec_info.channels, m_codec_info.samplingRate);
+		}
 		LOGF("AJM ATRAC9 initialized: %d Hz, %d ch, frame_samples=%d, superframe=%d bytes/%d "
 		     "frames\n",
 		     m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,

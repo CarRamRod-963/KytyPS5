@@ -3,7 +3,13 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <mutex>
+#include <utility>
+#include <vector>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -405,6 +411,8 @@ struct Context {
 
 	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
 	void                   Advance(size_t length) { native->Rip += length; }
+	[[nodiscard]] uint64_t Flags() const { return native->EFlags; }
+	void                   SetFlags(uint64_t value) { native->EFlags = static_cast<DWORD>(value); }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
@@ -438,6 +446,8 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
 	}
+	[[nodiscard]] uint64_t Flags() const { return native->uc_mcontext->__ss.__rflags; }
+	void                   SetFlags(uint64_t value) { native->uc_mcontext->__ss.__rflags = value; }
 	[[nodiscard]] auto& Gpr(uint8_t index) const {
 		auto*     state       = &native->uc_mcontext->__ss;
 		uint64_t* registers[] = {&state->__rax, &state->__rcx, &state->__rdx, &state->__rbx,
@@ -488,6 +498,8 @@ struct Context {
 	void Advance(size_t length) {
 		native->uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
 	}
+	[[nodiscard]] uint64_t Flags() const { return static_cast<uint64_t>(native->uc_mcontext.gregs[REG_EFL]); }
+	void                   SetFlags(uint64_t value) { native->uc_mcontext.gregs[REG_EFL] = static_cast<greg_t>(value); }
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		if (native->uc_mcontext.fpregs == nullptr) {
 			return nullptr;

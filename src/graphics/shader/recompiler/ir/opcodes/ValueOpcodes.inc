@@ -359,3 +359,23 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+
+// IEEE halves packed two per U32 (low lane bits 0-15), both lanes at once.
+VALUE_OPCODE(HalfPkAdd, U32, U32, U32)
+VALUE_OPCODE(HalfPkMul, U32, U32, U32)
+VALUE_OPCODE(HalfPkFma, U32, U32, U32, U32)
+VALUE_OPCODE(HalfPkMin, U32, U32, U32)
+VALUE_OPCODE(HalfPkMax, U32, U32, U32)
+VALUE_OPCODE(HalfPkMinTri, U32, U32, U32, U32)
+VALUE_OPCODE(HalfPkMaxTri, U32, U32, U32, U32)
+VALUE_OPCODE(HalfPkMedTri, U32, U32, U32, U32)
+VALUE_OPCODE(HalfPkSaturate, U32, U32)
+// The low-lane half of a U32 as an f32 operand of f32 arithmetic, and an f32 arithmetic result as a half (low lane):
+// plain conversions, a NaN's payload not kept (the host's f32 arithmetic returns its canonical NaN either way).
+VALUE_OPCODE(HalfToF32Arith, F32, U32)
+VALUE_OPCODE(F32ToHalfArith, U32, F32)
+
+// KYTY_DIAG_WATERFALL_RECORD0_CENSUS (diagnostic, workaround W11's counter): the two address dwords a waterfall reads
+// with ReadFirstLane, the same two fields of record 0 (KYTY_DIAG_WATERFALL_POINTER_RECORD0) and the lanes counted (the
+// read's mask). Counts per wave the lanes and those whose address differs (BindlessBindings.h WaterfallRecord0CensusWord).
+VALUE_OPCODE(WaterfallRecord0Census, Void, U32, U32, U32, U32, U1)

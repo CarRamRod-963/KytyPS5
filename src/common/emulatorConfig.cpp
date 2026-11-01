@@ -2,9 +2,17 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/threads.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
 
 namespace Config {
 
@@ -202,7 +210,10 @@ bool RenderDocEnabled() {
 }
 
 bool ReadbackLinearImagesEnabled() {
-	return g_config->readback_linear_images;
+	// Always on (M118, whatever the launcher's setting says): GPU-written linear images are written back to guest memory,
+	// as on PS5 where the CPU sees what the GPU wrote. Ghost of Yotei's CPU occlusion test reads the hi-Z pyramid from
+	// memory; without it the test used a pyramid frozen around a cutscene and distant objects vanished every other frame.
+	return true;
 }
 
 bool ReadbackTiledImagesEnabled() {
@@ -235,6 +246,70 @@ bool PlayGoHackEnabled() {
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+bool PrecompileOnly() {
+	return g_config->precompile_only;
+}
+
+uint32_t GetPrecompileThreads() {
+	return g_config->precompile_threads;
+}
+
+const std::filesystem::path& GetPrecompileExportHints() {
+	return g_config->precompile_export_hints;
+}
+
+const std::filesystem::path& GetPrecompileImportHints() {
+	return g_config->precompile_import_hints;
+}
+
+const std::filesystem::path& GetGameDir() {
+	return g_config->game_dir;
+}
+
+// Based on TheCruZ/KytyPS5-GTA 12ec19890 and dd7a6e008 (emulatorConfig.cpp), GPL-2.0. The list and the priority rule are
+// ours: physical cores 1, 3, 4 and 2 of a 9800X3D (one CCD, SMT siblings adjacent), away from the interrupt-heavy core 0;
+// only the threads that own the stream get the higher priority (the recording and resolve threads spin).
+void ConfigureGpuStageThread(GpuStageThread stage) {
+	static const std::array<int, 4> cpus = [] {
+		std::array<int, 4> result {2, 6, 8, 4};
+		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		if (value == nullptr) {
+			return result;
+		}
+		if (std::string_view(value) == "off") {
+			return std::array<int, 4> {-1, -1, -1, -1};
+		}
+		for (auto& cpu: result) {
+			char* end = nullptr;
+			cpu       = static_cast<int>(std::strtol(value, &end, 10));
+			if (end == value) {
+				EXIT("invalid KYTY_GPU_THREAD_CPUS: %s\n", std::getenv("KYTY_GPU_THREAD_CPUS"));
+			}
+			value = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	static const bool high_priority = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	if (high_priority && (stage == GpuStageThread::Execution || stage == GpuStageThread::CommandProcessor)) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	// Other threads otherwise run on the SMT siblings of the pinned stages and slow them down: give the stages whole
+	// physical cores. KYTY_GPU_THREAD_MIN_CORES: the physical cores the rest of the process must keep (default 4: an
+	// 8-core processor reserves, a 6-core one does not).
+	static std::once_flag reserved;
+	std::call_once(reserved, [] {
+		const char*  value     = std::getenv("KYTY_GPU_THREAD_MIN_CORES");
+		const size_t min_cores = value != nullptr ? std::strtoul(value, nullptr, 10) : 4u;
+		const auto   result    = Common::Thread::ReserveCores(cpus, min_cores);
+		std::fprintf(stderr, "GPU_THREAD_CPUS execution=%d recording=%d resolve=%d command_processor=%d: %s\n", cpus[0],
+		             cpus[1], cpus[2], cpus[3], result.c_str());
+	});
+	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

@@ -38,7 +38,10 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
+	// waitUntilSafeForRendering (default): blocks until no flip of the buffer is pending.
 	void WaitFlipDone(int handle, int index);
+	// KYTY_UPSTREAM_FLIP_SUSPEND=1 (upstream a358b847c): non-blocking; false also arms a GPU wake for the next flip.
+	[[nodiscard]] bool IsSafeForRendering(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 

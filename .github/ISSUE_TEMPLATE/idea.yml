@@ -1,0 +1,56 @@
+name: Idea
+description: Suggest an improvement to the emulator or the launcher.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The emulator's first goal is to compute the same results as the PS5. Improvements beyond the PS5 (higher
+        resolution, upscalers and similar) are added only as separate switches that the user turns on, and only once
+        the PS5-accurate path works. See CONTRIBUTING.md.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Launcher
+        - Emulation accuracy
+        - Performance
+        - Improvement beyond the PS5 (optional switch)
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work. For emulator changes, say what it would cost or gain if you know.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Optional. Other ways you considered.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: This idea does not include game files or anything taken from the game's code.
+          required: true

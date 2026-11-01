@@ -66,7 +66,12 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order) {
-	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
+	auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
+	if (encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm &&
+	    Prospero::Diagnostic111110UnormAsFloat()) {
+		// Scene targets programmed as COLOR_11_11_10 UNORM store packed unsigned floats.
+		encoding.buffer_format = Prospero::BufferFormat::k11_11_10Float;
+	}
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
 		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
 		                                ? Prospero::RemapTextureFormat(encoding.buffer_format)
@@ -108,6 +113,9 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 }
 
 SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+	if (format == Prospero::BufferFormat::k11_11_10UNorm && Prospero::Diagnostic111110UnormAsFloat()) {
+		format = Prospero::BufferFormat::k11_11_10Float;
+	}
 	const auto backing_format = Prospero::RemapTextureFormat(format);
 	const auto host_format = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);
 	const auto conversion_format =

@@ -6,6 +6,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+
 namespace Libs::Graphics {
 
 namespace ImageViewOps {
@@ -35,6 +37,13 @@ namespace ImageViewOps {
                                               vk::Format view_format, uint32_t swizzle) noexcept {
 	EXIT("unsupported %s color image view: image_format=%d view_format=%d swizzle=0x%03x\n", usage,
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
+}
+
+// Whether the device samples R8_SRGB views (optional in Vulkan; set once at device creation, vulkanWindow.cpp). A guest
+// 8_SRGB T# read then gets an R8_SRGB view of its R8_UNORM image: the sampler decodes before filtering, as on the PS5.
+[[nodiscard]] inline std::atomic<bool>& SampledR8SrgbSupported() noexcept {
+	static std::atomic<bool> supported {false};
+	return supported;
 }
 
 [[nodiscard]] inline vk::Format SrgbStorageViewFormat(vk::Format image_format) noexcept {

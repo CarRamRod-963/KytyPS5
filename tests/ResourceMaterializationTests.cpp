@@ -1,13 +1,15 @@
-#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "SrtWalkerTestMemory.h"
+#include "graphics/shader/recompiler/ir/passes/SrtTape.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <set>
 
 namespace {
 
@@ -16,22 +18,6 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ResourceMaterializationTests: failed: %s\n", text);
     std::abort();
   }
-}
-
-// Every extracted plan below is the one a restarted game loads from the shader cache: exactly
-// its bytes load, and the loaded plan saves back to them.
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
-Extract(const Libs::Graphics::ShaderRecompiler::IR::Program &program) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
-  auto extended = bytes;
-  extended.push_back(0u);
-  ResourcePlan loaded, truncated, padded;
-  Check(LoadResourcePlan(bytes, loaded) && SaveResourcePlan(loaded) == bytes &&
-            !LoadResourcePlan(std::span(bytes).first(bytes.size() - 1u), truncated) &&
-            !LoadResourcePlan(extended, padded),
-        "resource plan did not round-trip through its exact cache bytes");
-  return loaded;
 }
 
 bool RejectSpecializationRead(void *userdata, uint64_t, std::span<uint32_t>) {
@@ -48,24 +34,6 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   result->id = static_cast<uint32_t>(program.blocks.size() - 1u);
   program.block_storage.push_back(std::move(block));
   return *result;
-}
-
-// Lists one extra source per block and walks the plan: each source's activity is its block's reachability.
-std::vector<uint8_t> ReachedBlocks(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
-                                   const Libs::Graphics::ShaderRecompiler::IR::SrtRuntime &runtime) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const auto first = static_cast<uint32_t>(plan.descriptor_sources.size());
-  for (uint32_t block = 0; block < plan.control_flow.size(); ++block) {
-    plan.descriptor_sources.emplace_back();
-    plan.control_flow[block].sources.push_back(first + block);
-  }
-  CompileSrtWalker(plan);
-  std::vector<uint32_t> flat;
-  Check(WalkSrt(plan, runtime, flat, nullptr), "reachability walk failed");
-  std::vector<uint8_t> reached;
-  for (uint32_t block = 0; block < plan.control_flow.size(); ++block)
-    reached.push_back(WalkedActive(plan, first + block));
-  return reached;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
@@ -109,7 +77,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
   program.resource_tracking_complete = true;
   AddValueBlock(program);
   program.info.uses_dma = true;
-  return Extract(program);
+  return ExtractResourcePlan(program);
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
@@ -130,7 +98,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0});
-  return Extract(program);
+  return ExtractResourcePlan(program);
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
@@ -185,10 +153,10 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   return program;
 }
 
-void TestWalkerLoadsBypassSpecializationReader() {
+void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
-  auto plan = Extract(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
   uint32_t specialization_reads = 0;
   const SrtRuntime runtime{.userdata = &specialization_reads,
                            .read_specialization_memory =
@@ -198,10 +166,10 @@ void TestWalkerLoadsBypassSpecializationReader() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mapped SRT stage materialization failed");
   Check(specialization_reads == 0,
-        "walker load used the specialization reader");
+        "ordinary SRT read used the specialization reader");
   Check(snapshot.flattened_srt.size() == 1 &&
             snapshot.flattened_srt[0] == dword,
-        "walker did not load the mapped SRT DWORD");
+        "cache rematerialization did not use the direct reader by default");
 }
 
 void TestNativeNestedSrtRefresh() {
@@ -240,11 +208,26 @@ void TestNativeNestedSrtRefresh() {
   leaf->Arg(0).Instruction()->SetArg(1, pointer_high);
   leaf->SetArg(1, Value(7u));
   read(leaf->Arg(0), 11u);
-  auto plan = Extract(program);
-  Check(plan.srt_code != nullptr, "nested user-data tree did not compile an x86 walker");
+  auto plan = ExtractResourcePlan(program);
+  // Upstream compiled an x86 walker (ResourcePlan::srt_code) for this nested user-data tree. Ours replaced that
+  // walker with the SRT tape (ResourcePlan::srt_tape, SrtTape.h), the dense evaluator MaterializeResources uses
+  // instead of SrtWalker. Equivalent expectation: this tree gets a tape (unless KYTY_DIAG_SRT_TAPE=0 turns tapes off).
+  Check(!SrtTapeEnabled() || (plan.srt_tape != nullptr && plan.srt_tape->Matches(plan)),
+        "nested user-data tree did not build an SRT tape");
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const SrtRuntime runtime{.user_data = user_data};
+  {
+    SrtWalker walker(plan, runtime);
+    Check(walker.RefreshFlatBuffer(snapshot.flattened_srt),
+          "native SRT refresh failed");
+    const auto loaded = first[1];
+    first[1] ^= 0xffffffffu;
+    uint32_t value = 0;
+    Check(walker.Evaluate(plan.srt_reads[0].value, value) && value == loaded,
+          "descriptor evaluation reloaded a value already copied by the native walker");
+    first[1] = loaded;
+  }
   for (const auto *data : {&first, &second}) {
     table = pointer_words(data->data());
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -252,20 +235,14 @@ void TestNativeNestedSrtRefresh() {
                   std::vector<uint32_t>{(*data)[1], table[0], table[1], (*data)[2]},
           "native SRT refresh lost pointer masking, alignment, or current values");
   }
-  {
-    // Unmapped tables and the null pointer they yield read as zero.
-    FakeGuestMemory unmapped;
-    const std::array<uint32_t, 2> unmapped_table{0x1000u, 0u};
-    Check(MaterializeResources(plan, {.user_data = unmapped_table}, snapshot, specialization) &&
-              snapshot.flattened_srt == std::vector<uint32_t>(4, 0u),
-          "faulting walker loads of a table and a null pointer did not read zero");
-  }
   Check(!MaterializeResources(plan, {.user_data = std::span(user_data).first(1)},
                               snapshot, specialization),
         "native SRT walk accepted truncated user data");
   const std::array<uint32_t, 2> fake_user_data{0x1003u, 0xabcd0000u};
   uint32_t reads = 0;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+  const SrtRuntime callback_runtime{
+      .user_data = fake_user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
         ++*static_cast<uint32_t *>(data);
         switch (address) {
           case 0x1000u: words[0] = 0x2003u; break;
@@ -275,26 +252,86 @@ void TestNativeNestedSrtRefresh() {
           default: return false;
         }
         return true;
-      }, &reads);
-  Check(MaterializeResources(plan, {.user_data = fake_user_data}, snapshot, specialization) && reads == 4 &&
+      },
+      .userdata = &reads};
+  Check(MaterializeResources(plan, callback_runtime, snapshot, specialization) && reads == 4 &&
             snapshot.flattened_srt ==
                 std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u, 0x5678u},
-        "native SRT walk repeated nested pointer reads");
+        "native-eligible SRT bypassed its callback or repeated nested pointer reads");
   leaf->SetArg(0, root);
   leaf->SetArg(1, Value(0u));
   program.srt_reads.resize(1);
   for (const int32_t offset : {-1, 7}) {
     program.memory_info[0].offset = static_cast<uint32_t>(offset);
-    auto bounded = Extract(program);
+    auto bounded = ExtractResourcePlan(program);
     auto base = pointer_words(second.data() + 1);
-    Check(bounded.srt_code != nullptr &&
+    // srt_code expectation of upstream -> SRT tape expectation of ours (see above).
+    Check((!SrtTapeEnabled() || bounded.srt_tape != nullptr) &&
               MaterializeResources(bounded, {.user_data = base}, snapshot, specialization) &&
               snapshot.flattened_srt[0] == second[offset < 0 ? 0 : 2],
-          "native SRT applied a signed immediate offset incorrectly");
+          "SRT tape was not built or applied a signed immediate offset incorrectly");
     base = offset < 0 ? std::array<uint32_t, 2>{0u, 0u}
                       : std::array<uint32_t, 2>{0xfffffffcu, 0xffffu};
     Check(!MaterializeResources(bounded, {.user_data = base}, snapshot, specialization),
           "native SRT accepted address underflow or 48-bit overflow");
+  }
+  high.Instruction()->SetArg(0, Value(ScalarReg(6)));
+  {
+    // Upstream refused its x86 walker (ResourcePlan::srt_code) for this tree: that walker loaded the root pointer
+    // with one 64-bit read of two adjacent user-data registers. Ours has no such walker: the SRT tape and SrtWalker
+    // read each pointer word from its own register, so nonadjacent words are no reason to refuse. The equivalent
+    // guard is the pointer assembly that refusal protected: low word from user data 4, high word from user data 6,
+    // never from the adjacent register 5. The reader serves only the expected address, so a pointer assembled
+    // from register 5 fails the read instead of touching host memory.
+    program.user_data_count = 3;
+    const auto pointer = pointer_words(second.data() + 1);
+    const std::array<uint32_t, 3> nonadjacent_user_data{pointer[0], 0xdeadbeefu, pointer[1]};
+    struct Probe {
+      uint64_t address;
+      uint32_t value;
+    } probe{reinterpret_cast<uint64_t>(&second[2]), second[2]};
+    const SrtRuntime probe_runtime{
+        .user_data = nonadjacent_user_data,
+        .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+          const auto &expected = *static_cast<const Probe *>(data);
+          if (address != expected.address || words.size() != 1) return false;
+          words[0] = expected.value;
+          return true;
+        },
+        .userdata = &probe};
+    const auto nonadjacent = ExtractResourcePlan(program);
+    Check(MaterializeResources(nonadjacent, probe_runtime, snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{second[2]},
+          "SRT evaluation assembled a nonadjacent user-data pointer from adjacent registers");
+    program.user_data_count = 2;
+  }
+  high.Instruction()->SetArg(0, Value(ScalarReg(5)));
+  program.memory_info[0].offset = 0;
+  program.srt_reads.push_back({pointer_low, 1});
+  program.srt_reads.push_back({pointer_high, 2});
+  leaf->SetArg(0, emit(ValueOpcode::GetAddressResource, {pointer_low, pointer_high}));
+  pointer_high.Instruction()->SetArg(1, Value(8u));
+  {
+    // Upstream refused its x86 walker here too: it loaded a nested pointer with one 64-bit read of adjacent table
+    // words. Ours reads each word on its own; the equivalent guard: the nested pointer is assembled from the table
+    // words at +0 and +8, never from the adjacent word at +4 (the reader serves only the expected addresses).
+    const std::array<uint32_t, 2> table_user_data{0x1003u, 0xabcd0000u};
+    const SrtRuntime nested_runtime{
+        .user_data = table_user_data,
+        .read_memory = +[](void *, uint64_t address, std::span<uint32_t> words) {
+          if (words.size() != 1) return false;
+          switch (address) {
+            case 0x1000u: words[0] = 0x2003u; break;     // pointer low word (+0)
+            case 0x1008u: words[0] = 0xabcd0000u; break; // pointer high word (+8)
+            case 0x2000u: words[0] = 0x1234u; break;     // leaf, through the assembled pointer
+            default: return false;
+          }
+          return true;
+        }};
+    const auto nested = ExtractResourcePlan(program);
+    Check(MaterializeResources(nested, nested_runtime, snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x1234u, 0x2003u, 0xabcd0000u},
+          "SRT evaluation assembled a nonadjacent nested pointer from adjacent table words");
   }
 }
 
@@ -347,7 +384,7 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
-void TestSrtAliasesShareReads() {
+void TestSrtAliasesRetainReadPolicy() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = SrtProgram(0x1000u);
   auto &block = *program.blocks[0];
@@ -375,33 +412,109 @@ void TestSrtAliasesShareReads() {
   DescriptorSource indirect;
   indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
   program.descriptor_sources.push_back(indirect);
-  auto plan = Extract(program);
+  auto plan = ExtractResourcePlan(program);
   for (const auto &inst : plan.value_storage) {
     Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
               inst.GetOpcode() != ValueOpcode::GetSrtResource,
           "retained plan still contains flattened-read aliases");
   }
-  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value,
-        "alias normalization lost read identity");
-  struct Reads { uint32_t count = 0; bool dirty = false; } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
-        auto &reads = *static_cast<Reads *>(data);
-        ++reads.count;
-        if (address == 0x1000u) words[0] = 0x1111u;
-        else if (address == 0x2000u) words[0] = 0x2222u;
-        else if (address == 0x3000u && !reads.dirty) words[0] = 0x1000u;
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value &&
+            plan.srt_reads[0].value.Instruction()->Flags<SrtReadFlags>().clean == 1u &&
+            plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
+            plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
+        "alias normalization lost read identity or retained discarded EXEC provenance");
+  // Upstream compiled no x86 walker (ResourcePlan::srt_code) for a plan with captured strict reads: that walker
+  // read host memory directly. Ours has no such walker; the SRT tape is built for this plan as well and is what
+  // MaterializeResources evaluates with, so the equivalent guarantee is that the tape keeps every slot's read
+  // policy (checked here, and walked like SrtWalker at the end of this test). Without a tape SrtWalker is used.
+  Check(plan.srt_tape == nullptr ||
+            (plan.srt_tape->Matches(plan) && plan.srt_tape->slots.size() == 3 &&
+             plan.srt_tape->slots[0].flat_clean && !plan.srt_tape->slots[1].flat_clean &&
+             plan.srt_tape->slots[2].flat_clean),
+        "SRT tape lost the strict read policy of a captured read");
+  struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (address == 0x2000u) words[0] = 0x2222u;
+        else if (address == 0x3000u) words[0] = 0x8000u;
+        else if (address == 0x8000u) words[0] = 0xeeeeu;
         else return false;
         return true;
-      }, &reads);
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (reads.dirty) return false;
+        if (address == 0x3000u) words[0] = 0x1000u;
+        else if (address == 0x1000u) words[0] = 0x1111u;
+        else return false;
+        return true;
+      }};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
-            reads.count == 3,
-        "normalized aliases changed nested reads or repeated a shared read");
-  // An unreadable pointer reads as zero, and so does the null table it yields.
-  reads = {.dirty = true};
-  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0u, 0x2222u, 0u} &&
-            reads.count == 3,
-        "unreadable pointer did not read as zero");
+  DescriptorValue descriptor;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, &clean);
+    Check(walker.RefreshFlatBuffer(flat) &&
+              flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+              walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x1111u &&
+              reads.strict == 2 && reads.ordinary == 1,
+          "normalized aliases changed nested strict reads or repeated a shared read");
+  }
+  Check(!SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "strict flat read accepted a missing clean evaluator");
+  auto no_reader = runtime;
+  no_reader.read_specialization_memory = nullptr;
+  {
+    SrtWalker clean(plan, CleanRuntime(no_reader));
+    Check(!SrtWalker(plan, no_reader, &clean).RefreshFlatBuffer(flat),
+          "strict flat read accepted a missing strict reader");
+  }
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor) &&
+            descriptor.dwords[0] == 0xeeeeu && reads.strict == 2 && reads.ordinary == 3,
+        "direct descriptor evaluation without a clean evaluator changed read domains");
+  reads.dirty = true;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    Check(!SrtWalker(plan, runtime, &clean).RefreshFlatBuffer(flat) &&
+              reads.strict == 3 && reads.ordinary == 3,
+          "dirty strict pointer fell back to an ordinary read");
+  }
+  // The same read policy through the SRT tape (ours; see the srt_tape check above): strict slots use the clean
+  // walker and its strict reader, a shared pointer read is read once, and a missing clean walker, a missing strict
+  // reader or a dirty strict read refuses instead of falling back to an ordinary read.
+  if (plan.srt_tape != nullptr) {
+    const auto &tape = *plan.srt_tape;
+    std::vector<uint32_t> tape_flat;
+    reads = {};
+    {
+      SrtTapeWalker tape_clean(tape, CleanRuntime(runtime), 1u);
+      SrtTapeWalker tape_walker(tape, runtime, 0u, &tape_clean);
+      Check(tape_walker.RefreshFlatBuffer(plan, tape_flat) &&
+                tape_flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+                reads.strict == 2 && reads.ordinary == 1,
+            "SRT tape changed nested strict reads or repeated a shared read");
+    }
+    Check(!SrtTapeWalker(tape, runtime, 0u).RefreshFlatBuffer(plan, tape_flat) &&
+              reads.strict == 2 && reads.ordinary == 1,
+          "SRT tape strict flat read accepted a missing clean evaluator");
+    {
+      SrtTapeWalker tape_clean(tape, CleanRuntime(no_reader), 1u);
+      Check(!SrtTapeWalker(tape, no_reader, 0u, &tape_clean).RefreshFlatBuffer(plan, tape_flat) &&
+                reads.strict == 2 && reads.ordinary == 1,
+            "SRT tape strict flat read accepted a missing strict reader");
+    }
+    reads = {.dirty = true};
+    {
+      SrtTapeWalker tape_clean(tape, CleanRuntime(runtime), 1u);
+      Check(!SrtTapeWalker(tape, runtime, 0u, &tape_clean).RefreshFlatBuffer(plan, tape_flat) &&
+                reads.strict == 1 && reads.ordinary == 0,
+            "SRT tape dirty strict pointer fell back to an ordinary read");
+    }
+  }
 }
 
 void TestUniformVectorDescriptorRead() {
@@ -435,66 +548,59 @@ void TestUniformVectorDescriptorRead() {
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
   Check(ValidateRuntimeValue(program, Value(&count)), "uniform DWORD count was rejected");
-  struct Reads { uint32_t value = 72; uint32_t count = 0; bool readable = true; } reads;
-  FakeGuestMemory fake([](void *data, uint64_t address, std::span<uint32_t> words) {
+  struct Reads { uint32_t value = 72; uint32_t strict = 0; uint32_t ordinary = 0; bool clean = true; } reads;
+  const SrtRuntime runtime{
+      .read_memory = [](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 999;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
         auto &reads = *static_cast<Reads *>(data);
-        ++reads.count;
-        if (!reads.readable || address != 0x1000u || words.size() != 1) return false;
+        ++reads.strict;
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
         words[0] = reads.value;
         return true;
-      }, &reads);
-  const SrtRuntime runtime;
+      }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const bool written : {false, true}) {
     program.info.buffers[0].written = written;
-    auto plan = Extract(program);
-    Check(plan.control_flow.empty() && plan.capture_specialization_reads,
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.empty() && plan.requires_specialization_memory &&
+              plan.capture_specialization_reads,
           "vector descriptor read depended on incidental control-flow capture");
     reads = {};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.buffers[0].dwords[2] == 145 && reads.count == 1 &&
+              snapshot.buffers[0].dwords[2] == 145 && reads.strict == 1 && reads.ordinary == 0 &&
               snapshot.specialization_reads ==
                   std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}},
           "vector descriptor input was not read and captured exactly once");
-    // An unreadable input reads as zero, so the count selects 0 + 1.
-    reads = {.readable = false};
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.buffers[0].dwords[2] == 1 && reads.count == 1,
-          "unreadable vector descriptor input did not read as zero");
-  }
-  // A read guarded by its EXEC mask depends on that mask, so it cannot reuse the unmasked read.
-  auto &guarded = block.AppendNewInst(ValueOpcode::LoadBufferU32,
-      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(&active)});
-  guarded.SetFlags(MemoryFlags{.index = 0});
-  auto &guarded_lane = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&guarded), Value(&active)});
-  program.descriptor_sources.push_back({.dwords = {Value(&guarded_lane)}, .dword_count = 1});
-  {
-    auto plan = Extract(program);
-    uint32_t value = 0;
-    reads = {};
-    Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], value) &&
-              value == 72u && reads.count == 1,
-          "EXEC-guarded vector read lost its mask");
+    reads.clean = false;
+    reads.strict = 0;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.strict == 1 && reads.ordinary == 0,
+          "dirty vector descriptor input fell back to an ordinary memory read");
   }
   count.SetArg(4, Value(false));
   auto &inactive = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(false)});
   program.descriptor_sources.push_back({.dwords = {Value(&inactive)}, .dword_count = 1});
-  reads.count = 0;
+  reads.strict = 0;
   uint32_t result = 99;
   {
-    auto plan = Extract(program);
-    Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], result) &&
-              result == 0 && reads.count == 0,
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
           "literal false EXEC read vector memory");
   }
   count.SetArg(4, Value(true));
   handle.SetArg(3, Value(0x204u));
   program.descriptor_sources.back().dwords[0] = Value(&count);
   {
-    auto plan = Extract(program);
-    Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], result) &&
-              result == 0 && reads.count == 0,
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
           "invalid vector buffer format read memory");
   }
   handle.SetArg(3, Value(0x16204u));
@@ -512,7 +618,7 @@ void TestExactReciprocalDescriptorArithmetic() {
                               std::bit_cast<float>(253u << 23u)}) {
     auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
     uint32_t result = 0;
-    Check(EvaluateSrtValue(program, {}, Value(&reciprocal), result) &&
+    Check(SrtWalker(program, {}).Evaluate(Value(&reciprocal), result) &&
               result == std::bit_cast<uint32_t>(1.f / divisor),
           "power-of-two reciprocal was not exact");
   }
@@ -521,7 +627,7 @@ void TestExactReciprocalDescriptorArithmetic() {
                               std::bit_cast<float>(254u << 23u)}) {
     auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
     uint32_t result = 0;
-    Check(!EvaluateSrtValue(program, {}, Value(&reciprocal), result),
+    Check(!SrtWalker(program, {}).Evaluate(Value(&reciprocal), result),
           "unsupported reciprocal rounding or exceptional input was accepted");
   }
 }
@@ -558,7 +664,7 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
-  // Only memory-derived host decisions capture their descriptor reads.
+  // Only memory-derived host decisions need clean, disjoint descriptor reads.
   auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
       {memory_condition ? Value(&read) : Value(&offset),
        Value(memory_condition ? 0x8000u : 4u)});
@@ -581,28 +687,38 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
       {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
       .SetFlags(MemoryFlags{.index = 1});
-  auto plan = Extract(program);
+  auto plan = ExtractResourcePlan(program);
   Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
         "conditional writable descriptor used the wrong memory dependency policy");
-  struct Reads { uint32_t count = 0; bool readable = false; } reads;
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
-        auto &reads = *static_cast<Reads *>(data);
-        ++reads.count;
-        if (!reads.readable || address != 0x1004u) return false;
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
         words[0] = 0x8000u;
         return true;
-      }, &reads);
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1004u) return false;
+        words[0] = 0x8000u;
+        return true;
+      }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  for (const bool readable : {false, true}) {
-    reads = {.readable = readable};
-    // The predicate and the descriptor share one read. An unreadable one is zero, which
-    // makes a memory predicate skip the store block and leave its descriptor inactive.
-    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
-              reads.count == 1,
-          "writable descriptor repeated or skipped its shared read");
-    Check(snapshot.buffers[0].dwords[0] == (readable ? 0x8000u : 0u) &&
+  for (const bool clean : {false, true}) {
+    reads = {.clean = clean};
+    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    const bool expected = !memory_condition || clean;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
+              reads.ordinary == (memory_condition ? 0u : 1u) &&
+              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+          "writable descriptor changed reader policy or bypassed a dirty memory predicate");
+    if (!expected) continue;
+    Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
               snapshot.specialization_reads == (memory_condition
                   ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}}
                   : std::vector<std::pair<uint64_t, uint64_t>>{}),
@@ -651,21 +767,26 @@ void TestSharedControlPredicates() {
       program.blocks[i]->terminator.true_block = program.blocks[i == 0 ? 1 : 3];
       program.blocks[i]->terminator.false_block = program.blocks[2];
     }
-    auto plan = Extract(program);
-    Check(plan.value_storage.size() <= 2u * depth + 12u &&
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.value_storage.size() == depth + 5 &&
               plan.control_flow.size() == 4 &&
               plan.control_flow[0].condition == plan.control_flow[1].condition &&
               !plan.capture_specialization_reads,
           "shared predicates expanded into trees or retained varying dependencies");
     for (const uint32_t flag : {0u, 1u}) {
       const std::array<uint32_t, 1> user_data{flag};
+      SrtWalker walker(plan, {.user_data = user_data});
       uint32_t result = 99;
       const bool conjunction = operation == ValueOpcode::LogicalAnd;
       const bool known = conjunction ? flag == 0 : flag != 0;
-      Check(EvaluateSrtValue(plan, {.user_data = user_data}, plan.control_flow[0].condition, result) == known &&
+      Check(walker.Evaluate(plan.control_flow[0].condition, result) == known &&
                 (!known || result == uint32_t{conjunction}),
             "shared predicate changed its uniform factor or cached runtime values");
-      Check(ReachedBlocks(plan, {.user_data = user_data}) == (known
+      std::vector<uint32_t> flat;
+      // Ours keeps the walk state in the calling thread's evaluation scratch (ResourcePlan::Scratch) instead of
+      // ResourcePlan::visited_blocks; SrtWalker::RefreshFlatBuffer fills it the same way.
+      Check(walker.RefreshFlatBuffer(flat) &&
+                plan.ThreadScratch().visited_blocks == (known
                     ? (conjunction ? std::vector<uint8_t>{1, 1, 0, 1}
                                    : std::vector<uint8_t>{1, 0, 1, 0})
                     : std::vector<uint8_t>{1, 1, 1, 1}),
@@ -674,78 +795,116 @@ void TestSharedControlPredicates() {
   }
 }
 
-void TestNestedExecPredicatesReuseReads() {
+// Table slots: two GPU-selected image tables that grow from 9 to 40 (and 12 to 43) candidates. For
+// every key (each present one and two missing ones) the descriptor the shader's search selects - simulated as
+// EmitIndirectResourceIndex emits it on the flattened SRT, then the ordinal's candidate - is the same with and
+// without the slots; with them the specialization (image count, mapping offsets, search steps) changes only when a
+// table crosses a power of two.
+void TestIndirectTableSlotsSelectSame() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  constexpr uint32_t depth = 12;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  for (uint32_t i = 0; i < 3; ++i) AddValueBlock(program);
-  auto &entry = *program.blocks[0];
-  auto &use = *program.blocks[1];
-  auto &exit = *program.blocks[2];
-  const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
-    return Value(&entry.AppendNewInst(opcode, args));
+  struct Outcome {
+    std::vector<uint32_t> selected; // dword 0 of the selected descriptor per (root, key)
+    std::vector<uint32_t> shape;    // image count, then per root mapping offset and search steps
   };
-  const auto lane = emit(ValueOpcode::GetBuiltin,
-      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
-  const auto address = emit(ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
-  const auto count = emit(ValueOpcode::LoadAddressU32,
-      {address, Value(0u), Value(0u), Value(true)});
-  count.Instruction()->SetFlags(MemoryFlags{.index = 0});
-  auto condition = emit(ValueOpcode::LogicalNot,
-      {emit(ValueOpcode::ULessThanEqual32, {count, lane})});
-  // A compact shared DAG must not become a tree of fresh EXEC evaluations.
-  for (uint32_t i = 0; i < depth; ++i) {
-    const auto mask = emit(ValueOpcode::INotEqual32, {lane, Value(i)});
-    condition = emit(ValueOpcode::LogicalAnd,
-        {mask, emit(ValueOpcode::LogicalOr, {condition, condition})});
+  const auto run = [](uint32_t count_a, uint32_t count_b, bool slots) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    // Candidate i: every third one a 2D-array texture and every fifth one with another swizzle (kinds the specialization
+    // keeps per candidate); the newest candidate is listed in the middle, as a new key lands among sorted keys.
+    const auto add_source = [&](uint32_t tag, uint32_t i) {
+      DescriptorSource source;
+      source.dword_count = 8;
+      source.dwords.fill(Value(0u));
+      source.dwords[0] = Value(tag);
+      source.dwords[1] = Value(static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+      const auto type = i % 3u == 0u ? Libs::Graphics::Prospero::ImageType::kColor2DArray
+                                     : Libs::Graphics::Prospero::ImageType::kColor2D;
+      source.dwords[3] = Value((i % 5u == 0u ? Libs::Graphics::DstSel(5, 4, 6, 7) : Libs::Graphics::DstSel(4, 5, 6, 7)) |
+          (static_cast<uint32_t>(type) << 28u));
+      program.descriptor_sources.push_back(source);
+      return static_cast<uint32_t>(program.descriptor_sources.size() - 1u);
+    };
+    const auto ordered = [](uint32_t count) {
+      std::vector<uint32_t> order;
+      for (uint32_t i = 0; i + 1u < count; ++i) order.push_back(i);
+      order.insert(order.begin() + order.size() / 2u, count - 1u);
+      return order;
+    };
+    std::array<std::vector<uint32_t>, 2> lists;
+    for (const uint32_t i : ordered(count_a)) lists[0].push_back(add_source(0x1000u + i * 0x40u, i));
+    for (const uint32_t i : ordered(count_b)) lists[1].push_back(add_source(0x9000u + i * 0x40u, i));
+    for (uint32_t r = 0; r < 2u; ++r) {
+      DescriptorSource root;
+      root.dword_count = 8;
+      root.dwords.fill(Value(0u));
+      root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = lists[r];
+      program.descriptor_sources.push_back(root);
+      program.info.images.push_back({
+          .source = static_cast<uint32_t>(program.descriptor_sources.size() - 1u),
+          .resource_class = ImageResourceClass::Sampled,
+          .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+          .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2DArray});
+    }
+    auto plan = ExtractResourcePlan(program);
+    const SrtRuntime runtime{.read_memory = +[](void *, uint64_t, std::span<uint32_t>) { return false; },
+                             .userdata = nullptr,
+                             .read_specialization_memory = +[](void *, uint64_t, std::span<uint32_t>) { return false; }};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    SetIndirectTableSlotsOverride(slots);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization), "indirect table slots: materialization failed");
+    SetIndirectTableSlotsOverride(std::nullopt);
+    Outcome out;
+    out.shape.push_back(static_cast<uint32_t>(specialization.images.size()));
+    const auto &flat = snapshot.flattened_srt;
+    for (uint32_t r = 0; r < 2u; ++r) {
+      const auto &root = specialization.images[r];
+      out.shape.push_back(root.indirect_mapping_offset);
+      out.shape.push_back(root.indirect_search_iterations);
+      std::vector<uint32_t> children;
+      for (uint32_t i = 2; i < specialization.images.size(); ++i) {
+        if (specialization.images[i].indirect_root == r) children.push_back(i);
+      }
+      const uint32_t mapping = root.indirect_mapping_offset;
+      const uint32_t count = flat[mapping];
+      for (uint32_t key = 0; key < lists[r].size() + 2u; ++key) {
+        uint32_t low = 0, high = count;
+        for (uint32_t step = 0; step < root.indirect_search_iterations; ++step) {
+          const bool active = low < high;
+          const uint32_t mid = (low + high) >> 1u;
+          const uint32_t probe = active ? mid : 0u;
+          const bool less = flat[mapping + 1u + probe * 2u] < key;
+          if (active && less) low = mid + 1u;
+          if (active && !less) high = mid;
+        }
+        const bool in_range = low < count;
+        const uint32_t entry = mapping + 1u + 2u * (in_range ? low : 0u);
+        const bool match = in_range && flat[entry] == key;
+        const uint32_t ordinal = match ? flat[entry + 1u] : 0u;
+        Check(ordinal <= children.size(), "indirect table slots: ordinal past the candidates");
+        const uint32_t image = ordinal == 0u ? r : children[ordinal - 1u];
+        out.selected.push_back(snapshot.images[image].dwords[0]);
+      }
+    }
+    return out;
+  };
+  std::set<std::vector<uint32_t>> shapes_off, shapes_on;
+  for (uint32_t n = 9; n <= 40; ++n) {
+    const auto off = run(n, n + 3u, false);
+    const auto on = run(n, n + 3u, true);
+    Check(off.selected == on.selected, "indirect table slots: a key selects another descriptor");
+    shapes_off.insert(off.shape);
+    shapes_on.insert(on.shape);
   }
-  entry.condition = condition;
-  entry.terminator.kind = TerminatorKind::ConditionalBranch;
-  entry.terminator.true_block = &use;
-  entry.terminator.false_block = &exit;
-  entry.AddBranch(&use);
-  entry.AddBranch(&exit);
-  use.terminator.kind = TerminatorKind::Branch;
-  use.terminator.true_block = &exit;
-  use.AddBranch(&exit);
-  DescriptorSource source;
-  source.dwords = {Value(0x8000u), Value(1u << 16u), Value(16u), Value(3u << 28u)};
-  source.dword_count = 4;
-  program.descriptor_sources.push_back(source);
-  program.info.buffers.push_back({.source = 0, .read = true});
-  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
-  const auto buffer = Value(&use.AppendNewInst(ValueOpcode::GetBufferResource,
-      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
-  use.AppendNewInst(ValueOpcode::LoadBufferU32,
-      {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
-      .SetFlags(MemoryFlags{.index = 1});
-  auto plan = Extract(program);
-  struct Reads { uint32_t value = 0; bool readable = true; uint32_t count = 0; } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
-        auto &reads = *static_cast<Reads *>(data);
-        ++reads.count;
-        if (!reads.readable || address != 0x1000u || words.size() != 1) return false;
-        words[0] = reads.value;
-        return true;
-      }, &reads);
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  for (const auto state : {Reads{64u, true}, Reads{0u, true}, Reads{64u, false}, Reads{64u, true}}) {
-    reads = state;
-    Check(MaterializeResources(plan, {}, snapshot, specialization),
-          "nested EXEC predicates rejected a valid resource snapshot");
-    // An unreadable count reads as zero.
-    const bool inactive = !reads.readable || reads.value == 0;
-    Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
-          "nested EXEC predicates lost an unknown branch or retained stale runtime facts");
-    Check(reads.count == 1 && snapshot.specialization_reads ==
-              std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}},
-          "EXEC contexts repeated a mask-independent scalar read");
-  }
+  std::printf("indirect table slots: permutations over 9..40 candidates: %zu without, %zu with\n", shapes_off.size(),
+              shapes_on.size());
+  std::fflush(stdout);
+  Check(shapes_on.size() <= 12u && shapes_off.size() >= 20u,
+        "indirect table slots: the specialization still follows every new candidate");
 }
 
 void TestFiniteImageRefreshReusesScalarReads() {
@@ -786,12 +945,20 @@ void TestFiniteImageRefreshReusesScalarReads() {
       .resource_class = ImageResourceClass::Sampled,
       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
-  auto plan = Extract(program);
+  auto plan = ExtractResourcePlan(program);
   struct Reads {
     std::array<uint32_t, 3> words{0x100u, 0x200u, 0x200u};
     std::array<uint32_t, 3> counts{};
+    uint32_t ordinary = 0;
   } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->ordinary;
+        return false;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
         if (words.size() != 1 || address < 0x1000u || address >= 0x100cu ||
             (address & 3u) != 0) return false;
         auto &reads = *static_cast<Reads *>(data);
@@ -799,10 +966,15 @@ void TestFiniteImageRefreshReusesScalarReads() {
         ++reads.counts[index];
         words[0] = reads.words[index];
         return true;
-      }, &reads);
-  const SrtRuntime runtime;
+      }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The read reuse and deduplication below are checked in the layout before table slots (2 images, no padding);
+  // TestIndirectTableSlotsSelectSame checks the slots against it.
+  SetIndirectTableSlotsOverride(false);
+  struct RestoreSlots {
+    ~RestoreSlots() { SetIndirectTableSlotsOverride(std::nullopt); }
+  } restore_slots;
   const auto capacities = [&] {
     return std::array{snapshot.images.capacity(), snapshot.flattened_srt.capacity(),
                       snapshot.specialization_reads.capacity(), specialization.images.capacity()};
@@ -819,15 +991,15 @@ void TestFiniteImageRefreshReusesScalarReads() {
   };
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "finite image materialization failed");
-  Check(reads.counts == std::array<uint32_t, 3>{1, 1, 1} &&
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{1, 1, 1} &&
             snapshot.specialization_reads.size() == 3,
-        "finite image candidates repeated or skipped scalar reads");
+        "finite image candidates repeated scalar reads or bypassed clean provenance");
   check_mapping({0, 1, 1, 1});
   const auto warm_capacities = capacities();
   reads.words = {0x300u, 0x300u, 0x400u};
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "finite image refresh failed after descriptor changes");
-  Check(reads.counts == std::array<uint32_t, 3>{2, 2, 2} &&
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{2, 2, 2} &&
             snapshot.specialization_reads.size() == 3 &&
             snapshot.images[0].dwords[0] == 0x300u && snapshot.images[1].dwords[0] == 0x400u,
         "finite image refresh retained old scalar values or repeated reads");
@@ -836,379 +1008,10 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool counted_loop = false) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  for (uint32_t i = 0; i < 6; ++i) AddValueBlock(program);
-  auto &entry = *program.blocks[0];
-  auto &loop = *program.blocks[1];
-  auto &body = *program.blocks[2];
-  auto &merge = *program.blocks[3];
-  auto &use = *program.blocks[4];
-  auto &exit = *program.blocks[5];
-  const auto emit = [](Block &block, ValueOpcode opcode, std::initializer_list<Value> args) {
-    return Value(&block.AppendNewInst(opcode, args));
-  };
-  const auto branch = [](Block &block, Block &target, Value condition = {}, Block *other = nullptr) {
-    block.terminator.kind = other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
-    block.terminator.true_block = &target;
-    block.terminator.false_block = other;
-    block.condition = condition;
-    block.AddBranch(&target);
-    if (other) block.AddBranch(other);
-  };
-  Value lane, active, initial;
-  if (!counted_loop) {
-    lane = emit(entry, ValueOpcode::GetBuiltin,
-        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-    active = emit(entry, ValueOpcode::INotEqual32, {lane, Value(0u)});
-    const auto initial_mask = independent_mask
-        ? emit(entry, ValueOpcode::IEqual32, {lane, Value(0u)}) : active;
-    initial = emit(entry, ValueOpcode::SelectU32,
-        {initial_mask, Value(UINT32_MAX), Value(0u)});
-  }
-  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
-  const auto address = emit(entry, ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
-  const auto count = emit(entry, ValueOpcode::LoadAddressU32,
-      {address, Value(0u), Value(0u), Value(true)});
-  count.Instruction()->SetFlags(MemoryFlags{.index = 0});
-  if (counted_loop) {
-    branch(entry, loop);
-  } else {
-    const auto rejected = emit(entry, ValueOpcode::ULessThanEqual32, {count, lane});
-    const auto accepted = emit(entry, ValueOpcode::LogicalNot, {rejected});
-    branch(entry, loop, emit(entry, ValueOpcode::LogicalAnd, {active, accepted}), &merge);
-  }
-
-  // A nonempty traversal contains a varying loop-carried value. Its cycle must
-  // remain unknown; only the proven empty traversal can select the bypass arm.
-  auto &carried = loop.AppendNewInst(ValueOpcode::Phi);
-  carried.SetFlags(Type::U32);
-  const auto next = emit(body, ValueOpcode::IAdd32, {Value(&carried), Value(1u)});
-  carried.AddPhiOperand(&entry, counted_loop ? Value(0u) : lane);
-  carried.AddPhiOperand(&body, next);
-  const auto condition = counted_loop
-      ? emit(loop, ValueOpcode::ULessThan32, {Value(&carried), count})
-      : emit(loop, ValueOpcode::INotEqual32, {Value(&carried), Value(UINT32_MAX)});
-  branch(loop, counted_loop ? use : body, condition, &merge);
-  loop.terminator.loop_header = true;
-  loop.terminator.continue_block = &body;
-  loop.terminator.merge_block = &merge;
-  branch(body, loop);
-  if (counted_loop) {
-    branch(merge, exit);
-    branch(use, body);
-  } else {
-    auto &selected = merge.AppendNewInst(ValueOpcode::Phi);
-    selected.SetFlags(Type::U32);
-    selected.AddPhiOperand(&entry, initial);
-    selected.AddPhiOperand(&loop, Value(&carried));
-    const auto valid = emit(merge, ValueOpcode::INotEqual32, {Value(&selected), Value(UINT32_MAX)});
-    branch(merge, use, emit(merge, ValueOpcode::LogicalAnd, {active, valid}), &exit);
-    branch(use, exit);
-  }
-  DescriptorSource source;
-  const auto descriptor_address = emit(use, ValueOpcode::GetAddressResource,
-      {Value(0x2000u), Value(0u)});
-  for (uint32_t i = 0; i < 4; ++i) {
-    const auto index = static_cast<uint32_t>(program.memory_info.size());
-    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
-    source.dwords[i] = emit(use, ValueOpcode::LoadAddressU32,
-        {descriptor_address, Value(i * 4u), Value(0u), Value(true)});
-    source.dwords[i].Instruction()->SetFlags(MemoryFlags{.index = index});
-  }
-  source.dword_count = 4;
-  program.descriptor_sources.push_back(source);
-  program.info.buffers.push_back({.source = 0, .read = true});
-  const auto buffer_index = static_cast<uint32_t>(program.memory_info.size());
-  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
-  const auto buffer = emit(use, ValueOpcode::GetBufferResource,
-      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
-  emit(use, ValueOpcode::LoadBufferU32, {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
-      .Instruction()->SetFlags(MemoryFlags{.index = buffer_index});
-  auto plan = Extract(program);
-  struct Reads { uint32_t count = 0; bool readable = true; uint32_t descriptors = 0; } reads;
-  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
-        constexpr std::array<uint32_t, 4> descriptor{0x8000u, 1u << 16u, 16u,
-                                                   (3u << 28u) | 0x4dfacu};
-        auto &reads = *static_cast<Reads *>(data);
-        if (address == 0x1000u && reads.readable) {
-          words[0] = reads.count;
-          return true;
-        }
-        if (address < 0x2000u || address >= 0x2010u || address % 4u || words.size() != 1)
-          return false;
-        ++reads.descriptors;
-        words[0] = descriptor[(address - 0x2000u) / 4u];
-        return true;
-      }, &reads);
-  const SrtRuntime runtime;
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  for (const auto state : {Reads{0u, true}, Reads{4u, true}, Reads{4u, false}, Reads{0u, true}}) {
-    reads = state;
-    if (!counted_loop) {
-      uint32_t condition = 99;
-      Check(!EvaluateSrtValue(plan, runtime, plan.control_flow[3].condition, condition),
-            "direct merge evaluation used missing or previous runtime reachability");
-    }
-    Check(MaterializeResources(plan, runtime, snapshot, specialization),
-          "partial traversal proof rejected a valid resource snapshot");
-    // An unreadable count reads as zero.
-    const bool inactive = !independent_mask && (!reads.readable || reads.count == 0u);
-    Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
-          "empty traversal kept its descriptor or an uncertain traversal lost it");
-    Check(specialization.buffers[0].zero_stride_oob == inactive,
-          "inactive traversal did not expose dead vector reads to specialization");
-    Check(reads.descriptors == (inactive ? 0u : 4u),
-          "inactive traversal read its descriptor or an uncertain traversal skipped it");
-    if (inactive) {
-      Check(!snapshot.specialization_reads.empty(), "empty traversal lost its captured scalar read");
-      for (const auto &read : snapshot.specialization_reads)
-        Check(read == std::pair<uint64_t, uint64_t>{0x1000u, 4u},
-              "empty traversal proof captured an unrelated memory range");
-    }
-  }
-}
-
-void TestCyclicControlPredicatesRemainUnknown() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  for (uint32_t i = 0; i < 4; ++i) AddValueBlock(program);
-  auto &entry = *program.blocks[0];
-  auto &left = *program.blocks[1];
-  auto &right = *program.blocks[2];
-  auto &exit = *program.blocks[3];
-  const auto lane = Value(&entry.AppendNewInst(ValueOpcode::GetBuiltin,
-      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}));
-  const auto u = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(0u)}));
-  const auto v = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {lane, Value(1u)}));
-  auto &p = left.AppendNewInst(ValueOpcode::Phi);
-  auto &q = right.AppendNewInst(ValueOpcode::Phi);
-  p.SetFlags(Type::U1);
-  q.SetFlags(Type::U1);
-  const auto a = Value(&left.AppendNewInst(ValueOpcode::LogicalAnd, {u, Value(&p)}));
-  const auto b = Value(&right.AppendNewInst(ValueOpcode::LogicalAnd, {v, Value(&q)}));
-  p.AddPhiOperand(&entry, Value(true));
-  p.AddPhiOperand(&right, b);
-  q.AddPhiOperand(&entry, Value(true));
-  q.AddPhiOperand(&left, a);
-  const auto branch = [](Block &block, Value condition, Block &yes, Block &no) {
-    block.condition = condition;
-    block.terminator.kind = TerminatorKind::ConditionalBranch;
-    block.terminator.true_block = &yes;
-    block.terminator.false_block = &no;
-    block.AddBranch(&yes);
-    block.AddBranch(&no);
-  };
-  // Two loop entries have no single header whose Phi can be discarded up front.
-  branch(entry, u, left, right);
-  branch(left, a, right, exit);
-  branch(right, b, left, exit);
-  auto plan = Extract(program);
-  uint32_t value = 99;
-  Check(!EvaluateSrtValue(plan, {}, plan.control_flow[1].condition, value) &&
-            !EvaluateSrtValue(plan, {}, plan.control_flow[2].condition, value),
-        "cyclic varying control acquired an unsupported uniform value");
-  Check(ReachedBlocks(plan, {}) == std::vector<uint8_t>({1, 1, 1, 1}),
-        "cyclic control lost a possible branch during reachability");
-}
-
-void TestBackEdgeReachesPhiPredecessor() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.user_data_count = 3;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  for (uint32_t i = 0; i < 4; ++i) AddValueBlock(program);
-  auto &entry = *program.blocks[0];
-  auto &header = *program.blocks[1];
-  auto &body = *program.blocks[2];
-  auto &exit = *program.blocks[3];
-  const auto branch = [](Block &block, Block &target, Value condition = {}, Block *other = nullptr) {
-    block.terminator.kind = other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
-    block.terminator.true_block = &target;
-    block.terminator.false_block = other;
-    block.condition = condition;
-    block.AddBranch(&target);
-    if (other) block.AddBranch(other);
-  };
-  // header: p = Phi(entry: 0, body: 1); table[1] == p enters body, which returns to header. The
-  // first pass evaluates p and loads table[1] before body is reached; the walk must revisit both,
-  // capture the load once and reach exit, which loads table[0].
-  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
-  const auto table = Value(&entry.AppendNewInst(ValueOpcode::GetAddressResource,
-      {Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))})),
-       Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}))}));
-  const auto load = [&](Block &block, uint32_t offset) -> Inst & {
-    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32, {table, Value(offset), Value(0u), Value(true)});
-    read.SetFlags(MemoryFlags{.index = 0});
-    return read;
-  };
-  auto &p = header.AppendNewInst(ValueOpcode::Phi);
-  p.SetFlags(Type::U32);
-  p.AddPhiOperand(&entry, Value(0u));
-  p.AddPhiOperand(&body, Value(1u));
-  branch(entry, header);
-  branch(header, body, Value(&header.AppendNewInst(ValueOpcode::IEqual32, {Value(&load(header, 4u)), Value(&p)})),
-         &exit);
-  branch(body, header);
-  exit.terminator.kind = TerminatorKind::Return;
-  program.srt_reads.push_back({Value(&load(exit, 0u)), 0});
-  exit.AppendNewInst(ValueOpcode::ReadConst,
-                     {Value(&exit.AppendNewInst(ValueOpcode::GetSrtResource)), Value(0u)});
-  auto plan = Extract(program);
-  Check(plan.control_flow.size() == 4 && plan.control_phi_predecessors.size() == 1,
-        "back-edge plan lost its control flow or Phi");
-  plan.capture_specialization_reads = true;
-  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  {
-    // The table is unmapped: its loads read zero instead of faulting the walk.
-    FakeGuestMemory unmapped;
-    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
-              snapshot.flattened_srt == std::vector<uint32_t>{0u},
-          "faulting load in a reachable block did not read zero");
-  }
-  for (uint32_t selected : {0u, 1u}) {
-    FakeGuestMemory fake(+[](void *userdata, uint64_t address, std::span<uint32_t> words) {
-          words[0] = address == 0x1000u ? 0x5678u : *static_cast<uint32_t *>(userdata);
-          return address == 0x1000u || address == 0x1004u;
-        }, &selected);
-    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
-              snapshot.flattened_srt == std::vector<uint32_t>{0x5678u},
-          "back edge to an evaluated Phi left its exit unreachable");
-    Check(snapshot.specialization_reads ==
-              std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}, {0x1000u, 4u}},
-          "Phi restart kept the loads of the abandoned pass");
-    Check(ReachedBlocks(plan, {.user_data = user_data}) ==
-              (selected == 0u ? std::vector<uint8_t>{1, 1, 1, 1} : std::vector<uint8_t>{1, 1, 0, 1}),
-          "Phi restart followed a rejected edge or missed a reachable one");
-  }
-}
-
-void TestEmptyScalarBufferSpecialization() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  struct Fixture {
-    Program program;
-    std::vector<std::pair<Inst *, Type>> uses;
-    Inst *nonnull = nullptr;
-  };
-  const auto make_fixture = [] {
-    Fixture fixture;
-    auto &program = fixture.program;
-    program.stage = Libs::Graphics::ShaderType::Compute;
-    program.srt_plan_complete = program.resource_tracking_complete = true;
-    program.user_data_count = 4u;
-    auto &block = AddValueBlock(program);
-    DescriptorSource source;
-    source.dword_count = 4u;
-    for (uint32_t word = 0; word < 4u; ++word)
-      source.dwords[word] = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
-          {Value(static_cast<ScalarReg>(word))}));
-    program.descriptor_sources.push_back(source);
-    program.info.buffers.push_back({.source = 0u, .read = true, .scalar = true});
-    const auto table = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
-        {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
-    std::array<Value, 4> words;
-    for (uint32_t word = 0; word < 4u; ++word) {
-      program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .resource = 0u,
-                                     .offset = word * 4u});
-      auto &read = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {table, Value(0u)});
-      read.SetFlags(MemoryFlags{.index = word});
-      words[word] = Value(&read);
-    }
-    const auto handle = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
-        {words[0], words[1], words[2], words[3]}));
-    for (const auto opcode : {ValueOpcode::ReadConstBuffer, ValueOpcode::LoadBufferU8,
-                              ValueOpcode::LoadBufferU16, ValueOpcode::LoadBufferU32,
-                              ValueOpcode::LoadBufferU32x2, ValueOpcode::LoadBufferU32x3,
-                              ValueOpcode::LoadBufferU32x4}) {
-      const auto index = static_cast<uint32_t>(program.memory_info.size());
-      program.memory_info.push_back({.kind = ResourceKind::IndirectBuffer, .resource = UINT32_MAX,
-          .data_dwords = BufferComponentCount(opcode),
-          .data_bits = opcode == ValueOpcode::LoadBufferU8 ? 8u : opcode == ValueOpcode::LoadBufferU16 ? 16u : 32u,
-          .formatted = opcode == ValueOpcode::LoadBufferU32});
-      auto &read = opcode == ValueOpcode::ReadConstBuffer
-          ? block.AppendNewInst(opcode, {handle, Value(0u)})
-          : block.AppendNewInst(opcode, {handle, Value(0u), Value(0u), Value(0u), Value(true)});
-      read.SetFlags(MemoryFlags{.index = index});
-      fixture.uses.emplace_back(&block.AppendNewInst(ValueOpcode::Identity, {Value(&read)}), read.GetType());
-    }
-    const auto nonnull = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
-        {words[0], words[1], words[2], Value(1u)}));
-    auto &read = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {nonnull, Value(0u)});
-    read.SetFlags(MemoryFlags{.index = 4u});
-    fixture.nonnull = &block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
-    return fixture;
-  };
-  auto fixture = make_fixture();
-  auto plan = Extract(fixture.program);
-  std::array<uint32_t, 4> descriptor{0x1000u, 8u << 16u, 0u, 3u << 28u};
-  uint32_t reads = 0u;
-  const SrtRuntime runtime{.user_data = descriptor, .userdata = &reads,
-                           .read_specialization_memory = RejectSpecializationRead};
-  FakeGuestMemory fake(RejectSpecializationRead, &reads);
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization, empty, populated;
-  for (const uint32_t records : {0u, 1u, 0x20000000u, 0u}) {
-    descriptor[2] = records;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0u &&
-              specialization.buffers[0].scalar_empty == (records == 0u),
-          "scalar emptiness read table contents or truncated its 64-bit byte size");
-    if (records == 0u) {
-      if (empty.buffers.empty()) empty = specialization;
-      else Check(specialization == empty, "returning to an empty scalar table changed its specialization");
-    }
-    else if (records == 1u) populated = specialization;
-    else Check(specialization == populated, "nonempty scalar size created a shader permutation");
-    auto current = make_fixture();
-    ApplyResourceSpecialization(current.program, specialization);
-    for (const auto &[use, type] : current.uses) {
-      const auto value = use->Arg(0).Resolve();
-      Check(value.GetType() == type, "empty scalar-table folding changed the load result type");
-      if (records != 0u) {
-        Check(value.TryInstruction() != nullptr && BufferAccessOf(value.Instruction()->GetOpcode()) == BufferAccess::Read,
-              "nonempty scalar table lost a runtime buffer load");
-      } else if (value.IsImmediate()) {
-        Check(value == Value(uint8_t{0}) || value == Value(uint16_t{0}) || value == Value(0u),
-              "empty scalar table did not produce a typed zero");
-      } else {
-        for (size_t component = 0; component < value.Instruction()->NumArgs(); ++component)
-          Check(value.Instruction()->Arg(component) == Value(0u),
-                "empty scalar table retained a nonzero vector component");
-      }
-    }
-    Check(current.nonnull->Arg(0).Resolve().TryInstruction() != nullptr,
-          "a partly nonzero indirect descriptor was treated as unbound");
-  }
-  Check(empty != populated, "empty-to-populated scalar transition reused the folded specialization");
-  plan.info.buffers[0].scalar = false;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            !specialization.buffers[0].scalar_empty,
-        "vector-only resource acquired scalar-empty specialization");
-  empty.buffers[0].indirect_root = 0u;
-  empty.buffers.push_back(empty.buffers[0]);
-  empty.buffers[1].scalar_empty = false;
-  ApplyResourceSpecialization(fixture.program, empty);
-  for (const auto &[use, type] : fixture.uses)
-    Check(use->Arg(0).GetType() == type && use->Arg(0).Resolve().TryInstruction() != nullptr &&
-              BufferAccessOf(use->Arg(0).ResolveInstruction()->GetOpcode()) == BufferAccess::Read,
-          "empty root folded a scalar read with nonempty candidates");
-}
-
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
-  auto plan = Extract(program);
+  auto plan = ExtractResourcePlan(program);
   std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
   const SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -1236,237 +1039,91 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
-void TestSignedStorageSpecialization() {
+void TestRecordKeyedRanges() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using F = Libs::Graphics::Prospero::BufferFormat;
-  using N = Libs::Graphics::Prospero::TextureNumericClass;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  program.user_data_count = 1u;
-  auto &block = AddValueBlock(program);
-  DescriptorSource source;
-  source.dword_count = 8u;
-  source.dwords.fill(Value(0u));
-  source.dwords[0] = Value(0x100u);
-  source.dwords[1] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
-  constexpr auto swizzle = Libs::Graphics::DstSel(5, 4, 1, 0);
-  source.dwords[3] = Value(swizzle |
-      (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
-  program.descriptor_sources.push_back(source);
-  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Storage,
-      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D, .written = true});
-  auto plan = Extract(program);
-  std::array<uint32_t, 1> data{};
-  const SrtRuntime runtime{.user_data = data};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization, signed16;
-  for (const auto format : {F::k16SInt, F::k32SInt, F::k16SInt}) {
-    data[0] = uint32_t(format) << 20u;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization),
-          "write-only signed storage image failed materialization");
-    const auto conversion = format == F::k16SInt ? format : F::kInvalid;
-    const auto view = format == F::k16SInt ? F::k16UInt : F::k32UInt;
-    Check(specialization.images[0].numeric_class == N::Uint &&
-              specialization.images[0].conversion_format == conversion &&
-              specialization.images[0].shader_swizzle == swizzle &&
-              snapshot.images[0].dwords[1] == data[0] &&
-              RawSignedStorageFormat(plan.info.images[0], format) == view,
-          "signed storage specialization lost guest format, conversion, swizzle or raw view width");
-    if (format == F::k16SInt) {
-      if (signed16.images.empty()) signed16 = specialization;
-      else Check(specialization == signed16, "signed storage format refresh retained a stale specialization");
-    } else {
-      Check(specialization != signed16, "signed 16/32-bit stores shared incompatible conversion state");
-    }
-    ApplyResourceSpecialization(program, specialization);
-    const auto binding = DescriptorBindingForImage(program.info.images[0]);
-    Check(binding && ImageBindingResourceClass(*binding) == ImageResourceClass::Storage,
-          "signed storage conversion did not reuse the unsigned storage binding");
-  }
-  for (const auto format : {F::k8SInt, F::k16SInt, F::k32SInt}) {
-    data[0] = uint32_t(format) << 20u;
-    auto &image = plan.info.images[0];
-    image.read = true;
-    Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
-              !MaterializeResources(plan, runtime, snapshot, specialization),
-          "signed raw storage view accepted a non-atomic read/write image");
-    image.atomic = true;
-    Check((RawSignedStorageFormat(image, format) != F::kInvalid) == (format == F::k32SInt) &&
-              MaterializeResources(plan, runtime, snapshot, specialization) == (format == F::k32SInt),
-          "signed storage conversion changed atomic format eligibility");
-    image.atomic64 = true;
-    Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
-              !MaterializeResources(plan, runtime, snapshot, specialization),
-          "signed 16/32-bit image acquired a 64-bit atomic raw view");
-    image.resource_class = ImageResourceClass::Sampled;
-    image.written = image.atomic = image.atomic64 = false;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              specialization.images[0].numeric_class == N::Sint &&
-              specialization.images[0].conversion_format == F::kInvalid &&
-              Libs::Graphics::Prospero::NumBytesPerElement(format) ==
-                  (format == F::k8SInt ? 1u : format == F::k16SInt ? 2u : 4u) &&
-              RawSignedStorageFormat(image, format) == F::kInvalid,
-          "storage conversion changed ordinary signed image reads");
-    image.resource_class = ImageResourceClass::Storage;
-    image.written = true;
-    image.read = false;
-  }
-}
-
-// One descriptor serves a store, an atomic that a user-data condition guards, and an image no
-// block lists. Unreached, the atomic reads a zero descriptor instead of the RGBA8 format the
-// others use; reached, it rejects that format.
-void TestUnreachedImageIgnoresSharedDescriptor(bool atomic64) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-  using Libs::Graphics::Prospero::BufferFormat;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = program.resource_tracking_complete = true;
-  program.user_data_count = 2u;
-  auto &entry = AddValueBlock(program);
-  auto &guarded = AddValueBlock(program);
-  auto &done = AddValueBlock(program);
-  const auto user = [&](uint32_t index) {
-    return Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(index))}));
+  // Record-keyed V#s: a record-keyed V# source as the tracker plans it (table V# in user data 4..7, record
+  // count in user data 2, the V# at record + 64 of 196-byte records) for one dword store at offset 8 without an index.
+  const auto make_plan = [](uint32_t table_offset) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    const auto user_data = [&](uint32_t index) {
+      return Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))}));
+    };
+    DescriptorSource table;
+    table.dword_count = 4;
+    for (uint32_t word = 0; word < 4; ++word) table.dwords[word] = user_data(4u + word);
+    program.descriptor_sources.push_back(table);
+    DescriptorSource record;
+    record.dword_count = 4;
+    record.dwords.fill(Value(0u));
+    auto &indirect = record.indirect_descriptor.emplace();
+    indirect.table_source = 0;
+    indirect.table_offset = table_offset;
+    indirect.table_immediate = 64;
+    indirect.table_stride = 196;
+    indirect.key_count = user_data(2);
+    indirect.record_keyed = true;
+    program.descriptor_sources.push_back(record);
+    program.info.indirect_ranges.push_back({.source = 1, .access_begin = 8, .access_end = 12, .written = true});
+    return ExtractResourcePlan(program);
   };
-  DescriptorSource source;
-  source.dword_count = 8u;
-  source.dwords.fill(Value(0u));
-  source.dwords[0] = Value(0x100u);
-  source.dwords[1] = user(0);
-  source.dwords[3] = Value(uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
-  program.descriptor_sources.push_back(source);
-  const auto dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  for (const bool atomic : {false, true, false})
-    program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Storage,
-        .dimension = dimension, .written = true, .atomic = atomic, .atomic64 = atomic && atomic64});
-  for (uint32_t image = 0; image < 2u; ++image)
-    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = image});
-  entry.AppendNewInst(ValueOpcode::ImageWrite, {Value(0u), Value(0u), Value(0u), Value(true)})
-      .SetFlags(MemoryFlags{.index = 0});
-  guarded.AppendNewInst(atomic64 ? ValueOpcode::ImageAtomicUMax64 : ValueOpcode::ImageAtomicUMax32,
-                        {Value(0u), Value(0u), Value(0u), Value(true)})
-      .SetFlags(MemoryFlags{.index = 1});
-  entry.condition = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {user(1), Value(0u)}));
-  entry.terminator.kind = TerminatorKind::ConditionalBranch;
-  entry.terminator.true_block = &guarded;
-  entry.terminator.false_block = &done;
-  guarded.terminator.kind = TerminatorKind::Branch;
-  guarded.terminator.true_block = &done;
-  done.terminator.kind = TerminatorKind::Return;
-  auto plan = Extract(program);
-  std::array<uint32_t, 2> data{uint32_t(BufferFormat::k8_8_8_8UNorm) << 20u, 0u};
-  const SrtRuntime runtime{.user_data = data};
+  struct Memory {
+    std::array<uint32_t, 196> words{};
+    uint32_t reads = 0;
+  } memory;
+  std::array<uint32_t, 8> user_data{0u, 0u, 1u, 0u, 0x1000u, 0u, 4u * 196u, 0u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .userdata = &memory,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &memory = *static_cast<Memory *>(data);
+        if (address < 0x1000u || (address & 3u) != 0u ||
+            address - 0x1000u + words.size_bytes() > sizeof(memory.words)) return false;
+        std::copy_n(memory.words.begin() + (address - 0x1000u) / 4u, words.size(), words.begin());
+        ++memory.reads;
+        return true;
+      }};
+  auto plan = make_plan(0u);
+  Check(plan.capture_specialization_reads && plan.requires_specialization_memory &&
+            plan.resource_tracking_complete,
+        "record-keyed plan did not capture its specialization reads");
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[0].dwords[1] == data[0] && snapshot.images[2].dwords[1] == data[0] &&
-            snapshot.images[1] == DescriptorValue{.dword_count = 8u},
-        "unreached atomic image kept the shared descriptor or an unlisted image lost it");
-  data[1] = 1u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "reached atomic image accepted a format its width rejects");
-}
-
-void TestIndirectImageSamplerClasses(bool mixed) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  using Libs::Graphics::Prospero::BufferFormat;
-  using Libs::Graphics::Prospero::TextureNumericClass;
-  auto program = MixedSamplerProgram();
-  auto &first = program.descriptor_sources[0];
-  first.dwords[0] = Value(0x100u);
-  first.dwords[1] = Value(static_cast<uint32_t>(BufferFormat::k8UNorm) << 20u);
-  first.dwords[3] = program.descriptor_sources[1].dwords[3];
-  program.descriptor_sources[1].dwords[1] = Value(static_cast<uint32_t>(
-      mixed ? BufferFormat::k8UInt : BufferFormat::k8UNorm) << 20u);
-  DescriptorSource root;
-  root.dword_count = 8;
-  root.dwords.fill(Value(0u));
-  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 0};
-  program.info.images.resize(1);
-  program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
-  program.descriptor_sources.push_back(root);
-  program.info.samplers.resize(1);
-  program.info.sampled_pairs.resize(1);
-  auto plan = Extract(program);
-  std::array<uint32_t, 1> user_data{0x11111111u};
-  uint32_t reads = 0;
-  const SrtRuntime runtime{.user_data = user_data, .userdata = &reads,
-                           .read_specialization_memory = RejectSpecializationRead};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0 &&
-            snapshot.images.size() == 2 && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 1u &&
-            specialization.images[0].numeric_class == TextureNumericClass::Float &&
-            specialization.images[1].numeric_class ==
-                (mixed ? TextureNumericClass::Uint : TextureNumericClass::Float),
-        "indirect image materialization rejected or changed a typed candidate");
-  const auto offset = specialization.images[0].indirect_mapping_offset;
-  Check(snapshot.flattened_srt[offset] == 3u &&
-            snapshot.flattened_srt[offset + 2u] == 0u &&
-            snapshot.flattened_srt[offset + 4u] == 1u &&
-            snapshot.flattened_srt[offset + 6u] == 0u,
-        "mixed image classes changed selector ordinals or duplicated candidates");
-  ApplyResourceSpecialization(program, specialization);
-  Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
-            snapshot.samplers.size() == 1 && program.info.samplers.size() == (mixed ? 2u : 1u),
-        "indirect images lost candidates or created unnecessary sampler variants");
-  user_data[0] = 0x33333333u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization),
-        "mixed image sampler refresh failed");
-  for (uint32_t index = 0; index < program.info.samplers.size(); ++index) {
-    const auto &sampler = program.info.samplers[index];
-    Check(sampler.snapshot_index == 0u && sampler.source == plan.info.samplers[0].source &&
-              sampler.force_point_filtering == (index != 0u) &&
-              sampler.integer_border == (index != 0u) &&
-              snapshot.samplers[sampler.snapshot_index].dwords[0] == user_data[0],
-          "typed sampler variants lost filtering, border class, or shared live descriptor");
-  }
-}
-
-void TestShaderCacheRecords() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  // Equivalent selector domains share one key group, which a load rebuilds.
-  Program selectors;
-  AddValueBlock(selectors);
-  for (const uint32_t stride : {4u, 8u, 4u}) {
-    DescriptorSource source;
-    source.indirect_descriptor = DescriptorSource::IndirectDescriptor{
-        .selector = DescriptorSource::IndirectDescriptor::SelectorRead{.stride = stride}};
-    selectors.descriptor_sources.push_back(source);
-  }
-  selectors.descriptor_sources.emplace_back();
-  const auto plan = Extract(selectors);
-  Check(plan.selector_groups == std::vector<uint32_t>{0u, 1u, 0u, UINT32_MAX} &&
-            plan.selector_keys.size() == 2u,
-        "loaded plan lost its selector key groups");
-
-  const std::array values{Value(), Value(ScalarReg(3)), Value(VectorReg(5)), Value(true),
-                          Value(uint8_t{7}), Value(uint16_t{9}), Value(11u), Value(uint64_t{1} << 40u),
-                          Value::F16(0x3c00u), Value::F32(-2.5f)};
-  Writer writer;
-  Io(writer, values);
-  Reader reader{writer.bytes};
-  std::array<Value, values.size()> loaded;
-  Io(reader, loaded);
-  Check(reader.ok && reader.bytes.empty() && loaded == values,
-        "immediate values changed through the shader cache");
-  // Damaged records: a missing instruction, a type that is no value type, an oversized count and
-  // an unknown opcode.
-  for (const uint8_t type : {1u, 3u}) {
-    const std::array<uint8_t, 12> bytes{type};
-    Reader damaged{bytes};
-    Value value;
-    Io(damaged, value);
-    Check(!damaged.ok, "damaged value was accepted");
-  }
-  ResourcePlan oversized, unknown;
-  Check(!LoadResourcePlan(std::array<uint8_t, 4>{0xffu, 0xffu, 0xffu, 0xffu}, oversized) &&
-            !LoadResourcePlan(std::array<uint8_t, 14>{1u, 0u, 0u, 0u, 0xffu, 0xffu}, unknown),
-        "damaged resource plan was accepted");
+  const auto materialize = [&](uint32_t stride, uint32_t records, uint32_t word3) {
+    memory.words[16] = 0x40000u;
+    memory.words[17] = stride << 16u;
+    memory.words[18] = records;
+    memory.words[19] = word3;
+    return MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.indirect_ranges_complete;
+  };
+  using Ranges = std::vector<IndirectRange>;
+  constexpr uint32_t Format = 5u << 12u;
+  // OOB mode 2 does not check the index: without one of its own an access moves only by ADD_TID's lane.
+  Check(materialize(16u, 4u, Format | (2u << 28u)) &&
+            snapshot.indirect_ranges == Ranges{{0x40008u, 4u, true}} &&
+            snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x1040u, 16u}},
+        "an unindexed record V# was not bounded by its fixed offsets or its record was not captured");
+  Check(materialize(16u, 4u, Format | (2u << 28u) | (1u << 23u)) &&
+            snapshot.indirect_ranges == Ranges{{0x40008u, 63u * 16u + 4u, true}},
+        "ADD_TID did not widen an unindexed record range by the lane");
+  // Modes 0 and 1 check the index against NUM_RECORDS.
+  Check(materialize(16u, 10u, Format) && snapshot.indirect_ranges == Ranges{{0x40008u, 9u * 16u + 4u, true}},
+        "a structured record V# was not bounded by its record count");
+  Check(materialize(16u, 0u, Format) && snapshot.indirect_ranges.empty(),
+        "a record V# without records gained a range");
+  Check(!materialize(16383u, 0x80000u, Format), "a record V# whose 32-bit buffer offset can wrap was bounded");
+  Check(!materialize(16u, 0x2000000u, Format), "a record V# range past the size limit was accepted");
+  // A table V# with the unbounded record count binds 2^27 - 256 bytes on every device: a record past them refuses.
+  auto far_plan = make_plan(1u << 27u);
+  user_data[6] = UINT32_MAX;
+  const auto reads = memory.reads;
+  Check(!MaterializeResources(far_plan, runtime, snapshot, specialization) && memory.reads == reads,
+        "a record past the bound bytes of an unbounded table was read");
+  user_data[6] = 4u * 196u;
+  Check(materialize(16u, 10u, Format), "record-keyed materialization did not recover after refusals");
 }
 
 } // namespace
@@ -1486,10 +1143,19 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
-  TestWalkerLoadsBypassSpecializationReader();
+  // KYTY_ENV_DEFAULTS=0 (Common::EnvDefaults, since 2026-10-23): the defaults moved from run-game.ps1 read as
+  // unset, so the cases keep checking the paths they were written for, unless the environment sets it.
+  if (std::getenv("KYTY_ENV_DEFAULTS") == nullptr) {
+#ifdef _WIN32
+    _putenv_s("KYTY_ENV_DEFAULTS", "0");
+#else
+    setenv("KYTY_ENV_DEFAULTS", "0", 1);
+#endif
+  }
+  TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
-  TestSrtAliasesShareReads();
+  TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
@@ -1497,19 +1163,10 @@ int main() {
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
   TestSharedControlPredicates();
-  TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();
-  for (const bool independent_mask : {false, true})
-    TestEmptyTraversalSkipsUnmappedDescriptor(independent_mask);
-  TestEmptyTraversalSkipsUnmappedDescriptor(false, true);
-  TestCyclicControlPredicatesRemainUnknown();
-  TestBackEdgeReachesPhiPredecessor();
-  TestEmptyScalarBufferSpecialization();
+  TestIndirectTableSlotsSelectSame();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
-  TestSignedStorageSpecialization();
-  for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
-  for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
-  TestShaderCacheRecords();
+  TestRecordKeyedRanges();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

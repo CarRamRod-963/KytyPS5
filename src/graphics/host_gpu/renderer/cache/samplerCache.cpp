@@ -1,11 +1,49 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 
 #include "common/assert.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 namespace Libs::Graphics {
+
+// A sampler is created once per key and destroyed only by ~SamplerCache (m_samplers is never erased from or overwritten),
+// so each thread keeps a direct-mapped memo key -> handle in front of the locked lookup. An entry names its SamplerCache
+// by a never reused id: the entries of a destroyed cache can not match another one.
+
+namespace {
+
+constexpr size_t SamplerMemoSize = 256; // power of two
+
+struct SamplerMemoEntry {
+	uint64_t                owner = 0; // SamplerCache::m_instance_id, 0 = empty
+	std::array<uint32_t, 5> key {};
+	vk::Sampler             sampler;
+};
+
+thread_local std::array<SamplerMemoEntry, SamplerMemoSize> t_sampler_memo;
+
+size_t SamplerMemoSlot(const std::array<uint32_t, 5>& key) {
+	uint64_t hash = 0x9e3779b97f4a7c15ull;
+	for (const auto value: key) {
+		hash = (hash ^ value) * 0xff51afd7ed558ccdull;
+		hash ^= hash >> 32u;
+	}
+	return static_cast<size_t>(hash) & (SamplerMemoSize - 1u);
+}
+
+} // namespace
+
+uint64_t SamplerCache::NextInstanceId() {
+	static std::atomic<uint64_t> next {1};
+	return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 SamplerCache::~SamplerCache() {
 	for (const auto& [key, sampler]: m_samplers) {
@@ -15,9 +53,29 @@ SamplerCache::~SamplerCache() {
 }
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
-	Common::LockGuard lock(m_mutex);
-
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	auto& entry = t_sampler_memo[SamplerMemoSlot(key)];
+	if (entry.owner == m_instance_id && entry.key == key) return entry.sampler;
+
+	Common::LockGuard lock(m_mutex);
+	const auto sampler = GetSamplerLocked(r, integer_border, key);
+	entry.owner   = m_instance_id;
+	entry.key     = key;
+	entry.sampler = sampler;
+	return sampler;
+}
+
+bool SamplerCache::KeyOf(vk::Sampler sampler, std::array<uint32_t, 5>& key) {
+	Common::LockGuard lock(m_mutex);
+	if (auto iter = m_keys.find(static_cast<VkSampler>(sampler)); iter != m_keys.end()) {
+		key = iter->second;
+		return true;
+	}
+	return false;
+}
+
+vk::Sampler SamplerCache::GetSamplerLocked(const ShaderSamplerResource& r, bool integer_border,
+                                           const SamplerKey& key) {
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}
@@ -132,6 +190,13 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
 	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
+	if (r.DepthCompareFunc() != 0) {
+		static std::atomic_uint logged_funcs {0};
+		const auto bit = 1u << r.DepthCompareFunc();
+		if ((logged_funcs.fetch_or(bit) & bit) == 0) {
+			std::fprintf(stderr, "SAMPLER_COMPARE func=%u\n", static_cast<uint32_t>(r.DepthCompareFunc()));
+		}
+	}
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;
@@ -150,11 +215,28 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.mipLodBias       = 0.0f;
 	}
 
+	// FILTER_MODE (S# word 0 bits 29-30): 0 blends the filter footprint, 1 returns its minimum and
+	// 2 its maximum (used e.g. for min/max depth pyramids).
+	vk::SamplerReductionModeCreateInfo reduction {};
+	if (r.FilterMode() == 1u || r.FilterMode() == 2u) {
+		reduction.reductionMode = r.FilterMode() == 1u ? vk::SamplerReductionMode::eMin : vk::SamplerReductionMode::eMax;
+		sampler_info.pNext      = &reduction;
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 4u) {
+			std::fprintf(stderr, "SAMPLER_REDUCTION mode=%s mag=%u min=%u mip=%u\n",
+			             r.FilterMode() == 1u ? "min" : "max", static_cast<uint32_t>(r.XyMagFilter()),
+			             static_cast<uint32_t>(r.XyMinFilter()), static_cast<uint32_t>(r.MipFilter()));
+		}
+	}
+
 	vk::Sampler vk_sampler = nullptr;
 	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);
+	if (CmdSignature::Enabled()) {
+		m_keys.emplace(static_cast<VkSampler>(vk_sampler), key); // KYTY_TRACE_CMD_SIGNATURE
+	}
 	return vk_sampler;
 }
 

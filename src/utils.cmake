@@ -81,7 +81,10 @@ if(KYTY_CLANG_CL)
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 			
-	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /wd4244 /wd4305 /wd4800 /wd4345")
+	# Guest code runs natively and needs AVX2, so every host has it (upstream fd6b28c4b: x86-64-v3 without floating-point
+	# contraction). Spelled /arch:AVX2 (clang-cl: -target-cpu haswell, the same feature set): the maintainer's build scripts
+	# pass /arch:AVX2 in CMAKE_CXX_FLAGS_RELEASE as well, and clang-cl errors on that argument when -march overrides it.
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /arch:AVX2 /clang:-ffp-contract=off /wd4244 /wd4305 /wd4800 /wd4345")
   
 	if(KYTY_WARNINGS_ARE_ERRORS)
 		#set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /WX")

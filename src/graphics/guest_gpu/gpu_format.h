@@ -46,6 +46,7 @@ uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+bool                       Diagnostic111110UnormAsFloat();
 
 } // namespace Libs::Graphics::Prospero
 

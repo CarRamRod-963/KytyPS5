@@ -1,17 +1,26 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
+#include "common/shaderEnv.h"
 #include "common/logging/log.h"
+#include "common/workaroundHits.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -21,21 +30,15 @@ struct TessellationAddress {
 	Kind     kind        = Kind::Unknown;
 	uint32_t coefficient = 0;
 	uint32_t constant    = 0;
-
-	bool operator==(const TessellationAddress&) const = default;
 };
 
-// Reflects the LS output stride, or the HS output stride and patch constant range.
-void ReflectTessellationLayout(const Decoder::Program& program, bool local,
-                               ShaderTessellationInputInfo& info) {
+uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
+                                   uint32_t control_points, uint32_t input_stride) {
 	using namespace Decoder;
-	using Address   = TessellationAddress;
-	using Kind      = Address::Kind;
-	using Registers = std::array<Address, IR::NumVectorRegs>;
-
-	const auto control_points = local ? info.input_control_points : info.output_control_points;
-	Registers  entry {}, registers;
-	entry[local ? 3u : 1u] =
+	using Address = TessellationAddress;
+	using Kind    = Address::Kind;
+	std::array<Address, IR::NumVectorRegs> registers {};
+	registers[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
 	const auto read     = [&](const Operand& operand) -> Address {
@@ -85,125 +88,161 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
-	// A branch joins its target with the fallthrough path. Definitions that differ between
-	// the paths are unknown there. Loop headers repeat the walk until back edges are stable.
-	std::unordered_map<uint32_t, Registers> joins, loops;
-	const auto merge = [](Registers& into, const Registers& from) {
-		bool changed = false;
-		for (uint32_t index = 0; index < into.size(); index++) {
-			if (into[index] == from[index]) continue;
-			changed |= into[index] != Address {};
-			into[index] = {};
-		}
-		return changed;
+	uint32_t stride = 0;
+	// Data flow over the instructions: the register state at a branch target is the merge of the states of every path
+	// reaching it (equal definitions survive, others become unknown), iterated to a fixed point so forward branches and
+	// loops are handled; code after an unconditional branch is reached only through such a join. Branches to the last
+	// instruction (stage exits) preserve the active path's definitions, as before. The address checks run once over the
+	// converged states.
+	using Registers = std::array<Address, IR::NumVectorRegs>;
+	const auto same = [](const Address& a, const Address& b) {
+		return a.kind == b.kind && a.coefficient == b.coefficient && a.constant == b.constant;
 	};
-
-	uint32_t stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
-	for (bool repeat = true; repeat;) {
-		repeat    = false;
-		registers = entry;
-		for (const auto& inst: program.instructions) {
-			if (const auto join = joins.find(inst.pc); join != joins.end()) {
-				merge(registers, join->second);
-				joins.erase(join);
-			}
-			if (const auto loop = loops.find(inst.pc); loop != loops.end())
-				merge(registers, loop->second);
-			if (IsDirectBranch(inst.opcode)) {
-				const bool back = inst.branch_target <= inst.pc;
-				const auto [join, inserted] =
-				    (back ? loops : joins).try_emplace(inst.branch_target, registers);
-				const bool changed = !inserted && merge(join->second, registers);
-				repeat |= back && (inserted || changed);
-			}
-			const bool local_store  = IsDsWriteOpcode(inst.opcode);
-			const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
-			const bool control_store = !local && buffer_store &&
-			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-			if ((local && local_store) || control_store) {
-				const auto address = read(inst.src0);
-				if (address.kind != Kind::Affine) {
-					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
-					     local ? "LS" : "HS", inst.pc);
-				}
-				if (address.coefficient != 0u) {
-					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
-					                     (stride != 0u && stride != address.coefficient));
-					stride = address.coefficient;
-				} else if (control_store) {
-					// Control-point-independent HS outputs are patch constants.
-					const auto begin = address.constant + inst.offset;
-					patch_begin      = std::min(patch_begin, begin);
-					patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
+	const auto& insts = program.instructions;
+	const auto  exit_pc = insts.back().pc;
+	std::unordered_map<uint32_t, size_t> index_of;
+	for (size_t i = 0; i < insts.size(); i++) index_of.emplace(insts[i].pc, i);
+	std::vector<Registers> in(insts.size());
+	std::vector<bool>      reached(insts.size(), false), queued(insts.size(), false);
+	std::vector<size_t>    work;
+	const auto join_into = [&](size_t target, const Registers& state) {
+		if (!reached[target]) {
+			reached[target] = true;
+			in[target]      = state;
+		} else {
+			bool changed = false;
+			for (size_t r = 0; r < state.size(); r++) {
+				if (!same(in[target][r], state[r]) && in[target][r].kind != Kind::Unknown) {
+					in[target][r] = {};
+					changed       = true;
 				}
 			}
-			// Store vdata is a source, despite occupying the decoder's dst field.
-			if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
-			const auto lhs   = read(inst.src0);
-			const auto rhs   = read(inst.src1);
-			const auto third = read(inst.src2);
-			Address    value;
-			switch (inst.opcode) {
-				case Opcode::V_BFE_U32:
-					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
-					}
-					break;
-				case Opcode::V_AND_B32: {
-					const auto mask = lhs.kind == Kind::PackedControlPoint ? rhs
-					                : rhs.kind == Kind::PackedControlPoint ? lhs
-					                                                       : Address {};
-					if (mask == constant(0xffu)) value = constant(0u);
-					if (mask == constant(0x1f00u)) value = {Kind::Affine, 256u, 0u};
-					break;
-				}
-				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
-				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
-				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
-				case Opcode::V_MAD_U32_U24:
-					value = add(multiply(low24(lhs), low24(rhs)), third);
-					break;
-				case Opcode::V_LSHL_ADD_U32:
-					if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
-						value = add(multiply(lhs, constant(1u << rhs.constant)), third);
-					break;
-				case Opcode::V_LSHLREV_B32:
-					if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
-						value = multiply(rhs, constant(1u << lhs.constant));
-					break;
-				case Opcode::V_SUB_NC_U32:
-					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-						value =
-						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
-					break;
-				default: break;
-			}
-			if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
-			    inst.dst.dpp)
-				value = {};
-			for (uint32_t index = 0;
-			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size();
-			     index++) {
-				registers[inst.dst.reg + index] = {};
-			}
-			registers.at(inst.dst.reg) = value;
+			if (!changed) return;
 		}
+		if (!queued[target]) {
+			queued[target] = true;
+			work.push_back(target);
+		}
+	};
+	const auto step = [&](const Decoder::Instruction& inst, bool check) {
+		const bool local_store =
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
+		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
+		const bool control_store =
+		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
+		const bool control_read =
+		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+		               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
+		if (check && ((local && local_store) || control_store || control_read)) {
+			const auto address = read(inst.src0);
+			if (address.kind != Kind::Affine) {
+				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
+				     inst.pc);
+			}
+			if (address.coefficient != 0u) {
+				const auto expected = control_read ? input_stride : stride;
+				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
+				                     (expected != 0u && expected != address.coefficient));
+				if (!control_read) stride = address.coefficient;
+			}
+		}
+		// Store vdata is a source, despite occupying the decoder's dst field.
+		if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) return;
+		const auto lhs   = read(inst.src0);
+		const auto rhs   = read(inst.src1);
+		const auto third = read(inst.src2);
+		Address    value;
+		switch (inst.opcode) {
+			case Opcode::V_BFE_U32:
+				if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+				    rhs.coefficient == 0u && third.kind == Kind::Affine &&
+				    third.coefficient == 0u) {
+					if (rhs.constant == 8u && third.constant == 5u) value = {Kind::Affine, 1u, 0u};
+					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+				}
+				break;
+			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
+			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
+			case Opcode::V_LSHL_ADD_U32:
+				if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
+					value = add(multiply(lhs, constant(1u << rhs.constant)), third);
+				break;
+			case Opcode::V_LSHLREV_B32:
+				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
+					value = multiply(rhs, constant(1u << lhs.constant));
+				break;
+			case Opcode::V_MOV_B32: value = lhs; break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+			case Opcode::V_AND_B32:
+				// The packed HS ID's low byte (& 0xff) is the patch ordinal, 0 for the logical interface.
+				if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine && rhs.coefficient == 0u &&
+				     rhs.constant == 0xffu) ||
+				    (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine && lhs.coefficient == 0u &&
+				     lhs.constant == 0xffu)) {
+					value = constant(0u);
+				} else if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine && rhs.coefficient == 0u &&
+				            rhs.constant == 0x1f00u) ||
+				           (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine && lhs.coefficient == 0u &&
+				            lhs.constant == 0x1f00u)) {
+					// Upstream 77458260f: the masked control-point field (& 0x1f00) is the control point times 256.
+					value = {Kind::Affine, 256u, 0u};
+				} else if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && rhs.kind == Kind::Affine &&
+				           rhs.coefficient == 0u) {
+					value = constant(lhs.constant & rhs.constant);
+				}
+				break;
+			case Opcode::V_OR_B32:
+				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && rhs.kind == Kind::Affine &&
+				    rhs.coefficient == 0u)
+					value = constant(lhs.constant | rhs.constant);
+				break;
+			case Opcode::V_SUB_NC_U32:
+				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
+				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
+					value = affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+				break;
+			default: break;
+		}
+		if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
+		    inst.dst.dpp)
+			value = {};
+		for (uint32_t index = 0;
+		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size(); index++) {
+			registers[inst.dst.reg + index] = {};
+		}
+		registers.at(inst.dst.reg) = value;
+	};
+	join_into(0, registers);
+	while (!work.empty()) {
+		const auto i = work.back();
+		work.pop_back();
+		queued[i]          = false;
+		registers          = in[i];
+		const auto& inst   = insts[i];
+		bool        falls  = true;
+		if (IsDirectBranch(inst.opcode) && inst.branch_target != exit_pc) {
+			const auto target = index_of.find(inst.branch_target);
+			EXIT_NOT_IMPLEMENTED(target == index_of.end());
+			join_into(target->second, registers);
+			falls = inst.opcode != Opcode::S_BRANCH;
+		} else if (!IsDirectBranch(inst.opcode)) {
+			step(inst, false);
+		}
+		if (falls && i + 1 < insts.size()) join_into(i + 1, registers);
 	}
-	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
-	(local ? info.ls_stride : info.hs_stride) = stride;
-	if (patch_end != 0u) {
-		EXIT_NOT_IMPLEMENTED(patch_begin < stride * control_points);
-		info.patch_base = patch_begin;
-		info.patch_size = patch_end - patch_begin;
+	for (size_t i = 0; i < insts.size(); i++) {
+		if (!reached[i] || IsDirectBranch(insts[i].opcode)) continue;
+		registers = in[i];
+		step(insts[i], true);
 	}
+	EXIT_NOT_IMPLEMENTED(stride == 0u);
+	return stride;
 }
 
 const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
@@ -214,15 +253,6 @@ const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
 	                                                                                 : nullptr;
 }
 
-// Whether an access predicate, possibly a conjunction of EXEC masks, implies a condition.
-bool Implies(IR::Value predicate, IR::Value condition) {
-	predicate = predicate.Resolve();
-	if (predicate == condition.Resolve()) return true;
-	const auto* inst = predicate.TryInstruction();
-	return inst != nullptr && inst->GetOpcode() == IR::ValueOpcode::LogicalAnd &&
-	       (Implies(inst->Arg(0), condition) || Implies(inst->Arg(1), condition));
-}
-
 IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value value,
                         IR::Value predicate, std::unordered_map<IR::Inst*, IR::Value>& resolved) {
 	using namespace IR;
@@ -231,46 +261,181 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	if (source == nullptr) return value;
 	if (const auto found = resolved.find(source); found != resolved.end()) return found->second;
 	if (source->GetOpcode() == ValueOpcode::SelectU32) {
-		return Implies(predicate, source->Arg(0))
+		return source->Arg(0).Resolve() == predicate.Resolve()
 		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
 		           : value;
 	}
-	// Pure address arithmetic that stays behind EXEC selects; mul24 lowers to IMul32 of BFEs.
-	const auto opcode = source->GetOpcode();
-	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
-	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract)
+	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
 		return value;
-	std::array<Value, 3> args;
-	bool                 changed = false;
-	for (size_t index = 0; index < source->NumArgs(); index++) {
-		args[index] = ActiveAddress(block, before, source->Arg(index), predicate, resolved);
-		changed |= args[index] != source->Arg(index).Resolve();
-	}
-	if (changed) {
-		const auto flags = source->Flags<uint64_t>();
-		const auto copy =
-		    source->NumArgs() == 2u
-		        ? block.PrependNewInst(before, opcode, {args[0], args[1]}, flags)
-		        : block.PrependNewInst(before, opcode, {args[0], args[1], args[2]}, flags);
-		value = Value(&*copy);
+	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
+	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
+	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
+		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
+		                                 source->Flags<uint64_t>());
+		value     = Value(&*copy);
 	}
 	resolved.emplace(source, value);
 	return value;
 }
 
+// A ring address the constant propagation cannot fold is evaluated with the lane's predicated VGPR writes taken as
+// performed (the access runs under the EXEC of the lanes that wrote its address registers) through additions, 24-bit
+// multiplies, shifts and masks. The water hull shader c1a55c56c2e59361 stores its per-patch data at
+// 0x8000 - 0x60 * (patch ordinal + 1); unfolded, that address was taken as control-point data of invocation 0
+// (32672 % 80) and overwrote control point 0 (exploded water). Exact when every write taken as performed was made
+// by every accessing lane or leaves the same address either way (all cases in the game are the first);
+// an address that depends on the lane stops the translation.
+// `access_predicate` / `other_exec` (KYTY_TRACE_PERF, PERF workaround_hits tess_ring): set when a predicated write taken
+// as performed was made under another EXEC value than the access's (the case the evaluation cannot prove exact).
+bool EvaluateActiveAddress(IR::Value value, uint32_t& result, uint32_t depth = 0, const IR::Value* access_predicate = nullptr,
+                           bool* other_exec = nullptr) {
+	using namespace IR;
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != Type::U32) return false;
+		result = value.U32();
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 48u) return false;
+	uint32_t a = 0, b = 0, c = 0;
+	const auto arg = [&](size_t index, uint32_t& out) {
+		return EvaluateActiveAddress(inst->Arg(index), out, depth + 1u, access_predicate, other_exec);
+	};
+	// (x << s) & m == 0 and BFE(x << s, offset, count) == 0 when the field lies below the shift (packed patch ordinal).
+	const auto shifted_below = [](const Inst* source, uint32_t limit) {
+		if (source == nullptr || source->GetOpcode() != ValueOpcode::ShiftLeftLogical32) return false;
+		const auto shift = source->Arg(1).Resolve();
+		return shift.IsImmediate() && shift.U32() < 32u && limit <= shift.U32();
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::SelectU32:
+			// A predicated VGPR write: Select(exec, new value, old value).
+			if (arg(1, a)) {
+				if (other_exec != nullptr && access_predicate != nullptr &&
+				    inst->Arg(0).Resolve() != access_predicate->Resolve()) {
+					// Still exact when every accessing lane made the write (the access's EXEC is a LogicalAnd chain with
+					// the write's) or when the old value is the same address; otherwise the address depends on the lane.
+					const auto implies = [&](auto&& self, Value p, Value q, uint32_t d) -> bool {
+						p = p.Resolve();
+						if (p == q) return true;
+						const auto* conj = p.TryInstruction();
+						return d < 8u && conj != nullptr && conj->GetOpcode() == ValueOpcode::LogicalAnd &&
+						       (self(self, conj->Arg(0), q, d + 1u) || self(self, conj->Arg(1), q, d + 1u));
+					};
+					uint32_t   old     = 0;
+					const bool covered = implies(implies, *access_predicate, inst->Arg(0).Resolve(), 0u);
+					const bool same    = !covered && arg(2, old) && old == a;
+					static std::atomic_uint logged {0};
+					if (logged.fetch_add(1) < 32u) {
+						std::fprintf(stderr, "TESS_RING_PREDICATE %s new=%u%s\n",
+						             covered ? "covered" : same ? "same_both" : "lane_dependent", a,
+						             same ? "" : covered ? "" : " (address depends on the lane)");
+					}
+					if (!covered && !same) *other_exec = true;
+				}
+				result = a;
+				return true;
+			}
+			return false;
+		case ValueOpcode::Phi: {
+			bool found = false;
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				if (!arg(i, a)) return false;
+				if (found && a != result) return false;
+				result = a;
+				found  = true;
+			}
+			return found;
+		}
+		case ValueOpcode::IAdd32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a + b;
+			return true;
+		case ValueOpcode::ISub32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a - b;
+			return true;
+		case ValueOpcode::IMul32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a * b;
+			return true;
+		case ValueOpcode::ShiftLeftLogical32:
+			if (!arg(0, a) || !arg(1, b) || b >= 32u) return false;
+			result = a << b;
+			return true;
+		case ValueOpcode::ShiftRightLogical32:
+			if (!arg(0, a) || !arg(1, b) || b >= 32u) return false;
+			result = a >> b;
+			return true;
+		case ValueOpcode::BitwiseOr32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a | b;
+			return true;
+		case ValueOpcode::BitwiseAnd32: {
+			for (size_t side = 0; side < 2u; side++) {
+				const auto mask = inst->Arg(side ^ 1u).Resolve();
+				if (mask.IsImmediate()) {
+					uint32_t width = 0;
+					while (width < 32u && (mask.U32() >> width) != 0u) width++;
+					if (shifted_below(inst->Arg(side).Resolve().TryInstruction(), width)) {
+						result = 0;
+						return true;
+					}
+				}
+			}
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a & b;
+			return true;
+		}
+		case ValueOpcode::BitFieldUExtract: {
+			if (!arg(1, b) || !arg(2, c) || b > 32u || c > 32u - b) return false;
+			if (shifted_below(inst->Arg(0).Resolve().TryInstruction(), b + c)) {
+				result = 0;
+				return true;
+			}
+			if (!arg(0, a)) return false;
+			result = c == 0u ? 0u : c == 32u ? a : (a >> b) & ((1u << c) - 1u);
+			return true;
+		}
+		default: return false;
+	}
+}
+
 } // namespace
+
 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
-	ReflectTessellationLayout(local_program, true, info);
-	ReflectTessellationLayout(control_program, false, info);
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
-	     "patch_base=0x%x patch_size=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
-	     info.patch_base, info.patch_size);
+	// KYTY_TRACE_SHADER_CODE_DIR=<dir> (diagnostic): the LS and HS code of every analysed pair, raw and decoded, named
+	// by an FNV-1a hash of the code (written before the analysis, so an unsupported pattern can be inspected).
+	if (const char* dir = Common::EnvRead::ShaderCodeDir(); dir != nullptr) {
+		const auto dump = [&](const char* stage, std::span<const uint32_t> code, const Decoder::Program& decoded) {
+			uint64_t hash = 0xcbf29ce484222325ull;
+			for (const auto word: code) hash = (hash ^ word) * 0x100000001b3ull;
+			const auto base = fmt::format("{}/tess_{}_{:016x}", dir, stage, hash);
+			if (FILE* f = std::fopen((base + ".bin").c_str(), "wb")) {
+				std::fwrite(code.data(), 1, code.size_bytes(), f);
+				std::fclose(f);
+			}
+			const auto text = Decoder::ProgramToString(decoded);
+			if (FILE* f = std::fopen((base + ".asm").c_str(), "w")) {
+				std::fwrite(text.data(), 1, text.size(), f);
+				std::fclose(f);
+			}
+			std::fprintf(stderr, "TESS_DUMP %s %s.bin (%zu dwords)\n", stage, base.c_str(), code.size());
+		};
+		dump("ls", local, local_program);
+		dump("hs", control, control_program);
+	}
+	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
+	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
+	                                           info.ls_stride);
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
@@ -291,7 +456,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		}
 	}
 	ConstantPropagationPass(program.blocks, program.wave_size);
-	uint32_t reads = 0, writes = 0, factors = 0, patches = 0;
+	uint32_t reads = 0, writes = 0, factors = 0;
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto&      inst   = *it;
@@ -328,28 +493,44 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				components = BufferComponentCount(inst.GetOpcode());
 				address    = inst.Arg(2).Resolve();
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
+				if (bool other_exec = false; !address.IsImmediate()) {
+					if (uint32_t evaluated = 0; EvaluateActiveAddress(address, evaluated, 0, &predicate, &other_exec)) {
+						static std::atomic_uint logged {0};
+						if (other_exec || logged.fetch_add(1) < 16u) {
+							std::fprintf(stderr, "TESS_RING_ADDRESS stage=%u write=%d address=%u%s\n",
+							             static_cast<uint32_t>(options.stage), write ? 1 : 0, evaluated,
+							             other_exec ? " other_exec" : "");
+						}
+						address = Value(evaluated);
+						// KYTY_TRACE_PERF (PERF workaround_hits tess_ring): per translated program.
+						Common::WorkaroundHits::Note(Common::WorkaroundHits::Hit::TessRingEvaluated);
+						if (other_exec) {
+							EXIT("tessellation ring address %u depends on the lane (stage %u): a predicated write the access does not "
+							     "cover\n",
+							     evaluated, static_cast<uint32_t>(options.stage));
+						}
+					}
+				}
 				if (base->Arg(0).U32() == 1u) {
 					EXIT_NOT_IMPLEMENTED(!write ||
 					                     options.stage != ShaderType::TessellationControl);
 					kind = TessellationAttribute::Factor;
 					factors += components;
 				} else {
-					// After its barrier, the HS may read back outputs of other control points.
-					const bool output = options.stage == ShaderType::TessellationControl;
-					EXIT_NOT_IMPLEMENTED(
-					    !output && (write || options.stage != ShaderType::TessellationEvaluation));
-					kind = output ? TessellationAttribute::ControlOutput
-					              : TessellationAttribute::EvaluationInput;
+					kind = write ? TessellationAttribute::ControlOutput
+					             : TessellationAttribute::EvaluationInput;
+					EXIT_NOT_IMPLEMENTED(write
+					                         ? options.stage != ShaderType::TessellationControl
+					                         : options.stage != ShaderType::TessellationEvaluation);
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
-						const auto begin = address.U32() + memory.offset;
-						EXIT_NOT_IMPLEMENTED(begin < tess.patch_base ||
-						                     begin + 4u * components >
-						                         tess.patch_base + tess.patch_size);
-						kind = output ? TessellationAttribute::PatchOutput
-						              : TessellationAttribute::PatchInput;
-						// HS read-backs must not hide misplaced patch stores from the check below.
-						if (write || !output) patches += components;
+						if (!write) {
+							EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::TessellationEvaluation);
+							kind = TessellationAttribute::PatchInput;
+						} else {
+							EXIT_NOT_IMPLEMENTED(!write);
+							kind = TessellationAttribute::PatchOutput;
+						}
 					}
 				}
 			} else {
@@ -400,14 +581,11 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
-	// Patch constant stores whose EXEC selects were not stripped would land in control points.
-	EXIT_NOT_IMPLEMENTED(options.stage == ShaderType::TessellationControl &&
-	                     tess.patch_size != 0u && patches == 0u);
-	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u patches=%u\n",
+	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"
 	                                                       : "TES",
-	     reads, writes, factors, patches);
+	     reads, writes, factors);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

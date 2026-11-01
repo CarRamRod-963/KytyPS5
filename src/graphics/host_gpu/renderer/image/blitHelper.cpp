@@ -193,6 +193,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+	// The blit's pipeline declares only viewport and scissor dynamic, so binding it replaced the
+	// pipeline and the dynamic state the game's draws recorded (KYTY_DIAG_DRAW_STATE_FILTER).
+	command_buffer.InvalidateGraphicsState();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();
 }

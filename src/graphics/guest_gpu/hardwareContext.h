@@ -412,7 +412,7 @@ struct ScreenViewport {
 	uint16_t clip_rect_rule                       = 0xffffu;
 	int      clip_rect_left[4]                    = {};
 	int      clip_rect_top[4]                     = {};
-	int      clip_rect_right[4]                   = {16384, 16384, 16384, 16384};
+	int      clip_rect_right[4]                   = {16384, 16384, 16384, 16384}; // upstream 4eb5ee110
 	int      clip_rect_bottom[4]                  = {16384, 16384, 16384, 16384};
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
@@ -597,10 +597,17 @@ struct ShaderRegisters {
 	}
 };
 
+enum class UserSgprType { Unknown, Region, Vsharp };
+
 struct UserSgprInfo {
 	static constexpr int SGPRS_MAX = 32;
 
-	uint32_t value[SGPRS_MAX] = {0};
+	uint32_t     value[SGPRS_MAX] = {0};
+	UserSgprType type[SGPRS_MAX]  = {};
+	uint32_t     count            = 0;
+	// KYTY_UPSTREAM_GPU_INDIRECT_RECORDS=2 (GS user data only): the registers a GPU-executed indirect packet named, which
+	// on the hardware hold its last record's offsets until the next write; the command processor never wrote them.
+	uint32_t indirect_stale = 0;
 };
 
 struct VertexShaderInfo {
@@ -685,6 +692,8 @@ public:
 
 	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
+	// Upstream f7226ca7d (object/primitive IDs always to RT7) - not used: our the ObjPrimID write writes them to the
+	// slot the payload registers name (GetDrawPayloadControl / GetObjprimIdControl), so m_sh_regs' copies stay 0.
 	[[nodiscard]] bool HasObjectPrimitiveIdOutput() const {
 		return (m_sh_regs.m_vgtDrawPayloadCntl & 1u) != 0 &&
 		       (m_render_target_mask & 0xf0000000u) != 0;
@@ -871,6 +880,14 @@ public:
 	[[nodiscard]] uint8_t GetStencilClearValue() const { return m_stencil_clear_value; }
 	void SetStencilClearValue(uint8_t clear_value) { m_stencil_clear_value = clear_value; }
 
+	// VGT_DRAW_PAYLOAD_CNTL (bit 0 OBJPRIM_ID_EN, bit 3 OBJECT_ID_INST_EN) and PA_CL_OBJPRIM_ID_CNTL (bit 0
+	// OBJ_ID_SEL, bit 1 ADD_PIPED_PRIM_ID, bit 2 EN_32BIT_OBJPRIMID): the hardware ObjPrimID write
+	// (the ObjPrimID write).
+	[[nodiscard]] uint32_t GetDrawPayloadControl() const { return m_draw_payload_cntl; }
+	void                   SetDrawPayloadControl(uint32_t value) { m_draw_payload_cntl = value; }
+	[[nodiscard]] uint32_t GetObjprimIdControl() const { return m_objprim_id_cntl; }
+	void                   SetObjprimIdControl(uint32_t value) { m_objprim_id_cntl = value; }
+
 	[[nodiscard]] float    GetLineWidth() const { return m_line_width; }
 	void                   SetLineWidth(float width) { m_line_width = width; }
 	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
@@ -892,8 +909,6 @@ public:
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
 	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
-	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
-	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
 	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
 	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }
@@ -924,6 +939,8 @@ public:
 private:
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
+	uint32_t m_draw_payload_cntl     = 0;
+	uint32_t m_objprim_id_cntl       = 0;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
@@ -1052,10 +1069,32 @@ public:
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
 
-	void SetPsUserSgpr(uint32_t id, uint32_t value) { m_ps.ps_user_sgpr.value[id] = value; }
-	void SetCsUserSgpr(uint32_t id, uint32_t value) { m_cs.cs_user_sgpr.value[id] = value; }
-	void SetHsUserSgpr(uint32_t id, uint32_t value) { m_vs.hs_user_sgpr.value[id] = value; }
-	void SetGsUserSgpr(uint32_t id, uint32_t value) { m_vs.gs_user_sgpr.value[id] = value; }
+	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_ps.ps_user_sgpr.value[id] = value;
+		m_ps.ps_user_sgpr.type[id]  = type;
+		m_ps.ps_user_sgpr.count =
+		    ((id + 1) > m_ps.ps_user_sgpr.count ? (id + 1) : m_ps.ps_user_sgpr.count);
+	}
+	void SetCsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_cs.cs_user_sgpr.value[id] = value;
+		m_cs.cs_user_sgpr.type[id]  = type;
+		m_cs.cs_user_sgpr.count =
+		    ((id + 1) > m_cs.cs_user_sgpr.count ? (id + 1) : m_cs.cs_user_sgpr.count);
+	}
+	void SetHsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.hs_user_sgpr.value[id] = value;
+		m_vs.hs_user_sgpr.type[id]  = type;
+		m_vs.hs_user_sgpr.count =
+		    ((id + 1) > m_vs.hs_user_sgpr.count ? (id + 1) : m_vs.hs_user_sgpr.count);
+	}
+	void SetGsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.gs_user_sgpr.value[id] = value;
+		m_vs.gs_user_sgpr.type[id]  = type;
+		m_vs.gs_user_sgpr.count =
+		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
+		m_vs.gs_user_sgpr.indirect_stale &= ~(1u << id);
+	}
+	void MarkGsIndirectStale(uint32_t mask) { m_vs.gs_user_sgpr.indirect_stale |= mask; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

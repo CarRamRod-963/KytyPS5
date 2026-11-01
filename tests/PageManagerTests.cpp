@@ -554,6 +554,58 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestImageReadWatch() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(address + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracking region");
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  // The bit stands above the watcher counts: no access while set, back to what the watchers need when cleared.
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(!manager.ImageReadArmed(address) && !manager.ImageReadBypass(address),
+        "an unarmed page reports the image read watch");
+  manager.ArmImageRead(address + 16, page_size); // the two pages the range touches
+  Check(Protection(memory) == PAGE_NOACCESS && Protection(memory + page_size) == PAGE_NOACCESS,
+        "the image read watch did not remove access");
+  Check(IsWritable(memory + page_size * 2), "the image read watch touched a page outside its range");
+  Check(manager.ImageReadArmed(address) && manager.ImageReadArmedInRange(address + 8, 1) &&
+            !manager.ImageReadArmedInRange(address + page_size * 2, page_size),
+        "the image read bit is not reported");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS, "a watcher change lifted the image read watch");
+  manager.UpdatePageWatchers<true>(address, page_size);
+  manager.DisarmImageRead(address, page_size * 2);
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "disarming did not restore what the watchers need");
+
+  // The buffer cache's access watcher: the emulator's own read must fault, not read around it.
+  RegionBits access;
+  access.Set(0);
+  manager.UpdatePageWatchersForRegion<true, true>(address, access);
+  manager.ArmImageRead(address, page_size);
+  Check(!manager.ImageReadBypass(address), "the bypass hides a page the buffer cache watches");
+
+  // The merged pass (OpenPageWatchersForRegion) must not open an armed page, and page 1 between two changed pages must
+  // not take a run's mode either.
+  manager.UpdatePageWatchers<true>(address + page_size, page_size * 2);
+  manager.ArmImageRead(address + page_size, page_size);
+  RegionBits read_open = access;
+  RegionBits write_open;
+  write_open.SetRange(0, 3);
+  manager.OpenPageWatchersForRegion(address, read_open, write_open);
+  Check(Protection(memory) == PAGE_NOACCESS && Protection(memory + page_size) == PAGE_NOACCESS,
+        "the merged pass opened a page under the image read watch");
+  Check(IsWritable(memory + page_size * 2), "the merged pass did not open a page without the watch");
+  manager.DisarmImageRead(address, page_size * 2);
+  Check(IsWritable(memory) && IsWritable(memory + page_size), "disarming left a page closed after the merged pass");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestConcurrentSharedWatchers() {
   constexpr size_t worker_count = 8;
   PageManager manager;
@@ -704,6 +756,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestImageReadWatch();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");

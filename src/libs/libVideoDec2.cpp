@@ -4,10 +4,15 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs {
@@ -301,6 +306,17 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// One output picture as the decoder writes it: NV12, rows padded to a 256-byte pitch (see
+// videoDec2Decoder.cpp), rounded up to 64 KiB. Games size their frame pools from this value
+// (Ghost of Yotei needs at least 4 frames and skipped every movie with the old fixed 16 MiB).
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
+	const auto width  = static_cast<uint64_t>(std::max(config->max_frame_width, 1));
+	const auto height = static_cast<uint64_t>(std::max(config->max_frame_height, 1));
+	const auto pitch  = (width + 255u) & ~uint64_t {255};
+	const auto bytes  = pitch * height + pitch * ((height + 1u) / 2u);
+	return static_cast<size_t>((bytes + 0xffffu) & ~uint64_t {0xffff});
+}
+
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
 	PRINT_NAME();
@@ -325,7 +341,7 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -354,7 +370,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -557,20 +573,96 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 	return OK;
 }
 
+// KYTY_TRACE_VIDEODEC=1: every Videodec2 call with its result on stderr (first 32 per function,
+// then every 256th); the PRINT_NAME switch only covers the thread that registered the library.
+static int32_t TraceVideodec(const char* function, int32_t result, uint64_t detail = 0, uint64_t caller = 0) {
+	static const bool enabled = std::getenv("KYTY_TRACE_VIDEODEC") != nullptr;
+	if (enabled) {
+		static std::mutex                                  mutex;
+		static std::unordered_map<std::string, uint64_t>   calls;
+		std::scoped_lock                                   lock(mutex);
+		const auto                                         n = calls[function]++;
+		if (n < 32u || n % 256u == 0u) {
+			std::fprintf(stderr, "VIDEODEC %s #%llu result=0x%08x detail=0x%llx caller=0x%llx\n", function,
+			             static_cast<unsigned long long>(n), static_cast<uint32_t>(result),
+			             static_cast<unsigned long long>(detail), static_cast<unsigned long long>(caller));
+		}
+	}
+	return result;
+}
+
+static int32_t KYTY_SYSV_ABI TracedQueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* info) {
+	return TraceVideodec("QueryComputeMemoryInfo", QueryComputeMemoryInfo(info));
+}
+static int32_t KYTY_SYSV_ABI TracedAllocateComputeQueue(const Videodec2ComputeConfigInfo* config,
+                                                        const Videodec2ComputeMemoryInfo* memory,
+                                                        Videodec2ComputeQueue*            queue) {
+	return TraceVideodec("AllocateComputeQueue", AllocateComputeQueue(config, memory, queue));
+}
+static int32_t KYTY_SYSV_ABI TracedReleaseComputeQueue(Videodec2ComputeQueue queue) {
+	return TraceVideodec("ReleaseComputeQueue", ReleaseComputeQueue(queue));
+}
+static int32_t KYTY_SYSV_ABI TracedQueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
+                                                          Videodec2DecoderMemoryInfo*       memory) {
+	return TraceVideodec("QueryDecoderMemoryInfo", QueryDecoderMemoryInfo(config, memory));
+}
+static int32_t KYTY_SYSV_ABI TracedCreateDecoder(const Videodec2DecoderConfigInfo* config,
+                                                 const Videodec2DecoderMemoryInfo* memory,
+                                                 Videodec2Decoder*                 decoder) {
+	// KYTY_TRACE_VIDEODEC_CODE=<file>: 16 KiB of guest code around the caller (once), for reading
+	// what the game does with the result.
+	if (static bool dumped = false; !dumped) {
+		dumped = true;
+		if (const char* path = std::getenv("KYTY_TRACE_VIDEODEC_CODE"); path != nullptr) {
+			const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			if (FILE* f = std::fopen(path, "wb")) {
+				const uint64_t base = (caller & ~uint64_t {0xfff}) - 0x6000;
+				std::fwrite(&base, sizeof(base), 1, f);
+				std::fwrite(reinterpret_cast<const void*>(base), 1, 0x8000, f);
+				std::fclose(f);
+			}
+		}
+	}
+	return TraceVideodec("CreateDecoder", CreateDecoder(config, memory, decoder),
+	                     config != nullptr ? (static_cast<uint64_t>(config->max_frame_width) << 32u | static_cast<uint32_t>(config->max_frame_height)) : 0,
+	                     reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
+static int32_t KYTY_SYSV_ABI TracedDeleteDecoder(Videodec2Decoder decoder) {
+	return TraceVideodec("DeleteDecoder", DeleteDecoder(decoder), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
+static int32_t KYTY_SYSV_ABI TracedDecode(Videodec2Decoder decoder, const Videodec2InputData* input,
+                                          Videodec2FrameBuffer* frame, Videodec2OutputInfo* output) {
+	const auto result = Decode(decoder, input, frame, output);
+	return TraceVideodec("Decode", result,
+	                     (input != nullptr ? input->au_size : 0) |
+	                         (frame != nullptr && frame->is_accepted ? (1ull << 63u) : 0));
+}
+static int32_t KYTY_SYSV_ABI TracedFlush(Videodec2Decoder decoder, Videodec2FrameBuffer* frame,
+                                         Videodec2OutputInfo* output) {
+	return TraceVideodec("Flush", Flush(decoder, frame, output));
+}
+static int32_t KYTY_SYSV_ABI TracedReset(Videodec2Decoder decoder) {
+	return TraceVideodec("Reset", Reset(decoder), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
+static int32_t KYTY_SYSV_ABI TracedGetPictureInfo(const Videodec2OutputInfo* output, void* first,
+                                                  void* second) {
+	return TraceVideodec("GetPictureInfo", GetPictureInfo(output, first, second));
+}
+
 LIB_DEFINE(InitVideoDec2_1) {
 	PRINT_NAME_ENABLE(true);
 
-	LIB_FUNC("RnDibcGCPKw", QueryComputeMemoryInfo);
-	LIB_FUNC("eD+X2SmxUt4", AllocateComputeQueue);
-	LIB_FUNC("UvtA3FAiF4Y", ReleaseComputeQueue);
-	LIB_FUNC("qqMCwlULR+E", QueryDecoderMemoryInfo);
-	LIB_FUNC("CNNRoRYd8XI", CreateDecoder);
-	LIB_FUNC("jwImxXRGSKA", DeleteDecoder);
-	LIB_FUNC("852F5+q6+iM", Decode);
-	LIB_FUNC("l1hXwscLuCY", Flush);
-	LIB_FUNC("wJXikG6QFN8", Reset);
-	LIB_FUNC("NtXRa3dRzU0", GetPictureInfo);
-	LIB_FUNC("kjrLbcyhEiw", GetPictureInfo);
+	LIB_FUNC("RnDibcGCPKw", TracedQueryComputeMemoryInfo);
+	LIB_FUNC("eD+X2SmxUt4", TracedAllocateComputeQueue);
+	LIB_FUNC("UvtA3FAiF4Y", TracedReleaseComputeQueue);
+	LIB_FUNC("qqMCwlULR+E", TracedQueryDecoderMemoryInfo);
+	LIB_FUNC("CNNRoRYd8XI", TracedCreateDecoder);
+	LIB_FUNC("jwImxXRGSKA", TracedDeleteDecoder);
+	LIB_FUNC("852F5+q6+iM", TracedDecode);
+	LIB_FUNC("l1hXwscLuCY", TracedFlush);
+	LIB_FUNC("wJXikG6QFN8", TracedReset);
+	LIB_FUNC("NtXRa3dRzU0", TracedGetPictureInfo);
+	LIB_FUNC("kjrLbcyhEiw", TracedGetPictureInfo);
 }
 
 } // namespace VideoDec2

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -5,7 +6,9 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envRead.h"
 #include "common/logging/log.h"
+#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -25,6 +28,8 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -221,7 +226,10 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
+	// Default waitUntilSafeForRendering: blocks the caller until no flip of the buffer is pending.
 	void Wait(VideoOutConfig& cfg, int index);
+	// KYTY_UPSTREAM_FLIP_SUSPEND=1: the GPU thread's non-blocking test (the stalled GPU is woken on a flip).
+	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -240,6 +248,7 @@ private:
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
 	};
+	void SignalDoneLocked();
 
 	Graphics::Presenter& m_presenter;
 	Common::Mutex        m_mutex;
@@ -250,6 +259,7 @@ private:
 	std::list<Request>   m_cpu_requests;
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
+	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
 };
 
@@ -549,7 +559,13 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
+		if (Common::OverlayStats::Enabled()) {
+			Common::OverlayStats::Add(Common::OverlayStats::Counter::FlipQueueFull); // KYTY_OVERLAY
+		}
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+	}
+	if (Common::OverlayStats::Enabled()) {
+		Common::OverlayStats::Add(Common::OverlayStats::Counter::FlipRequest); // KYTY_OVERLAY
 	}
 	return OK;
 }
@@ -924,7 +940,11 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		// KYTY_OVERLAY: this vblank period ended after the next one was due (the loop does not sleep before it).
 		if (total_wait < 0) {
+			if (Common::OverlayStats::Enabled()) {
+				Common::OverlayStats::Add(Common::OverlayStats::Counter::LateVblank);
+			}
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
 		}
 	}
@@ -953,7 +973,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 				}
 			}
 		}
-		m_done_cond_var.SignalAll();
+		SignalDoneLocked();
 	}
 	if (cfg.flip_status.flipPendingNum >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRejected);
@@ -1033,7 +1053,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			it = queue->erase(it);
 		}
 	}
-	m_done_cond_var.SignalAll();
+	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
 	m_mutex.Unlock();
@@ -1125,6 +1145,39 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	// Always (rare: only when it changes): whether the presented buffers are HDR, and their format. A rare run whose
+	// whole image is washed out and cyan from the start ("cyan curtain") is suspected to present HDR buffers: the
+	// Ghost of Yotei dump's display-status calls are patched out, so its HDR-capable flag is read from stale stack bytes
+	// every frame and decides whether its display buffers are registered as HDR.
+	{
+		static std::atomic<int> last_hdr {-1};
+		if (last_hdr.exchange(hdr ? 1 : 0) != (hdr ? 1 : 0)) {
+			std::fprintf(stderr, "VIDEOOUT_PRESENT_FORMAT hdr=%d fmt=%u vk=%d extent=%ux%u\n", hdr ? 1 : 0,
+			             static_cast<uint32_t>(source_info.guest_format), static_cast<int>(source_info.pixel_format),
+			             source_info.extent.width, source_info.extent.height);
+		}
+	}
+	// KYTY_TRACE_FLIPS=1 (diagnostic): what each presented flip shows (first 16, then every 60th).
+	if (Common::EnvRead::Flips()) {
+		static std::atomic_uint flips {0};
+		const auto n = flips.fetch_add(1);
+		::Libs::Graphics::GpuCheckpoints::FlipAddress(static_cast<uint32_t>(index)).store(source_info.data.address);
+		if (n < 16u || n % 60u == 0u) {
+			std::fprintf(stderr, "FLIP n=%u index=%d special=%d addr=0x%llx size=0x%llx fmt=%u vk=%d extent=%ux%u tile=%u pitch=%u\n",
+			             n, index, special ? 1 : 0, static_cast<unsigned long long>(source_info.data.address),
+			             static_cast<unsigned long long>(source_info.data.size),
+			             static_cast<uint32_t>(source_info.guest_format), static_cast<int>(source_info.pixel_format),
+			             source_info.extent.width, source_info.extent.height,
+			             static_cast<uint32_t>(source_info.tile_mode), source_info.pitch);
+			std::fflush(stderr);
+		}
+	}
+	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(
+		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
+		    "displaying PQ video-out pixels unchanged.\n");
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
@@ -1199,6 +1252,15 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
+void FlipQueue::SignalDoneLocked() {
+	m_done_cond_var.SignalAll();
+	// A stalled GPU cannot drain and shut down without re-checking under m_mutex, so it is alive here.
+	if (m_gpu_waiting) {
+		m_gpu_waiting = false;
+		m_presenter.Renderer().GetGpu().Wake();
+	}
+}
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1212,8 +1274,22 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+// A display buffer is safe for rendering once it is neither displayed nor waiting to be.
+bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	const bool safe = cfg.flip_status.currentBuffer != index &&
+	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	m_gpu_waiting = !safe;
+	return safe;
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
+	if (tracy::ProfilerAvailable()) {
+		FrameMark;
+	}
 
 	m_mutex.Lock();
 	if (m_requests.empty()) {
@@ -1305,7 +1381,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		it = m_requests.erase(it);
 	}
 	m_processing = false;
-	m_done_cond_var.SignalAll();
+	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_mutex.Unlock();
 	for (size_t i = count; i != 0; i--) {
@@ -1520,6 +1596,12 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
 	}
 
+	// Always (registrations are rare): the display-buffer format of each registered set, so a run's log shows whether the
+	// game registered SDR or HDR buffers (see VIDEOOUT_PRESENT_FORMAT).
+	std::fprintf(stderr, "VIDEOOUT_REGISTER set=%d start=%d count=%d format=0x%016" PRIx64 " hdr=%d %ux%u pitch=%u tiling=%u\n",
+	             set_index, buffer_index_start, buffer_num, attribute->pixel_format,
+	             Graphics::IsHdrVideoOutPixelFormat(attribute->pixel_format) ? 1 : 0, attribute->width, attribute->height,
+	             attribute->pitch_in_pixel, attribute->tiling_mode);
 	BufferAttributeGroup group {
 	    .attribute = *attribute,
 	    .category  = category,
@@ -1696,6 +1778,14 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 	m_impl->GetFlipQueue().Wait(*ctx, index);
 }
 
+bool VideoOutDriver::IsSafeForRendering(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	EXIT_IF(ctx == nullptr);
+
+	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
+	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index);
+}
+
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
 
@@ -1857,10 +1947,18 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute = 0;
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
+	// KYTY_VIDEOOUT_1080P=1: the primary output reports a 1080p display, as a PS5 connected to a Full HD TV; the game
+	// then picks its own 1080p output mode (fewer pixels to render). Read once, logged once.
+	static const bool report_1080p = [] {
+		const char* value = std::getenv("KYTY_VIDEOOUT_1080P");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) std::fprintf(stderr, "VIDEOOUT_1080P enabled: the game is told a 1080p display is connected\n");
+		return on;
+	}();
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    report_1080p ? 1u : ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

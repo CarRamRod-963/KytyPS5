@@ -2,6 +2,7 @@
 
 #include "configuration.h"
 #include "gameContent.h"
+#include "gameTileView.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -26,6 +27,8 @@
 #include <QtConcurrentRun>
 
 namespace {
+
+constexpr int COVER_PIXELS = 304; // 2 x the Play tile's 152 px cover
 
 enum Column {
 	NameColumn,
@@ -223,6 +226,10 @@ void ConfigurationItem::Update(bool reload_icon) {
 		    m_info->basedir, QStringLiteral("sce_sys/icon0.png"), GameContent::MaxImageSize);
 		QPixmap icon;
 		m_icon = !icon_data.isEmpty() && icon.loadFromData(icon_data) ? QIcon(icon) : QIcon {};
+		// The tile's cover (Play), kept at twice the tile size for high-DPI screens.
+		setData(NameColumn, GameTileView::CoverRole,
+		        icon.isNull() ? QPixmap() : icon.scaled(COVER_PIXELS, COVER_PIXELS, Qt::KeepAspectRatioByExpanding,
+		                                                Qt::SmoothTransformation));
 	}
 	UpdateIcon();
 	UpdateStatusIndicator();
@@ -265,6 +272,7 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 
 void ConfigurationItem::SetRunning(bool state) {
 	m_running = state;
+	setData(NameColumn, GameTileView::RunningRole, state);
 
 	QFont f = font(NameColumn);
 	f.setBold(state);

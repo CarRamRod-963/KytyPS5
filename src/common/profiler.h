@@ -2,6 +2,7 @@
 #define KYTY_COMMON_PROFILER_H_
 
 #include "common/common.h"
+#include "common/diagFastPath.h"
 
 #include <cstdint>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
@@ -23,6 +24,13 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 namespace Profiler {
 
 void SetThreadName(const char* name);
+
+// The is_active argument of every KYTY_PROFILER_BLOCK zone: whether the Tracy profiler is running. tracy::ProfilerAvailable()
+// is an out-of-line call per zone, so the zone reads the profiler bit that Initialize and Shutdown keep in the diagnostic
+// flag word instead (the profiler is started only by Initialize: TRACY_MANUAL_LIFETIME).
+[[nodiscard]] inline bool BlockActive() noexcept {
+	return (Common::DiagFastPath::g_state.load(std::memory_order_relaxed) & Common::DiagFastPath::kProfiler) != 0;
+}
 
 void Initialize();
 void Shutdown();
@@ -51,7 +59,7 @@ struct Lifecycle {
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
 	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
+	    TRACY_CALLSTACK, ::Profiler::BlockActive())
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 

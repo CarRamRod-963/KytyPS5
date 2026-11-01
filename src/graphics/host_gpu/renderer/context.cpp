@@ -3,15 +3,18 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
@@ -38,6 +41,14 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// A new command buffer starts without any pipeline or dynamic state (KYTY_DIAG_DRAW_STATE_FILTER).
+	InvalidateGraphicsState();
+}
+
+void CommandBuffer::InvalidateGraphicsState() const noexcept {
+	m_graphics_state = GraphicsState {};
+	// The record packets: the recording thread's copy is forgotten at the same place of the command stream.
+	NoteGraphicsStateInvalidated(m_buffer);
 }
 
 void CommandBuffer::End() const {
@@ -67,6 +78,30 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	if (CmdSignature::Enabled()) {
+		// KYTY_TRACE_CMD_SIGNATURE: the render pass's size, layers, and each attachment's layout, load op and clear
+		// value (not its view: a handle).
+		std::array<uint64_t, 4 + (RENDER_COLOR_ATTACHMENTS_MAX + 1) * 4> words {};
+		size_t                                                           count = 0;
+		words[count++] = state.width;
+		words[count++] = state.height;
+		words[count++] = state.num_layers;
+		words[count++] = state.num_color_attachments;
+		const auto attachment_words = [&](const RenderAttachment& attachment) {
+			words[count++] = static_cast<uint64_t>(attachment.image_layout) |
+			                 (uint64_t {attachment.is_clear} << 32u) | (uint64_t {attachment.has_depth} << 33u) |
+			                 (uint64_t {attachment.depth_clear} << 34u) | (uint64_t {attachment.has_stencil} << 35u) |
+			                 (uint64_t {attachment.stencil_clear} << 36u) | (uint64_t {attachment.image_view ? 1u : 0u} << 37u);
+			words[count++] = attachment.clear_value[0] | (uint64_t {attachment.clear_value[1]} << 32u);
+			words[count++] = attachment.clear_value[2] | (uint64_t {attachment.clear_value[3]} << 32u);
+			words[count++] = 0;
+		};
+		for (uint32_t i = 0; i < state.num_color_attachments; i++) {
+			attachment_words(state.color_attachments[i]);
+		}
+		attachment_words(state.depth_stencil_attachment);
+		CmdSignature::Fold(CmdSignature::Kind::BeginRendering, words.data(), count * sizeof(uint64_t));
+	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -103,6 +138,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	FlushComputeAccess(Handle()); // compute writes before rendering reads them
 	Handle().beginRendering(rendering);
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
@@ -118,9 +154,14 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	// KYTY_FIX_OCCLUSION_QUERIES: a host occlusion query begun in this render pass instance ends in it; slots for
+	// the next ones are reset outside it.
+	auto& occlusion = m_context.GetOcclusionQueries();
+	occlusion.BeforeEndRendering(Handle());
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	occlusion.AfterEndRendering(Handle());
 }
 
 } // namespace Libs::Graphics

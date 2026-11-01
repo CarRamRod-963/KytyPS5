@@ -1,8 +1,11 @@
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/lookupMemo.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -16,6 +19,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -111,13 +115,35 @@ static vk::StencilOpState ConvertStencilState(
                                                                  uint32_t samples) {
 	auto&      graphics         = buffer.GetGraphics();
 	const auto required_samples = vulkan_sample_count(samples);
-	const auto supports         = [&](vk::Format format) {
+	const auto supports_query   = [&](vk::Format format) {
 		vk::ImageFormatProperties properties {};
 		return format != vk::Format::eUndefined &&
 		       graphics.GetImageFormatProperties(
 		           format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
 		           vk::ImageCreateFlags {}, &properties) == vk::Result::eSuccess &&
 		       static_cast<bool>(properties.sampleCounts & required_samples);
+	};
+	// common/lookupMemo.h: the answer per (format, samples, usage) is a device fact; the last few
+	// are kept per thread instead of the mutex-guarded map lookup.
+	struct SupportMemo {
+		vk::Format              format  = vk::Format::eUndefined;
+		vk::SampleCountFlagBits samples = {};
+		vk::ImageUsageFlags     usage   = {};
+		bool                    valid   = false;
+		bool                    answer  = false;
+	};
+	static thread_local std::array<SupportMemo, 8> support_memo {};
+	static thread_local uint32_t                   support_next = 0;
+	const auto supports = [&](vk::Format format) {
+		const auto usage = DepthTargetImageUsage();
+		for (const auto& memo: support_memo) {
+			if (!memo.valid || memo.format != format || memo.samples != required_samples || memo.usage != usage) continue;
+			Common::LookupMemo::NoteHit(Common::LookupMemo::Kind::Format);
+			return memo.answer;
+		}
+		const bool answer = supports_query(format);
+		support_memo[support_next++ % support_memo.size()] = {format, required_samples, usage, true, answer};
+		return answer;
 	};
 	if (!has_stencil) {
 		return supports(policy.depth_attachment_format) ? policy.depth_attachment_format
@@ -173,6 +199,14 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (has_htile) {
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
 			DepthFatal("invalid HTile metadata address");
+		}
+		// Clear tracking covers slices 0..63; higher slices read as not fast-cleared (KYTY_FIX_HTILE_SLICE_CLEAR: all).
+		if (z.depth_view.slice_max >= 64 && TextureCache::HtileSliceClearMode() == 0u) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true)) {
+				std::fprintf(stderr, "DepthTarget: HTile clear tracking limited to 64 of %u slices\n",
+				             static_cast<uint32_t>(z.depth_view.slice_max) + 1u);
+			}
 		}
 	}
 	if (!z.size.valid) {
@@ -254,8 +288,9 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r, bool metadata_expand) {
 	KYTY_PROFILER_FUNCTION();
+	const StageF::Zone stagef_target(StageF::Sub::Target); // KYTY_TRACE_STAGEF
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
@@ -267,7 +302,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
-	if (!depth_active && !stencil_active) {
+	if (!depth_active && !stencil_active && !metadata_expand) {
 		return;
 	}
 	const bool attachment_unbound =
@@ -315,11 +350,32 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
 	                            !z.depth_view.depth_write_disable && !r.depth_clear_enable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
+	static constinit Common::OnceValue<bool> trace_depth_addr_once;
+	const bool trace_depth_addr = trace_depth_addr_once.Get([&] { return std::getenv("KYTY_TRACE_DEPTH_ADDR") != nullptr; });
+	if (trace_depth_addr && r.depth_test_enable && !r.depth_write_enable) {
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 24u) {
+			std::fprintf(stderr,
+			             "DEPTH_WRITE_OFF z_write_enable=%d depth_write_disable=%d depth_clear=%d zfunc=%u "
+			             "z_read=0x%llx z_write=0x%llx\n",
+			             dc.z_write_enable ? 1 : 0, z.depth_view.depth_write_disable ? 1 : 0,
+			             rc.depth_clear_enable ? 1 : 0, static_cast<uint32_t>(dc.zfunc),
+			             static_cast<unsigned long long>(z.z_read_base_addr),
+			             static_cast<unsigned long long>(z.z_write_base_addr));
+		}
+	}
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	// The attachment's load clears by aspect (upstream 57791645e; ours: depth_load_clear_enable = depth_clear_enable,
+	// stencil from stencil_clear_enable), set at resolve time since AttachmentWriteAspects is read before acquisition;
+	// AcquireRenderTargets adds a pending HTILE clear of the depth aspect. (Upstream 5bf37f52a sets them only there
+	// and also clears compressed stencil on a pending HTILE clear; not taken: our ClearMeta on a depth clear stays.)
+	r.load_clear_aspects = {};
+	if (r.depth_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+	if (r.stencil_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 	r.stencil_clear_value = hw.GetStencilClearValue();
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
@@ -406,6 +462,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
+	GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (5ull << 16u) | 407u);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());

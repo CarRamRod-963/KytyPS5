@@ -4,6 +4,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <cstdint>
+#include <vector>
+
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
@@ -19,6 +22,16 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+
+// Consecutive compute dispatches are ordered only by the guest's own sync events (as on the console); the access barrier
+// after a dispatch is deferred to the next non-dispatch GPU work (FlushComputeAccess), and a dispatch that directly
+// follows another dispatch skips its hazard barrier.
+bool ComputeAccessPending();
+void SetComputeAccessPending();
+void FlushComputeAccess(vk::CommandBuffer vk_buffer);
+bool ComputeHazardCovered();
+void NoteComputeHazardBarrier();
+
 
 } // namespace Libs::Graphics
 

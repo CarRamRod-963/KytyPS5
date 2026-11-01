@@ -1,11 +1,23 @@
+#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveAb.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/perfCounters.h"
+#include "graphics/host_gpu/renderer/stageFTrace.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
 
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -56,7 +68,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool prefer_host)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -67,19 +79,65 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// Buffers with a device address keep dedicated allocations. Upstream lets VMA suballocate them (d58aefde4, with
+	// 4644c5292 zeroing the BDA tables that suballocated memory no longer guarantees); not taken without a measurement
+	// (allocation count, BAR placement and the VRAM budget logic all see the change).
+	const VmaAllocationCreateFlags bda_flag =
+	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	// A stream buffer asked for host memory is allocated like an upload buffer (CPU writes only).
+	const bool host_stream = prefer_host && usage == MemoryUsage::Stream;
+	allocation_info.usage  = host_stream ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	vk::Result        result        = vk::Result::eErrorOutOfDeviceMemory;
+	if (usage == MemoryUsage::DeviceLocal && cpu_address != 0) {
+		// Device-local and host-visible (resizable BAR), persistently mapped; falls back to plain
+		// device-local memory when none is left.
+		auto bar           = allocation_info;
+		bar.flags         |= VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		bar.requiredFlags  = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		result             = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator,
+		                                                             static_cast<const VkBufferCreateInfo*>(buffer_info), &bar,
+		                                                             &native_buffer, &m_allocation, &allocation_result));
+		static std::atomic_uint fallbacks {0};
+		if (result != vk::Result::eSuccess && fallbacks.fetch_add(1) < 8u) {
+			std::fprintf(stderr, "DIAG_BAR_READS allocation of 0x%llx bytes fell back to device-local (%d)\n",
+			             static_cast<unsigned long long>(size), static_cast<int>(result));
+		}
+	}
+	if (result != vk::Result::eSuccess) {
+		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                                                 &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess && host_stream) {
+		// No host memory left within the budget: the old placement of the stream buffers.
+		std::fprintf(stderr, "DIAG_STREAM_HOST allocation of 0x%llx bytes fell back to device memory (%d)\n",
+		             static_cast<unsigned long long>(size), static_cast<int>(result));
+		allocation_info.usage = AllocationUsage(usage);
+		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                                                 &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
+	// KYTY_VRAM_BUDGET / KYTY_VRAM_GC_FIX: past the driver's budget a buffer the caches need (or the temporary buffer
+	// an eviction downloads into) is allocated anyway (the driver pages it) instead of ending the session; the
+	// collectors bring the usage back down.
+	if (result != vk::Result::eSuccess && (VramBudgetEnabled() || VramGcFixEnabled())) {
+		auto over = allocation_info;
+		over.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                                                 &over, &native_buffer, &m_allocation, &allocation_result));
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 8u) {
+			std::fprintf(stderr, "VRAM_BUDGET allocation of 0x%llx bytes made past the driver budget (%d)\n",
+			             static_cast<unsigned long long>(size), static_cast<int>(result));
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -102,8 +160,89 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+// ---- KYTY_PERF_DIRECT_RANGES (A1 stage 2, notes\A1-WSPOLNA-PAMIEC.md) ---------------------------------------------
+namespace {
+
+uint32_t HostPointerTypeBits(GraphicContext& graphics, uint64_t cpu_address) {
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	const auto result = graphics.device.getMemoryHostPointerPropertiesEXT(
+	    vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, reinterpret_cast<const void*>(cpu_address), &properties);
+	return result == vk::Result::eSuccess ? properties.memoryTypeBits : 0u;
+}
+} // namespace
+
+bool Buffer::CanImportGuestMemory(GraphicContext& graphics, uint64_t cpu_address, uint64_t size) {
+	// The host pointer and the size must be multiples of minImportedHostPointerAlignment (4 KiB on the test GPU).
+	if (size == 0 || (cpu_address & 0xfffu) != 0 || (size & 0xfffu) != 0) return false;
+	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetMemoryHostPointerPropertiesEXT == nullptr) return false;
+	return HostPointerTypeBits(graphics, cpu_address) != 0;
+}
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, GuestDirectTag tag, uint64_t cpu_address,
+               uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
+      m_size(size) {
+	// D6 step K4 (GuestDirectTag::failed): a refused import leaves the buffer empty (the destructor then does nothing).
+	const auto refuse = [&](bool failed) {
+		if (!failed || tag.failed == nullptr) return false;
+		if (m_buffer != nullptr) graphics.device.destroyBuffer(m_buffer, nullptr);
+		m_buffer      = nullptr;
+		*tag.failed   = true;
+		return true;
+	};
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	const bool created = graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) == vk::Result::eSuccess;
+	if (!created) m_buffer = nullptr;
+	if (refuse(!created)) return;
+	EXIT_NOT_IMPLEMENTED(!created);
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
+	const uint32_t types = HostPointerTypeBits(graphics, cpu_address) & requirements.memoryTypeBits;
+	if (refuse(types == 0 || requirements.size > size)) return;
+	EXIT_NOT_IMPLEMENTED(types == 0 || requirements.size > size);
+	vk::ImportMemoryHostPointerInfoEXT import {};
+	import.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	import.pHostPointer = reinterpret_cast<void*>(cpu_address);
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	flags.pNext = &import;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(types));
+	const auto result        = graphics.device.allocateMemory(&allocate, nullptr, &m_direct_memory);
+	if (result != vk::Result::eSuccess) m_direct_memory = nullptr;
+	if (refuse(result != vk::Result::eSuccess)) return;
+	if (result != vk::Result::eSuccess) {
+		std::fprintf(stderr, "PERF_DIRECT_RANGES import of 0x%llx bytes at 0x%llx failed: %d\n",
+		             static_cast<unsigned long long>(size), static_cast<unsigned long long>(cpu_address),
+		             static_cast<int>(result));
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(graphics.device.bindBufferMemory(m_buffer, m_direct_memory, 0) != vk::Result::eSuccess);
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = m_buffer;
+	m_device_address    = graphics.device.getBufferAddress(address_info);
+	EXIT_IF(m_device_address == 0);
+	m_coherent = true;
+}
+
 Buffer::~Buffer() {
+	if (m_direct_memory != nullptr) {
+		CommandRecorder::DrainBeforeDestroy(); // (as below)
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		m_graphics->device.freeMemory(m_direct_memory, nullptr);
+		return;
+	}
 	if (m_buffer != nullptr) {
+		// A command in the ring may still name this buffer (VMA does not go through the
+		// dispatcher's destroy functions).
+		CommandRecorder::DrainBeforeDestroy();
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -179,6 +318,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	GpuCheckpoints::Mark(native, 0xFEED000000000000ull | (3ull << 16u) | 184u);
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
@@ -205,6 +345,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
+	GpuCheckpoints::Mark(native, 0xFEED000000000000ull | (3ull << 16u) | 210u);
 	native.fillBuffer(Handle(), offset, size, value);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
@@ -214,9 +355,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+                           uint64_t size, bool prefer_host)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags, size, prefer_host),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
@@ -301,6 +441,7 @@ void StreamBuffer::Commit() {
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
+	const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);
 	EXIT_IF(data == nullptr);
@@ -318,10 +459,28 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
-		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+		const bool busy = !Scheduler().IsFree(watch.tick);
+		if (busy && !allow_wait) {
 			return false;
 		}
+		// KYTY_TRACE_STREAM_WAITS=1: waits for the GPU to release ring space, by ring (usage, size).
+		static const bool trace_waits = std::getenv("KYTY_TRACE_STREAM_WAITS") != nullptr;
+		const auto        wait_start  = trace_waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::StreamWrap); // KYTY_TRACE_SYNC_TIMELINE
 		Scheduler().Wait(watch.tick);
+		if (trace_waits && busy) {
+			static std::atomic_uint64_t waits[4] {};
+			static std::atomic_uint64_t micros[4] {};
+			const auto                  usage = static_cast<uint32_t>(Usage()) & 3u;
+			micros[usage] += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count());
+			const auto total = waits[usage].fetch_add(1) + 1;
+			if ((total & 0xffu) == 0) {
+				std::fprintf(stderr, "STREAM_WAITS usage=%u size=%lluMiB waits=%llu ms=%llu\n", usage,
+				             static_cast<unsigned long long>(Size() >> 20u), static_cast<unsigned long long>(total),
+				             static_cast<unsigned long long>(micros[usage].load() / 1000u));
+			}
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}

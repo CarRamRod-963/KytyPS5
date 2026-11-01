@@ -1,0 +1,78 @@
+name: Problem in the launcher
+description: The launcher window, its settings, game list, shader cache tools or bug report export does not work.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Issues are public.** Everything you write or attach here can be read by anyone.
+        For problems that appear after the game has started, use **Problem in the game** instead.
+
+  - type: input
+    id: fork-version
+    attributes:
+      label: Fork version
+      description: Shown in the launcher's footer and in About. If you built it yourself, add the commit.
+      placeholder: "Example: v0.1"
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Windows version and display scaling
+      placeholder: "Example: Windows 11 24H2, 150%"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: page
+    attributes:
+      label: Launcher page
+      options:
+        - First start
+        - Play
+        - Display
+        - Graphics
+        - Shaders
+        - Advanced
+        - About
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the launcher.
+        2. ...
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots
+      description: Optional. A screenshot of the launcher window usually shows the problem fastest.
+
+  - type: textarea
+    id: bug-report
+    attributes:
+      label: Bug report zip
+      description: "Optional. If the launcher still opens, use Advanced → Support → **Export bug report**, check the file list, then drag the zip here."
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true

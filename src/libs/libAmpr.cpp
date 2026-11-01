@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/startupTrace.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -15,12 +16,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <unordered_set>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <deque>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -63,6 +69,7 @@ static std::condition_variable                           g_submission_cv;
 static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
 static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
+
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
 	(void)write;
@@ -1193,9 +1200,9 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 			return LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
-		uint64_t bytes_read = 0;
-		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
-		                                      command.size, &bytes_read);
+		uint64_t   bytes_read = 0;
+		auto       result     = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
+		                                            command.size, &bytes_read);
 		static std::atomic<uint32_t> s_logged_dlc_reads {0};
 		if (host_path.filename() == "re_dlc_000.pak" && s_logged_dlc_reads.fetch_add(1) < 32) {
 			LOGF("\tAPR read dlc: id=0x%08" PRIx32 ", offset=0x%016" PRIx64 ", size=0x%016" PRIx64
@@ -1207,6 +1214,46 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
 			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
 			return result;
+		}
+		// KYTY_TRACE_APR=1: every ~5 s, how many APR file reads ran, their bytes and the last file.
+		static const bool trace_apr = [] {
+			const char* value = std::getenv("KYTY_TRACE_APR");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (trace_apr) {
+			static std::mutex                            mutex;
+			static uint64_t                              reads = 0;
+			static uint64_t                              bytes = 0;
+			static auto                                  window = std::chrono::steady_clock::now();
+			std::scoped_lock                             lock(mutex);
+			reads++;
+			bytes += bytes_read;
+			const auto now = std::chrono::steady_clock::now();
+			if (now - window >= std::chrono::seconds(5)) {
+				std::fprintf(stderr, "APR_READS reads=%llu bytes=%llu last=%s\n", static_cast<unsigned long long>(reads),
+				             static_cast<unsigned long long>(bytes), Common::PathToString(host_path).c_str());
+				reads  = 0;
+				bytes  = 0;
+				window = now;
+			}
+		}
+		// KYTY_TRACE_APR_FILES=1: the first APR read of every file, in order (which assets a scene loads).
+		static const bool trace_apr_files = std::getenv("KYTY_TRACE_APR_FILES") != nullptr;
+		if (trace_apr_files) {
+			static std::mutex                      mutex;
+			static std::unordered_set<std::string> seen;
+			std::scoped_lock                       lock(mutex);
+			const auto                             path_text = Common::PathToString(host_path);
+			if (seen.insert(path_text).second) {
+				std::fprintf(stderr, "APR_FILE #%zu %s\n", seen.size(), path_text.c_str());
+			}
+			// Movies: every read (offset, size), to see how far playback gets.
+			if (path_text.find("movies") != std::string::npos) {
+				std::fprintf(stderr, "APR_MOVIE_READ offset=0x%llx size=0x%llx read=0x%llx %s\n",
+				             static_cast<unsigned long long>(command.file_offset),
+				             static_cast<unsigned long long>(command.size),
+				             static_cast<unsigned long long>(bytes_read), path_text.c_str());
+			}
 		}
 	} else if (const auto* payload =
 	               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
@@ -1230,6 +1277,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	               std::get_if<CommandBufferState::WriteCounterCommand>(&entry.data)) {
 		g_counters[command->index].store(command->value, std::memory_order_release);
 	} else if (const auto* payload = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
+		const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::AmmCommand); // KYTY_TRACE_STARTUP
 		const auto& command = *payload;
 		int         result  = OK;
 		if (command.kind == AmmCommandKind::Unmap) {
@@ -1255,6 +1303,8 @@ struct Submission {
 	size_t                                   cursor = 0;
 	void*                                    result = nullptr;
 	uint32_t                                 id     = 0;
+	// KYTY_TRACE_STARTUP: when an APR submission was queued (unset otherwise).
+	std::chrono::steady_clock::time_point    queued {};
 };
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
@@ -1338,6 +1388,10 @@ private:
 			if (complete) {
 				AprShared::WriteResult(submission.result, result, error_offset);
 				AprShared::SetSubmissionComplete(submission.id);
+				if (submission.queued != std::chrono::steady_clock::time_point {}) {
+					Common::StartupTrace::Add(Common::StartupTrace::Counter::AprLatency,
+					                          Common::StartupTrace::NanosSince(submission.queued));
+				}
 			}
 			lock.lock();
 			if (complete) {
@@ -1383,10 +1437,17 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
+	// KYTY_TRACE_STARTUP: APR submissions and their commands (sub=n/commands).
+	if (!amm && Common::StartupTrace::Enabled()) {
+		Common::StartupTrace::Add(Common::StartupTrace::Counter::AprSubmit, 0, state.commands.size());
+	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
-	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	Submission submission {std::move(state.commands), 0, result, id};
+	if (!amm && Common::StartupTrace::Enabled()) {
+		submission.queued = std::chrono::steady_clock::now(); // KYTY_TRACE_STARTUP: submit-to-complete latency
+	}
+	(amm ? amm_engine : apr_engine).Submit(priority, std::move(submission));
 	return OK;
 }
 
@@ -1421,24 +1482,33 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
+	// KYTY_TRACE_STARTUP: every APR file read (bytes, time) and the host file open inside it.
+	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::AprRead);
+	Common::File  local_file;
+	Common::File* file = nullptr;
+	{
+		const Common::StartupTrace::Scope open_scope(Common::StartupTrace::Counter::AprOpen);
+		if (local_file.Open(host_path, Common::File::Mode::Read)) {
+			file = &local_file;
+		}
+	}
+	if (file == nullptr) {
 		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
-	const auto file_size = file.Size();
+	const auto file_size = file->Size();
 	if (file_offset >= file_size) {
-		file.Close();
+		local_file.Close();
 		return OK;
 	}
-	if (!file.Seek(file_offset)) {
-		file.Close();
+	if (!file->Seek(file_offset)) {
+		local_file.Close();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
+		local_file.Close();
 		return OK;
 	}
 
@@ -1451,15 +1521,16 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
 		uint32_t read = 0;
-		file.Read(buffer.data(), request, &read);
+		file->Read(buffer.data(), request, &read);
 		if (read == 0) {
 			break;
 		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		*bytes_read += read;
 	}
+	startup_scope.SetBytes(*bytes_read);
 
-	file.Close();
+	local_file.Close();
 	return OK;
 }
 

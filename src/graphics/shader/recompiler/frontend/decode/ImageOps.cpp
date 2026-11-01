@@ -1,9 +1,11 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
+#include "common/shaderEnv.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -68,6 +70,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 		components++;
 	}
 	if ((flags & (ImageSampleFlagLod | ImageSampleFlagLodClamp)) != 0) {
+		components++;
+	}
+	// The _CL clamp is the last body component (RDNA 2 ISA 8.2.5, "Image Opcodes with Sampler").
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
 		components++;
 	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {

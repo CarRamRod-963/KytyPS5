@@ -2,22 +2,45 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envRead.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/startupTrace.h"
+#include <optional>
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/debugSample.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
 #include "graphics/presentation/openxrHeadset.h"
+#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 
+#include "kernel/memory.h"
+#include "graphics/host_gpu/queueLockSite.h"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
+#include <unordered_set>
+#include <cstring>
+#include <cstdio>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,6 +52,86 @@
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
+
+static void TraceFrameTime(uint32_t frame); // KYTY_TRACE_FRAMETIME, defined below
+
+// KYTY_TRACE_MEM_DUMP=<hex address>:<hex size>[:<depth>][,...] with KYTY_TRACE_MEM_DUMP_FRAME=<n>[,<n>...]:
+// at those presented frames the guest memory ranges are written as hex qwords to
+// <KYTY_TRACE_FRAME_DIR>/memdump_<frame>.txt, following qwords that point to readable guest memory
+// (0x200 bytes each) up to <depth> levels. Diagnostic only (game data structures).
+// Guest backing first; memory outside the backing store (executable data) is read directly when
+// the host reports it committed and readable.
+static bool DebugReadGuest(uint64_t addr, void* out, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBacking(addr, out, size)) return true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+	    (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) == 0 ||
+	    (info.Protect & PAGE_GUARD) != 0 ||
+	    addr + size > reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize) {
+		return false;
+	}
+	std::memcpy(out, reinterpret_cast<const void*>(addr), size);
+	return true;
+#else
+	return false;
+#endif
+}
+
+static void DebugGuestMemoryDump(uint32_t frame) {
+	static const std::string frames = [] {
+		const char* value = std::getenv("KYTY_TRACE_MEM_DUMP_FRAME");
+		return value != nullptr ? "," + std::string(value) + "," : std::string();
+	}();
+	if (frames.empty() || frames.find("," + std::to_string(frame) + ",") == std::string::npos) return;
+	const char* spec = std::getenv("KYTY_TRACE_MEM_DUMP");
+	const char* dir  = Common::EnvRead::FrameDir();
+	if (spec == nullptr || dir == nullptr) return;
+	struct Block {
+		uint64_t addr;
+		uint64_t size;
+		int      depth;
+		uint64_t parent;
+	};
+	std::vector<Block> queue;
+	for (const char* p = spec; p != nullptr && *p != 0;) {
+		char*      end  = nullptr;
+		const auto addr = std::strtoull(p, &end, 16);
+		uint64_t   size = 0x200;
+		int        depth = 0;
+		if (end != nullptr && *end == ':') size = std::strtoull(end + 1, &end, 16);
+		if (end != nullptr && *end == ':') depth = static_cast<int>(std::strtol(end + 1, &end, 10));
+		queue.push_back({addr, size, depth, 0});
+		p = (end != nullptr && *end == ',') ? end + 1 : nullptr;
+	}
+	const std::string path = std::string(dir) + "/memdump_" + std::to_string(frame) + ".txt";
+	FILE*             file = std::fopen(path.c_str(), "w");
+	if (file == nullptr) return;
+	std::unordered_set<uint64_t> visited;
+	for (size_t i = 0; i < queue.size() && i < 4000u; i++) {
+		const auto block = queue[i];
+		if (!visited.insert(block.addr).second) continue;
+		std::vector<uint64_t> words(static_cast<size_t>((block.size + 7u) / 8u));
+		if (!DebugReadGuest(block.addr, words.data(), words.size() * 8u)) {
+			std::fprintf(file, "BLOCK 0x%llx unreadable\n", static_cast<unsigned long long>(block.addr));
+			continue;
+		}
+		std::fprintf(file, "BLOCK 0x%llx size=0x%llx depth=%d parent=0x%llx\n", static_cast<unsigned long long>(block.addr),
+		             static_cast<unsigned long long>(block.size), block.depth, static_cast<unsigned long long>(block.parent));
+		for (size_t w = 0; w < words.size(); w++) {
+			if (w % 4u == 0) std::fprintf(file, "  +%03zx:", w * 8u);
+			std::fprintf(file, " %016llx", static_cast<unsigned long long>(words[w]));
+			if (w % 4u == 3u || w + 1u == words.size()) std::fprintf(file, "\n");
+			const uint64_t q = words[w];
+			uint64_t       probe = 0;
+			if (block.depth > 0 && q >= 0x100000000ull && q < 0x8000000000ull && (q & 7u) == 0 &&
+			    DebugReadGuest(q, &probe, sizeof(probe)))
+				queue.push_back({q, 0x200, block.depth - 1, block.addr + w * 8u});
+		}
+	}
+	std::fclose(file);
+	std::fprintf(stderr, "MEM_DUMP frame=%u blocks=%zu -> %s\n", frame, visited.size(), path.c_str());
+}
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -328,6 +431,9 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		if (Common::OverlayStats::Enabled()) {
+			Common::OverlayStats::Add(Common::OverlayStats::Counter::SwapchainRebuild); // KYTY_OVERLAY
+		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
@@ -347,7 +453,17 @@ struct Presenter::Impl {
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
 		auto&      cache      = renderer.GetTextureCache();
+		static std::atomic_uint traced {0};
+		const bool trace = Common::EnvRead::Flips() && [&] {
+			const auto n = traced.fetch_add(1);
+			return n < 6u || n % 120u == 0u;
+		}();
+		if (trace) cache.DebugDescribeRegion("before", info.data.address, info.data.size);
 		const auto image_id   = cache.FindImage(desc);
+		if (trace) {
+			std::fprintf(stderr, "SURFACE chosen id=%u\n", static_cast<uint32_t>(image_id.index));
+			cache.DebugDescribeRegion("after", info.data.address, info.data.size);
+		}
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
@@ -485,6 +601,8 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+	PerfOverlayNoteSwapchain(m_extent.width, m_extent.height, create_info.presentMode,
+	                         static_cast<uint32_t>(m_images.size()), m_hdr_active); // KYTY_OVERLAY
 
 	m_image_views.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
@@ -533,7 +651,8 @@ void Swapchain::Destroy() {
 	auto& graphics = m_window.graphic_ctx;
 
 	{
-		Common::LockGuard queue_lock(graphics.queue_mutex);
+		CommandRecorder::SyncQueue(); // before the queue lock
+		QueueLockGuard queue_lock(graphics.queue_mutex, "swapchain.cpp:652");
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
 	if (m_system_overlay != nullptr) {
@@ -793,6 +912,9 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	auto       vk_command      = command.Handle();
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
+	// The overlays bind their own graphics pipelines and set their own dynamic state
+	// (KYTY_DIAG_DRAW_STATE_FILTER).
+	command.InvalidateGraphicsState();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
 	if (blit_source) {
@@ -946,7 +1068,8 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		CommandRecorder::SyncQueue(); // before the queue lock
+		QueueLockGuard lock(m_window.graphic_ctx.queue_mutex, "swapchain.cpp:1019");
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
@@ -991,6 +1114,169 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	TraceFrameTime(DebugPresentCount().fetch_add(1) + 1);
+	SyncTimeline::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_SYNC_TIMELINE
+	Common::StartupTrace::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_STARTUP
+	DebugGuestMemoryDump(DebugPresentCount().load());
+	// KYTY_TRACE_RENDERDOC_FRAME=<n> (with --rd and RenderDoc's Vulkan layer loaded): requests the RenderDoc
+	// capture that the F1 key requests, at presented frame n.
+	if (static const uint32_t rd_frame = [] {
+		    const char* value = std::getenv("KYTY_TRACE_RENDERDOC_FRAME");
+		    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	    }();
+	    rd_frame != 0 && DebugPresentCount().load() == rd_frame) {
+		RenderDocRequestCapture();
+	}
+	if (DebugRtEnabled()) {
+		// Same numbering as the window title (blank frames included, first frame = 1).
+		const auto      n            = DebugPresentCount().load();
+		const char*     dir          = Common::EnvRead::FrameDir();
+		DebugReadSamples(m_impl->window.graphic_ctx);
+		std::vector<DebugRtRecord>                    records;
+		std::vector<std::pair<std::string, uint32_t>> zero_draws;
+		std::vector<DebugCsRecord>                    cs_records;
+		{
+			std::scoped_lock lock(DebugRtMutex());
+			records.swap(DebugRtFrame());
+			zero_draws.swap(DebugZeroDraws());
+			cs_records.swap(DebugCsFrame());
+		}
+		bool triggered = false;
+		if (DebugCaptureFrame().exchange(false)) {
+			triggered = true;
+		} else if (const char* trigger = DebugRtTriggerPath(); trigger != nullptr) {
+			if (FILE* file = std::fopen(trigger, "rb")) {
+				std::fclose(file);
+				std::remove(trigger);
+				// Capture the whole next frame (compute outputs too), then dump at its present.
+				DebugCaptureIndex() = 0;
+				DebugCaptureFrame() = true;
+			}
+		}
+		// KYTY_TRACE_RT_DUMP_TIMES: the listed second that has just passed (one dump per second listed).
+		static size_t next_time = 0;
+		int64_t       due_time  = -1;
+		if (const auto& times = DebugRtDumpTimes(); next_time < times.size()) {
+			const double age = Common::StartupTrace::ProcessAge();
+			while (next_time < times.size() && age >= static_cast<double>(times[next_time])) {
+				due_time = times[next_time++];
+			}
+			if (due_time >= 0) {
+				std::fprintf(stderr, "RT_DUMP_TIME t=%lld frame=%u age=%.2f\n", static_cast<long long>(due_time), n,
+				             age);
+			}
+		}
+		// The next frames record their draws and dispatches for the dump (DebugRtCollecting) only when one of them
+		// may be dumped: a captured frame, a listed second less than 2 s away, a listed frame number up to 3 ahead.
+		{
+			bool        collect = DebugCaptureFrame().load();
+			const auto& times   = DebugRtDumpTimes();
+			if (next_time < times.size() &&
+			    static_cast<double>(times[next_time]) - Common::StartupTrace::ProcessAge() <= 2.0) {
+				collect = true;
+			}
+			for (const auto frame: DebugRtDumpFrames()) {
+				if (frame > n && frame <= n + 3u) collect = true;
+			}
+			DebugRtCollect().store(collect, std::memory_order_relaxed);
+		}
+		if (triggered || due_time >= 0 || std::ranges::find(DebugRtDumpFrames(), n) != DebugRtDumpFrames().end()) {
+			auto& graphics = m_impl->window.graphic_ctx;
+			auto& cache    = m_impl->renderer.GetTextureCache();
+			if (dir != nullptr) {
+				DebugQueueFullDump(graphics, buffer.Handle(), image,
+				                   std::string(dir) + (due_time >= 0 ? "/rttime" + std::to_string(due_time)
+				                                                     : "/rtframe" + std::to_string(n)) +
+				                       "_presented",
+				                   false);
+			}
+			for (size_t r = 0; r < records.size(); ++r) {
+				const auto& record = records[r];
+				std::string shaders;
+				for (size_t k = 0; k < record.shaders.size(); ++k) {
+					const auto& [vs, ps] = record.shaders[k];
+					char text[48];
+					std::snprintf(text, sizeof(text), " %016llx/%016llx", static_cast<unsigned long long>(vs),
+					              static_cast<unsigned long long>(ps));
+					shaders += " [" + (k < record.markers.size() ? record.markers[k] : std::string("-")) + "]";
+					shaders += text;
+				}
+				std::fprintf(stderr, "RT_DUMP frame=%u rt=%zu addr=0x%llx extent=%ux%u depth=%d draws=%u vs/ps:%s\n", n,
+				             r, static_cast<unsigned long long>(record.address), record.width, record.height,
+				             record.depth ? 1 : 0, record.draws, shaders.c_str());
+				if (dir == nullptr || (!triggered && std::getenv("KYTY_TRACE_RT_DUMP_PRESENTED_ONLY") != nullptr)) {
+					continue;
+				}
+				for (auto* alias: cache.DebugImagesAt(record.address)) {
+					if (alias->backing.extent.width != record.width || alias->backing.extent.height != record.height) {
+						continue;
+					}
+					char name[96];
+					std::snprintf(name, sizeof(name), "/rtframe%u_rt%02zu_%llx", n, r,
+					              static_cast<unsigned long long>(record.address));
+					DebugQueueFullDump(graphics, buffer.Handle(), *alias, std::string(dir) + name);
+				}
+			}
+			for (const auto& cs: cs_records) {
+				std::fprintf(stderr, "RT_CS frame=%u marker=[%s] hash=0x%016llx count=%u writes:%s reads:%s\n", n,
+				             cs.marker.c_str(), static_cast<unsigned long long>(cs.hash), cs.count, cs.writes.c_str(),
+				             cs.reads.c_str());
+			}
+			for (const auto& [path, count]: zero_draws) {
+				std::fprintf(stderr, "RT_ZERO frame=%u marker=[%s] zero_instance_draws=%u\n", n, path.c_str(), count);
+			}
+			std::fflush(stderr);
+		}
+	}
+	// KYTY_TRACE_PROXY_COUNTS alone (renderCompute.cpp): its buffer dumps are written at each present.
+	static const bool proxy_counts_only = Common::EnvRead::ProxyCounts() &&
+	                                      !Common::EnvRead::Flips() && !DebugRtEnabled();
+	if (proxy_counts_only) DebugReadSamples(m_impl->window.graphic_ctx);
+	if (Common::EnvRead::Flips()) {
+		static uint32_t presented = 0;
+		const auto n = presented++;
+		// Samples queued at the previous point are read one frame later.
+		DebugReadSamples(m_impl->window.graphic_ctx);
+		// Inside the trace window (KYTY_TRACE_STENCIL_TRIGGER) every presented frame is dumped too.
+		if (n == 3u || n == 10u || n % 30u == 0u || DebugStencilWindow() || DebugFrameRange()) {
+			DebugArm().fetch_add(1);
+			auto& graphics = m_impl->window.graphic_ctx;
+			DebugQueueSample(graphics, buffer.Handle(), image, "frame" + std::to_string(n) + " presented");
+			if (const char* dir = Common::EnvRead::FrameDir(); dir != nullptr) {
+				DebugQueueFullDump(graphics, buffer.Handle(), image,
+				                   std::string(dir) + "/frame" + std::to_string(n));
+			}
+			// KYTY_TRACE_SAMPLE_ADDRS: further guest image addresses (hex, comma separated).
+			if (const char* list = std::getenv("KYTY_TRACE_SAMPLE_ADDRS"); list != nullptr) {
+				std::string text(list);
+				size_t      start = 0;
+				while (start < text.size()) {
+					const auto end     = text.find(',', start);
+					const auto token   = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+					const auto address = std::strtoull(token.c_str(), nullptr, 16);
+					m_impl->renderer.GetTextureCache().DebugDescribeRegion(token.c_str(), address, 1);
+					const auto images = m_impl->renderer.GetTextureCache().DebugImagesAt(address);
+					for (size_t k = 0; k < images.size(); ++k) {
+						DebugQueueSample(graphics, buffer.Handle(), *images[k],
+						                 "frame" + std::to_string(n) + " " + token + "#" + std::to_string(k) +
+						                     (images[k]->IsGpuModified() ? " gpu" : " cpu"));
+						// The first listed address is dumped whole, every alias; others when at most 64 MiB.
+						const char* dir = Common::EnvRead::FrameDir();
+						if (dir != nullptr && (start == 0 || images[k]->info.data.size <= (64ull << 20u))) {
+							DebugQueueFullDump(graphics, buffer.Handle(), *images[k],
+							                   std::string(dir) + "/frame" + std::to_string(n) + "_" + token +
+							                       "_alias" + std::to_string(k));
+						}
+					}
+					if (images.empty()) {
+						std::fprintf(stderr, "SAMPLE %s not cached\n", token.c_str());
+					}
+					if (end == std::string::npos) break;
+					start = end + 1;
+				}
+			}
+		}
+	}
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
@@ -1000,6 +1286,37 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	return *frame;
 }
 
+// KYTY_TRACE_FRAMETIME=1 (diagnostic): one "FRAMETIME frame=<n> ms=<time since the previous present>"
+// line per presented frame, for frame-time percentiles (scripts/analysis/frametime.py).
+#if defined(KYTY_PGO_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
+static void TraceFrameTime(uint32_t frame) {
+#if defined(KYTY_PGO_GENERATE)
+	// KYTY_PGO_WRITE_FRAME=<n> (instrumented PGO builds only): write the profile (LLVM_PROFILE_FILE) at every n-th
+	// presented frame; runs end with a forced stop, which skips the write at exit, and a long play must not lose it all.
+	static const uint32_t pgo_write_frame = [] {
+		const char* value = std::getenv("KYTY_PGO_WRITE_FRAME");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (pgo_write_frame != 0 && frame % pgo_write_frame == 0) {
+		const int result = __llvm_profile_write_file();
+		std::fprintf(stderr, "PGO_PROFILE_WRITTEN frame=%u result=%d\n", frame, result);
+	}
+#endif
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_FRAMETIME");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!on) return;
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	const auto  ms   = std::chrono::duration<double, std::milli>(now - last).count();
+	last             = now;
+	std::fprintf(stderr, "FRAMETIME frame=%u ms=%.1f\n", frame, ms);
+}
+
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
@@ -1007,6 +1324,11 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->hdr   = false;
 	frame->blank = true;
+	// The renderer lock stays in presentation (upstream d58aefde4 removed it): it also orders the present scheduler
+	// below with Impl::Present, which takes it under present_mutex, so this path must not take present_mutex inside it.
+	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	TraceFrameTime(DebugPresentCount().fetch_add(1) + 1);
+	SyncTimeline::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_SYNC_TIMELINE
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1014,7 +1336,6 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
-		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1064,6 +1385,9 @@ void Presenter::Present(std::span<const Layer> layers) {
 			m_impl->frames.Release(previous.frame);
 		}
 		previous = layer;
+		if (layer.bus == 0 && layer.frame != nullptr && PerfOverlayEnabled()) { // KYTY_OVERLAY: a new frame
+			PerfOverlayNoteFrame(layer.frame->image.extent.width, layer.frame->image.extent.height);
+		}
 	}
 	m_impl->Present();
 }
@@ -1082,6 +1406,7 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+	window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
@@ -1093,25 +1418,59 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage(present_scheduler);
+		auto status = [&] {
+			KYTY_PROFILER_BLOCK("Present::Acquire");
+			return swapchain.AcquireNextImage(present_scheduler);
+		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		// present_mutex owns the prepared frames and this scheduler. Only queue submission
-		// is shared with rendering, and it has its own queue_mutex.
-		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
-		                                 swapchain.PrepareSystemOverlay();
-		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-		                                draw_system_overlay);
-		const auto tick = swapchain.Submit(present_scheduler);
-		for (const auto& layer: layers) {
-			if (layer.frame != nullptr) {
-				layer.frame->present_tick = tick;
+		{
+			// The renderer lock stays here (upstream d58aefde4 dropped it from presentation and relies on present_mutex
+			// and queue_mutex only); our renderer and KYTY_TRACE_PERF render_lock statistics keep it.
+			std::optional<Common::LockGuard> render_lock_holder;
+			const auto lock_start = std::chrono::steady_clock::now(); // KYTY_TRACE_PERF: RenderLockStats
+			{
+				KYTY_PROFILER_BLOCK("Present::RenderLock");
+				render_lock_holder.emplace(renderer.GetMutex());
+			}
+			const auto lock_got = std::chrono::steady_clock::now();
+			KYTY_PROFILER_BLOCK("Present::RecordSubmit");
+			auto&             command = present_scheduler.BeginCommand();
+			// KYTY_OVERLAY: the performance overlay is drawn on every frame shown but, unlike the dialogs, asks for no
+			// repeated presents of the last frame (NeedsSystemOverlayRefresh): it changes the present cadence of nothing.
+			// The upstream performance panel (F2 while KYTY_OVERLAY is off) is drawn by the same pass.
+			const bool draw_system_overlay =
+			    (overlay_visual.active || PerfOverlayVisible() || PerformanceOverlayEnabled()) &&
+			    swapchain.PrepareSystemOverlay();
+			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+			                                draw_system_overlay);
+			const auto submit_start = std::chrono::steady_clock::now();
+			const auto tick = swapchain.Submit(present_scheduler);
+			for (const auto& layer: layers) {
+				if (layer.frame != nullptr) {
+					layer.frame->present_tick = tick;
+				}
+			}
+			{
+				const auto ns = [](auto d) {
+					return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+				};
+				const auto now  = std::chrono::steady_clock::now();
+				auto&      st   = GetRenderLockStats();
+				const auto hold = ns(now - lock_got);
+				st.present_wait_ns.fetch_add(ns(lock_got - lock_start), std::memory_order_relaxed);
+				st.present_hold_ns.fetch_add(hold, std::memory_order_relaxed);
+				st.present_submit_ns.fetch_add(ns(now - submit_start), std::memory_order_relaxed);
+				NoteMax(st.present_hold_max_ns, hold);
+				st.presents.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
-		status = swapchain.Present();
+		status = [&] {
+			KYTY_PROFILER_BLOCK("Present::QueuePresent");
+			return swapchain.Present();
+		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

@@ -470,7 +470,7 @@ static KYTY_SYSV_ABI void stack_chk_fail() {
 }
 
 static KYTY_SYSV_ABI int sigprocmask(int /*how*/, const void* /*set*/, void* /*oset*/) {
-	// PRINT_NAME();
+	HLE_COUNT(); // PRINT_NAME();
 
 	// LOGF("\t how = %d\n", how);
 	// LOGF("\t set = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(set));
@@ -1361,6 +1361,14 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 }
 
 static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	HLE_COUNT(); // PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(d < 0);
+
+	if (Network::Net::IsSocket(d)) {
+		return Network::Net::Send(d, static_cast<const char*>(buf), static_cast<uint64_t>(nbytes), 0);
+	}
+
 	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
@@ -1386,7 +1394,7 @@ static int KYTY_SYSV_ABI close(int d) {
 }
 
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
-	// PRINT_NAME();
+	HLE_COUNT(); // PRINT_NAME();
 
 	if (buf == nullptr) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;

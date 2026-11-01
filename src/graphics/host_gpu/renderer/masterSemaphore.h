@@ -28,14 +28,27 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
+	// Refresh queries the timeline semaphore (a kernel call) at most once per 100 microseconds; in between it keeps the
+	// last known GPU tick, which only makes IsFree conservative for that long. RefreshNow and Wait always query.
 	void Refresh();
+	void RefreshNow();
 	void Wait(uint64_t tick);
+	// KYTY_TRACE_PERF_SAMPLE_IDLE: the semaphore's value now, from any thread (no stats, the known tick stays).
+	[[nodiscard]] uint64_t QueryTickRaw() const;
+
+	// KYTY_TRACE_PERF (PERF semaphore): semaphore queries (calls/ns) by caller: 0 Refresh, 1 Wait before blocking, 2 Wait
+	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats.
+	struct Stats {
+		std::atomic<uint64_t> queries[4] {}, query_ns[4] {}, blocks {0}, block_ns {0};
+	};
+	static Stats& GetStats();
 
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<int64_t>  m_last_refresh_ns {0};
 };
 
 } // namespace Libs::Graphics

@@ -175,10 +175,12 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::GlobalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
-		case StageInputKind::BaseVertex: AddInput(info, kind, 0, 1, "gl_BaseVertex"); break;
-		case StageInputKind::BaseInstance: AddInput(info, kind, 0, 1, "gl_BaseInstance"); break;
 		case StageInputKind::PackedAncillary:
-		case StageInputKind::Parameter: break;
+		case StageInputKind::Parameter:
+		// Draw parameters are emitter-only (GPU indirect vertex variant).
+		case StageInputKind::BaseVertex:
+		case StageInputKind::BaseInstance:
+		case StageInputKind::DrawIndex: break;
 	}
 }
 
@@ -287,6 +289,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	info.float64 |= inst.GetType() == Type::F64;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
+	// Buffer stores and atomics of any kind (BDA stores: Program::has_address_writes; scratch is per lane).
+	info.buffer_writes |= buffer_access == BufferAccess::Write || buffer_access == BufferAccess::Atomic;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
 	    shared_access != SharedAccess::None) {
 		const auto index = inst.Flags<MemoryFlags>().index;
@@ -343,6 +347,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					const auto bits = StorageBufferElementBits(program, selected);
 					info.buffer_u8 |= bits == 8u;
 					info.buffer_u16 |= bits == 16u;
+					info.coherent_narrow |= selected.coherent && bits != 32u;
 				};
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
@@ -446,8 +451,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::InstanceIndex:
 				case StageInputKind::FrontFacing:
 				case StageInputKind::LocalInvocationIndex:
-				case StageInputKind::BaseVertex:
-				case StageInputKind::BaseInstance:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}
@@ -510,22 +513,29 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
-		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
+		case ValueOpcode::ReadConst: info.uses_flattened_srt = info.uses_read_const = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
-		case ValueOpcode::ConditionRef:
-			info.subgroup_vote |=
-			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+		case ValueOpcode::SharedAtomicIAdd32:
+		case ValueOpcode::SharedAtomicISub32: info.ordered_lds_atomics |= inst.HasUses(); break;
+		case ValueOpcode::ConditionRef: {
+			// Upstream da1950188 votes (GroupNonUniformVote); our wave-pair and lane-share paths still ballot the
+			// condition, so both capabilities stay declared as before the merge.
+			const bool vector = inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+			info.subgroup_vote |= vector;
+			info.subgroup_ballot |= vector;
 			break;
+		}
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
 		case ValueOpcode::SubgroupUMinU32:
 		case ValueOpcode::SubgroupUMaxU32:
-		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupOrU32:
+		case ValueOpcode::WaterfallRecord0Census: info.subgroup_arithmetic = true; break; // (the census: IAdd reduce, elect)
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -581,13 +591,14 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.outputs.clear();
 	info.user_data_registers.clear();
 	for (auto& buffer: info.buffers) buffer.live = false;
-	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
+	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt = info.uses_read_const =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
-	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
-	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
+	info.bvh = info.bvh8 = info.bvh_stack = info.ordered_lds_atomics = info.subgroup_ballot = info.subgroup_vote =
+	    info.subgroup_barrier = info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	info.buffer_writes = info.coherent_narrow = false;
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -600,8 +611,10 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
+	// A GPU-selected sampler reads its key/ordinal mapping from the flattened SRT as well (LoadInstructionSampler).
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	                           std::ranges::any_of(info.images, uses_mapping) ||
+	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	switch (program.stage) {
 		case ShaderType::Vertex:
@@ -611,14 +624,19 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
-			if (input_info.pixel->object_primitive_id) {
-				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
-					    return output.kind == StageOutputKind::Mrt && output.location == 7u;
+			// The ObjPrimID write: the slot the hardware writes VGT_OBJECT_ID (+ the primitive index) to; the guest
+			// pixel shader does not export it.
+			if (input_info.pixel->HasObjprimOutput()) {
+				if (std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+					    return output.kind == StageOutputKind::Mrt &&
+					           output.location == input_info.pixel->objprim_slot;
 				    })) {
-					return Fail("explicit MRT7 export overlaps automatic object/primitive ID");
+					return Fail("ObjPrimID slot is also an exported MRT");
 				}
-				AddBuiltinInput(info, StageInputKind::PrimitiveId);
-				AddOutput(info, StageOutputKind::ObjectPrimitiveId, 0, 7, "out_object_primitive_id");
+				AddOutput(info, StageOutputKind::ObjPrimId, 0, input_info.pixel->objprim_slot, "out_objprim_id");
+				if (input_info.pixel->objprim_add_prim_id) {
+					AddInput(info, StageInputKind::PrimitiveId, 0, 1, "gl_PrimitiveID");
+				}
 			}
 			break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, info); break;

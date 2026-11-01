@@ -92,13 +92,25 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true; // default on (volumetric mist, water; --no-tessellation off)
 	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
+	// --precompile-only: compile the recorded shader journals into the driver cache and exit, without starting the
+	// game (Emulator::Run, PipelineCache::RunPrecompileOnly). --precompile-threads: its workers (0 = the
+	// KYTY_SHADER_PRECOMPILE_THREADS setting).
+	bool                   precompile_only             = false;
+	uint32_t               precompile_threads          = 0;
+	// --export-hints <file>: with --precompile-only, the journals are written as a hints file (no game code) and the run
+	// ends. --import-hints <file>: before the precompile, the hints' code is looked for in the game folder and the records
+	// found are added to the journals (shaderPrecompile.h PrecompileHintsExport / PrecompileHintsImport).
+	std::filesystem::path  precompile_export_hints;
+	std::filesystem::path  precompile_import_hints;
+	// The game folder of --game (the importer reads its files).
+	std::filesystem::path  game_dir;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -170,6 +182,17 @@ bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
+// Threads of the emulated GPU's stages. KYTY_GPU_THREAD_CPUS lists the logical processors the execution, recording,
+// resolve and command processor threads are pinned to ("off" leaves them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps
+// the normal priority of the execution and command processor threads.
+enum class GpuStageThread : uint32_t { Execution = 0, Recording = 1, Resolve = 2, CommandProcessor = 3 };
+// Applies the priority and affinity of `stage` to the calling thread.
+void ConfigureGpuStageThread(GpuStageThread stage);
+bool     PrecompileOnly();
+uint32_t GetPrecompileThreads();
+const std::filesystem::path& GetPrecompileExportHints();
+const std::filesystem::path& GetPrecompileImportHints();
+const std::filesystem::path& GetGameDir();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

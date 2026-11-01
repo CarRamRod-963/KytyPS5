@@ -11,6 +11,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -80,6 +81,8 @@ public:
 	}
 
 	void        AddFunction(std::span<const uint32_t> words);
+	[[nodiscard]] size_t FunctionWordCount() const { return m_functions.size(); }
+	[[nodiscard]] const std::vector<uint32_t>& FunctionWords() const { return m_functions; }
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
@@ -141,6 +144,17 @@ private:
 	uint32_t    DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
 	                                 std::initializer_list<TypeAnnotation> annotations);
 	uint32_t    DeclareConstant(spv::Op opcode, std::vector<uint32_t> key);
+
+public:
+	// The single 32-bit operand of a scalar OpConstant id, if `id` is one.
+	[[nodiscard]] bool TryScalarConstant(uint32_t id, uint32_t& value) const {
+		const auto it = m_constant_words.find(id);
+		if (it == m_constant_words.end()) return false;
+		value = it->second;
+		return true;
+	}
+
+private:
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
 	uint32_t                                  m_next_id = 1;
@@ -159,6 +173,7 @@ private:
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	std::unordered_map<uint32_t, uint32_t>    m_constant_words;
 	size_t                                    m_unpatched_phi_incomings = 0;
 	bool                                      m_emit_names              = false;
 };

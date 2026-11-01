@@ -61,6 +61,29 @@ public:
 	// bit `keys` selects; a hit expands to 0xff when `expand` is set.
 	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
 	                                         uint32_t keys, bool expand);
+	// KYTY_FIX_SHARED_IMAGE_MEMORY's direct path: the linear host copy of `target`'s level 0 takes, texel by texel, the
+	// guest bytes the linear host copy of `source`'s level 0 holds at the same guest addresses (gpu_tiler_alias_copy).
+	// Both images: tiled, 2D, one level and layer, level 0 outside the mip tail (AliasCopyFits).
+	// KYTY_FIX_IMAGE_MEMORY_OWNER: one rectangle of level 0 of a tiled 2D image with one level and layer (level 0 outside
+	// the mip tail, 1x1 texel elements): with `tile`, the rectangle's texels in `linear` (rows of width * bytes per
+	// element) go to their guest offsets in `tiled`, whose byte at `tiled_offset` stands for guest address
+	// `tiled_guest_address`; otherwise the reverse. x0 and y0 are multiples of the block's texel width and height.
+	void TileRect(bool tile, const ImageInfo& info, uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+	              vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
+	              uint64_t tiled_offset, uint64_t tiled_capacity, uint64_t tiled_guest_address);
+	// KYTY_FIX_IMAGE_MEMORY_OWNER: whole guest-memory blocks of `source` into `target` in one pass (gpu_tiler_retile),
+	// texel by texel through both in-block tables, on raw texel bits copied out of and back into the images. A job is
+	// one block: the target's texel rectangle (origin and the size inside its extent) and position XOR value, the
+	// source's likewise (t_base/s_base: set by Retile). Both images: tiled 2D, one level and layer, the same block size,
+	// no colour transform (RetileFits); jobs at most 65535.
+	struct RetileJob {
+		uint32_t t_x0, t_y0, w, h, s_x0, s_y0, s_w, s_h, t_xor, s_xor, t_base, s_base;
+	};
+	[[nodiscard]] static bool RetileFits(const Image& target, const Image& source) noexcept;
+	void Retile(Image& target, Image& source, std::span<const RetileJob> jobs);
+	[[nodiscard]] static bool AliasCopyFits(const ImageInfo& info) noexcept;
+	void AliasCopy(vk::Buffer target_linear, uint64_t target_size, const ImageInfo& target, vk::Buffer source_linear,
+	               uint64_t source_size, const ImageInfo& source);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -140,7 +163,21 @@ private:
 	vk::Pipeline                            m_d32_to_d16      = nullptr;
 	vk::Pipeline                            m_color_transform = nullptr;
 	vk::Pipeline                            m_color_clear     = nullptr;
+	// AliasCopy: its own layout (three storage buffers, 76 bytes of push constants) and the in-block tables, one pair per
+	// (block family, element size) written once into a host-visible buffer.
+	vk::DescriptorSetLayout                 m_alias_descriptor_layout = nullptr;
+	vk::PipelineLayout                      m_alias_pipeline_layout   = nullptr;
+	vk::Pipeline                            m_alias_copy              = nullptr;
+	std::unique_ptr<Buffer>                 m_alias_tables;
+	uint32_t                                m_alias_tables_used = 0; // words
+	std::array<std::array<uint32_t, 2>, FamilyCount * BytesPerElementCount> m_alias_table_at {}; // +1; 0: none
+	[[nodiscard]] std::array<uint32_t, 2> AliasTables(const TileBlockLayout& block);
 	std::unique_ptr<Buffer>                 m_clear_predicates;
+	// Retile: its own layout (four storage buffers: source and target rectangles, jobs, tables) and its linear buffers.
+	vk::DescriptorSetLayout                 m_retile_descriptor_layout = nullptr;
+	vk::PipelineLayout                      m_retile_pipeline_layout   = nullptr;
+	vk::Pipeline                            m_retile                   = nullptr;
+	std::array<std::unique_ptr<Buffer>, 2>   m_retile_linear;
 };
 
 } // namespace Libs::Graphics

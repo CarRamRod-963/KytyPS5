@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/overlayStats.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio_internal.h"
@@ -406,6 +407,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		if (queued < static_cast<int>(prepared_size)) {
 			if (port->queue_primed) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+				// KYTY_OVERLAY: a primed port ran (nearly) dry before the game's next buffer came.
+				if (Common::OverlayStats::Enabled()) {
+					Common::OverlayStats::Add(Common::OverlayStats::Counter::AudioStarved);
+				}
 			}
 			port->queue_primed = false;
 		}

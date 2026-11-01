@@ -82,8 +82,18 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static thread_local bool t_pass_access_violations = false;
+
+void PassAccessViolations(bool pass) {
+	t_pass_access_violations = pass;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+
+	if (t_pass_access_violations && exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+		return EXCEPTION_CONTINUE_SEARCH; // the thread's own __except handles it (PassAccessViolations)
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
@@ -112,6 +122,72 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
+		// Diagnostic: name the faulting instruction of a fatal arithmetic exception.
+		// Also guard-page violations (0x80000001) and stack overflows: until now the process died
+		// with no trace. The fault address and the thread's stack range tell a stack overflow on a
+		// thread whose stack the system does not grow apart from a read of another thread's stack.
+		if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ||
+		    exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+			ULONG_PTR low = 0, high = 0;
+			GetCurrentThreadStackLimits(&low, &high);
+			fprintf(stderr,
+			        "HOST_EXCEPTION_STACK code=0x%08lx rip=0x%016llx rsp=0x%016llx access=%llu addr=0x%016llx "
+			        "thread=%lu stack=[0x%016llx,0x%016llx)\n",
+			        static_cast<unsigned long>(exception_record->ExceptionCode),
+			        static_cast<unsigned long long>(exception->ContextRecord->Rip),
+			        static_cast<unsigned long long>(exception->ContextRecord->Rsp),
+			        static_cast<unsigned long long>(exception_record->NumberParameters > 0
+			                                            ? exception_record->ExceptionInformation[0]
+			                                            : 0),
+			        static_cast<unsigned long long>(exception_record->NumberParameters > 1
+			                                            ? exception_record->ExceptionInformation[1]
+			                                            : 0),
+			        GetCurrentThreadId(), static_cast<unsigned long long>(low),
+			        static_cast<unsigned long long>(high));
+			// Return addresses on the stack inside the emulator executable (resolve with the link map:
+			// scripts/resolve-perf.py), so the caller of the faulting library routine can be named.
+			const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+			const auto* rsp = reinterpret_cast<const uint64_t*>(exception->ContextRecord->Rsp);
+			fprintf(stderr, "HOST_EXCEPTION_FRAMES exe_base=0x%016llx", static_cast<unsigned long long>(exe));
+			int found = 0;
+			for (int k = 0; k < 512 && found < 24; k++) {
+				const auto address = reinterpret_cast<uint64_t>(rsp + k);
+				if (address + 8u > high) break;
+				const auto value = rsp[k];
+				if (value > exe && value < exe + 0x10000000ull) {
+					fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(value - exe));
+					found++;
+				}
+			}
+			fprintf(stderr, "\n");
+			fflush(stderr);
+		}
+		if (exception_record->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+		    exception_record->ExceptionCode == EXCEPTION_INT_OVERFLOW ||
+		    exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+			const auto* c = exception->ContextRecord;
+			HMODULE     module = nullptr;
+			char        name[MAX_PATH] = "guest";
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       static_cast<LPCSTR>(exception_record->ExceptionAddress), &module) &&
+			    module != nullptr) {
+				GetModuleFileNameA(module, name, MAX_PATH);
+			}
+			fprintf(stderr,
+			        "HOST_EXCEPTION code=0x%08lx rip=0x%016llx module=%s base=0x%llx rax=0x%llx rcx=0x%llx "
+			        "rdx=0x%llx rbx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx r8=0x%llx r9=0x%llx "
+			        "r14=0x%llx\n",
+			        static_cast<unsigned long>(exception_record->ExceptionCode),
+			        static_cast<unsigned long long>(c->Rip), name,
+			        reinterpret_cast<unsigned long long>(module), static_cast<unsigned long long>(c->Rax),
+			        static_cast<unsigned long long>(c->Rcx), static_cast<unsigned long long>(c->Rdx),
+			        static_cast<unsigned long long>(c->Rbx), static_cast<unsigned long long>(c->Rsi),
+			        static_cast<unsigned long long>(c->Rdi), static_cast<unsigned long long>(c->Rbp),
+			        static_cast<unsigned long long>(c->Rsp), static_cast<unsigned long long>(c->R8),
+			        static_cast<unsigned long long>(c->R9), static_cast<unsigned long long>(c->R14));
+			fflush(stderr);
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
