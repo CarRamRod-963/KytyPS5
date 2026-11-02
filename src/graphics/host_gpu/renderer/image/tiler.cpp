@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <numeric>
 #include <tuple>
 #include <vector>
 #include <cstring>
@@ -766,9 +767,11 @@ bool TileManager::RetileFits(const Image& target, const Image& source) noexcept 
 	return fits(target) && fits(source) && target.info.tiling.block.block_size == source.info.tiling.block.block_size;
 }
 
-// The jobs' texel rectangles of both images go to linear buffers (one image-to-buffer copy each, rows of the
-// rectangle's width, each rectangle 16-byte aligned), gpu_tiler_retile moves the bytes between them, and the target's
-// rectangles go back (one buffer-to-image copy): four commands per call whatever the number of blocks.
+// The jobs' texel rectangles of both images go to linear buffers (one image-to-buffer copy each), gpu_tiler_retile
+// moves the bytes between them, and the target's rectangles go back (one buffer-to-image copy): four commands per call
+// whatever the number of blocks. Side-by-side blocks of one block row of an image (the same top and height, every one
+// but the last a whole block wide) are one copied rectangle, one region of the copy instead of one per block: the
+// regions' count, not the bytes, is what costs the GPU time (2.11, ~3700 blocks a frame in Quality).
 void TileManager::Retile(Image& target, Image& source, std::span<const RetileJob> jobs) {
 	EXIT_IF(jobs.empty() || jobs.size() > 0xffffu || !RetileFits(target, source));
 	struct Params {
@@ -811,12 +814,8 @@ void TileManager::Retile(Image& target, Image& source, std::span<const RetileJob
 	const auto  s_tables = AliasTables(s_block);
 	// The linear layout of the rectangles, checked against the images (every rectangle inside its extent, every XOR
 	// value inside the block and a multiple of the element size: the pass reads and writes only inside the buffers).
-	std::vector<RetileJob>           placed(jobs.begin(), jobs.end());
-	std::vector<vk::BufferImageCopy> t_copies, s_copies;
-	t_copies.reserve(placed.size());
-	s_copies.reserve(placed.size());
-	uint64_t t_size = 0, s_size = 0;
-	for (auto& job: placed) {
+	std::vector<RetileJob> placed(jobs.begin(), jobs.end());
+	for (const auto& job: placed) {
 		EXIT_IF(job.w == 0u || job.h == 0u || job.s_w == 0u || job.s_h == 0u || job.w > t_block.block_width ||
 		        job.h > t_block.block_height || job.s_w > s_block.block_width || job.s_h > s_block.block_height ||
 		        job.t_x0 % t_block.block_width != 0u || job.t_y0 % t_block.block_height != 0u ||
@@ -827,30 +826,58 @@ void TileManager::Retile(Image& target, Image& source, std::span<const RetileJob
 		        uint64_t {job.s_y0} + job.s_h > source.backing.extent.height || job.t_xor >= t_block.block_size ||
 		        job.s_xor >= s_block.block_size || job.t_xor % t_block.bytes_per_element != 0u ||
 		        job.s_xor % s_block.bytes_per_element != 0u);
-		t_size     = Common::AlignUp(t_size, 16u);
-		s_size     = Common::AlignUp(s_size, 16u);
-		job.t_base = static_cast<uint32_t>(t_size);
-		job.s_base = static_cast<uint32_t>(s_size);
-		vk::BufferImageCopy copy {};
-		copy.imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		copy.bufferOffset      = t_size;
-		copy.bufferRowLength   = job.w;
-		copy.bufferImageHeight = job.h;
-		copy.imageOffset       = vk::Offset3D {static_cast<int32_t>(job.t_x0), static_cast<int32_t>(job.t_y0), 0};
-		copy.imageExtent       = vk::Extent3D {job.w, job.h, 1};
-		t_copies.push_back(copy);
-		copy.bufferOffset      = s_size;
-		copy.bufferRowLength   = job.s_w;
-		copy.bufferImageHeight = job.s_h;
-		copy.imageOffset       = vk::Offset3D {static_cast<int32_t>(job.s_x0), static_cast<int32_t>(job.s_y0), 0};
-		copy.imageExtent       = vk::Extent3D {job.s_w, job.s_h, 1};
-		s_copies.push_back(copy);
-		t_size += uint64_t {job.w} * job.h * t_block.bytes_per_element;
-		s_size += uint64_t {job.s_w} * job.s_h * s_block.bytes_per_element;
 	}
-	EXIT_IF(t_size > UINT32_MAX || s_size > UINT32_MAX);
-	t_size               = Common::AlignUp(t_size, 16u);
-	s_size               = Common::AlignUp(s_size, 16u);
+	// One side's copied rectangles (each 16-byte aligned): the jobs in row order, side-by-side blocks joined.
+	const auto place = [&](bool target_side, const TileBlockLayout& block, std::vector<vk::BufferImageCopy>& copies) {
+		struct Rect {
+			uint32_t x0, y0, w, h;
+		};
+		const auto rect = [&](const RetileJob& job) {
+			return target_side ? Rect {job.t_x0, job.t_y0, job.w, job.h} : Rect {job.s_x0, job.s_y0, job.s_w, job.s_h};
+		};
+		std::vector<uint32_t> order(placed.size());
+		std::iota(order.begin(), order.end(), 0u);
+		std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+			const auto ra = rect(placed[a]), rb = rect(placed[b]);
+			return ra.y0 != rb.y0 ? ra.y0 < rb.y0 : ra.x0 < rb.x0;
+		});
+		const uint32_t bpe  = block.bytes_per_element;
+		uint64_t       size = 0;
+		for (size_t first = 0; first < order.size();) {
+			const Rect r0    = rect(placed[order[first]]);
+			uint32_t   width = r0.w;
+			size_t     last  = first + 1;
+			for (; last < order.size(); last++) {
+				const Rect r = rect(placed[order[last]]);
+				if (r.y0 != r0.y0 || r.h != r0.h || width % block.block_width != 0u || r.x0 != r0.x0 + width) break;
+				width += r.w;
+			}
+			size                 = Common::AlignUp(size, 16u);
+			const uint64_t pitch = uint64_t {width} * bpe;
+			for (size_t k = first; k < last; k++) {
+				auto&          job  = placed[order[k]];
+				const uint64_t base = size + uint64_t {rect(job).x0 - r0.x0} * bpe;
+				EXIT_IF(base > UINT32_MAX || pitch > UINT32_MAX);
+				(target_side ? job.t_base : job.s_base)   = static_cast<uint32_t>(base);
+				(target_side ? job.t_pitch : job.s_pitch) = static_cast<uint32_t>(pitch);
+			}
+			vk::BufferImageCopy copy {};
+			copy.imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.bufferOffset      = size;
+			copy.bufferRowLength   = width;
+			copy.bufferImageHeight = r0.h;
+			copy.imageOffset       = vk::Offset3D {static_cast<int32_t>(r0.x0), static_cast<int32_t>(r0.y0), 0};
+			copy.imageExtent       = vk::Extent3D {width, r0.h, 1};
+			copies.push_back(copy);
+			size += pitch * r0.h;
+			first = last;
+		}
+		EXIT_IF(size > UINT32_MAX);
+		return Common::AlignUp(size, 16u);
+	};
+	std::vector<vk::BufferImageCopy> t_copies, s_copies;
+	const uint64_t                   t_size = place(true, t_block, t_copies);
+	const uint64_t                   s_size = place(false, s_block, s_copies);
 	const auto linear    = [&](std::unique_ptr<Buffer>& buffer, uint64_t size) -> Buffer& {
         if (!buffer || buffer->Size() < size) {
             if (buffer) m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });

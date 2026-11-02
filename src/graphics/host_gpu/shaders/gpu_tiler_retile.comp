@@ -3,7 +3,8 @@
 
 // KYTY_FIX_IMAGE_MEMORY_OWNER: one pass that gives a target image the guest bytes a source image holds over whole
 // blocks of guest memory both images cover. The blocks' texel rectangles of both images are copied into linear
-// buffers (raw texel bits, rows of the rectangle's width) around this pass. One work-group row per block: for each
+// buffers (raw texel bits; a block's rows `pitch` bytes apart: side-by-side blocks share one copied rectangle) around
+// this pass. One work-group row per block: for each
 // target texel of the block, its byte offset in the block (the target's in-block table, XOR the block position's
 // value), then for each source element covering those bytes its texel (the source's inverse in-block table at the
 // offset XOR the source block's value); bytes of source texels outside the source's extent keep the target's.
@@ -23,6 +24,8 @@ struct Job {
 	uint s_xor;
 	uint t_base; // byte offset of the target rectangle in the target buffer
 	uint s_base; // byte offset of the source rectangle in the source buffer
+	uint t_pitch; // bytes between the target rectangle's rows
+	uint s_pitch; // bytes between the source rectangle's rows
 };
 
 layout(set = 0, binding = 0, std430) readonly buffer Source { uint8_t source_bytes[]; };
@@ -48,7 +51,7 @@ void main() {
 	const uint u        = texel % job.w;
 	const uint v        = texel / job.w;
 	const uint t_offset = tables[p.t_forward + v * p.t_block_width + u] ^ job.t_xor;
-	const uint target   = job.t_base + (v * job.w + u) * p.t_bpe;
+	const uint target   = job.t_base + v * job.t_pitch + u * p.t_bpe;
 	uint       k        = 0u;
 	for (uint step = 0u; step < 16u && k < p.t_bpe; step++) {
 		const uint offset = t_offset + k;
@@ -58,7 +61,7 @@ void main() {
 		const uint sv     = place >> 16u;
 		const uint chunk  = max(min(p.s_bpe - (offset - base), p.t_bpe - k), 1u);
 		if (place != 0xffffffffu && su < job.s_w && sv < job.s_h) {
-			const uint source = job.s_base + (sv * job.s_w + su) * p.s_bpe + (offset - base);
+			const uint source = job.s_base + sv * job.s_pitch + su * p.s_bpe + (offset - base);
 			for (uint c = 0u; c < chunk; c++) {
 				target_bytes[target + k + c] = source_bytes[source + c];
 			}

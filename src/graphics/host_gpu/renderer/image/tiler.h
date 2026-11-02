@@ -74,10 +74,10 @@ public:
 	// KYTY_FIX_IMAGE_MEMORY_OWNER: whole guest-memory blocks of `source` into `target` in one pass (gpu_tiler_retile),
 	// texel by texel through both in-block tables, on raw texel bits copied out of and back into the images. A job is
 	// one block: the target's texel rectangle (origin and the size inside its extent) and position XOR value, the
-	// source's likewise (t_base/s_base: set by Retile). Both images: tiled 2D, one level and layer, the same block size,
-	// no colour transform (RetileFits); jobs at most 65535.
+	// source's likewise (t_base/s_base and the row pitches: set by Retile). Both images: tiled 2D, one level and layer,
+	// the same block size, no colour transform (RetileFits); jobs at most 65535.
 	struct RetileJob {
-		uint32_t t_x0, t_y0, w, h, s_x0, s_y0, s_w, s_h, t_xor, s_xor, t_base, s_base;
+		uint32_t t_x0, t_y0, w, h, s_x0, s_y0, s_w, s_h, t_xor, s_xor, t_base, s_base, t_pitch, s_pitch;
 	};
 	[[nodiscard]] static bool RetileFits(const Image& target, const Image& source) noexcept;
 	void Retile(Image& target, Image& source, std::span<const RetileJob> jobs);
