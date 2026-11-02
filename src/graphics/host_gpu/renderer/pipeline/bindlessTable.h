@@ -78,6 +78,10 @@ public:
 	// the rest equally (BindlessTable constructor: from the device's limits, no capacity of our own; 16384 slots let the
 	// particle table's textures run out: black fog and broken clouds with the large tables on the table path, 24.10).
 	static constexpr uint32_t ReservedSampledImages = 4096;
+	// The most sampled images the arrays take from the device: NVIDIA reports 1048576 (261120 per array, the tested size);
+	// AMD drivers report up to 2^32-1, and a pool of that many descriptors fails ("create bindless descriptor pool
+	// failed: ErrorUnknown", a player's Radeon, 2.11).
+	static constexpr uint32_t MaxSampledImages = 1u << 20u;
 	static constexpr uint32_t TranslationEntries = 1u << 22u;
 	static constexpr uint32_t MaxSamplers        = 4096;
 

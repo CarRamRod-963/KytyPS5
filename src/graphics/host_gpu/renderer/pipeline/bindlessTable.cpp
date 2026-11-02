@@ -225,7 +225,7 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 		return;
 	}
 	// The device's update-after-bind sampled images, less what a pipeline's other bindings keep, shared by the arrays.
-	const uint32_t device_images = graphics.bindless_max_sampled_images;
+	const uint32_t device_images = std::min(graphics.bindless_max_sampled_images, MaxSampledImages);
 	m_images_per_array =
 	    device_images > ReservedSampledImages ? (device_images - ReservedSampledImages) / ImageArrays : 0u;
 	std::fprintf(stderr,
