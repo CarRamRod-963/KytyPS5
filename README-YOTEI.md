@@ -59,6 +59,11 @@ What to expect: on the test PC (Ryzen 7 9800X3D, RTX 5070 Ti) the game runs at r
 fps in the open world with the default settings, more with the mods above. The emulator's GPU work runs on four threads, each on its own
 physical CPU core, chosen automatically for the processor (`KYTY_GPU_THREAD_CPUS=off` turns that off).
 
+Known slow spot: some in-engine cutscenes (for example the Snake cutscene) drop to about 6-7 fps for a minute, with
+a few seconds at 1-2 fps; the game returns to its usual frame rate after them. The game renders them at up to 4K,
+and in the first ~50 s after a save is loaded the emulator still translates the game's shaders in the background
+(again on every start). The **Render at 1080p** mod helps a little (about +10% in that cutscene).
+
 ## Building (Windows)
 
 Toolchain used for this fork:
