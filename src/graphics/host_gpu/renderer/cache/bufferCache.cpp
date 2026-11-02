@@ -1036,11 +1036,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// A CPU read of a GPU-modified page downloads every GPU-modified range of the same buffer within +-4 MiB in one
 			// synchronization, so neighbouring reads do not each wait for the GPU again (an approximation of timing only).
 			if (!is_write) {
-				const uint64_t     window = ReadWindowBytes;
-				const uint64_t     start  = buffer.CpuAddress();
-				const uint64_t     end    = start + buffer.Size();
-				const uint64_t     lo     = std::max(start, vaddr > window ? (vaddr - window) & ~0xfffull : 0ull);
-				const uint64_t     hi     = std::min(end, (vaddr + size + window + 0xfffull) & ~0xfffull);
+				const auto [lo, hi] = ReadRange(buffer, vaddr, size);
 				if (lo < hi && lo <= vaddr && vaddr + size <= hi) {
 					PerfCount(PerfKind::SyncRead);
 
@@ -1109,11 +1105,7 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 	uint64_t lo = vaddr;
 	uint64_t hi = vaddr + size;
 	if (!is_write) {
-		const uint64_t     window = ReadWindowBytes;
-		const uint64_t     start  = buffer.CpuAddress();
-		const uint64_t     end    = start + buffer.Size();
-		const uint64_t     w_lo   = std::max(start, vaddr > window ? (vaddr - window) & ~0xfffull : 0ull);
-		const uint64_t     w_hi   = std::min(end, (vaddr + size + window + 0xfffull) & ~0xfffull);
+		const auto [w_lo, w_hi] = ReadRange(buffer, vaddr, size);
 		if (w_lo < w_hi && w_lo <= vaddr && vaddr + size <= w_hi) {
 			lo = w_lo;
 			hi = w_hi;
@@ -3556,6 +3548,32 @@ void BufferCache::BarBatchRead(const uint8_t* mapped, uint64_t base,
 		Libs::LibKernel::Memory::WriteBacking(start, data, end - start);
 	}
 	ReportBarBatch();
+}
+
+// The read window, unless the host mapping cannot serve it at once (more than BarMaxBytes GPU-dirty, or written by work
+// not finished) while the pages of the access can: then those pages, so the read waits for their writes only and not
+// for the whole queue (frame timeline 2.11: a 4-byte SRT read at the start of a frame took a 1.36 MB window and waited
+// 6-9.5 ms for 5 command buffers, its own bytes long written; live A/B +1.8% standing, +7.7% walking, draws equal). The
+// bytes left outside stay GPU-modified and synchronize when accessed.
+std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const uint64_t start = buffer.CpuAddress();
+	const uint64_t end   = start + buffer.Size();
+	const uint64_t lo    = std::max(start, vaddr > ReadWindowBytes ? (vaddr - ReadWindowBytes) & ~0xfffull : 0ull);
+	const uint64_t hi    = std::min(end, (vaddr + size + ReadWindowBytes + 0xfffull) & ~0xfffull);
+	if (!(lo < hi && lo <= vaddr && vaddr + size <= hi)) return {vaddr, vaddr + size};
+	if (buffer.Mapped().empty()) return {lo, hi};
+	const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
+	if (ready == m_buffer_ready_tick.end()) return {lo, hi};
+	const auto servable = [&](uint64_t a, uint64_t b) {
+		std::vector<std::pair<uint64_t, uint64_t>> intervals;
+		uint64_t                                   newest = 0, total = 0;
+		if (ScanBarDownload(buffer, a, b - a, intervals, newest, total) >= 0) return false;
+		return total <= BarMaxBytes && std::max(newest, ready->second) < m_scheduler.CurrentTick();
+	};
+	if (servable(lo, hi)) return {lo, hi};
+	const uint64_t p_lo = std::max(start, vaddr & ~0xfffull);
+	const uint64_t p_hi = std::min(end, (vaddr + size + 0xfffull) & ~0xfffull);
+	return servable(p_lo, p_hi) ? std::pair {p_lo, p_hi} : std::pair {lo, hi};
 }
 
 int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {

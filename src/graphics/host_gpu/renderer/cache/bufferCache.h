@@ -767,6 +767,8 @@ private:
 	// write tick are copied from the mapping after waiting for that tick only. 1: copied and
 	// published, -1: not possible (use the GPU copy path).
 	int TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// The range a CPU read of [vaddr, vaddr + size) downloads (ReadMemory, PlanCallerWait).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadRange(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Its publish of the intervals from span reads of the mapping.
 	void BarBatchRead(const uint8_t* mapped, uint64_t base, const std::vector<std::pair<uint64_t, uint64_t>>& intervals);
 	// Its scan: the GPU-dirty intervals of the GPU-modified pages of [vaddr, vaddr + size), the newest 64 KiB granule
