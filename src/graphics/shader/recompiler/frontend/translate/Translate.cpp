@@ -1294,10 +1294,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 		entry_ir.SetExec(initial_exec);
-		// Pixel EXEC words start with the live (non-helper) lanes; helpers keep the per-lane EXEC.
-		const auto initial_mask = options.stage == ShaderType::Pixel
-		                              ? entry_ir.Emit(IR::ValueOpcode::LiveMask)
-		                              : entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
+		// The EXEC words start with every lane the wave runs, pixel helper lanes included (not upstream 5429888d4's
+		// LiveMask): VCC and the masks the shader derives from EXEC then keep the helpers, which compute the
+		// coordinates of implicit-LOD samples in branches. Without them the quad derivatives are wrong and distant
+		// terrain, the snow mask and the fog take far too coarse a mip (Ghost of Yotei, 2.11).
+		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
 		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
 		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
 		                                               : IR::U32(IR::Value(0u));
