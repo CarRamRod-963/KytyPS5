@@ -254,7 +254,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || ClampNanCheckBinding(state.program) ||
 	                                                 RtTripsCheckBinding(state.program); // KYTY_DIAG_RT_TRIPS
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: ReadConst reads FlattenedSrtUniform; the storage binding keeps the SRT mapping
+	// Uniform const buffers (ShaderIR.h): ReadConst reads FlattenedSrtUniform; the storage binding keeps the SRT mapping
 	// reads of GPU-selected descriptors (ValidateNativeProgram expects the same split).
 	const bool srt_uniform = info.uses_read_const && IR::ReadConstUniform(state.program.srt_reads.size());
 	const auto uses_mapping = [](const auto& resource) { return resource.indirect_root != UINT32_MAX; };
@@ -355,16 +355,11 @@ void DefineDescriptors(EmitterState& state) {
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
-				if (IR::UniformConstBuffers()) {
-					// KYTY_PERF_UNIFORM_CONST_BUFFERS: every shader-data read is a constant dword index.
-					EXIT_IF(bindings.ShaderDataDwords() > IR::UniformBufferMaxBytes / 4u);
-					state.shader_data_uniform_variable =
-					    Define(UniformDwordBlockType(state, bindings.ShaderDataDwords()), "shader_data",
-					           spv::StorageClassUniform);
-					break;
-				}
-				state.shader_data_storage_variable =
-				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				// Uniform const buffers (ShaderIR.h): every shader-data read is a constant dword index.
+				EXIT_IF(bindings.ShaderDataDwords() > IR::UniformBufferMaxBytes / 4u);
+				state.shader_data_uniform_variable =
+				    Define(UniformDwordBlockType(state, bindings.ShaderDataDwords()), "shader_data",
+				           spv::StorageClassUniform);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrtUniform:
 				state.flattened_srt_uniform_variable =

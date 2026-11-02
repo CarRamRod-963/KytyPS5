@@ -95,8 +95,8 @@ No launch script or settings file is needed: a plain `kyty_emulator.exe --game .
 maintainer's test runs. All settings this fork depends on are defaults in the source:
 
 - `src/common/envDefaults.h` holds the table of settings that used to come from the launch script, each marked as
-  `config` (ordinary setting or measured performance switch), `correct` (hardware behaviour still carrying an old
-  `DIAG_` name) or `workaround` (see below), with the work item that will replace it;
+  `config` (ordinary setting or measured performance switch), `unproven` (probably hardware behaviour, named
+  `FIX_`) or `workaround` (named `WORKAROUND_`, see below), with the work item that will replace it;
 - every other switch has its default where it is read (`std::getenv("KYTY_...")`), documented in the comment above it.
 
 An environment variable still overrides any default (`KYTY_X=0` turns a switch off), and `KYTY_ENV_DEFAULTS=0` ignores
@@ -122,17 +122,20 @@ until their replacement lands.
 | Area (work item) | Switches | What may differ from the PS5 |
 |---|---|---|
 | GPU-written memory (D6) | `DIAG_BDA_STORE_TRACK`, `DIAG_BDA_STORE_UNTRACKED`, `DIAG_BDA_PIN_FAULTED`, `DIAG_FAULT_WINDOW_KB`, `DIAG_SCALAR_READS_IGNORE_ADDRESS_WRITES` | pages the GPU writes through pointers are tracked late and kept generously; rare stale reads |
-| Image memory shared by several images (D4/D5) | `DIAG_ALIAS_SYNC` | transient targets copied between aliases; some post-processing (screen-space GI filter) may be off |
-| Stencil and depth metadata (D8) | `DIAG_STENCIL_PLANE_SYNC`, `DIAG_STENCIL_STORAGE_SHADOW`, `DIAG_PRESERVE_STENCIL`, `DIAG_STENCIL_ALIAS_COPY`, `DIAG_HTILE_FULL_RANGE`, `DIAG_HTILE_RMW_CLEAR` (code), `DIAG_DEPTH_ENCODING_LENIENT` | stencil kept as copies, HTILE emulated as "full range"; occasional missing masks or shadow tiles |
-| Colour compression (A5) | `DIAG_DCC_FAST_CLEAR`, `DIAG_DCC_KEEP_BUFFER_WRITES`, `DIAG_COLOR_META_UNALIGNED_SKIP` | simplified DCC clear handling |
+| Image memory shared by several images (D4/D5) | `WORKAROUND_ALIAS_SYNC` | transient targets copied between aliases; some post-processing (screen-space GI filter) may be off |
+| Stencil and depth metadata (D8) | `WORKAROUND_STENCIL_PLANE_SYNC`, `WORKAROUND_STENCIL_STORAGE_SHADOW`, `WORKAROUND_PRESERVE_STENCIL`, `WORKAROUND_STENCIL_ALIAS_COPY`, `WORKAROUND_HTILE_FULL_RANGE`, `FIX_HTILE_RMW_CLEAR` (code), `WORKAROUND_DEPTH_ENCODING_LENIENT` | stencil kept as copies, HTILE emulated as "full range"; occasional missing masks or shadow tiles |
+| Colour compression (A5) | `WORKAROUND_DCC_FAST_CLEAR`, `DIAG_DCC_KEEP_BUFFER_WRITES`, `DIAG_COLOR_META_UNALIGNED_SKIP` | simplified DCC clear handling |
+| One fill compute shader (A5) | `WORKAROUND_FILL_CS_HASHES` (code: shader `2bd3cd129405f9a9`) | the shader is recognised by its hash and its stores are taken as a DCC fast clear (it still runs); with the list set by hand, a listed shader's output is filled instead of computed |
 | GPU-selected (bindless) textures (D1/D2) | `DIAG_BINDLESS_EAGER`, `DIAG_NULL_TEXTURE_GRAY`, `DIAG_BINDLESS_IMMEDIATE_BUDGET` (code: 64 new textures per frame) | a new texture can show a placeholder for 1-3 frames; unresolved descriptors read as empty (e.g. snow and mud tracks). Fixed since 2026-10-29 (C9): texture tables over 1 MiB (particles, mist) are translated like every other table instead of showing placeholders past 1 MiB, and a table the table path cannot take stops with `BINDLESS_TABLE_REFUSED` instead of a silent placeholder |
 | Shaders capped (D7) | `SHADER_LOOP_LIMIT_HASHES` (2 shaders), `DIAG_SKIP_UNSUPPORTED_CS`, global loop watchdog `KYTY_SHADER_LOOP_LIMIT` (code; a safety net, not a workaround: every shader loop ends after 65,536 iterations so a runaway loop cannot hang the GPU - it never fired in our tests, 0 of ~1,950 checks at the gate and in the village, 29.10). The particle-emit shader 142383a7 is no longer skipped (29.10; it runs rarely - if a crash follows the log line `W9_PARTICLE_EMIT`, report it) | rare shaders with a loop cap |
-| Terrain shaders (M42) | `DIAG_WATERFALL_POINTER_RECORD0` | approximate material table in some terrain shaders |
+| Terrain shaders (M42) | `WORKAROUND_WATERFALL_POINTER_RECORD0` | approximate material table in some terrain shaders |
 | Texture edge cases | `SDK_FIX_MIP_CHAIN_CLAMP`, `SDK_FIX_NULL_COMPARE_DEPTH`, `SDK_FIX_INTEGER_POINT` (code) | rare sampling edge cases approximated (logged) |
 | Game-specific table (D6) | `RECORD_KEYED_GAME_COUNTS` (code) | one shader's record count is read from the game's data layout instead of a generic bound |
 
-Seven more table entries are marked `correct` (believed to be the hardware's behaviour; three still need an exactness
-check). The game's GPU timer reads host GPU busy time (`FIX_VIRTUAL_GPU_CLOCK`); because the emulated frame takes
+The hardware behaviour that was once a switch (formatted stores through GPU-selected descriptors, the GDS base in M0,
+textures less aligned than their swizzle block, mip-tail slices) is always on now. Two table entries are marked
+`unproven` (`FIX_TEXTURE_CLAMP_LAST_LEVEL`, `FIX_RT_11_11_10_FLOAT`: believed to be the hardware's behaviour, an
+exactness check is still open). The game's GPU timer reads host GPU busy time (`FIX_VIRTUAL_GPU_CLOCK`); because the emulated frame takes
 longer than on a PS5, the game stays at a lower internal resolution than on the console (1080p at the test scene of
 most measurements). Reporting the time a PS5 would take is open.
 

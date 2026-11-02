@@ -180,9 +180,8 @@ struct EmitterState {
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: the uniform blocks of ReadConst and of the shader data.
+	// Uniform const buffers (ShaderIR.h): the uniform blocks of ReadConst and of the shader data.
 	uint32_t                                         flattened_srt_uniform_variable = 0;
 	uint32_t                                         shader_data_uniform_variable   = 0;
 	// KYTY_BINDLESS (set 1): one runtime image array per image type, the key -> slot translation
@@ -656,7 +655,7 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
-// KYTY_PERF_UNIFORM_CONST_BUFFERS: a uniform block of `dwords` dwords stored as uvec4 elements (std140, stride 16),
+// Uniform const buffers (ShaderIR.h): a uniform block of `dwords` dwords stored as uvec4 elements (std140, stride 16),
 // and dword `index` of such a block.
 uint32_t UniformDwordBlockType(EmitterState& state, uint32_t dwords);
 uint32_t LoadUniformDword(EmitterState& state, uint32_t variable, uint32_t index);

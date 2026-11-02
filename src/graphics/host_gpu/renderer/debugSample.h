@@ -268,36 +268,6 @@ inline void DebugQueueFullDump(GraphicContext& graphics, vk::CommandBuffer comma
 	copy.imageExtent      = vk::Extent3D {w, h, depth ? 1u : slices};
 	command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, sample.buffer, 1, &copy);
 	DebugPushSample(std::move(sample));
-	// KYTY_TRACE_DUMP_MIPS=1: further mip levels of 2D color images, each to <path>_mip<N>_<WxH>_<fmt>.raw.
-	static const bool dump_mips = std::getenv("KYTY_TRACE_DUMP_MIPS") != nullptr;
-	if (dump_mips && !depth && !blocks && slices == 1u && layers == 1u) {
-		for (uint32_t mip = 1; mip < std::min(image.backing.mip_levels, 12u); ++mip) {
-			const auto mw = std::max(1u, w >> mip);
-			const auto mh = std::max(1u, h >> mip);
-			vk::BufferCreateInfo mip_info {};
-			mip_info.size  = uint64_t {mw} * mh * texel_bytes;
-			mip_info.usage = vk::BufferUsageFlagBits::eTransferDst;
-			if (budgeted && !DebugDumpWithinBudget(mip_info.size)) break;
-			VmaAllocationInfo mip_result {};
-			VkBuffer          mip_native = VK_NULL_HANDLE;
-			DebugSample       mip_sample;
-			if (vmaCreateBuffer(graphics.allocator, reinterpret_cast<const VkBufferCreateInfo*>(&mip_info),
-			                    &allocation_info, &mip_native, &mip_sample.allocation, &mip_result) != VK_SUCCESS) {
-				break;
-			}
-			mip_sample.buffer    = mip_native;
-			mip_sample.mapped    = mip_result.pMappedData;
-			mip_sample.dump_size = mip_info.size;
-			mip_sample.dump_path = path + "_mip" + std::to_string(mip) + "_" + std::to_string(mw) + "x" +
-			                       std::to_string(mh) + "_" + vk::to_string(image.backing.format) + ".raw";
-			vk::BufferImageCopy mip_copy {};
-			mip_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 1};
-			mip_copy.imageExtent      = vk::Extent3D {mw, mh, 1};
-			command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, mip_sample.buffer, 1,
-			                          &mip_copy);
-			DebugPushSample(std::move(mip_sample));
-		}
-	}
 	// The stencil aspect of a combined depth/stencil image goes to its own file (1 byte per texel).
 	if (depth && format_name.find("S8") != std::string::npos) {
 		vk::BufferCreateInfo stencil_info {};
@@ -533,13 +503,10 @@ inline std::atomic<bool>& DebugRtCollect() {
 inline bool DebugRtCollecting() {
 	return DebugRtEnabled() && DebugRtCollect().load(std::memory_order_relaxed);
 }
-// Game debug markers are tracked for RT dumps, for KYTY_TRACE_VK_LABELS (labels then carry the pass name) and for
-// the scene audit (KYTY_TRACE_AUDIT_FRAME: every record names its pass).
+// Game debug markers are tracked for RT dumps and for KYTY_TRACE_VK_LABELS (labels then carry the pass name).
 inline bool DebugMarkersEnabled() {
 	static constinit Common::OnceValue<bool> labels_once;
-	const bool labels = labels_once.Get([] {
-		return std::getenv("KYTY_TRACE_VK_LABELS") != nullptr || std::getenv("KYTY_TRACE_AUDIT_FRAME") != nullptr;
-	});
+	const bool labels = labels_once.Get([] { return std::getenv("KYTY_TRACE_VK_LABELS") != nullptr; });
 	return labels || DebugRtEnabled();
 }
 inline void DebugRtRecordDraw(uint64_t address, uint32_t width, uint32_t height, bool depth, uint64_t vs,

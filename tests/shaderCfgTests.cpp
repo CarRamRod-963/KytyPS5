@@ -10911,10 +10911,12 @@ void TestMeshExportStorage() {
     for (const auto dword :
          {static_cast<uint32_t>(reg - result.program.info.user_data_registers.begin()),
           layout.memory_offset_dword}) {
+      // Shader data is a uniform block of uvec4 elements: element dword / 4, component dword % 4.
       const auto operand =
-          std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
-          " %uint_0 %uint_" +
-          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
+          layout.UsesPushData()
+              ? "vsharp %uint_0 %uint_" + std::to_string(dword + push_data_start)
+              : "shader_data %uint_0 %uint_" + std::to_string(dword >> 2u) + " %uint_" +
+                    std::to_string(dword & 3u);
       Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
             "mesh user SGPR or buffer offset loaded from the wrong storage");
     }

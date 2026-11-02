@@ -29,7 +29,6 @@ struct ResourceSnapshot;
 // before them, and a read -> write barrier after them. Buffers are copied from the VkBuffer/offset the dispatch
 // is bound to (meta.txt: backing=cache|stream bound_offset=, guest_nz= / host_nz= of the CPU views), indexed by
 // the shader's program buffer index like the descriptor in meta.txt.
-// KYTY_TRACE_REF_SKIP=<n>: capture the (n+1)-th dispatch at or after the frame instead of the first.
 namespace RefCapture {
 
 // True for the one dispatch to capture (first match at or after the frame); claims it.

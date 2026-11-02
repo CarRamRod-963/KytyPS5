@@ -18,8 +18,6 @@ namespace Libs::Graphics {
 // A colour-metadata slice that could not be read from the backing store (MaterializeColorClear).
 void MetadataReadFailure(uint64_t address, uint64_t size);
 void LogDccKey10Apply(const char* path, const TextureCache::ImageDesc& desc, const vk::ClearColorValue& clear);
-// KYTY_FIX_VIEW_LAYOUT_MATCH: a request ResolveOverlap kept apart from the cached image at its address.
-void ViewLayoutMatchNote(const ImageInfo& requested, const Image& cached);
 
 // KYTY_TRACE_PERF: PERF image_unregister (TextureCache::UnregisterImage counts, TakeImageUnregisterStats reports).
 extern std::mutex                                g_unregister_mutex;

@@ -294,12 +294,9 @@ void Accumulate(State& s, const Chunk& chunk) {
 		}
 		std::sort(by_marker.begin(), by_marker.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
 		const auto us = [&](uint64_t ticks) { return static_cast<double>(ticks) * s.ns_per_tick / 1.0e3; };
-		// KYTY_TRACE_GPU_TIMELINE_TOP=<n>: marker paths per line (default 4).
-		static const size_t top_n = [] {
-			const char* text = std::getenv("KYTY_TRACE_GPU_TIMELINE_TOP");
-			return text != nullptr ? static_cast<size_t>(std::strtoul(text, nullptr, 10)) : size_t {4};
-		}();
-		std::string top;
+		// Marker paths per line.
+		constexpr size_t top_n = 4;
+		std::string      top;
 		for (size_t i = 0; i < by_marker.size() && i < top_n; i++) {
 			const uint32_t m = by_marker[i].second;
 			top += " [" + std::to_string(static_cast<int>(us(by_marker[i].first))) + "us " +

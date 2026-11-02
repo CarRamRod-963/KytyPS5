@@ -1526,7 +1526,7 @@ bool IsDwordBufferStore(IR::ValueOpcode op) {
 	       op == IR::ValueOpcode::StoreBufferU32x3 || op == IR::ValueOpcode::StoreBufferU32x4;
 }
 
-// Formatted X/XY/XYZ/XYZW store through a GPU-selected descriptor (KYTY_DIAG_INDIRECT_FORMATTED_STORES):
+// Formatted X/XY/XYZ/XYZW store through a GPU-selected descriptor (hardware behaviour, M48):
 // the runtime format of descriptor word 3 selects the encoding; the whole format is written
 // (missing VGPRs zero-filled, as RDNA2 does). Packed formats are packed into one 16/32-bit piece;
 // other formats write each 8/16/32-bit channel at its byte offset. Wider channels stay dropped.
@@ -3014,11 +3014,9 @@ void DefineIndirectRawDword(ValueEmitContext& ctx) {
 }
 
 // A formatted X..XYZW store of 32-bit VGPR data through a GPU-selected descriptor, written by StoreIndirectFormatted
-// (record-keyed, or every such store with KYTY_DIAG_INDIRECT_FORMATTED_STORES): its component count, else 0.
-static uint32_t IndirectFormattedStoreComponents(const EmitterState& state, const IR::Inst& inst,
-                                                 const IR::MemoryInfo& mem) {
+// (record-keyed or not): its component count, else 0.
+static uint32_t IndirectFormattedStoreComponents(const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind != IR::ResourceKind::IndirectBuffer || !mem.formatted || mem.data_bits != 32u) return 0u;
-	if (!mem.record_keyed && !IR::IndirectFormattedStores(state.program.shader_hash)) return 0u;
 	return std::max(IR::BufferComponentCount(inst.GetOpcode()), 1u);
 }
 
@@ -3045,7 +3043,7 @@ void DefineIndirectStoreFunctions(ValueEmitContext& ctx) {
 			if (index >= state.program.memory_info.size()) continue;
 			const auto& mem = state.program.memory_info[index];
 			if (mem.kind != IR::ResourceKind::IndirectBuffer) continue;
-			if (const auto components = IndirectFormattedStoreComponents(state, inst, mem); components != 0u) {
+			if (const auto components = IndirectFormattedStoreComponents(inst, mem); components != 0u) {
 				state.indirect_formatted_store_functions.emplace(components, 0u);
 			} else if (!mem.formatted) {
 				(mem.coherent ? raw_store_coherent : raw_store) = true; // StoreIndirectBuffer (EmitStoreMemory)
@@ -3602,7 +3600,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	if (state.flattened_srt_uniform_variable != 0) {
-		// KYTY_PERF_UNIFORM_CONST_BUFFERS: the slot is an immediate below srt_reads.size() (ValidateNativeProgram),
+		// Uniform const buffers (ShaderIR.h): the slot is an immediate below srt_reads.size() (ValidateNativeProgram),
 		// and the host's flat buffer holds at least srt_reads.size() words.
 		return LoadUniformDword(state, state.flattened_srt_uniform_variable, inst.Arg(1).Resolve().U32());
 	}
@@ -3726,7 +3724,7 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitPairLdsWriteSync(ctx.state, mem, true);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
-	else if (const auto formatted = IndirectFormattedStoreComponents(ctx.state, inst, mem); formatted != 0u)
+	else if (const auto formatted = IndirectFormattedStoreComponents(inst, mem); formatted != 0u)
 		StoreIndirectFormatted(ctx, inst, formatted); // record-keyed: record-keyed formatted stores
 	else if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted)
 		ctx.Fail(inst, "formatted store through an unresolved descriptor"); // tracking stops such a store first

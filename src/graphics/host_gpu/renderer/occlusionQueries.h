@@ -68,7 +68,7 @@ public:
 	// stream. False when the host queries are not available (the caller then publishes the synthetic count).
 	[[nodiscard]] bool Dump(CommandBuffer& buffer, uint64_t address);
 	// Without host queries: the dump the caller published synthetically, only to know which guest queries are open
-	// (scene audit / draw-drop diagnostics).
+	// (draw-drop diagnostics).
 	void NoteSyntheticDump(uint64_t address);
 	// Right before a guest draw command is recorded inside a render pass instance.
 	void BeforeDraw(vk::CommandBuffer recorder);

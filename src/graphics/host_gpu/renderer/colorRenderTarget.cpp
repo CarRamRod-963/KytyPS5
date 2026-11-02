@@ -14,7 +14,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -69,7 +68,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
-	const StageF::Zone stagef_target(StageF::Sub::Target); // KYTY_TRACE_STAGEF
 	const auto& hw = buffer.GetRegisters();
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
@@ -216,7 +214,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	// KYTY_TRACE_PERF (PERF workaround_hits fmt30): a target programmed COLOR_10_11_11 + UNORM (guest format 30), taken as
-	// packed unsigned floats by KYTY_DIAG_RT_11_11_10_FLOAT; its address is kept for the T#s that read it.
+	// packed unsigned floats by KYTY_FIX_RT_11_11_10_FLOAT; its address is kept for the T#s that read it.
 	if (Common::WorkaroundHits::Enabled() &&
 	    Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type).buffer_format ==
 	        Prospero::BufferFormat::k11_11_10UNorm &&

@@ -334,100 +334,6 @@ void WriteSpecialization(Writer& w, const Specialization& s) {
 	}
 }
 
-// KYTY_TRACE_SPEC_CENSUS=1 (diagnostic, 25.10): how predictable a compute shader's specialization is before its first
-// dispatch (project B1: compile at AgcCreateShader). Per journal: records, shader hashes, distinct specializations;
-// "shared" = records whose specialization another shader hash also has; "top guess" = records whose specialization is
-// the most common one among the other hashes with the same resource counts (buffers/images/samplers) - the guess a
-// creation-time compile would make; then the 12 most common specializations.
-void SpecializationCensus(const std::vector<PrecompileStageRecord>& records) {
-	static const std::string value = [] {
-		const char* v = std::getenv("KYTY_TRACE_SPEC_CENSUS");
-		return v != nullptr ? std::string(v) : std::string();
-	}();
-	// KYTY_TRACE_SPEC_CENSUS=<hex hash>: that shader's journal records, each with what differs from its first record
-	// (push start, static key words, specialization words, SPIR-V hash, build) - why it has several permutations.
-	if (value.size() == 16u) {
-		const uint64_t                        wanted = std::strtoull(value.c_str(), nullptr, 16);
-		const PrecompileStageRecord*          first  = nullptr;
-		std::vector<uint32_t>                 first_spec;
-		size_t                                n      = 0;
-		for (const auto& record: records) {
-			if (record.shader_hash != wanted) continue;
-			Writer w;
-			WriteSpecialization(w, record.specialization);
-			std::string diff;
-			if (first == nullptr) {
-				first      = &record;
-				first_spec = w.words;
-			} else {
-				if (record.push_data_start != first->push_data_start)
-					diff += fmt::format(" push={}->{}", first->push_data_start, record.push_data_start);
-				for (size_t k = 0; k < std::max(record.static_key.size(), first->static_key.size()); ++k) {
-					const uint32_t a = k < first->static_key.size() ? first->static_key[k] : 0xffffffffu;
-					const uint32_t b = k < record.static_key.size() ? record.static_key[k] : 0xffffffffu;
-					if (a != b) diff += fmt::format(" key[{}]={:x}->{:x}", k, a, b);
-				}
-				for (size_t k = 0; k < std::max(w.words.size(), first_spec.size()); ++k) {
-					const uint32_t a = k < first_spec.size() ? first_spec[k] : 0xffffffffu;
-					const uint32_t b = k < w.words.size() ? w.words[k] : 0xffffffffu;
-					if (a != b) diff += fmt::format(" spec[{}]={:x}->{:x}", k, a, b);
-				}
-				if (record.user_data.size() != first->user_data.size()) diff += " user_data_count";
-			}
-			std::fprintf(stderr, "SPEC_CENSUS record %zu hash=%016llx spirv=%016llx revision=%016llx push=%u key_words=%zu spec_words=%zu%s\n",
-			             n++, static_cast<unsigned long long>(wanted), static_cast<unsigned long long>(record.spirv_hash),
-			             static_cast<unsigned long long>(record.revision), record.push_data_start, record.static_key.size(),
-			             w.words.size(), diff.c_str());
-		}
-		return;
-	}
-	if (value.empty() || value[0] != '1' || records.empty()) return;
-	struct Item {
-		uint64_t hash, spec, shape;
-	};
-	std::vector<Item> items;
-	items.reserve(records.size());
-	for (const auto& record: records) {
-		Writer w;
-		WriteSpecialization(w, record.specialization);
-		const auto& s     = record.specialization;
-		const auto  shape = (static_cast<uint64_t>(s.buffers.size()) << 32u) | (s.images.size() << 16u) | s.samplers.size();
-		items.push_back({record.shader_hash, XXH3_64bits(w.words.data(), w.words.size() * sizeof(uint32_t)), shape});
-	}
-	std::unordered_map<uint64_t, std::unordered_set<uint64_t>>                      hashes_of_spec;
-	std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::unordered_set<uint64_t>>> shape_spec_hashes;
-	std::unordered_set<uint64_t>                                                    hashes;
-	for (const auto& i: items) {
-		hashes_of_spec[i.spec].insert(i.hash);
-		shape_spec_hashes[i.shape][i.spec].insert(i.hash);
-		hashes.insert(i.hash);
-	}
-	size_t shared = 0, top = 0;
-	for (const auto& i: items) {
-		if (hashes_of_spec[i.spec].size() >= 2) ++shared;
-		// The most common specialization in this shape among the other shader hashes (leave this hash out).
-		uint64_t best = 0;
-		size_t   best_n = 0;
-		for (const auto& [spec, users]: shape_spec_hashes[i.shape]) {
-			const size_t n = users.size() - (users.contains(i.hash) ? 1u : 0u);
-			if (n > best_n) {
-				best_n = n;
-				best   = spec;
-			}
-		}
-		if (best_n != 0 && best == i.spec) ++top;
-	}
-	std::fprintf(stderr,
-	             "SPEC_CENSUS compute records=%zu hashes=%zu specializations=%zu shapes=%zu shared=%zu top_guess=%zu\n",
-	             items.size(), hashes.size(), hashes_of_spec.size(), shape_spec_hashes.size(), shared, top);
-	std::vector<std::pair<size_t, uint64_t>> ranked;
-	for (const auto& [spec, users]: hashes_of_spec) ranked.emplace_back(users.size(), spec);
-	std::sort(ranked.rbegin(), ranked.rend());
-	for (size_t k = 0; k < ranked.size() && k < 12; ++k) {
-		std::fprintf(stderr, "SPEC_CENSUS top spec=0x%016" PRIx64 " hashes=%zu\n", ranked[k].second, ranked[k].first);
-	}
-}
-
 bool ReadSpecialization(Reader& r, Specialization& s) {
 	constexpr uint32_t Limit = 4096;
 	const auto buffers = r.U32();
@@ -1965,7 +1871,6 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 	             warm != 0 && ShaderReuseEnabled() ? " (compiled for the reuse store, no pipeline)" : "",
 	             rejected != 0 ? ", some records rejected" : "", torn ? ", torn tail dropped" : "",
 	             other_layout ? ", the file has another record layout or version (its records dropped)" : "");
-	SpecializationCensus(m_compute_records);
 
 	// --precompile-only records nothing: the file is left as it is (one of another layout stays for the build that
 	// wrote it; a torn tail is repaired by the next game start).
@@ -2341,7 +2246,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 			return false;
 		}
 		// Nor one with an image conversion format the emitter cannot make under this run's format switches
-		// (a format-30 record of a KYTY_DIAG_RT_11_11_10_FLOAT=0 run ended every later run in ImageConversionFormat). The
+		// (a format-30 record of a KYTY_FIX_RT_11_11_10_FLOAT=0 run ended every later run in ImageConversionFormat). The
 		// images as ApplyResourceSpecialization makes them: the translation's fields (a candidate's are its root's) with
 		// the record's conversion format. The record stays in the journal: a run with its settings makes it again.
 		for (size_t i = 0; i < s.images.size(); i++) {
@@ -2352,7 +2257,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 			if (logged.fetch_add(1) < 16u) {
 				std::fprintf(stderr,
 				             "SHADER_PRECOMPILE_FORMAT_MISMATCH hash=0x%016llx stage=%s key=%s image=%zu conversion=%u "
-				             "(recorded with other format switches, e.g. KYTY_DIAG_RT_11_11_10_FLOAT; skipped)\n",
+				             "(recorded with other format switches, e.g. KYTY_FIX_RT_11_11_10_FLOAT; skipped)\n",
 				             static_cast<unsigned long long>(record.shader_hash), StageName(record.stage),
 				             HexKey(record.Key()).c_str(), i, static_cast<uint32_t>(s.images[i].conversion_format));
 				std::fflush(stderr);

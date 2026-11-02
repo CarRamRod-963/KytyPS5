@@ -65,28 +65,7 @@ inline bool PrintHleNamesDefault() {
 #define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define KYTY_HLE_CONCAT_IMPL(a, b) a##b
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define KYTY_HLE_CONCAT(a, b) KYTY_HLE_CONCAT_IMPL(a, b)
-
-// HLE_COUNT(): only the KYTY_TRACE_HLE_COUNT counter of PRINT_NAME (hot functions that do not log).
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define HLE_COUNT()                                                                                \
-	Libs::HleScope KYTY_HLE_CONCAT(kyty_hle_scope_, __LINE__)(                                     \
-	    Libs::HleCountEnabled() ? [fn = __func__]() -> Libs::HleCounter* {                         \
-		    static Libs::HleCounter counter(g_library, fn);                                        \
-		    return &counter;                                                                       \
-	    }()                                                                                        \
-	                            : nullptr)
-
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	Libs::HleScope KYTY_HLE_CONCAT(kyty_hle_scope_, __LINE__)(                                     \
-	    Libs::HleCountEnabled() ? [fn = __func__]() -> Libs::HleCounter* {                         \
-		    static Libs::HleCounter counter(g_library, fn);                                        \
-		    return &counter;                                                                       \
-	    }()                                                                                        \
-	                            : nullptr);                                                        \
 	if (PRINT_NAME_ENABLED || Libs::TraceAllCalls()) {                                             \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}
@@ -108,47 +87,6 @@ namespace Libs {
 	static std::atomic<int64_t> used {0};
 	return used.fetch_add(1, std::memory_order_relaxed) < budget;
 }
-
-// KYTY_TRACE_HLE_COUNT=1 (diagnostic): every PRINT_NAME function counts its calls and the time
-// until it returns (all threads); every ~5 s the top functions by time and by calls are printed as
-// HLE_TOP lines.
-[[gnu::noinline]] inline bool HleCountEnabled() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_HLE_COUNT");
-		return value != nullptr && value[0] == '1';
-	}();
-	return on;
-}
-
-struct HleCounter {
-	HleCounter(const char* library, const char* function);
-	const char*           library;
-	const char*           function;
-	std::atomic<uint64_t> calls {0};
-	std::atomic<uint64_t> ns {0};
-	uint64_t              last_calls = 0;
-	uint64_t              last_ns    = 0;
-	HleCounter*           next       = nullptr;
-};
-
-uint64_t HleNowNs();
-
-class HleScope {
-public:
-	explicit HleScope(HleCounter* counter): m_counter(counter), m_start(counter != nullptr ? HleNowNs() : 0) {}
-	~HleScope() {
-		if (m_counter != nullptr) {
-			m_counter->calls.fetch_add(1, std::memory_order_relaxed);
-			m_counter->ns.fetch_add(HleNowNs() - m_start, std::memory_order_relaxed);
-		}
-	}
-	HleScope(const HleScope&)            = delete;
-	HleScope& operator=(const HleScope&) = delete;
-
-private:
-	HleCounter* m_counter;
-	uint64_t    m_start;
-};
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {

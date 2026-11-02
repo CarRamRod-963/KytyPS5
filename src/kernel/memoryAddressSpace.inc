@@ -372,7 +372,6 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
-		// KYTY_TRACE_TEXWIN (TW2): AddressSpace::CopySparseMemory<false> counts the gap bytes its callback zero-fills.
 		CopySparseRange(m_maps, vaddr, data, size,
 		                [this](const auto& entry, uint64_t start) {
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
@@ -970,7 +969,6 @@ public:
 				return false;
 			}
 		}
-		[[maybe_unused]] uint64_t zeroed = 0; // KYTY_TRACE_TEXWIN (TW2), copy_private == false only
 		const bool copied = m_backing->TryReadSparseBacking(
 		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
 			    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
@@ -985,14 +983,9 @@ public:
 				                    },
 				                    zero);
 			    } else {
-				    zeroed += bytes;
 				    zero(start, destination, bytes);
 			    }
 		    });
-		if constexpr (!copy_private) {
-			// KYTY_TRACE_TEXWIN (TW2): bytes zero-filled for this image upload (pages without guest memory).
-			if (copied && Graphics::TexWin::Enabled()) Graphics::TexWin::NoteSparseRead(vaddr, size, zeroed);
-		}
 		return copied;
 	}
 

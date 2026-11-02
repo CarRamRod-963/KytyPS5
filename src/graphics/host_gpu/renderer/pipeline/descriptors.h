@@ -41,7 +41,6 @@ struct PreparedBindings {
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
-	bool                                  census_hit = false; // KYTY_TRACE_TABLE_CENSUS: would-hit stage (RebindImages timing)
 	// The table sets (descriptors.cpp): the stage set used by this call (hit) or to complete with its views (store);
 	// the image registry epoch after the hit proof.
 	void*                                 table_hit    = nullptr;
@@ -50,7 +49,7 @@ struct PreparedBindings {
 	std::vector<uint64_t>                 image_source; // the table sets: per image slot, the set version it was filled from (0: none)
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: the same uploaded SRT words as a uniform buffer view (ReadConst).
+	// Uniform const buffers (ShaderIR.h): the same uploaded SRT words as a uniform buffer view (ReadConst).
 	vk::DescriptorBufferInfo              flattened_srt_uniform;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
@@ -94,7 +93,7 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
-// KYTY_DIAG_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): for a depth T# IsSupportedDepthTextureEncoding refused, what
+// KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): for a depth T# IsSupportedDepthTextureEncoding refused, what
 // differs from the encoding it accepts (descriptors.cpp has the rule, from RDNA2 ISA table 45).
 enum class DepthEncodingFields : uint32_t {
 	Ignored, // only fields the texture unit does not use for this T#: sampling reads what the accepted encoding reads

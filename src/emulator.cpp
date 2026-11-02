@@ -2,7 +2,6 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/diagFastPath.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -101,8 +100,6 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	// KYTY_TRACE_STARTUP: its reporter starts here, before anything it measures.
 	(void)Common::StartupTrace::Enabled();
-	// Before any thread draws, so the diagnostic hooks' flag word is decided from the start.
-	Common::DiagFastPath::Init();
 	Common::InstallAbortReporters();
 
 	subsystems.Initialize<Config::Lifecycle>();

@@ -14,12 +14,13 @@
 // kind:
 //   config     - ordinary setting or a measured performance switch;
 //   correct    - hardware behaviour, not a workaround (M48; confirmed from the AMD ISA guides and the
-//                game's data, publication plan stage 2 pack 1; the evidence is at each reader), still named DIAG_
-//                for history (renamed in a later pack);
+//                game's data, publication plan stage 2 pack 1; the evidence is at each reader); such behaviour is
+//                no switch any more (the M48 formatted stores, GDS M0 base, misaligned T#s and mip-tail slices are
+//                always on), so no entry has this kind now;
 //   unproven   - probably hardware behaviour (M48), but an exactness check is still open (named at its reader):
-//                to be confirmed before it counts as correct;
-//   workaround - logged approximation (AGENTS rules 1 and 5): stays on until its proper implementation replaces it;
-//                item = its entry in the workaround list (D1-D8, A5, M42...).
+//                to be confirmed before it counts as correct; named KYTY_FIX_*;
+//   workaround - logged approximation (AGENTS rules 1 and 5), named KYTY_WORKAROUND_*: stays on until its proper
+//                implementation replaces it; item = its entry in the workaround list (D1-D8, A5, M42...).
 // KYTY_DIAG_NULL_TEXTURE_GRAY off (an unbound texture reads (0,0,0,0) as the hardware; =1 brings it back).
 // KYTY_SHADER_LOOP_LIMIT_HASHES empty, KYTY_DIAG_SKIP_UNSUPPORTED_CS off (0 skipped in 4 test places);
 // 142383a7de1e5111 stays skipped until a place that runs it can be tested.
@@ -38,30 +39,24 @@ inline constexpr EnvDefault EnvDefaults[] = {
     {"KYTY_SHADER_PRECOMPILE_THREADS", "6", "config", ""},
     {"KYTY_VRAM_GC_FIX", "1", "config", ""},
     {"KYTY_VRAM_BUDGET", "1", "config", ""},
-    {"KYTY_PERF_UNIFORM_CONST_BUFFERS", "1", "config", ""},
     {"KYTY_BINDLESS", "1", "config", ""},
     {"KYTY_BINDLESS_RECORD_TABLES", "1", "config", ""},
     {"KYTY_BINDLESS_R128", "1", "config", ""},
     {"KYTY_PIPELINE_CACHE_ANY_REVISION", "1", "config", ""},
     // D6 step K4: what one BDA miss promotes while the BDA fallback is on (faultManager.cpp).
     {"KYTY_PERF_BDA_PROMOTE_KB", "2048", "config", ""},
-    // Hardware behaviour, not a workaround (M48):
-    {"KYTY_DIAG_INDIRECT_FORMATTED_STORES", "1", "correct", "M48"}, // RDNA2 MUBUF formatted store, V# read at run time
-    {"KYTY_DIAG_GDS_M0_BASE", "1", "correct", "M48"},               // GCN3 ISA 3.7: GDS M0 = {base[15:0], size[15:0]}
-    {"KYTY_DIAG_TEXTURE_ALLOW_MISALIGNED", "1", "correct", "M48"},  // RDNA2 ISA table 45: T# base 256-byte aligned
-    {"KYTY_DIAG_MIP_TAIL_SLICES", "1", "correct", "M48"},           // GFX10 mip-tail placement (tile.cpp)
     // Probably hardware behaviour, exactness check open (M48):
-    {"KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
-    {"KYTY_DIAG_RT_11_11_10_FLOAT", "1", "unproven", "M48"},
-    {"KYTY_DIAG_ALIAS_SYNC", "1", "workaround", "D4/D5"},
-    {"KYTY_DIAG_STENCIL_PLANE_SYNC", "2", "workaround", "D8"},
-    {"KYTY_DIAG_STENCIL_STORAGE_SHADOW", "1", "workaround", "D8"},
-    {"KYTY_DIAG_PRESERVE_STENCIL", "1", "workaround", "D8"},
-    {"KYTY_DIAG_STENCIL_ALIAS_COPY", "1", "workaround", "D8"},
-    {"KYTY_DIAG_HTILE_FULL_RANGE", "1", "workaround", "D8"},
-    {"KYTY_DIAG_DEPTH_ENCODING_LENIENT", "1", "workaround", "D8"},
-    {"KYTY_DIAG_DCC_FAST_CLEAR", "1", "workaround", "A5"},
-    {"KYTY_DIAG_WATERFALL_POINTER_RECORD0", "1", "workaround", "M42"},
+    {"KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
+    {"KYTY_FIX_RT_11_11_10_FLOAT", "1", "unproven", "M48"},
+    {"KYTY_WORKAROUND_ALIAS_SYNC", "1", "workaround", "D4/D5"},
+    {"KYTY_WORKAROUND_STENCIL_PLANE_SYNC", "2", "workaround", "D8"},
+    {"KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW", "1", "workaround", "D8"},
+    {"KYTY_WORKAROUND_PRESERVE_STENCIL", "1", "workaround", "D8"},
+    {"KYTY_WORKAROUND_STENCIL_ALIAS_COPY", "1", "workaround", "D8"},
+    {"KYTY_WORKAROUND_HTILE_FULL_RANGE", "1", "workaround", "D8"},
+    {"KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT", "1", "workaround", "D8"},
+    {"KYTY_WORKAROUND_DCC_FAST_CLEAR", "1", "workaround", "A5"},
+    {"KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0", "1", "workaround", "M42"},
 };
 
 // std::getenv(name), or the code default above when the variable is not set (nullptr for names not in the table).

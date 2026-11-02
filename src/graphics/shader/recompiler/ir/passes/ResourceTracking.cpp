@@ -29,17 +29,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// KYTY_TRACE_ADDRESS_WRITES=1 (diagnostic): which instruction marks a program as writing through addresses (the mark
-// makes scalar specialization reads of the same draw or dispatch unprovable), once per shader and pc.
-static void TraceAddressWrite(uint64_t hash, uint32_t pc, const char* why) {
-	static const bool enabled = Common::ShaderEnv::Read("KYTY_TRACE_ADDRESS_WRITES") != nullptr;
-	if (!enabled) return;
-	static std::mutex                               mutex;
-	static std::set<std::pair<uint64_t, uint32_t>> seen;
-	std::scoped_lock                                lock(mutex);
-	if (seen.size() >= 256u || !seen.insert({hash, pc}).second) return;
-	std::fprintf(stderr, "ADDRESS_WRITE hash=0x%016llx pc=0x%08x %s\n", static_cast<unsigned long long>(hash), pc, why);
-}
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -864,11 +853,11 @@ public:
 	// record's S# exactly (RecordTableSampler). Without it such a sampler stays unresolved
 	// and stops translation.
 
-	static bool DiagWaterfallPointerRecord0() {
+	static bool WorkaroundWaterfallPointerRecord0() {
 		static const bool enabled = [] {
 			// Default from Common::EnvDefaults; workaround: M42 (lane exchange /
 			// terrain material pointer), to be replaced by the proper implementation; =0 turns it off.
-			const char* value = Common::ShaderEnv::Read("KYTY_DIAG_WATERFALL_POINTER_RECORD0");
+			const char* value = Common::ShaderEnv::Read("KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0");
 			return value != nullptr && value[0] == '1';
 		}();
 		return enabled;
@@ -954,7 +943,7 @@ public:
 		return Value(&*copy);
 	}
 
-	// KYTY_DIAG_WATERFALL_POINTER_RECORD0=1: logged APPROXIMATION. A scalar-load base address that a
+	// KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0=1: logged APPROXIMATION. A scalar-load base address that a
 	// waterfall reads with v_readfirstlane from an idxen buffer record (e.g. a per-tile material
 	// table pointer) is replaced by the same field of record 0, so the descriptor table becomes a
 	// snapshot source. Only the address operands of scalar loads change; the waterfall compares
@@ -963,7 +952,7 @@ public:
 	// WaterfallRecord0Census compares the lane's address (the ReadFirstLane results) with record 0's
 	// and counts on the GPU the lanes and those that differ (BindlessBindings.h).
 	void UniformizeWaterfallPointers() {
-		if (!DiagWaterfallPointerRecord0()) return;
+		if (!WorkaroundWaterfallPointerRecord0()) return;
 		uint32_t rewritten = 0;
 		uint32_t census = 0;
 		for (auto* block: m_program.blocks) {
@@ -1005,7 +994,7 @@ public:
 			char suffix[24] = "";
 			if (WaterfallRecord0Census()) std::snprintf(suffix, sizeof(suffix), " census=%u", census);
 			std::fprintf(stderr,
-			             "DIAG_WATERFALL_POINTER_RECORD0 APPROXIMATION hash=0x%016llx addresses=%u%s\n",
+			             "WORKAROUND_WATERFALL_POINTER_RECORD0 APPROXIMATION hash=0x%016llx addresses=%u%s\n",
 			             static_cast<unsigned long long>(m_program.shader_hash), rewritten, suffix);
 		}
 	}
@@ -2821,7 +2810,7 @@ private:
 					indirect.key_count = bound->Arg(1);
 				else if (const auto bound = DoWhileImmediateBound(key); bound != 0u)
 					indirect.key_count = Value(bound);
-				else if (DiagWaterfallPointerRecord0()) {
+				else if (WorkaroundWaterfallPointerRecord0()) {
 					if (const auto guarded = GuardedKeyBound(key, handle.Parent()); guarded != 0u)
 						indirect.key_count = Value(guarded);
 				}
@@ -3104,7 +3093,6 @@ private:
 		uint32_t                 budget = 4096u;
 		std::vector<const Inst*> leaves;
 		std::set<std::tuple<const Inst*, const Inst*, std::vector<const Inst*>>> seen;
-		std::string              failure; // KYTY_TRACE_RECORD_KEYED_REFUSE
 	};
 
 	// Path proofs: adds to proof.leaves the reads `word` can hold where `state` equals proof.wanted.
@@ -3113,31 +3101,18 @@ private:
 	// true on the lane) gives its new value there. A phi arm on a loop back edge drops the masks the loop defines (the
 	// arm is an earlier iteration's). False when `state` reaches a value that is no constant, select or phi.
 	bool PairedLeaves(Value state, Value word, std::vector<const Inst*> masks, PathProof& proof) const {
-		if (proof.budget == 0u) {
-			proof.failure = "budget";
-			return false;
-		}
+		if (proof.budget == 0u) return false;
 		--proof.budget;
 		state = state.Resolve();
 		word  = word.Resolve();
 		if (state.IsImmediate()) {
-			if (state.GetType() != Type::U32) {
-				proof.failure = "state type";
-				return false;
-			}
+			if (state.GetType() != Type::U32) return false;
 			if (state.U32() != proof.wanted) return true;
 			std::unordered_set<const Inst*> phis;
-			if (!PhiLeaves(word, proof.leaves, phis)) {
-				proof.failure = "immediate V# word";
-				return false;
-			}
-			return true;
+			return PhiLeaves(word, proof.leaves, phis);
 		}
 		const auto* inst = state.TryInstruction();
-		if (inst == nullptr) {
-			proof.failure = "state";
-			return false;
-		}
+		if (inst == nullptr) return false;
 		if (!proof.seen.emplace(inst, word.TryInstruction(), masks).second) return true;
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::SelectU32: {
@@ -3162,10 +3137,7 @@ private:
 						for (size_t other = 0; other < paired->NumArgs(); ++other) {
 							if (paired->PhiBlock(other) == inst->PhiBlock(arm)) arm_word = paired->Arg(other);
 						}
-						if (arm_word.IsEmpty()) {
-							proof.failure = "phi arms";
-							return false;
-						}
+						if (arm_word.IsEmpty()) return false;
 					}
 					auto kept = masks;
 					if (inst->PhiBlock(arm) == nullptr || BlockDominates(inst->Parent(), inst->PhiBlock(arm))) {
@@ -3175,16 +3147,14 @@ private:
 				}
 				return inst->NumArgs() != 0u;
 			}
-			default:
-				proof.failure = "state op=" + std::string(ValueOpcodeName(inst->GetOpcode()));
-				return false;
+			default: return false;
 		}
 	}
 
 	// Path proofs: the handle's V# words are phis of reads, and every access through it runs only where
 	// some VGPR state equals a constant (a term of its EXEC); pairing that state with each word leaves one read, the same
 	// for every access. `candidate` holds those reads and must be a valid direct source (e.g. fixed SRT reads).
-	bool MatchProvenDescriptor(const Inst& handle, DescriptorSource& candidate, std::string& why) {
+	bool MatchProvenDescriptor(const Inst& handle, DescriptorSource& candidate) {
 		candidate.dword_count = 4u;
 		for (uint32_t word = 0; word < 4u; ++word) {
 			const Inst* read = nullptr;
@@ -3197,38 +3167,20 @@ private:
 					for (uint32_t arg = 0; arg < 2u && !proven; ++arg) {
 						PathProof proof;
 						if (!ImmediateU32(test->Arg(arg), proof.wanted)) continue;
-						if (!PairedLeaves(test->Arg(arg ^ 1u), handle.Arg(word), masks, proof)) {
-							why += " [state " + std::to_string(proof.wanted) + ": " + proof.failure + "]";
-							continue;
-						}
-						if (proof.leaves.size() != 1u) {
-							why += " [state " + std::to_string(proof.wanted) + ": " +
-							       std::to_string(proof.leaves.size()) + " reads]";
-							continue;
-						}
-						if (read != nullptr && read != proof.leaves[0]) {
-							why = "accesses disagree";
-							return false;
-						}
+						if (!PairedLeaves(test->Arg(arg ^ 1u), handle.Arg(word), masks, proof)) continue;
+						if (proof.leaves.size() != 1u) continue;
+						if (read != nullptr && read != proof.leaves[0]) return false; // the accesses disagree
 						read   = proof.leaves[0];
 						proven = true;
 					}
 					if (proven) break;
 				}
-				if (!proven) {
-					why += " terms=";
-					for (const auto* term: masks) why += std::string(ValueOpcodeName(term->GetOpcode())) + ",";
-					return false;
-				}
+				if (!proven) return false;
 			}
 			candidate.dwords[word] = LowerDescriptorValue(Value(const_cast<Inst*>(read)));
 		}
 		uint32_t bad_dword = 0;
-		if (!ValidateSource(candidate, bad_dword)) {
-			why = "proven reads are no direct V# (dword " + std::to_string(bad_dword) + ")";
-			return false;
-		}
-		return true;
+		return ValidateSource(candidate, bad_dword); // the proven reads must be a direct V#
 	}
 
 	// Composed V#s: `value` as the host evaluates a V# word the shader composes. A select whose condition is
@@ -3276,29 +3228,12 @@ private:
 	// Composed V#s: the handle's V# (`descriptor`: its words as MakeSource lowered them) composed from
 	// uniform values: every word, projected (ProjectLaneUniform), is a value the host evaluates (ValidateSource). The
 	// words are ReadFirstLane results, so the V# is one for the whole wave and the candidate is exactly it.
-	bool MatchComposedDescriptor(const DescriptorSource& descriptor, DescriptorSource& candidate, std::string& why) {
-		if (descriptor.dword_count != 4u) {
-			why = "width " + std::to_string(descriptor.dword_count);
-			return false;
-		}
+	bool MatchComposedDescriptor(const DescriptorSource& descriptor, DescriptorSource& candidate) {
+		if (descriptor.dword_count != 4u) return false;
 		candidate.dword_count = 4u;
 		for (uint32_t word = 0; word < 4u; ++word) candidate.dwords[word] = ProjectLaneUniform(descriptor.dwords[word]);
 		uint32_t bad_dword = 0;
-		if (!ValidateSource(candidate, bad_dword)) {
-			// Every word that fails, each with its projected and original expression.
-			for (uint32_t word = 0; word < 4u; ++word) {
-				DescriptorSource single;
-				single.dword_count = 1u;
-				single.dwords[0] = candidate.dwords[word];
-				if (ValidateSource(single, bad_dword)) continue;
-				why += (why.empty() ? "dword " : "; dword ") + std::to_string(word) + " is no runtime value: projected=";
-				DescribeValueTree(candidate.dwords[word], 8u, why);
-				why += " original=";
-				DescribeValueTree(descriptor.dwords[word], 8u, why);
-			}
-			return false;
-		}
-		return true;
+		return ValidateSource(candidate, bad_dword);
 	}
 
 	// Composed V#s: `value` as opcodes and immediates to `depth` levels, at most ~4 KiB.
@@ -3327,27 +3262,20 @@ private:
 	// key * stride + field) of one table at consecutive fields, and every read runs only while the loop key is below
 	// its runtime count (BoundedLoop on the read's block), so the GPU can only select one of the count's candidate
 	// records: the host lists their ranges. The reads and the handle stay (the BDA emitters decode the V# at run time).
-	bool TryMakeRecordKeyedBuffer(Inst& handle, const DescriptorSource& descriptor, IndirectDescriptorPlan& plan,
-	                              std::string* why = nullptr) {
-		const auto refuse = [&](std::string reason) { // KYTY_TRACE_RECORD_KEYED_REFUSE
-			if (why != nullptr) *why = std::move(reason);
-			return false;
-		};
+	bool TryMakeRecordKeyedBuffer(Inst& handle, const DescriptorSource& descriptor, IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u || handle.Uses().empty())
-			return refuse("handle");
+			return false;
 		bool written = false;
 		for (const auto& use: handle.Uses()) {
 			uint32_t     first   = 0;
 			uint64_t     end     = 0;
 			bool         indexed = false;
 			BufferAccess access  = BufferAccess::None;
-			if (use.operand != 0u || !RecordKeyedAccess(*use.user, first, end, indexed, access))
-				return refuse(std::string("access op=") + std::string(ValueOpcodeName(use.user->GetOpcode())) +
-				              " operand=" + std::to_string(use.operand));
+			if (use.operand != 0u || !RecordKeyedAccess(*use.user, first, end, indexed, access)) return false;
 			written |= access != BufferAccess::Read;
 		}
 		// Loads alone keep their plain BDA path: only writes need their guest ranges known.
-		if (!written) return refuse("loads only");
+		if (!written) return false;
 		DescriptorSource table_source;
 		Value            key;
 		uint32_t         table_offset = 0, table_stride = 0, table_immediate = 0;
@@ -3357,16 +3285,12 @@ private:
 			// Path proofs: a V# the path picks among fixed reads is the one read its accesses can
 			// see: a direct candidate source, read at every materialization.
 			DescriptorSource candidate;
-			std::string      proof_why;
 			bool             composed = false;
-			if (!MatchProvenDescriptor(handle, candidate, proof_why)) {
-				const std::string refused = "no record table; path proof: " + proof_why;
+			if (!MatchProvenDescriptor(handle, candidate)) {
 				// Composed V#s: a V# the shader composes from uniform values is the one V# its accesses
 				// use: a direct candidate source as well.
 				candidate = {};
-				std::string composed_why;
-				if (!MatchComposedDescriptor(descriptor, candidate, composed_why))
-					return refuse(refused + "; composed: " + composed_why);
+				if (!MatchComposedDescriptor(descriptor, candidate)) return false;
 				composed = true;
 			}
 			DescriptorSource::IndirectDescriptor indirect;
@@ -3390,10 +3314,7 @@ private:
 		if (plan.table_indexed || plan.pointer_record || plan.split_offsets ||
 		    (table_source.dword_count != 4u && !address_table) || table_stride < 16u || (table_stride & 3u) != 0u ||
 		    (table_offset & 3u) != 0u)
-			return refuse("table shape indexed=" + std::to_string(plan.table_indexed) +
-			              " pointer=" + std::to_string(plan.pointer_record) + " split=" + std::to_string(plan.split_offsets) +
-			              " dwords=" + std::to_string(table_source.dword_count) + " stride=" + std::to_string(table_stride) +
-			              " offset=" + std::to_string(table_offset));
+			return false;
 		const auto* bound = BoundedLoop(key, plan.reads[0]->Parent());
 		DescriptorSource::IndirectDescriptor indirect;
 		// Game counts: without a loop, the game's own count of the address table's filled records.
@@ -3428,13 +3349,12 @@ private:
 		// size: only a loop or the key's value bounds its records.
 		const bool all_records =
 		    bound == nullptr && !game_count && !value_bound && !address_table;
-		if (bound == nullptr && !game_count && !value_bound && !all_records)
-			return refuse(address_table ? "address table without a bounded loop" : "no bounded loop");
+		if (bound == nullptr && !game_count && !value_bound && !all_records) return false;
 		for (uint32_t word = 1; bound != nullptr && word < 4u; ++word) {
 			// The same block gives the same proof (the words are usually read together).
 			if (plan.reads[word]->Parent() != plan.reads[0]->Parent() &&
 			    BoundedLoop(key, plan.reads[word]->Parent()) != bound)
-				return refuse("words in other loops");
+				return false;
 		}
 		indirect.table_source    = InternSource(table_source);
 		indirect.table_offset    = table_offset;
@@ -3477,21 +3397,8 @@ private:
 				uint32_t bad_dword = 0;
 				if (ValidateSource(descriptor, bad_dword)) continue;
 				IndirectDescriptorPlan plan;
-				// KYTY_TRACE_RECORD_KEYED_REFUSE=1 (temporary diagnostic): why a store through a GPU-selected V# is not
-				// record-keyed, once per shader and pc.
-				static const bool refuse_trace = Common::ShaderEnv::Read("KYTY_TRACE_RECORD_KEYED_REFUSE") != nullptr;
-				std::string why;
-				if (TryMakeRecordKeyedBuffer(*handle, descriptor, plan, refuse_trace ? &why : nullptr)) {
+				if (TryMakeRecordKeyedBuffer(*handle, descriptor, plan)) {
 					m_indirect_descriptors.push_back(std::move(plan));
-				} else if (refuse_trace) {
-					static std::mutex                               mutex;
-					static std::set<std::pair<uint64_t, uint32_t>> seen;
-					std::scoped_lock                                lock(mutex);
-					if (seen.size() < 512u && seen.insert({m_program.shader_hash, flags.pc}).second) {
-						std::fprintf(stderr, "RECORD_KEYED_REFUSE hash=0x%016llx pc=0x%08x op=%s %s\n",
-						             static_cast<unsigned long long>(m_program.shader_hash), flags.pc,
-						             std::string(ValueOpcodeName(inst.GetOpcode())).c_str(), why.c_str());
-					}
 				}
 			}
 		}
@@ -4127,13 +4034,6 @@ private:
 		range->read         = range->read || access != BufferAccess::Write;
 		range->written      = range->written || access != BufferAccess::Read;
 		range->atomic       = range->atomic || access == BufferAccess::Atomic;
-		static const bool trace = Common::EnvRead::IndirectRanges();
-		if (trace) {
-			std::fprintf(stderr, "INDIRECT_RANGE_ACCESS hash=0x%016llx pc=0x%08x source=%u op=%s bytes=[%u,%llu) indexed=%d\n",
-			             static_cast<unsigned long long>(m_program.shader_hash), pc, source,
-			             ValueOpcodeName(inst.GetOpcode()).data(), first, static_cast<unsigned long long>(end),
-			             indexed ? 1 : 0);
-		}
 	}
 
 	// Record-keyed V#s: record-keyed ranges only help a shader they leave without address writes. With other
@@ -4205,16 +4105,16 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				// KYTY_DIAG_INDIRECT_FORMATTED_STORES (hardware behaviour, M48): a formatted 32-bit store through a
-				// GPU-selected descriptor is written through BDA with the V# read at run time. Any other formatted store
-				// through an unresolved descriptor stops translation below.
+				// Hardware behaviour (M48; RDNA2 MUBUF BUFFER_STORE_FORMAT_*: address, bounds and data/number format come
+				// from the V# the GPU selected): a formatted 32-bit store through a GPU-selected descriptor is written
+				// through BDA with the V# read at run time (still dropped and logged: D16 stores, channels wider than 32
+				// bits). Any other formatted store through an unresolved descriptor stops translation below.
 				const bool via_bda = memory.kind == ResourceKind::Buffer && memory.formatted && !memory.typed &&
-				                     BufferAccessOf(op) == BufferAccess::Write &&
-				                     IndirectFormattedStores(m_program.shader_hash) && memory.data_bits == 32u &&
+				                     BufferAccessOf(op) == BufferAccess::Write && memory.data_bits == 32u &&
 				                     (op == ValueOpcode::StoreBufferU32 || op == ValueOpcode::StoreBufferU32x2 ||
 				                      op == ValueOpcode::StoreBufferU32x3 || op == ValueOpcode::StoreBufferU32x4);
 				if (via_bda) {
-					std::fprintf(stderr, "DIAG_INDIRECT_FORMATTED_STORES hash=0x%016llx pc=0x%08x "
+					std::fprintf(stderr, "INDIRECT_FORMATTED_STORES hash=0x%016llx pc=0x%08x "
 					             "formatted store through BDA (op=%s bits=%u components=%u)\n",
 					             static_cast<unsigned long long>(m_program.shader_hash), flags.pc,
 					             ValueOpcodeName(op).data(), memory.data_bits, memory.component_count);
@@ -4271,7 +4171,6 @@ private:
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
-				TraceAddressWrite(m_program.shader_hash, flags.pc, "address write");
 			}
 			m_info.uses_dma = true;
 			return;

@@ -46,7 +46,7 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
-	// KYTY_DIAG_DCC_GPU_CLEAR_CHECK: VK_EXT_conditional_rendering is enabled.
+	// KYTY_FIX_DCC_GPU_CLEAR_CHECK: VK_EXT_conditional_rendering is enabled.
 	bool                               conditional_rendering_enabled         = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;

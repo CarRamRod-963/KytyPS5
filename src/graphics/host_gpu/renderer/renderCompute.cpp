@@ -30,9 +30,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/sceneAudit.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -64,16 +61,16 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
-// KYTY_DIAG_HTILE_RMW_CLEAR (default on, user-approved; =0 turns it off; ported from peepostarexx/KytyPS5 dbeff606): a dispatch
+// KYTY_FIX_HTILE_RMW_CLEAR (default on, user-approved; =0 turns it off; ported from peepostarexx/KytyPS5 dbeff606): a dispatch
 // that reads and rewrites one depth surface's HTile in place (Ghost of Yotei clears each shadow map's HTile so, shader
 // b25b01ff1361e795) still runs, but the clear is recorded for the next draw. UpdateComputeMetaClears never takes a
 // read metadata buffer, so the shadow maps were never cleared and every caster failed the depth test (no moonlight).
 static void RecordHtileRewriteClear(TextureCache& cache, const ShaderComputeInputInfo& input) {
 	static constinit Common::OnceValue<bool> enabled_once;
 	const bool enabled = enabled_once.Get([] {
-		const char* value = std::getenv("KYTY_DIAG_HTILE_RMW_CLEAR");
+		const char* value = std::getenv("KYTY_FIX_HTILE_RMW_CLEAR");
 		const bool  on    = value == nullptr || value[0] != '0';
-		if (on) std::fprintf(stderr, "DIAG_HTILE_RMW_CLEAR enabled" "\n");
+		if (on) std::fprintf(stderr, "FIX_HTILE_RMW_CLEAR enabled" "\n");
 		return on;
 	});
 	const auto& program   = *input.stage.program;
@@ -361,8 +358,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		KYTY_PROFILER_BLOCK("Dispatch::ContextLock");
 		lock_holder.emplace(m_context.GetMutex());
 	}
-	const StageF::EventScope stagef_event; // KYTY_TRACE_STAGEF
-	const CmdSignature::EventScope cmd_signature_event(CmdSignature::EventKind::Dispatch); // KYTY_TRACE_CMD_SIGNATURE
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -373,12 +368,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		return;
 	}
-	// KYTY_TRACE_AUDIT_FRAME: before anything of this dispatch is recorded (it can submit the scheduler and wait).
-	if (SceneAudit::Enabled()) SceneAudit::OnCommandStart(m_context);
 	const bool unsupported = ShaderComputeSkippedAsUnsupported(sh_ctx.GetCs());
 	if (unsupported) {
 		LogSkippedDispatch("direct");
-		if (SceneAudit::Enabled()) SceneAudit::RecordSkippedDispatch(sh_ctx.GetCs().cs_regs.data_addr, false);
 		return;
 	}
 
@@ -451,9 +443,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (resources.specialization_reads.empty()) {
 		UpdateComputeMetaClears(input_info, buffer);
 		if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y, thread_group_z, mode)) {
-			if (SceneAudit::Enabled()) {
-				SceneAudit::RecordSkipped("dispatch", "replaced: native clear (image fill)", program.shader_hash);
-			}
 			ResetBindings();
 			return;
 		}
@@ -482,10 +471,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// memory read before anything of the dispatch is recorded (see RefCapture::Prefetch).
 	const bool ref_capture = RefCapture::Claim(program.shader_hash);
 	if (ref_capture) RefCapture::Prefetch(cs_regs);
-	{
-		const StageF::Zone stagef_disppre(StageF::Sub::EvDispPre); // M26
-		buffer.EndRendering();
-	}
+	buffer.EndRendering();
 	census_timer.Mark(3);
 	std::optional<DispatchSubTimer> sub_timer(std::in_place, DispatchSub::Pipeline); // KYTY_TRACE_DISPATCH_CENSUS
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -516,13 +502,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	sub_timer.reset();
 	census_timer.Mark(5);
-	// KYTY_TRACE_AUDIT_FRAME: the dispatch's bindings and full copies of what it reads (before the commit).
-	if (SceneAudit::Enabled()) {
-		SceneAudit::RecordDispatch(m_context, {&input_info.stage, &bindings}, thread_group_x, thread_group_y,
-		                           thread_group_z, false);
-	}
 
-	const StageF::Zone stagef_record(StageF::Sub::RecCompute); // KYTY_TRACE_STAGEF: to the end of the dispatch
 	auto              vk_buffer        = buffer.Handle();
 	sub_timer.emplace(DispatchSub::CommitBindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -579,7 +559,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (const auto writer_addr = ComputeTrace::CsWriterAddr(); writer_addr != 0) {
 		ComputeTrace::CsWriterTrace(writer_addr, program, resources, thread_group_x, thread_group_y, thread_group_z);
 	}
-	// KYTY_DIAG_DCC_FAST_CLEAR=1: a generic fill shader listed in KYTY_DIAG_FILL_CS_HASHES (default:
+	// KYTY_WORKAROUND_DCC_FAST_CLEAR=1: a generic fill shader listed in KYTY_WORKAROUND_FILL_CS_HASHES (default:
 	// Ghost of Yotei's 2bd3cd129405f9a9; V# in s[0:3], record s[4:7], one 16-byte record per thread)
 	// whose record repeats one byte wrote that key over the range; Ghost of Yotei fast-clears DCC
 	// surfaces this way. The fill still runs.
@@ -592,7 +572,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	bool dcc_pixel_fill = false;
 	if ((TextureCache::DccFastClearEnabled() || TextureCache::DccKey10FixEnabled()) && resources.user_data.size() >= 8u) {
 		static const std::string fill_hashes = [] {
-			const char* value = std::getenv("KYTY_DIAG_FILL_CS_HASHES");
+			const char* value = std::getenv("KYTY_WORKAROUND_FILL_CS_HASHES");
 			return value != nullptr ? std::string(value) : std::string("2bd3cd129405f9a9");
 		}();
 		// The list's 16-digit hashes compared as numbers (the same matches as a text search for a list of such hashes),
@@ -646,7 +626,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 	}
-	// KYTY_DIAG_FILL_CS_HASHES=<hex,...> (logged APPROXIMATION): a listed generic fill shader
+	// KYTY_WORKAROUND_FILL_CS_HASHES=<hex,...> (logged APPROXIMATION): a listed generic fill shader
 	// (V# in s[0:3], value in s4, one formatted store per thread) whose buffer format is a single
 	// 32-bit channel with a record stride above 4 bytes fills the whole record range with s4
 	// instead of one dword per record. Ghost of Yotei clears its motion vectors to NaN this way
@@ -654,9 +634,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	{
 		static constinit Common::OnceObject<std::string> fill_list_once;
 		const std::string& fill_list = fill_list_once.Get([] {
-			const char* value = std::getenv("KYTY_DIAG_FILL_CS_HASHES");
+			const char* value = std::getenv("KYTY_WORKAROUND_FILL_CS_HASHES");
 			std::string text  = value != nullptr ? std::string(value) : std::string();
-			if (!text.empty()) std::fprintf(stderr, "DIAG_FILL_CS_HASHES APPROXIMATION enabled (%s)\n", text.c_str());
+			if (!text.empty()) std::fprintf(stderr, "WORKAROUND_FILL_CS_HASHES APPROXIMATION enabled (%s)\n", text.c_str());
 			return text;
 		});
 		char hash_text[17] {};
@@ -668,7 +648,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (dcc_pixel_fill && !fill_list.empty()) {
 			static std::atomic_bool logged {false};
 			if (!logged.exchange(true)) {
-				std::fprintf(stderr, "FIX_DCC_KEY_0X10: KYTY_DIAG_FILL_CS_HASHES not applied to clear-to-pixel stores\n");
+				std::fprintf(stderr, "FIX_DCC_KEY_0X10: KYTY_WORKAROUND_FILL_CS_HASHES not applied to clear-to-pixel stores\n");
 			}
 		}
 		if (!dcc_pixel_fill && !fill_list.empty() && fill_list.find(hash_text) != std::string::npos &&
@@ -684,15 +664,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				const uint64_t bytes   = records * v.Stride();
 				static std::atomic_uint logged {0};
 				if (logged.fetch_add(1) < 16u)
-					std::fprintf(stderr, "DIAG_FILL_CS addr=0x%llx bytes=0x%llx stride=%u value=0x%08x\n",
+					std::fprintf(stderr, "WORKAROUND_FILL_CS addr=0x%llx bytes=0x%llx stride=%u value=0x%08x\n",
 					             static_cast<unsigned long long>(v.Base48()), static_cast<unsigned long long>(bytes),
 					             v.Stride(), resources.user_data[4]);
 				if (bytes != 0) {
 					m_context.GetBufferCache().FillBuffer(v.Base48(), bytes, resources.user_data[4], false);
 					PublishCpuDirtyRange(v.Base48(), bytes); // BDA sync epoch, as DMA_DATA fills
-					if (SceneAudit::Enabled()) {
-						SceneAudit::NoteSkipped("KYTY_DIAG_FILL_CS_HASHES: shader not run, its buffer filled with the value");
-					}
 					ResetBindings();
 					return;
 				}
@@ -716,12 +693,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	GpuCheckpoints::Mark(vk_buffer, program.shader_hash);
 	if (BarrierEveryCmdEnabled()) FullMemoryBarrier(vk_buffer);
-	if (ComputeTrace::CsResOn()) ComputeTrace::CsResTrace(program, resources, "direct", thread_group_x, thread_group_y, thread_group_z);
 	if (GpuTimer::LabelsEnabled()) GpuTimer::LabelBegin(vk_buffer, 'c', program.shader_hash, 0);
 	const uint32_t gpu_time = GpuTimer::BeginCommand(vk_buffer);
-	if (CmdSignature::Enabled()) { // KYTY_TRACE_CMD_SIGNATURE
-		CmdSignature::FoldWords(CmdSignature::Kind::Dispatch, {thread_group_x, thread_group_y, thread_group_z});
-	}
 	// Upstream d4465faa7: an ordered-append (GDS ds_ordered_count) dispatch of one guest wave per group runs its groups in
 	// launch order, one dispatchBase per group with a barrier in between, instead of in any order (the guest workgroup IDs
 	// are kept).
@@ -754,7 +727,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	GpuCheckpoints::Mark(vk_buffer, ~program.shader_hash);
 	if (twin_open) TwinDispatch::End(m_context, vk_buffer, program.shader_hash); // KYTY_DIAG_TWIN_DISPATCH: A's copy
-	if (ComputeTrace::CsOutOn()) ComputeTrace::CsOutTrace(m_context, vk_buffer, bindings, program, "direct");
 	if (ComputeTrace::GuestWatchOn()) ComputeTrace::GuestWatch::Poll(m_context, program.shader_hash);
 	if (ref_capture) {
 		RefCapture::After(m_context, vk_buffer, program, bindings, resources);
@@ -795,8 +767,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;
 	}
-	const StageF::EventScope stagef_event; // KYTY_TRACE_STAGEF
-	const CmdSignature::EventScope cmd_signature_event(CmdSignature::EventKind::DispatchIndirect); // KYTY_TRACE_CMD_SIGNATURE
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		// A dispatch without a program is dropped; logged (first 32, then every 1024th) because a register block
@@ -808,11 +778,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		return;
 	}
-	// KYTY_TRACE_AUDIT_FRAME: before anything of this dispatch is recorded (it can submit the scheduler and wait).
-	if (SceneAudit::Enabled()) SceneAudit::OnCommandStart(m_context);
 	if (ShaderComputeSkippedAsUnsupported(cs_regs)) {
 		LogSkippedDispatch("indirect");
-		if (SceneAudit::Enabled()) SceneAudit::RecordSkippedDispatch(cs_regs.cs_regs.data_addr, true);
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
@@ -834,10 +801,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// RefCapture::Prefetch).
 	const bool ref_capture = RefCapture::Claim(input_info.stage.program->shader_hash);
 	if (ref_capture) RefCapture::Prefetch(cs_regs);
-	{
-		const StageF::Zone stagef_disppre(StageF::Sub::EvDispPre); // M26
-		buffer.EndRendering();
-	}
+	buffer.EndRendering();
 	census_timer.Mark(3);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -860,9 +824,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	census_timer.Mark(5);
-	// KYTY_TRACE_AUDIT_FRAME: the dispatch's bindings and full copies of what it reads (group counts are GPU-side).
-	if (SceneAudit::Enabled()) SceneAudit::RecordDispatch(m_context, {&input_info.stage, &bindings}, 0, 0, 0, true);
-	const StageF::Zone stagef_record(StageF::Sub::RecCompute); // KYTY_TRACE_STAGEF: to the end of the dispatch
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
@@ -906,12 +867,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	GpuCheckpoints::Mark(vk_buffer, input_info.stage.program->shader_hash);
 	if (BarrierEveryCmdEnabled()) FullMemoryBarrier(vk_buffer);
-	if (ComputeTrace::CsResOn()) ComputeTrace::CsResTrace(program, *input_info.stage.resources, "indirect", 0, 0, 0);
 	if (GpuTimer::LabelsEnabled()) GpuTimer::LabelBegin(vk_buffer, 'c', program.shader_hash, 1);
 	const uint32_t gpu_time = GpuTimer::BeginCommand(vk_buffer);
-	if (CmdSignature::Enabled()) { // KYTY_TRACE_CMD_SIGNATURE: the guest's argument address
-		CmdSignature::FoldWords(CmdSignature::Kind::DispatchIndirect, {args_addr, mode});
-	}
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (GpuTimer::LabelsEnabled()) GpuTimer::LabelEnd(vk_buffer);
@@ -919,7 +876,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetBufferCache().NoteCommandEmitted();
 	GpuCheckpoints::Mark(vk_buffer, ~input_info.stage.program->shader_hash);
 	if (twin_open) TwinDispatch::End(m_context, vk_buffer, program.shader_hash); // KYTY_DIAG_TWIN_DISPATCH: A's copy
-	if (ComputeTrace::CsOutOn()) ComputeTrace::CsOutTrace(m_context, vk_buffer, bindings, program, "indirect");
 	if (ComputeTrace::GuestWatchOn()) ComputeTrace::GuestWatch::Poll(m_context, program.shader_hash);
 	if (ref_capture) {
 		RefCapture::After(m_context, vk_buffer, program, bindings, *input_info.stage.resources);

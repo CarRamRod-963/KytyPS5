@@ -146,8 +146,7 @@ public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	// True when the driver cache was written (or found unchanged, KYTY_PERF_PCACHE_SKIP_UNCHANGED); a background save
-	// returns true once its thread is started.
+	// True when the driver cache was written; a background save returns true once its thread is started.
 	bool Save(bool background = false);
 	void SaveIfDue();
 	// --precompile-only (WindowPrecompileOnly): starts the background compiles of the journals at once on `threads`

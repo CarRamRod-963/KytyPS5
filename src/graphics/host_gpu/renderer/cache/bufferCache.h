@@ -136,9 +136,6 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	// Diagnostics (reference captures): the cached buffer that already holds [vaddr, vaddr + size), without creating,
-	// merging or synchronizing anything; {nullptr, 0} when no single buffer holds the range.
-	[[nodiscard]] std::pair<Buffer*, uint64_t> FindCachedBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// HasGpuDirtyBytes for another thread (the resolve thread): the dirty-byte set changes only
 	// through GpuDirtyAdd/GpuDirtySubtract, which take m_gpu_dirty_mutex exclusively; this always takes it shared.
@@ -284,7 +281,7 @@ public:
 
 
 	// Called (GPU thread) for every range a draw, dispatch or tracked BDA store writes; the texture
-	// cache uses it to forget metadata keys it knows (KYTY_DIAG_DCC_KNOWN_KEYS).
+	// cache uses it to forget metadata keys it knows (KYTY_FIX_DCC_KNOWN_KEYS).
 	void SetGpuWriteObserver(std::function<void(uint64_t, uint64_t)> observer) { m_gpu_write_observer = std::move(observer); }
 	// The BDA fallback (M06): a mapped direct-memory page without a buffer gets a BDA table entry into the imported
 	// direct-memory backing (bit 0 set = fallback), so a shader reads and writes the guest's real bytes instead of zeros /

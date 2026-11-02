@@ -160,9 +160,6 @@ struct MemoryInfo {
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
-// KYTY_DIAG_INDIRECT_FORMATTED_STORES=1: formatted X stores through GPU-selected descriptors are
-// written through BDA in the runtime format instead of dropped (single-channel formats).
-bool IndirectFormattedStores(uint64_t shader_hash);
 // Record-keyed V#s (notes\PROJEKT-D6-KROK-B.md). B1: formatted stores through a GPU-selected V# that a bounded loop reads
 // from a record table are record-keyed like raw stores (their guest ranges are listed per materialization and obtained for
 // writing) and written through BDA in the runtime format. B2: a record-keyed V# whose key no bounded loop limits lists every
@@ -496,7 +493,7 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: the flattened SRT words ReadConst reads, as a uniform buffer.
+	// Uniform const buffers: the flattened SRT words ReadConst reads, as a uniform buffer.
 	FlattenedSrtUniform,
 	Count,
 };
@@ -734,34 +731,22 @@ struct BindlessFieldTally {
 	                          // converts in the shader)
 };
 
-// KYTY_PERF_UNIFORM_CONST_BUFFERS=1 (default on, Common::EnvDefaults; the unit tests run it off through
-// KYTY_ENV_DEFAULTS=0): the constant-index reads of the two host-made buffers are uniform
-// buffer reads instead of storage buffer reads (NVIDIA serves them from the constant cache, often as instruction
-// operands, instead of one L1 load per read):
+// Uniform const buffers: the constant-index reads of the two host-made buffers are uniform buffer reads instead of
+// storage buffer reads (NVIDIA serves them from the constant cache, often as instruction operands, instead of one L1
+// load per read):
 //  * ReadConst: flattened SRT slot `i` (an immediate below srt_reads.size(), which the host's flat buffer always
 //    holds, see SrtWalker::RefreshFlatBuffer) through a second binding of the same uploaded words
 //    (FlattenedSrtUniform); the SRT mapping reads (GPU-selected descriptors) keep the storage binding;
 //  * shader data dword `i` (an immediate below ShaderDataDwords()) when it is not push data: the ShaderData binding
-//    itself becomes a uniform buffer.
+//    itself is a uniform buffer.
 // Every read is a constant index inside the bound range, so the same bytes are read: same results.
-inline bool UniformConstBuffers() {
-	static constinit Common::OnceValue<bool> enabled_once;
-	const bool enabled = enabled_once.Get([] {
-		// Default from Common::EnvDefaults; =0 turns it off.
-		const char* value = Common::ShaderEnv::Read("KYTY_PERF_UNIFORM_CONST_BUFFERS");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "PERF_UNIFORM_CONST_BUFFERS enabled\n");
-		return on;
-	});
-	return enabled;
-}
 
 // The smallest maxUniformBufferRange Vulkan allows: a uniform view of this size binds on every device.
 inline constexpr uint32_t UniformBufferMaxBytes = 16384u;
 
 // The flattened SRT words of ReadConst go through FlattenedSrtUniform (when they fit one uniform buffer).
 inline bool ReadConstUniform(size_t srt_reads) {
-	return UniformConstBuffers() && srt_reads != 0u && srt_reads <= UniformBufferMaxBytes / 4u;
+	return srt_reads != 0u && srt_reads <= UniformBufferMaxBytes / 4u;
 }
 
 // M115: a formatted buffer whose V# is all zeros (a

@@ -8,7 +8,6 @@
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "graphics/guest_gpu/gpu_defs.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 namespace Libs::Graphics {
@@ -63,15 +62,6 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	entry.key     = key;
 	entry.sampler = sampler;
 	return sampler;
-}
-
-bool SamplerCache::KeyOf(vk::Sampler sampler, std::array<uint32_t, 5>& key) {
-	Common::LockGuard lock(m_mutex);
-	if (auto iter = m_keys.find(static_cast<VkSampler>(sampler)); iter != m_keys.end()) {
-		key = iter->second;
-		return true;
-	}
-	return false;
 }
 
 vk::Sampler SamplerCache::GetSamplerLocked(const ShaderSamplerResource& r, bool integer_border,
@@ -234,9 +224,6 @@ vk::Sampler SamplerCache::GetSamplerLocked(const ShaderSamplerResource& r, bool 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);
-	if (CmdSignature::Enabled()) {
-		m_keys.emplace(static_cast<VkSampler>(vk_sampler), key); // KYTY_TRACE_CMD_SIGNATURE
-	}
 	return vk_sampler;
 }
 

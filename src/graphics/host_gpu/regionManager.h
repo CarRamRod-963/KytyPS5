@@ -196,10 +196,10 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 
 inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 
-// KYTY_TRACE_STAGEF (renderer/stageFTrace.cpp) and the obtain and write memos (renderer/cache/bufferCache.cpp): one epoch
-// per tracker region, set to the next value of g_cpu_dirty_region_clock whenever MarkCpuDirtyRegion (or a deferred mark)
-// marks the region: a region's epoch changes at every mark, and a region whose epoch is newer than a clock value read
-// earlier was marked since (stage F's staleness). Null (nothing counted) before the BufferCache exists.
+// The obtain and write memos (renderer/cache/bufferCache.cpp): one epoch per tracker region, set to the next value of
+// g_cpu_dirty_region_clock whenever MarkCpuDirtyRegion (or a deferred mark) marks the region: a region's epoch changes at
+// every mark, and a region whose epoch is newer than a clock value read earlier was marked since. Null (nothing counted)
+// before the BufferCache exists.
 inline std::atomic<std::atomic<uint32_t>*> g_cpu_dirty_region_epochs {nullptr};
 inline std::atomic<uint32_t>               g_cpu_dirty_region_clock {0};
 
@@ -307,14 +307,6 @@ struct CpuDeferredCounters {
 };
 inline CpuDeferredCounters g_cpu_deferred_counters;
 
-// Moves whenever a page anywhere becomes CPU-dirty (a visible mark moves the epoch, a deferred one the counter;
-// both inside the region lock that sets the page bits) or a buffer is registered. For proofs that nothing became
-// CPU-dirty: g_cpu_dirty_epoch alone misses deferred guest writes.
-[[nodiscard]] inline uint64_t CpuDirtyMarkSequence() {
-	return g_cpu_dirty_epoch.load(std::memory_order_acquire) +
-	       g_cpu_deferred_counters.deferred_marks.load(std::memory_order_acquire);
-}
-
 // Sets g_cpu_dirty_deferred for the current thread while it lives (restores the previous value).
 class CpuDirtyDeferScope final {
 public:
@@ -337,7 +329,7 @@ inline void MarkCpuDeferredRegion(uint64_t region) {
 	g_cpu_deferred_regions.top[top_index].fetch_or(1ull << ((region / 64) % 64), std::memory_order_release);
 	g_cpu_deferred_groups.fetch_or(1ull << (top_index / 64), std::memory_order_acq_rel);
 	g_cpu_deferred_counters.deferred_marks.fetch_add(1, std::memory_order_relaxed);
-	// KYTY_TRACE_STAGEF: the bytes changed now, whenever the GPU work may see them (as
+	// The obtain and write memos: the bytes changed now, whenever the GPU work may see them (as
 	// MarkCpuDirtyRegion).
 	if (auto* epochs = g_cpu_dirty_region_epochs.load(std::memory_order_acquire); epochs != nullptr) {
 		NoteCpuDirtyRegionEpoch(epochs, region);

@@ -61,12 +61,6 @@ void MasterSemaphore::Refresh() {
 	RefreshNow();
 }
 
-uint64_t MasterSemaphore::QueryTickRaw() const {
-	uint64_t counter = 0;
-	if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter) != vk::Result::eSuccess) return 0;
-	return counter;
-}
-
 void MasterSemaphore::RefreshNow() {
 	uint64_t   counter = 0;
 	const auto start   = std::chrono::steady_clock::now();

@@ -4,9 +4,7 @@
 #include "common/profiler.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
-#include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -21,7 +19,6 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -231,47 +228,7 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	// KYTY_TRACE_PROTECT_PAGES=1 (diagnostic, default off): every ~5 s the 24 address ranges (64 KiB granules) the tracker
-	// changed the protection of most often, with the count per mode and the thread kind, to find pages that go back and
-	// forth every frame (stage F0 measured ~2,700 protection calls and ~11 ms per frame on the GPU thread).
-	static void TraceProtect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
-		struct Entry {
-			uint64_t calls = 0, bytes = 0, gpu = 0;
-			uint64_t by_mode[4] {};
-		};
-		static std::mutex                               mutex;
-		static std::unordered_map<uint64_t, Entry>      ranges;
-		static auto                                     window = std::chrono::steady_clock::now();
-		std::scoped_lock                                lock(mutex);
-		auto&                                           e = ranges[vaddr >> 16u];
-		e.calls++;
-		e.bytes += size;
-		if (PerfIsGpuThread()) e.gpu++;
-		e.by_mode[static_cast<uint32_t>(mode) & 3u]++;
-		const auto now = std::chrono::steady_clock::now();
-		if (now - window < std::chrono::seconds(5)) return;
-		window = now;
-		std::vector<std::pair<uint64_t, Entry>> top(ranges.begin(), ranges.end());
-		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.calls > b.second.calls; });
-		uint64_t total = 0;
-		for (const auto& [k, v]: top) total += v.calls;
-		std::fprintf(stderr, "PROTECT_PAGES window calls=%llu ranges=%zu frame=%u\n", static_cast<unsigned long long>(total),
-		             top.size(), Libs::Graphics::DebugPresentCount().load());
-		for (size_t i = 0; i < top.size() && i < 24u; i++) {
-			const auto& v = top[i].second;
-			std::fprintf(stderr, "PROTECT_PAGES 0x%llx calls=%llu bytes=%llu gpu=%llu modes=%llu/%llu/%llu/%llu\n",
-			             static_cast<unsigned long long>(top[i].first << 16u), static_cast<unsigned long long>(v.calls),
-			             static_cast<unsigned long long>(v.bytes), static_cast<unsigned long long>(v.gpu),
-			             static_cast<unsigned long long>(v.by_mode[0]), static_cast<unsigned long long>(v.by_mode[1]),
-			             static_cast<unsigned long long>(v.by_mode[2]), static_cast<unsigned long long>(v.by_mode[3]));
-		}
-		ranges.clear();
-	}
-
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		const StageF::Zone stagef_protect(StageF::Sub::Protect); // KYTY_TRACE_STAGEF
-		static const bool trace_protect = std::getenv("KYTY_TRACE_PROTECT_PAGES") != nullptr;
-		if (trace_protect) TraceProtect(vaddr, size, mode);
 		// KYTY_TRACE_PERF: tracker protections by thread kind (PERF locks).
 		struct ProtectTimer {
 			bool                                  on = PerfEnabled();

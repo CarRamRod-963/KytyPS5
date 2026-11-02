@@ -11,7 +11,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// KYTY_DIAG_SRT_TAPE=0 disables the tape; KYTY_DIAG_SRT_TAPE_VERIFY=1 cross-checks it against SrtWalker.
+// KYTY_FIX_SRT_TAPE=0 disables the tape; KYTY_FIX_SRT_TAPE_VERIFY=1 cross-checks it against SrtWalker.
 bool SrtTapeEnabled();
 bool SrtTapeVerifyEnabled();
 

@@ -3,7 +3,6 @@
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -121,7 +120,6 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	if (access == PageFaultAccess::Write) {
 		KYTY_PROFILER_BLOCK("Fault::Write");
-		if (TexWin::Enabled()) TexWin::NoteWriteFault(fault_vaddr); // KYTY_TRACE_TEXWIN (TW5)
 		if (BufferCache::UploadClobberCheck()) m_buffer_cache.NoteGuestWriteFault(fault_vaddr); // KYTY_D6_C0=2/3
 		{
 			// The BDA sync epoch: a guest thread's write waits for the next point that orders it before GPU work; the GPU
@@ -204,7 +202,6 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	if (TexWin::Enabled()) TexWin::NoteMapped(vaddr, size); // KYTY_TRACE_TEXWIN (TW5)
 	m_buffer_cache.QueueFallbackMap(vaddr, size); // the BDA fallback (M06)
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
@@ -218,18 +215,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	// KYTY_TRACE_TEXWIN (TW3, TW4): the caller's wall time, the GPU thread's time, which clause drained (null: off).
-	TexWin::UnmapRecord        texwin_record {};
-	TexWin::UnmapRecord* const texwin = TexWin::Enabled() ? &texwin_record : nullptr;
-	if (texwin != nullptr) TexWin::BeginUnmap(*texwin, vaddr, size);
-	const auto unmap = [this, vaddr, size, texwin] {
-		if (texwin != nullptr) {
-			// KYTY_TRACE_TEXWIN: the clauses of the decision below, each on its own (read-only queries).
-			const bool active = m_command_scheduler.Active();
-			TexWin::BeginUnmapExec(*texwin, active && m_buffer_cache.IsRegionRegistered(vaddr, size),
-			                       active && m_texture_cache.IsRegionRegistered(vaddr, size),
-			                       active && m_command_scheduler.HasPendingPriorityOperations());
-		}
+	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
@@ -238,7 +224,6 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto              tick = m_command_scheduler.CurrentTick();
 			SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::Unmap); // KYTY_TRACE_SYNC_TIMELINE
-			const TexWin::DrainScope texwin_drain(texwin);                    // KYTY_TRACE_TEXWIN (TW4)
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
@@ -250,7 +235,6 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_page_manager.DisarmImageRead(vaddr, size);
 		}
 		m_texture_cache.UnmapMemory(vaddr, size);
-		if (texwin != nullptr) TexWin::EndUnmapExec(*texwin);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
@@ -258,11 +242,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
-		if (texwin != nullptr) TexWin::EndUnmap(*texwin, true);
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
-	if (texwin != nullptr) TexWin::EndUnmap(*texwin, GuestGpu::IsGpuThread());
 }
 
 void RenderContext::PrepareBda() {

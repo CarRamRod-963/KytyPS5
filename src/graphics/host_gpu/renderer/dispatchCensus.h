@@ -17,7 +17,7 @@ enum class DispatchSub : uint32_t {
 	// KYTY_TRACE_DRAW_CENSUS (draws on the execution thread, renderDraw.cpp).
 	DrawPre, DrawRenderState, DrawPrograms, DrawTargets, DrawPipeline, DrawPlanSetup, DrawWait, DrawPost, DrawCommit,
 	CReplay, CAcquire, CVtx, CBind, CIndex, CDyn,
-	// CommitBindings parts (StageF's record split) and the graphics program lookup (ProgramCache::Get of non-compute
+	// CommitBindings parts (the record split) and the graphics program lookup (ProgramCache::Get of non-compute
 	// stages: key, resolved result taken, materialization, permutation; counts of each path).
 	BPre, BScan, BDesc, BTransit, BEmit, GLookup, GTake, GMr, GPerm, GPathResolved, GPathMr, Count
 };

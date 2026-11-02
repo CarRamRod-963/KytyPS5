@@ -74,12 +74,6 @@ void PerfSamplerStartForCurrentThread();
 // Diagnostics (a stuck wait, perfSampler.cpp): STACK_DUMP lines of another thread (a HANDLE) and of the calling thread.
 void PerfDumpThreadStack(void* thread_handle, const char* label);
 void PerfDumpCurrentStack(const char* label);
-// KYTY_TRACE_PERF_SAMPLE_IDLE=1 (diagnostic, with KYTY_TRACE_PERF_SAMPLE=1): the sampler keeps only the samples taken
-// while the host GPU has finished every submitted command buffer of the main scheduler (the GPU waits for this thread:
-// the frame's critical path). commandScheduler.cpp records the submissions and answers the query.
-bool PerfSampleIdleEnabled();
-void PerfSampleIdleNoteSubmitted(void* master, uint64_t tick);
-[[nodiscard]] bool PerfSampleGpuIdleNow();
 // KYTY_TRACE_PERF: a fixed CPU loop's time, the CPU and page faults (perfSampler.cpp; GPU thread, per report).
 void CpuProbeReport();
 
@@ -183,7 +177,7 @@ inline PerfReasonStats* PerfReasons() {
 	return values;
 }
 
-// The shader whose resources are being materialized on this thread (KYTY_TRACE_SRT_READS).
+// The shader whose resources are being materialized on this thread (KYTY_TRACE_SRT_CLASSES).
 inline uint64_t& PerfMaterializeHash() {
 	static thread_local uint64_t hash = 0;
 	return hash;

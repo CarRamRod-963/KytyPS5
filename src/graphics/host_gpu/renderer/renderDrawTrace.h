@@ -13,18 +13,9 @@
 // or the debug dump is set; each is reached through its gate or on a draw that is dropped anyway.
 namespace Libs::Graphics {
 
-// KYTY_TRACE_DRAW_DROPS=<text>[|<text>...] (diagnostic): a draw the renderer drops without recording anything, while the
-// debug marker path contains one of the texts, logs the reason, the path and the primitive type (once per reason and
-// path, up to 64 lines). Draws that disappear between the guest command stream and Vulkan show up here.
-// KYTY_TRACE_DRAW_DROPS=<marker text|...>: the first 64 distinct dropped draws (reason, marker path and, for draws
-// PrepareDrawRenderState leaves out, the register state that decided it) under a marker path containing one of
-// the texts, as DRAW_DROP lines.
-inline bool DrawDropTraceRequested() {
-	static const bool on = std::getenv("KYTY_TRACE_DRAW_DROPS") != nullptr;
-	return on;
-}
-// state: a JSON object with the register state behind the drop (audit "skip_state", DRAW_DROP state=), or null.
-void TraceDrawDrop(const char* reason, const CommandBuffer& buffer, const std::string* state = nullptr);
+// A draw the renderer drops without recording anything (KYTY_TRACE_CLEAN_DRAWS: a metadata / copy / resolve operation
+// ends a series of clean draws).
+void TraceDrawDrop(const char* reason, const CommandBuffer& buffer);
 
 // --graphics-debug-dump: the first draws' targets, inputs and skipped framebuffers.
 void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color, const RenderDepthInfo& depth,

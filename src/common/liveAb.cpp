@@ -38,7 +38,7 @@ constexpr SwitchInfo Switches[] = {
     // reads the live shader flags word, rewritten at frame boundaries; indirectLoadFast.h).
     {Switch::IndirectLoadFast, "KYTY_PERF_INDIRECT_LOAD_FAST", 1},
     // D4 step K1: only how an image bound for sampling, storage or rendering takes the bytes that other images over its
-    // memory wrote after it (phase 1: through guest memory, exactly; phase 0: KYTY_DIAG_ALIAS_SYNC's rectangle copy).
+    // memory wrote after it (phase 1: through guest memory, exactly; phase 0: KYTY_WORKAROUND_ALIAS_SYNC's rectangle copy).
     // Both keep the content serials, so either phase continues from what the other left; read once per bind.
     {Switch::SharedImageMemory, "KYTY_FIX_SHARED_IMAGE_MEMORY", 1},
     // Measurement only (APPROXIMATION): whether draw and dispatch packets inside the listed marker passes return before the
@@ -55,7 +55,6 @@ struct RefusedInfo {
 
 constexpr RefusedInfo Refused[] = {
     {"KYTY_PERF_DCC_GPU_ALL", "device features and GPU-write observers are set up at start"},
-    {"KYTY_PERF_UNIFORM_CONST_BUFFERS", "changes translated shader code (shader and pipeline caches)"},
 };
 
 struct Entry {
@@ -120,7 +119,9 @@ Config Parse() {
 			const auto* refused = std::ranges::find_if(Refused, [&](const RefusedInfo& r) { return name == r.name; });
 			reason              = refused != std::end(Refused)     ? refused->reason
 			                      : name.rfind("KYTY_DIAG_", 0) == 0 ? "DIAG switches are approximations or keep state"
-			                                                         : "not audited for live toggling";
+			                      : name.rfind("KYTY_WORKAROUND_", 0) == 0
+			                          ? "WORKAROUND switches are approximations or keep state"
+			                          : "not audited for live toggling";
 		} else if (value == 0) {
 			reason = "=0 is the off phase already";
 		} else if (value > info->max_value) {

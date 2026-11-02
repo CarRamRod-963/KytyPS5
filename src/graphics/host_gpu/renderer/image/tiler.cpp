@@ -26,10 +26,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <map>
 #include <tuple>
 #include <vector>
 #include <cstring>
@@ -272,40 +268,6 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
                          vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
                          const Tiling& tiling, bool clear_target) {
-	// KYTY_TRACE_TILER=1: per ~5 s, tiler work recorded in each direction (detile = guest tiled
-	// memory to linear, tile = linear/GPU image back to tiled guest memory): calls, texels and
-	// target bytes, with the largest surfaces (texel count and pipeline slot).
-	static const bool trace_tiler = std::getenv("KYTY_TRACE_TILER") != nullptr;
-	if (trace_tiler) {
-		struct Totals {
-			uint64_t calls = 0, texels = 0, bytes = 0;
-		};
-		static Totals                                            totals[2];
-		static std::map<std::pair<uint32_t, uint32_t>, uint64_t> sizes;
-		static auto window = std::chrono::steady_clock::now();
-		auto&       t      = totals[clear_target ? 0 : 1];
-		t.calls++;
-		t.texels += tiling.num_texels;
-		t.bytes += target_capacity;
-		sizes[{tiling.num_texels, tiling.pipeline_slot}] += tiling.num_texels;
-		if (std::chrono::steady_clock::now() - window >= std::chrono::seconds(5)) {
-			window = std::chrono::steady_clock::now();
-			std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> top(sizes.begin(), sizes.end());
-			std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-			std::fprintf(stderr, "TILER detile=%llu/%lluMtx/%lluMiB tile=%llu/%lluMtx/%lluMiB top",
-			             static_cast<unsigned long long>(totals[0].calls),
-			             static_cast<unsigned long long>(totals[0].texels >> 20u), static_cast<unsigned long long>(totals[0].bytes >> 20u),
-			             static_cast<unsigned long long>(totals[1].calls),
-			             static_cast<unsigned long long>(totals[1].texels >> 20u), static_cast<unsigned long long>(totals[1].bytes >> 20u));
-			for (size_t i = 0; i < top.size() && i < 8u; i++) {
-				std::fprintf(stderr, " [%u texels slot=%u %lluMtx]", top[i].first.first, top[i].first.second,
-				             static_cast<unsigned long long>(top[i].second >> 20u));
-			}
-			std::fprintf(stderr, "\n");
-			totals[0] = totals[1] = {};
-			sizes.clear();
-		}
-	}
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);

@@ -38,30 +38,26 @@ inline constexpr const char* Names[] = {
     "KYTY_BINDLESS_RECORD_TABLES",
     "KYTY_BINDLESS_STAGES",
     "KYTY_DIAG_BINDLESS_PLACEHOLDER_CENSUS",
-    "KYTY_DIAG_GDS_M0_BASE",
-    "KYTY_DIAG_INDIRECT_FORMATTED_STORES",
     "KYTY_DIAG_MOV_NO_FLOAT_MODS",
     "KYTY_DIAG_NULL_FORMATTED_STICKY",
     "KYTY_DIAG_PROBE",
     "KYTY_DIAG_PROBE_NTH",
-    // guest_gpu/gpu_format.cpp: format 30 as UFLOAT or as packed UNorm bits converted in the shader.
-    "KYTY_DIAG_RT_11_11_10_FLOAT",
     "KYTY_DIAG_RT_TRIPS",
     // pipelineCache.cpp: the listed shader's SPIR-V is replaced from a file.
     "KYTY_DIAG_SPIRV_REPLACE",
-    "KYTY_DIAG_SRT_TAPE",
-    "KYTY_DIAG_SRT_TAPE_VERIFY",
-    "KYTY_DIAG_WATERFALL_POINTER_RECORD0",
     "KYTY_DIAG_WATERFALL_RECORD0_CENSUS",
     "KYTY_FIX_CLAMP_NAN",
     "KYTY_FIX_CLAMP_NAN_HASHES",
+    // guest_gpu/gpu_format.cpp: format 30 as UFLOAT or as packed UNorm bits converted in the shader.
+    "KYTY_FIX_RT_11_11_10_FLOAT",
+    "KYTY_FIX_SRT_TAPE",
+    "KYTY_FIX_SRT_TAPE_VERIFY",
     // BufferCache::BdaEntryShareMode (bufferCache.cpp), read by the SPIR-V emitter.
     "KYTY_PERF_BDA_ENTRY_SHARE",
     "KYTY_PERF_BDA_ENTRY_SHARE_HASHES",
     "KYTY_PERF_BINDLESS_CLASSES",
     "KYTY_PERF_F16_CVT_PLAIN",
     "KYTY_PERF_SPIRV_STORE_OUTLINE",
-    "KYTY_PERF_UNIFORM_CONST_BUFFERS",
     // pipelineCache.cpp: the driver cache's signature (the warm list file is dropped with it).
     "KYTY_PIPELINE_CACHE_ANY_REVISION",
     "KYTY_RECORD_KEYED_VERIFY",
@@ -71,6 +67,7 @@ inline constexpr const char* Names[] = {
     "KYTY_SHADER_LOOP_LIMIT_HASHES",
     // shaders.cpp: eCaptureStatisticsKHR on the listed pipelines (the only TRACE_ name here).
     "KYTY_TRACE_PIPELINE_STATS",
+    "KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0",
 };
 
 // Sorted (strcmp order; checked below).
@@ -81,8 +78,6 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_DIAG_SKIP_CS_HASHES",
     "KYTY_DIAG_SKIP_CS_LIVE",
     "KYTY_DIAG_SKIP_UNSUPPORTED_CS",
-    // When the driver cache file is saved.
-    "KYTY_PERF_PCACHE_SKIP_UNCHANGED",
     // The background compiles' reuse store (shaderPrecompile.cpp): the same SPIR-V, made earlier.
     "KYTY_PERF_SHADER_REUSE_MB",
     // Table-mode pipelines made in the background: the key a lookup asks for, not what a key makes.
@@ -97,26 +92,16 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_SWEEP_SPIRV_OPSTATS",
     "KYTY_SWEEP_SPIRV_SLICE",
     "KYTY_TEST_PIPELINE_IDLE_FRAMES",
-    // Logs, censuses and dumps of code, SPIR-V and resources; a failed SPIR-V validation stops the run.
-    "KYTY_TRACE_ADDRESS_WRITES",
+    // Logs, censuses and dumps of code, SPIR-V and resources.
     "KYTY_TRACE_DISASM",
-    "KYTY_TRACE_FAST_ADOPT_TIME",
     "KYTY_TRACE_INDIRECT_COUNTS",
     "KYTY_TRACE_INDIRECT_IMAGE",
-    "KYTY_TRACE_INDIRECT_RANGES",
     "KYTY_TRACE_PERMUTATIONS",
-    "KYTY_TRACE_PIPELINE_REPEAT",
-    "KYTY_TRACE_RECORD_KEYED_REFUSE",
     "KYTY_TRACE_SHADER_CODE_DIR",
     "KYTY_TRACE_SHADER_STAGES",
-    "KYTY_TRACE_SPECIALIZATION",
-    "KYTY_TRACE_SPEC_CENSUS",
     "KYTY_TRACE_SPIRV_ALL_DIR",
     "KYTY_TRACE_SPIRV_TEXT",
-    "KYTY_TRACE_SPIRV_VALIDATE",
     "KYTY_TRACE_SRT_CLASSES",
-    // Read in the recompiler, but only refuses the resolve thread's "ahead" path while the run traces.
-    "KYTY_TRACE_SRT_READS",
 };
 
 namespace Detail {

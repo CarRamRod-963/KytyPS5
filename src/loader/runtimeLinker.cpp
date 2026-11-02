@@ -4,7 +4,6 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
-#include "common/envRead.h"
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -679,58 +678,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
-		}
-		// KYTY_TRACE_CPU_WRITE_WATCH=<hex address>:<hex size>[,...]: guest writes that fault inside the
-		// ranges (the first write to a GPU-tracked page after each GPU use) are logged once per
-		// instruction with registers and the top of the stack; 4 KiB of code around the instruction is
-		// saved to <KYTY_TRACE_FRAME_DIR>/cpuwrite_<rip>.bin (8-byte base + bytes, for guestdis.py).
-		if (access == GpuAccess::Write) {
-			static const std::vector<std::pair<uint64_t, uint64_t>> watch = [] {
-				std::vector<std::pair<uint64_t, uint64_t>> list;
-				const char* value = std::getenv("KYTY_TRACE_CPU_WRITE_WATCH");
-				while (value != nullptr && *value != 0) {
-					char*      end  = nullptr;
-					const auto addr = std::strtoull(value, &end, 16);
-					uint64_t   size = 0x1000;
-					if (end != nullptr && *end == ':') size = std::strtoull(end + 1, &end, 16);
-					list.emplace_back(addr, size);
-					if (end == nullptr || *end != ',') break;
-					value = end + 1;
-				}
-				return list;
-			}();
-			const auto fault = info->access_violation_vaddr;
-			if (std::ranges::any_of(watch, [&](const auto& w) { return fault >= w.first && fault - w.first < w.second; })) {
-				static std::mutex              mutex;
-				static std::vector<uint64_t>   seen;
-				std::scoped_lock               lock(mutex);
-				const auto rip = static_cast<uint64_t>(info->exception_address);
-				if (seen.size() < 64u && std::ranges::find(seen, rip) == seen.end()) {
-					seen.push_back(rip);
-					std::printf("CPU_WRITE_WATCH addr=0x%016" PRIx64 " rip=0x%016" PRIx64 " rax=%016" PRIx64 " rbx=%016" PRIx64
-					            " rcx=%016" PRIx64 " rdx=%016" PRIx64 " rsi=%016" PRIx64 " rdi=%016" PRIx64 " r8=%016" PRIx64
-					            " r9=%016" PRIx64 " rsp=%016" PRIx64 "\n",
-					            fault, rip, info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->r8, info->r9,
-					            info->rsp);
-					if (IsReadableRange(info->rsp, 24 * sizeof(uint64_t))) {
-						const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-						std::printf("CPU_WRITE_WATCH stack");
-						for (int i = 0; i < 24; ++i) std::printf(" %016" PRIx64, stack[i]);
-						std::printf("\n");
-					}
-					const uint64_t base = (rip & ~uint64_t {0xfff}) - 0x1000u;
-					if (const char* dir = Common::EnvRead::FrameDir(); dir != nullptr && IsReadableRange(base, 0x3000)) {
-						char name[512];
-						std::snprintf(name, sizeof(name), "%s/cpuwrite_%016" PRIx64 ".bin", dir, rip);
-						if (FILE* file = std::fopen(name, "wb")) {
-							std::fwrite(&base, sizeof(base), 1, file);
-							std::fwrite(reinterpret_cast<const void*>(base), 1, 0x3000, file);
-							std::fclose(file);
-						}
-					}
-					std::fflush(stdout);
-				}
-			}
 		}
 		if (Common::OverlayStats::Enabled()) {
 			Common::OverlayStats::Add(Common::OverlayStats::Counter::GpuMemoryFault); // KYTY_OVERLAY

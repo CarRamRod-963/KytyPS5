@@ -12,7 +12,6 @@
 #include "common/onceValue.h"
 #include "common/overlayStats.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/startupTrace.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -29,13 +28,10 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/renderer/stageFLookup.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/host_gpu/renderer/virtualGpuClock.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -68,9 +64,6 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 namespace Libs::Graphics {
-
-namespace QueueTrace = Common::QueueTrace; // KYTY_TRACE_QUEUES
-
 
 // A compute queue that the GPU thread has processed for at least ProducerFrames presented frames without one of its
 // slices ending blocked (a WAIT_REG_MEM that did not pass, a cede) is a producer: it never waits for another queue or for
@@ -567,7 +560,6 @@ void DeferLabel(CommandScheduler& scheduler, RenderContext& renderer, int event_
 			}
 			if (sequence != 0) gpu->MarkPublished(sequence); // (0: no journal, a test driving a processor here)
 			PublishCpuDirtyRange(dst, size); // BDA sync epoch
-			if (QueueTrace::Enabled()) QueueTrace::NoteWrite(dst, size); // KYTY_TRACE_QUEUES
 			const auto lag = static_cast<uint64_t>(std::max<int64_t>(LabelNowNs() - recorded_ns, 0));
 			g_label_stats.published.fetch_add(1, std::memory_order_relaxed);
 			g_label_stats.lag_ns.fetch_add(lag, std::memory_order_relaxed);
@@ -686,14 +678,8 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 			m_commands_running = true;
 		}
-		const bool queues_trace = QueueTrace::Enabled(); // KYTY_TRACE_QUEUES: a command inside a slice
-		if (queues_trace) QueueTrace::CommandBegin();
-		{
-			const StageF::Zone stagef_command(StageF::Sub::Command); // KYTY_TRACE_STAGEF
-			if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
-			command();
-		}
-		if (queues_trace) QueueTrace::CommandEnd();
+		if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
+		command();
 	}
 }
 
@@ -836,8 +822,6 @@ void GuestGpu::BecomeRendererOwner() {
 	PerfIsGpuThread() = true;
 	PerfSamplerStartForCurrentThread();
 	Common::StartupTrace::NoteGpuThread(); // KYTY_TRACE_STARTUP: its CPU time per second
-	if (StageF::Enabled()) StageF::MarkGpuThread(); // KYTY_TRACE_STAGEF
-	if (CmdSignature::Enabled()) CmdSignature::MarkGpuThread(); // KYTY_TRACE_CMD_SIGNATURE
 }
 
 void GuestGpu::RunCommands() {
@@ -1462,7 +1446,6 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
-		if (QueueTrace::Enabled()) QueueTrace::NoteSuspend(QueueTrace::SuspendReason::CeDe); // KYTY_TRACE_QUEUES
 		SuspendPm4();
 	}
 }
@@ -1470,14 +1453,12 @@ void CommandProcessor::WaitCe() {
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
-		if (QueueTrace::Enabled()) QueueTrace::NoteSuspend(QueueTrace::SuspendReason::CeDe); // KYTY_TRACE_QUEUES
 		SuspendPm4();
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
-		if (QueueTrace::Enabled()) QueueTrace::NoteSuspend(QueueTrace::SuspendReason::Rewind); // KYTY_TRACE_QUEUES
 		SuspendPm4();
 		return;
 	}
@@ -1505,7 +1486,6 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 		memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 		// BDA sync epoch: the commands after this one see the GPU thread's own write.
 		PublishCpuDirtyRange(reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * 4u);
-		if (QueueTrace::Enabled()) QueueTrace::NoteWrite(reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * 4u);
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * 4u);
 }
@@ -1572,13 +1552,6 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	if (SyncTimeline::Enabled()) {
 		SyncTimeline::GuestWaitRegMem(reinterpret_cast<uint64_t>(addr), value, ref, passed,
 		                              static_cast<uint32_t>(m_interrupt_event_id));
-	}
-	if (QueueTrace::Enabled()) { // KYTY_TRACE_QUEUES: cross-queue waits
-		if (passed) {
-			QueueTrace::NoteWaitPassed(reinterpret_cast<uint64_t>(addr), sizeof(T));
-		} else {
-			QueueTrace::NoteWaitBlocked(reinterpret_cast<uint64_t>(addr), sizeof(T));
-		}
 	}
 	if (!passed) {
 		// The queue waits: a wait of a block entered unread holds the stream (liveness guard, the stuck line).
@@ -1664,10 +1637,6 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		// BDA sync epoch: the commands after this one see the GPU thread's own write.
 		PublishCpuDirtyRange(reinterpret_cast<uint64_t>(dst),
 		                     write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * sizeof(uint32_t));
-		if (QueueTrace::Enabled()) { // KYTY_TRACE_QUEUES: WRITE_DATA labels
-			QueueTrace::NoteWrite(reinterpret_cast<uint64_t>(dst),
-			                      write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * sizeof(uint32_t));
-		}
 	});
 	if (write_one_address) {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), sizeof(uint32_t), src + dw_num - 1);
@@ -1778,7 +1747,6 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
 	// guest memory itself (the CPU paths).
 	if (!dst_gds) {
 		PublishCpuDirtyRange(dst_address_or_offset, num_bytes);
-		if (QueueTrace::Enabled()) QueueTrace::NoteWrite(dst_address_or_offset, num_bytes); // KYTY_TRACE_QUEUES
 	}
 }
 
@@ -1821,7 +1789,6 @@ static void PerfBlockedWait(std::chrono::steady_clock::duration waited) {
 	}
 }
 
-// KYTY_TRACE_STAGEF (M0): the "outside" class of a PM4 opcode.
 // The register structures (render.h RegsWritten*) a packet's handler may write. Register packets
 // write their own class; draws, index/instance setup, SET_BASE, buffer jumps and plain/marker NOPs write none; every
 // other packet counts as writing all three.
@@ -1848,59 +1815,6 @@ static uint32_t RegistersWrittenBy(uint32_t opcode, uint32_t r) {
 	}
 }
 
-static StageF::Sub StageFPacketSub(uint32_t opcode) {
-	switch (opcode) {
-		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_INDIRECT:
-		case Pm4::IT_DRAW_INDIRECT:
-		case Pm4::IT_DRAW_INDEX_INDIRECT:
-		case Pm4::IT_DRAW_INDEX_2:
-		case Pm4::IT_DRAW_INDIRECT_MULTI:
-		case Pm4::IT_DRAW_INDEX_AUTO:
-		case Pm4::IT_DRAW_INDEX_OFFSET_2:
-		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
-		case Pm4::IT_DISPATCH_DRAW:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return StageF::Sub::OutEvPre;
-		case Pm4::IT_SET_CONFIG_REG:
-		case Pm4::IT_SET_CONTEXT_REG:
-		case Pm4::IT_SET_SH_REG:
-		case Pm4::IT_SET_QUEUE_REG:
-		case Pm4::IT_SET_UCONFIG_REG:
-		case Pm4::IT_SET_UCONFIG_REG_INDEX:
-		case Pm4::IT_SET_SH_REG_INDIRECT:
-		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
-		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
-		case Pm4::IT_CONTEXT_CONTROL:
-		case Pm4::IT_CLEAR_STATE:
-		case Pm4::IT_INDEX_BUFFER_SIZE:
-		case Pm4::IT_INDEX_BASE:
-		case Pm4::IT_INDEX_TYPE:
-		case Pm4::IT_NUM_INSTANCES:
-		case Pm4::IT_SET_BASE: return StageF::Sub::OutSetReg;
-		case Pm4::IT_WAIT_REG_MEM:
-		case Pm4::IT_WAIT_REG_MEM_64:
-		case Pm4::IT_WAIT_ON_CE_COUNTER:
-		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF:
-		case Pm4::IT_MEM_SEMAPHORE:
-		case Pm4::IT_COND_EXEC:
-		case Pm4::IT_SET_PREDICATION: return StageF::Sub::OutWait;
-		case Pm4::IT_EVENT_WRITE:
-		case Pm4::IT_EVENT_WRITE_EOP:
-		case Pm4::IT_EVENT_WRITE_EOS:
-		case Pm4::IT_RELEASE_MEM:
-		case Pm4::IT_ACQUIRE_MEM:
-		case Pm4::IT_SURFACE_SYNC:
-		case Pm4::IT_PFP_SYNC_ME: return StageF::Sub::OutRelease;
-		case Pm4::IT_WRITE_DATA:
-		case Pm4::IT_DMA_DATA:
-		case Pm4::IT_CP_DMA:
-		case Pm4::IT_COPY_DATA:
-		case Pm4::IT_WRITE_CONST_RAM:
-		case Pm4::IT_DUMP_CONST_RAM: return StageF::Sub::OutWrite;
-		default: return StageF::Sub::OutOther;
-	}
-}
-
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -1911,12 +1825,6 @@ void GuestGpu::ThreadRun(void* data) {
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::CommandProcessor);
 	g_stream_gpu = gpu;
 	g_cp_thread  = true;
-	const bool queues_trace = QueueTrace::Enabled(); // KYTY_TRACE_QUEUES
-	if (queues_trace) QueueTrace::MarkGpuThread();
-	const auto idle_ns     = [](std::chrono::steady_clock::time_point start) {
-		return static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-	};
 
 	// When every queue waits (WAIT_REG_MEM), the command processor retries without sleeping until the spin budget
 	// is spent. Based on TheCruZ/KytyPS5-GTA 12ec19890 (graphicsRun.cpp), GPL-2.0.
@@ -1964,9 +1872,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
-				const auto empty_start = queues_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
-				if (queues_trace) QueueTrace::NoteIdle(idle_ns(empty_start), false);
 			}
 			if (gpu->m_stopping && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -2013,7 +1919,6 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 					PerfBlockedWait(std::chrono::steady_clock::now() - blocked_start);
 					if (GpuTimer::Enabled() && GpuTimer::TimelineCpuActive()) GpuTimer::NoteCpuWait('b', blocked_start); // KYTY_TRACE_GPU_TIMELINE
-					if (queues_trace) QueueTrace::NoteIdle(idle_ns(blocked_start), true);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -2051,38 +1956,18 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
-		bool complete = false;
-		{
-			if (queues_trace) {
-				// KYTY_TRACE_QUEUES: one slice of the queue.
-				static constexpr QueueTrace::SliceKind kinds[] = {QueueTrace::SliceKind::Graphics, QueueTrace::SliceKind::Compute,
-				                                                  QueueTrace::SliceKind::FlipPreparation,
-				                                                  QueueTrace::SliceKind::SuspendPoint};
-				QueueTrace::SliceBegin(submission.queue_id, kinds[static_cast<uint32_t>(submission.type)], submission.started);
-			}
-			{
-				// KYTY_TRACE_STAGEF: the slice's work outside draws, dispatches and named zones.
-				const StageF::Zone stagef_slice(StageF::Sub::Outside);
-				complete = gpu->Process(submission);
-			}
-			if (queues_trace) QueueTrace::SliceEnd(complete);
-		}
+		const bool complete = gpu->Process(submission);
 		if (complete || gpu->m_slice_progressed) {
 			gpu->m_last_progress = std::chrono::steady_clock::now(); // the queue waits guard
 			blocked_since.reset();
 		}
-		if (static const bool reports = PerfEnabled() || MemCensusRequested() || SyncTimeline::Enabled() || TexWin::Enabled() ||
-		                                StageF::Enabled();
-		    reports) {
+		if (static const bool reports = PerfEnabled() || MemCensusRequested() || SyncTimeline::Enabled(); reports) {
 			gpu->m_gfx_cp->EmitCallback([gpu] {
 				PerfReport(gpu->m_renderer);
 				SyncTimeline::Report(); // KYTY_TRACE_SYNC_TIMELINE
 				MemCensusReport(gpu->m_renderer);
-				if (TexWin::Enabled()) TexWin::Report(); // KYTY_TRACE_TEXWIN
-				if (StageF::Enabled()) StageF::MaybeReport(); // KYTY_TRACE_STAGEF
 			});
 		}
-		if (queues_trace) QueueTrace::Report(DebugPresentCount().load());
 
 		{ // The queue's history (IsProducerQueue).
 			const uint32_t frame = DebugPresentCount().load(std::memory_order_relaxed);
@@ -2248,8 +2133,7 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
-	const bool queues_trace = QueueTrace::Enabled(); // KYTY_TRACE_QUEUES: packets per queue
-	const bool observer_on  = DrawStateObserverOn(); // the draw-state observer (DrawStateObserverOn)
+	const bool observer_on = DrawStateObserverOn(); // the draw-state observer (DrawStateObserverOn)
 	// KYTY_DIAG_GPU_BURN_AT=pm4 (measurement only): one GPU-thread burn per packet handled (renderDraw.cpp GpuBurnAt).
 	const bool pm4_burn =
 	    RenderExecutor::GpuBurnSelected() == RenderExecutor::GpuBurnSite::Pm4 && GuestGpu::IsGpuThread();
@@ -2342,8 +2226,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		// KYTY_TRACE_STAGEF: the handler's own time by packet class (M0).
-		const StageF::Zone stagef_packet(StageF::Enabled() ? StageFPacketSub(opcode) : StageF::Sub::OutOther);
 		// The draw-state observer sees the packet before its handler (a draw's handler reads its answer).
 		if (observer_on) {
 			DrawStateObserver::ObservePacket(opcode, packet, std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw),
@@ -2355,7 +2237,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (execution.m_suspended) {
 			return; // the packet runs again from its start when the stream resumes
 		}
-		if (queues_trace) QueueTrace::NotePacket();
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (m_renderer.GetCommandScheduler().SubmitDeferred()) {
@@ -2607,7 +2488,6 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const uint64_t end   = pairs[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
-						if (QueueTrace::Enabled()) QueueTrace::NoteSuspend(QueueTrace::SuspendReason::Predication);
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;
@@ -2672,7 +2552,6 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	if (UpstreamIndirectRecordsMode() == 2u && args.offset_source != DrawOffsetSource::IndirectArgs) {
 		CheckStaleIndirectSgprs(operation, 0, "draw_index");
 	}
-	if (QueueTrace::Enabled()) QueueTrace::NoteDraw(); // KYTY_TRACE_QUEUES
 	if (Common::OverlayStats::Enabled()) NoteOverlayDraw(args.instance_count); // KYTY_OVERLAY
 	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
 }
@@ -2832,7 +2711,6 @@ bool CommandProcessor::DrawIndirectGpu(const GpuOperation& operation) {
 			operation.state.shaders->MarkGsIndirectStale(named);
 		}
 	}
-	if (QueueTrace::Enabled()) QueueTrace::NoteDraw(); // KYTY_TRACE_QUEUES: one host draw command
 	return true;
 }
 
@@ -3069,7 +2947,6 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 		}
 	}
 
-	if (QueueTrace::Enabled()) QueueTrace::NoteDispatch(); // KYTY_TRACE_QUEUES
 	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::Dispatch);
 	m_renderer.GetRenderExecutor().DispatchDirect(operation.submit_id, CurrentBuffer(), thread_group_x,
 	                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
@@ -3092,7 +2969,6 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 		ExecuteDispatchDirect(operation, args->x, args->y, args->z, dispatch.mode);
 		return;
 	}
-	if (QueueTrace::Enabled()) QueueTrace::NoteDispatch(); // KYTY_TRACE_QUEUES
 	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::Dispatch);
 	m_renderer.GetRenderExecutor().DispatchIndirect(operation.submit_id, CurrentBuffer(), dispatch.args_addr, dispatch.mode,
 	                                                IsAsyncComputeQueue());
@@ -3111,7 +2987,6 @@ void CommandProcessor::ExecuteDrawAuto(const GpuOperation& operation, DrawAutoAr
 	if (UpstreamIndirectRecordsMode() == 2u && args.offset_source != DrawOffsetSource::IndirectArgs) {
 		CheckStaleIndirectSgprs(operation, 0, "draw_auto");
 	}
-	if (QueueTrace::Enabled()) QueueTrace::NoteDraw(); // KYTY_TRACE_QUEUES
 	if (Common::OverlayStats::Enabled()) NoteOverlayDraw(args.instance_count); // KYTY_OVERLAY
 	m_renderer.GetRenderExecutor().DrawAuto(operation.submit_id, CurrentBuffer(), args);
 }
@@ -3308,9 +3183,6 @@ void CommandProcessor::ExecuteEndOfPipe(EndOfPipeWrite write, uint64_t sequence,
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, data & 0xffffu, data >> 16u);
 			PublishCpuDirtyRange(reinterpret_cast<uint64_t>(dst), // BDA sync epoch
 			                     uint64_t {data >> 16u} * sizeof(uint32_t));
-			if (QueueTrace::Enabled()) { // KYTY_TRACE_QUEUES
-				QueueTrace::NoteWrite(reinterpret_cast<uint64_t>(dst), uint64_t {data >> 16u} * sizeof(uint32_t));
-			}
 			if (with_interrupt) {
 				m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 			}
@@ -3369,7 +3241,6 @@ void CommandProcessor::WriteLabelNow(void* dst_gpu_addr, const void* value, uint
 		                         GetScheduler().GetMasterSemaphore().KnownGpuTick());
 	}
 	PublishCpuDirtyRange(dst, size); // BDA sync epoch
-	if (QueueTrace::Enabled()) QueueTrace::NoteWrite(dst, size); // KYTY_TRACE_QUEUES
 	if (with_interrupt) {
 		DeferEopInterrupt(interrupt_context_id);
 	}
@@ -3594,7 +3465,6 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	const auto sequence = EmitCallback([this, flip = m_flip, dst_gpu_addr, value] {
 		std::memcpy(dst_gpu_addr, &value, sizeof(value));
 		PublishCpuDirtyRange(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value)); // BDA sync epoch
-		if (QueueTrace::Enabled()) QueueTrace::NoteWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 		auto& command = CurrentBuffer();
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index, flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();
@@ -3624,7 +3494,6 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	const auto sequence = EmitCallback([this, flip = m_flip, dst_gpu_addr, value] {
 		std::memcpy(dst_gpu_addr, &value, sizeof(value));
 		PublishCpuDirtyRange(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value)); // BDA sync epoch
-		if (QueueTrace::Enabled()) QueueTrace::NoteWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 		auto& command = CurrentBuffer();
 		auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index, flip.flip_mode, flip.flip_arg);
 		(void)command.Handle();

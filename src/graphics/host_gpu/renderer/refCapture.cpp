@@ -42,10 +42,8 @@ constexpr uint64_t PageSize = 4096;
 
 struct Spec {
 	std::vector<uint64_t> hashes;
-	uint32_t              frame = 0;
-	uint32_t              skip  = 0;
+	uint32_t              frame      = 0;
 	bool                  on_trigger = false; // ":T": every dispatch of the frame captured on KYTY_TRACE_RT_DUMP_TRIGGER
-	bool                  skip_set   = false; // KYTY_TRACE_REF_SKIP given (":T": only that dispatch of the frame)
 };
 // ":T" captures: the index of the claimed dispatch among the listed shader's dispatches of the triggered frame.
 uint32_t& TriggerIndex() {
@@ -56,9 +54,7 @@ uint32_t& TriggerIndex() {
 // "<hash>[,<hash>...][:<frame>]": each listed shader's first dispatch (direct or indirect) at or after the frame.
 // "<hash>[,<hash>...]:T": every dispatch of the listed shaders (up to 8 each) in each frame captured on the
 // KYTY_TRACE_RT_DUMP_TRIGGER signal, into ref_<hash>_f<frame>_n<index> (e.g. all slices of a pass at the moment an
-// artifact is on screen); with KYTY_TRACE_REF_SKIP=<n> only the dispatch with that index.
-// KYTY_TRACE_REF_SKIP=<n> (default 0): the (n+1)-th such dispatch of each listed shader instead (the first one after
-// a present can run before the frame's own inputs exist, e.g. all render targets still cleared).
+// artifact is on screen).
 const Spec& GetSpec() {
 	static const Spec spec = [] {
 		Spec        result;
@@ -77,10 +73,6 @@ const Spec& GetSpec() {
 		} else if (*p == ':') {
 			result.frame = static_cast<uint32_t>(std::strtoul(p + 1, nullptr, 10));
 		}
-		if (const char* skip = std::getenv("KYTY_TRACE_REF_SKIP"); skip != nullptr) {
-			result.skip     = static_cast<uint32_t>(std::strtoul(skip, nullptr, 10));
-			result.skip_set = true;
-		}
 		return result;
 	}();
 	return spec;
@@ -91,13 +83,8 @@ std::string& CaptureDir() {
 	return dir;
 }
 
-uint64_t WindowBytes() {
-	static const uint64_t bytes = [] {
-		const char* value = std::getenv("KYTY_TRACE_REF_WINDOW_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 10u;
-	}();
-	return bytes;
-}
+// The guest bytes read around each user-data pointer.
+constexpr uint64_t WindowBytes = 64ull << 10u;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 int HostCopyFilter(unsigned long code) {
@@ -211,8 +198,7 @@ public:
 			}
 			// Buffer descriptors (V#): base[47:0] shares its qword with the stride, so the pointer test above never
 			// takes them. Their whole data range (up to 1 MiB) is read, host memory included: the class-9 tiled
-			// lighting keeps per-light V#s in records and their data moves between runs (KYTY_TRACE_REF_EXTRA
-			// named it by hand before).
+			// lighting keeps per-light V#s in records and their data moves between runs.
 			for (uint64_t offset = 0; offset + 16u <= PageSize; offset += 4u) {
 				uint32_t d[4] = {};
 				std::memcpy(d, bytes.data() + offset, 16u);
@@ -246,12 +232,6 @@ public:
 		std::fclose(index);
 	}
 	[[nodiscard]] size_t PageCount() const { return m_pages.size(); }
-	[[nodiscard]] std::vector<uint64_t> Pages() const {
-		std::vector<uint64_t> pages;
-		pages.reserve(m_pages.size());
-		for (const auto& [page, bytes]: m_pages) pages.push_back(page);
-		return pages;
-	}
 
 private:
 	static constexpr size_t                   MaxPages = 32768; // 128 MiB
@@ -260,23 +240,12 @@ private:
 	std::vector<uint64_t>                    m_new_pages;
 };
 
-// KYTY_TRACE_REF_CAPTURE_MIPS=1 (diagnostic, default off): every mip of 3D and layered color images is dumped too
-// (img<i>_before_mip<N>_<W>x<H>x<D>_<fmt>.raw; layers of an array folded into z like mip 0), not only the mips of
-// plain 2D images. refinterp loads them by the "mip<N>" part of the name and samples them (image_sample_l, mip filter).
-bool RefCaptureAllMips() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_REF_CAPTURE_MIPS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return on;
-}
-
 void DumpImage(RenderContext& context, vk::CommandBuffer command, TextureBinding& binding, bool written,
-               const std::string& prefix, bool all_mips = false) {
+               const std::string& prefix) {
 	if (!binding.image_id) return;
 	auto& image = context.GetTextureCache().GetImage(binding.image_id);
 	DebugQueueFullDump(context.GetGraphics(), command, image, prefix, false);
-	// Further mips of 2D color images (DebugQueueFullDump copies mip 0 only); with all_mips also of 3D and layered ones.
+	// Further mips of 2D color images (DebugQueueFullDump copies mip 0 only).
 	const auto format_name = vk::to_string(image.backing.format);
 	const bool depth       = !format_name.empty() && format_name[0] == 'D';
 	const bool blocks      = format_name.find("Block") != std::string::npos;
@@ -284,7 +253,7 @@ void DumpImage(RenderContext& context, vk::CommandBuffer command, TextureBinding
 	const bool volume      = image.backing.extent.depth > 1u;
 	const auto layers      = std::max(1u, image.info.resources.layers);
 	if (!depth && !blocks && texel_bytes != 0u && texel_bytes <= 16u &&
-	    (all_mips || (!volume && layers <= 1u)) && image.backing.samples == 1u) {
+	    !volume && layers <= 1u && image.backing.samples == 1u) {
 		for (uint32_t mip = 1; mip < std::min(image.backing.mip_levels, 16u); ++mip) {
 			const auto           w = std::max(1u, image.backing.extent.width >> mip);
 			const auto           h = std::max(1u, image.backing.extent.height >> mip);
@@ -420,7 +389,6 @@ bool Claim(uint64_t shader_hash) {
 	if (spec.hashes.empty() || DebugPresentCount().load() < spec.frame) return false;
 	static std::mutex                     mutex;
 	static std::vector<uint64_t>          claimed;
-	static std::map<uint64_t, uint32_t>   seen; // matching dispatches at or after the frame, per shader
 	std::scoped_lock                      lock(mutex);
 	if (std::find(spec.hashes.begin(), spec.hashes.end(), shader_hash) == spec.hashes.end()) return false;
 	if (spec.on_trigger) {
@@ -431,12 +399,10 @@ bool Claim(uint64_t shader_hash) {
 		if (entry.first != frame) entry = {frame, 0u};
 		if (entry.second >= 8u) return false;
 		const uint32_t index = entry.second++;
-		if (spec.skip_set && index != spec.skip) return false;
 		TriggerIndex() = index;
 		return true;
 	}
 	if (std::find(claimed.begin(), claimed.end(), shader_hash) != claimed.end()) return false;
-	if (seen[shader_hash]++ < spec.skip) return false;
 	claimed.push_back(shader_hash);
 	return true;
 }
@@ -475,28 +441,14 @@ static std::unique_ptr<CaptureInputs> ReadInputs(const HW::ComputeShaderInfo& cs
 		address += want;
 	}
 	auto& crawl = inputs->crawl;
-	// Read first, so the crawl's page budget cannot crowd them out.
-	// KYTY_TRACE_REF_EXTRA="<hex address>:<hex size>[,...]": guest ranges the pointer crawl does not
-	// reach (e.g. GLOBAL_LOAD bases computed in scalar registers), named by refinterp's MISSING list.
-	if (const char* extra = std::getenv("KYTY_TRACE_REF_EXTRA"); extra != nullptr) {
-		for (const char* p = extra; *p != 0;) {
-			char*          end         = nullptr;
-			const uint64_t extra_start = std::strtoull(p, &end, 16);
-			uint64_t       size        = 0x1000;
-			if (end != nullptr && *end == ':') size = std::strtoull(end + 1, &end, 16);
-			if (end == nullptr || end == p) break;
-			crawl.ReadWindow(extra_start, size, true);
-			p = *end == ',' ? end + 1 : end;
-		}
-	}
 	// Guest memory reachable from user-data pointers (two levels of pointers).
 	const auto& user  = cs.cs_user_sgpr;
 	for (uint32_t i = 0; i + 1u < user.count; i++) {
 		const uint64_t value = user.value[i] | (uint64_t {user.value[i + 1u]} << 32u);
-		if (value >= 0x10000ull && value < (1ull << 48u) && (value & 3u) == 0u) crawl.ReadWindow(value, WindowBytes());
+		if (value >= 0x10000ull && value < (1ull << 48u) && (value & 3u) == 0u) crawl.ReadWindow(value, WindowBytes);
 	}
-	crawl.Expand(WindowBytes() / 4u);
-	crawl.Expand(WindowBytes() / 4u);
+	crawl.Expand(WindowBytes / 4u);
+	crawl.Expand(WindowBytes / 4u);
 	return inputs;
 }
 
@@ -575,37 +527,6 @@ static void BeforeImpl(RenderContext& context, vk::CommandBuffer command, const 
 	}
 	const auto& crawl = inputs->crawl;
 	crawl.Write(dir);
-	// KYTY_TRACE_REF_GPU_MEM=1: every captured page that a cached buffer holds is also copied from that buffer on the GPU,
-	// right before the dispatch (gpumem_<page>.bin, one file per run of pages in one buffer, listed in gpumem.txt). Guest
-	// memory misses GPU writes the buffer cache does not track as GPU-modified (untracked stores, before D6 step K6);
-	// scripts/ref_gpu_merge.py puts these bytes into mem.bin before refinterp runs.
-	if (const char* gpu_mem = std::getenv("KYTY_TRACE_REF_GPU_MEM"); gpu_mem != nullptr && gpu_mem[0] == '1') {
-		FILE* index = std::fopen((dir + "/gpumem.txt").c_str(), "w");
-		auto& cache = context.GetBufferCache();
-		const auto pages = crawl.Pages();
-		uint32_t   runs  = 0;
-		for (size_t i = 0; i < pages.size() && runs < 8192u;) {
-			const auto [buffer, offset] = cache.FindCachedBuffer(pages[i], PageSize);
-			if (buffer == nullptr) {
-				i++;
-				continue;
-			}
-			size_t j = i + 1;
-			while (j < pages.size() && pages[j] == pages[j - 1] + PageSize && cache.FindCachedBuffer(pages[j], PageSize).first == buffer) j++;
-			const uint64_t bytes = (j - i) * PageSize;
-			char name[64];
-			std::snprintf(name, sizeof(name), "gpumem_%llx.bin", static_cast<unsigned long long>(pages[i]));
-			DebugQueueBufferDump(context.GetGraphics(), command, buffer->Handle(), offset, bytes, dir + "/" + name);
-			if (index != nullptr) {
-				std::fprintf(index, "%llx %llx %s\n", static_cast<unsigned long long>(pages[i]),
-				             static_cast<unsigned long long>(bytes), name);
-			}
-			runs++;
-			i = j;
-		}
-		if (index != nullptr) std::fclose(index);
-		std::fprintf(stderr, "REF_CAPTURE gpu memory runs=%u pages=%zu\n", runs, pages.size());
-	}
 
 	FILE* meta = std::fopen((dir + "/meta.txt").c_str(), "w");
 	if (meta == nullptr) return;
@@ -643,7 +564,7 @@ static void BeforeImpl(RenderContext& context, vk::CommandBuffer command, const 
 			             binding.desc.view_info.base_layer, binding.desc.view_info.layer_count);
 		}
 		std::fprintf(meta, "\n");
-		DumpImage(context, command, binding, written, dir + "/img" + std::to_string(i) + "_before", RefCaptureAllMips());
+		DumpImage(context, command, binding, written, dir + "/img" + std::to_string(i) + "_before");
 	}
 	for (uint32_t j = 0; j < program.info.buffers.size(); j++) {
 		const bool written = program.info.buffers[j].written;

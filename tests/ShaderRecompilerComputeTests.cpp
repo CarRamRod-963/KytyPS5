@@ -15730,7 +15730,8 @@ public:
 
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
-                             size_t dword_count, bool device_address = false) {
+                             size_t dword_count, bool device_address = false,
+                             bool uniform = false) {
     Buffer ret;
     ret.size = static_cast<vk::DeviceSize>(std::max<size_t>(dword_count, 1u) *
                                            sizeof(u32));
@@ -15738,7 +15739,8 @@ public:
     vk::BufferCreateInfo buffer_info{};
     buffer_info.sType = vk::StructureType::eBufferCreateInfo;
     buffer_info.size = ret.size;
-    buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer;
+    buffer_info.usage = uniform ? vk::BufferUsageFlagBits::eUniformBuffer
+                                : vk::BufferUsageFlagBits::eStorageBuffer;
     if (device_address) {
       buffer_info.usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
@@ -16201,8 +16203,10 @@ public:
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
+    Buffer flattened_uniform_buffer;
     Buffer shared_buffer;
     vk::DescriptorBufferInfo flattened_info{};
+    vk::DescriptorBufferInfo flattened_uniform_info{};
     vk::DescriptorBufferInfo user_data_info{};
     vk::DescriptorBufferInfo shared_info{};
     vk::DescriptorBufferInfo gds_info{};
@@ -16290,18 +16294,30 @@ public:
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
-    if (Count(Kind::ShaderData) != 0) {
-      user_data_buffer =
-          CreateStorageBuffer(test.name, shader_data, shader_data.size());
-      user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
+    // The uniform bindings as the game binds them (descriptors.cpp): the words padded with zeros to whole uvec4
+    // elements, the view at most UniformBufferMaxBytes.
+    const auto uniform_buffer = [&](const std::vector<u32> &words, Buffer *buffer,
+                                    vk::DescriptorBufferInfo *info, Kind kind) {
+      auto padded = words;
+      padded.resize((padded.size() + 3u) & ~size_t{3}, 0u);
+      *buffer = CreateStorageBuffer(test.name, padded, padded.size(), false, true);
+      *info = {buffer->buffer, 0,
+               std::min<vk::DeviceSize>(buffer->size, ShaderRecompiler::IR::UniformBufferMaxBytes)};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = Native(Kind::ShaderData);
+      write.dstBinding = Native(kind);
       write.descriptorCount = 1;
-      write.descriptorType = vk::DescriptorType::eStorageBuffer;
-      write.pBufferInfo = &user_data_info;
+      write.descriptorType = vk::DescriptorType::eUniformBuffer;
+      write.pBufferInfo = info;
       writes.push_back(write);
+    };
+    if (Count(Kind::FlattenedSrtUniform) != 0) {
+      uniform_buffer(compiled.resources.flattened_srt, &flattened_uniform_buffer, &flattened_uniform_info,
+                     Kind::FlattenedSrtUniform);
+    }
+    if (Count(Kind::ShaderData) != 0) {
+      uniform_buffer(shader_data, &user_data_buffer, &user_data_info, Kind::ShaderData);
     }
     if (Count(Kind::Gds) != 0) {
       Require(test.name, "dispatch", gds_buffer != nullptr,
@@ -16529,6 +16545,9 @@ public:
     }
     if (user_data_buffer.buffer != nullptr) {
       DestroyBuffer(&user_data_buffer);
+    }
+    if (flattened_uniform_buffer.buffer != nullptr) {
+      DestroyBuffer(&flattened_uniform_buffer);
     }
     DestroyBuffer(&shared_buffer);
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
@@ -41264,7 +41283,7 @@ void CheckDepthTextureEncoding() {
           !IsSupportedDepthTextureEncoding(non_msaa_iterate_256),
       "compressed sampled depth accepted an unsupported address or control");
 
-  // KYTY_DIAG_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): the game's refused 2D depth T#s (logs 2026-10-20..23) differ
+  // KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): the game's refused 2D depth T#s (logs 2026-10-20..23) differ
   // only in fields the texture unit does not use (RDNA2 ISA table 45), except CORNER_SAMPLES in one kind.
   const ShaderTextureResource game_unused_words{{
       0x508f3600u, 0xc1600000u, 0x01ffc1ffu, 0x91800924u,
@@ -42414,7 +42433,7 @@ void CheckResourcePlanHandoff() {
                                                      specialization);
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
-    // Live scalar data takes the uniform view when it fits one (KYTY_PERF_UNIFORM_CONST_BUFFERS, a code default).
+    // Live scalar data takes the uniform view when it fits one (uniform const buffers, ShaderIR.h).
     const auto flattened_srt =
         bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] +
         bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrtUniform)];
@@ -42468,8 +42487,7 @@ void CheckNativeImageDescriptorTypes() {
               NativeDescriptorType(DescriptorBindingKind::SharedMemory) ==
                   vk::DescriptorType::eStorageBuffer &&
               NativeDescriptorType(DescriptorBindingKind::ShaderData) ==
-                  (ShaderRecompiler::IR::UniformConstBuffers() ? vk::DescriptorType::eUniformBuffer
-                                                               : vk::DescriptorType::eStorageBuffer),
+                  vk::DescriptorType::eUniformBuffer,
           "non-image binding has the wrong Vulkan descriptor type");
   std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
 }

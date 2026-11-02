@@ -10,7 +10,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include <atomic>
@@ -441,7 +440,6 @@ void StreamBuffer::Commit() {
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
-	const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);
 	EXIT_IF(data == nullptr);
@@ -463,24 +461,8 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (busy && !allow_wait) {
 			return false;
 		}
-		// KYTY_TRACE_STREAM_WAITS=1: waits for the GPU to release ring space, by ring (usage, size).
-		static const bool trace_waits = std::getenv("KYTY_TRACE_STREAM_WAITS") != nullptr;
-		const auto        wait_start  = trace_waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::StreamWrap); // KYTY_TRACE_SYNC_TIMELINE
 		Scheduler().Wait(watch.tick);
-		if (trace_waits && busy) {
-			static std::atomic_uint64_t waits[4] {};
-			static std::atomic_uint64_t micros[4] {};
-			const auto                  usage = static_cast<uint32_t>(Usage()) & 3u;
-			micros[usage] += static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count());
-			const auto total = waits[usage].fetch_add(1) + 1;
-			if ((total & 0xffu) == 0) {
-				std::fprintf(stderr, "STREAM_WAITS usage=%u size=%lluMiB waits=%llu ms=%llu\n", usage,
-				             static_cast<unsigned long long>(Size() >> 20u), static_cast<unsigned long long>(total),
-				             static_cast<unsigned long long>(micros[usage].load() / 1000u));
-			}
-		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}

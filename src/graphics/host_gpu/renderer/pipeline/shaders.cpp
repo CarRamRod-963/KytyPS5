@@ -130,13 +130,7 @@ void NotePipelineVariant(uint64_t vs_hash, uint64_t ps_hash, const PipelineVaria
 		}
 		if (list.size() < 64) list.push_back(variant);
 	}
-	// KYTY_TRACE_PIPELINE_REPEAT=1: every repeat, driver-cache hits too (the startup precompile replays every pipeline of
-	// the journal, so one load shows all the variants the game ever made).
-	static const bool all = [] {
-		const char* value = std::getenv("KYTY_TRACE_PIPELINE_REPEAT");
-		return value != nullptr && value[0] == '1';
-	}();
-	if (earlier == 0 || (ms < 50.0 && !all)) return;
+	if (earlier == 0 || ms < 50.0) return;
 	std::fprintf(stderr, "PIPELINE_REPEAT %s vs=0x%016llx ps=0x%016llx %.0fms earlier=%zu diff=%s\n",
 	             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(vs_hash),
 	             static_cast<unsigned long long>(ps_hash), ms, earlier, diff.c_str());

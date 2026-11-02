@@ -15,7 +15,6 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <xxhash.h>
@@ -84,13 +83,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
-	// KYTY_TRACE_SPIRV_VALIDATE=1 (diagnostic, default off): every translated module is validated as with
-	// --shader-validation (the test runners pass it off); a failure names the shader and stops before the driver sees it.
-	static const bool trace_validate = [] {
-		const char* value = std::getenv("KYTY_TRACE_SPIRV_VALIDATE");
-		return value != nullptr && value[0] == '1';
-	}();
-	if (!Config::ShaderValidationEnabled() && !trace_validate) {
+	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -120,69 +113,6 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	std::fprintf(stderr, "SPIRV_VALIDATE_FAIL %s hash=0x%016llx: %s", label,
 	             static_cast<unsigned long long>(shader_hash), messages.c_str());
 	return false;
-}
-
-// KYTY_TRACE_SPECIALIZATION=<hex hash,...> (diagnostic, M115): a new permutation of a listed shader prints what
-// differs from its previous permutation (push-data start and every buffer, image and sampler specialization field),
-// or all of it for the first one: which resource property gives a shader a new permutation (and a cold compile).
-void TraceSpecialization(uint64_t hash, const char* stage_name, const ShaderRecompiler::IR::ResourceSpecialization* prev,
-                         size_t permutations, const ShaderRecompiler::IR::ResourceSpecialization& spec, uint32_t push_data_cursor) {
-	static const std::string list = [] {
-		const char* value = std::getenv("KYTY_TRACE_SPECIALIZATION");
-		return value != nullptr ? std::string(value) : std::string();
-	}();
-	// =all: every shader, from its second permutation on (only what differs).
-	if (list.empty() || (list == "all" ? permutations == 0 : list.find(fmt::format("{:016x}", hash)) == std::string::npos))
-		return;
-	std::string out = fmt::format("SPECIALIZATION hash={:016x} stage={} permutation={} push_cursor={} buffers={} images={} samplers={}",
-	                              hash, stage_name, permutations + 1, push_data_cursor, spec.buffers.size(),
-	                              spec.images.size(), spec.samplers.size());
-	if (prev != nullptr && (prev->buffers.size() != spec.buffers.size() || prev->images.size() != spec.images.size() ||
-	                        prev->samplers.size() != spec.samplers.size()))
-		out += fmt::format(" (prev counts {}/{}/{})", prev->buffers.size(), prev->images.size(), prev->samplers.size());
-	const auto field = [&](const char* kind, size_t index, const char* name, uint64_t now, std::optional<uint64_t> before) {
-		if (before.has_value() && *before == now) return;
-		out += before.has_value() ? fmt::format(" {}{}.{}={}->{}", kind, index, name, *before, now)
-		                          : fmt::format(" {}{}.{}={}", kind, index, name, now);
-	};
-	for (size_t i = 0; i < spec.buffers.size(); i++) {
-		const auto& b = spec.buffers[i];
-		const auto* p = prev != nullptr && i < prev->buffers.size() ? &prev->buffers[i] : nullptr;
-		const auto  was = [&](uint64_t v) { return p != nullptr ? std::optional<uint64_t>(v) : std::nullopt; };
-		field("b", i, "stride", b.packed_stride, was(p ? p->packed_stride : 0));
-		field("b", i, "format", static_cast<uint64_t>(b.descriptor_format), was(p ? static_cast<uint64_t>(p->descriptor_format) : 0));
-		field("b", i, "swizzle", b.descriptor_swizzle, was(p ? p->descriptor_swizzle : 0));
-		field("b", i, "zero_stride_oob", b.zero_stride_oob ? 1 : 0, was(p ? (p->zero_stride_oob ? 1 : 0) : 0));
-		field("b", i, "indirect_root", b.indirect_root, was(p ? p->indirect_root : 0));
-		field("b", i, "indirect_offset", b.indirect_mapping_offset, was(p ? p->indirect_mapping_offset : 0));
-		field("b", i, "indirect_iterations", b.indirect_search_iterations, was(p ? p->indirect_search_iterations : 0));
-	}
-	for (size_t i = 0; i < spec.images.size(); i++) {
-		const auto& m = spec.images[i];
-		const auto* p = prev != nullptr && i < prev->images.size() ? &prev->images[i] : nullptr;
-		const auto  was = [&](uint64_t v) { return p != nullptr ? std::optional<uint64_t>(v) : std::nullopt; };
-		field("i", i, "class", static_cast<uint64_t>(m.numeric_class), was(p ? static_cast<uint64_t>(p->numeric_class) : 0));
-		field("i", i, "dim", static_cast<uint64_t>(m.dimension), was(p ? static_cast<uint64_t>(p->dimension) : 0));
-		field("i", i, "mips", m.mip_count, was(p ? p->mip_count : 0));
-		field("i", i, "conversion", static_cast<uint64_t>(m.conversion_format), was(p ? static_cast<uint64_t>(p->conversion_format) : 0));
-		field("i", i, "swizzle", m.shader_swizzle, was(p ? p->shader_swizzle : 0));
-		field("i", i, "indirect_root", m.indirect_root, was(p ? p->indirect_root : 0));
-		field("i", i, "indirect_offset", m.indirect_mapping_offset, was(p ? p->indirect_mapping_offset : 0));
-		field("i", i, "indirect_iterations", m.indirect_search_iterations, was(p ? p->indirect_search_iterations : 0));
-		field("i", i, "cube", m.cube ? 1 : 0, was(p ? (p->cube ? 1 : 0) : 0));
-		field("i", i, "fmask", m.fmask ? 1 : 0, was(p ? (p->fmask ? 1 : 0) : 0));
-		field("i", i, "bindless", m.bindless ? 1 : 0, was(p ? (p->bindless ? 1 : 0) : 0));
-		field("i", i, "bindless_stride", m.bindless_stride_dwords, was(p ? p->bindless_stride_dwords : 0));
-	}
-	for (size_t i = 0; i < spec.samplers.size(); i++) {
-		const auto& s = spec.samplers[i];
-		const auto* p = prev != nullptr && i < prev->samplers.size() ? &prev->samplers[i] : nullptr;
-		const auto  was = [&](uint64_t v) { return p != nullptr ? std::optional<uint64_t>(v) : std::nullopt; };
-		field("s", i, "indirect_root", s.indirect_root, was(p ? p->indirect_root : 0));
-		field("s", i, "indirect_offset", s.indirect_mapping_offset, was(p ? p->indirect_mapping_offset : 0));
-		field("s", i, "indirect_iterations", s.indirect_search_iterations, was(p ? p->indirect_search_iterations : 0));
-	}
-	std::fprintf(stderr, "%s\n", out.c_str());
 }
 
 void DumpModule(const char* stage_name, uint64_t shader_hash, const std::vector<uint32_t>& spirv) {

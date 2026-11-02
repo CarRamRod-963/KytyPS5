@@ -28,84 +28,10 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/recordPackets.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 
 #include "graphics/host_gpu/queueLockSite.h"
 namespace Libs::Graphics {
-
-// KYTY_TRACE_OPEN_FLUSH=1 (diagnostic, default off): a GPU-thread wait for the open command buffer (it is submitted
-// and waited for at once: a read of GPU-written data recorded in it) - how many draws/dispatches the buffer held, how
-// long it had been open, and how long the GPU had already been idle while it was being recorded (checked at each
-// draw/dispatch). Idle time while the buffer filled is what an earlier submission could have used. One OPEN_FLUSH line
-// every ~5 s, per frame. Nothing else changes.
-namespace OpenFlushTrace {
-[[nodiscard]] bool Enabled() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_OPEN_FLUSH");
-		const bool  e     = value != nullptr && value[0] == '1';
-		if (e) std::fprintf(stderr, "TRACE_OPEN_FLUSH enabled\n");
-		return e;
-	}();
-	return on;
-}
-using Clock = std::chrono::steady_clock;
-Clock::time_point g_open_since {};
-Clock::time_point g_idle_since {};
-bool              g_idle_seen = false;
-struct Totals {
-	uint64_t flushes = 0, commands = 0, wait_us = 0, age_us = 0, idle_us = 0, hideable_us = 0, idle_flushes = 0;
-	uint64_t by_commands[5] {}; // 0, 1-4, 5-16, 17-48, >48
-};
-Totals                 g_totals;
-Clock::time_point      g_last_report = Clock::now();
-uint32_t               g_last_frame  = 0;
-[[nodiscard]] uint64_t Us(Clock::duration d) {
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
-}
-void Report() {
-	const auto now = Clock::now();
-	if (now - g_last_report < std::chrono::seconds(5)) return;
-	const uint32_t frame  = DebugPresentCount().load();
-	const double   frames = frame > g_last_frame ? static_cast<double>(frame - g_last_frame) : 1.0;
-	g_last_report         = now;
-	g_last_frame          = frame;
-	auto& t               = g_totals;
-	std::fprintf(stderr,
-	             "OPEN_FLUSH frames=%.0f per_frame flushes=%.2f commands_avg=%.1f wait_ms=%.2f open_ms=%.2f "
-	             "gpu_idle_while_open_ms=%.2f hideable_ms=%.2f idle_flushes=%.2f by_commands[0/1-4/5-16/17-48/48+]="
-	             "%.2f/%.2f/%.2f/%.2f/%.2f\n",
-	             frames, t.flushes / frames, t.flushes != 0 ? static_cast<double>(t.commands) / t.flushes : 0.0,
-	             t.wait_us / frames / 1e3, t.age_us / frames / 1e3, t.idle_us / frames / 1e3, t.hideable_us / frames / 1e3,
-	             t.idle_flushes / frames, t.by_commands[0] / frames, t.by_commands[1] / frames, t.by_commands[2] / frames,
-	             t.by_commands[3] / frames, t.by_commands[4] / frames);
-	t = {};
-}
-} // namespace OpenFlushTrace
-
-// KYTY_TRACE_PERF_SAMPLE_IDLE (perfCounters.h): the main scheduler's semaphore and the last tick handed to vkQueueSubmit.
-static std::atomic<MasterSemaphore*> g_idle_master {nullptr};
-static std::atomic<uint64_t>         g_idle_submitted {0};
-
-bool PerfSampleIdleEnabled() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_PERF_SAMPLE_IDLE");
-		return value != nullptr && value[0] == '1';
-	}();
-	return on;
-}
-
-void PerfSampleIdleNoteSubmitted(void* master, uint64_t tick) {
-	g_idle_master.store(static_cast<MasterSemaphore*>(master), std::memory_order_release);
-	g_idle_submitted.store(tick, std::memory_order_release);
-}
-
-bool PerfSampleGpuIdleNow() {
-	auto* master = g_idle_master.load(std::memory_order_acquire);
-	if (master == nullptr) return false;
-	const uint64_t submitted = g_idle_submitted.load(std::memory_order_acquire);
-	return master->QueryTickRaw() >= submitted;
-}
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -159,7 +85,6 @@ struct AsyncSubmitPacket {
 	uint64_t          debug_submit = 0;
 	uint32_t          debug_arg[4] {};
 	uint64_t          debug_arg4 = 0;
-	MasterSemaphore*  master     = nullptr; // KYTY_TRACE_PERF_SAMPLE_IDLE
 };
 static_assert(std::is_trivially_copyable_v<AsyncSubmitPacket>);
 
@@ -167,9 +92,6 @@ void AsyncSubmitOnWorker(const void* blob) {
 	auto packet = *static_cast<const AsyncSubmitPacket*>(blob);
 	if (GpuTimer::Enabled()) GpuTimer::NoteQueueSubmit(packet.tick); // KYTY_TRACE_GPU_TIMELINE
 	const auto result = QueueSubmitLocked(*packet.graphics, packet.buffer, packet.submit);
-	if (packet.master != nullptr && result == vk::Result::eSuccess) {
-		PerfSampleIdleNoteSubmitted(packet.master, packet.tick); // KYTY_TRACE_PERF_SAMPLE_IDLE
-	}
 	if (result != vk::Result::eSuccess) {
 		GpuCheckpoints::Dump(packet.graphics->queue);
 		ReportVulkanFatal("vkQueueSubmit (record thread)", result, packet.tick, packet.debug_op, packet.debug_submit,
@@ -378,60 +300,9 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
-// KYTY_TRACE_WAIT_CALLERS=1: fence waits are attributed to their caller (return address relative
-// to the executable base) with the time spent; the top callers are printed every 2048 waits.
-static void TraceWaitCaller(uint64_t caller, uint64_t micros) {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_WAIT_CALLERS");
-		return value != nullptr && value[0] == '1';
-	}();
-	if (!on) return;
-	static std::mutex mutex;
-	std::scoped_lock  lock(mutex);
-	struct Entry {
-		uint64_t caller;
-		uint64_t count;
-		uint64_t micros;
-	};
-	static std::vector<Entry> entries;
-	static uint64_t           total = 0;
-	auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry& e) { return e.caller == caller; });
-	if (it == entries.end()) {
-		entries.push_back({caller, 0, 0});
-		it = entries.end() - 1;
-	}
-	it->count++;
-	it->micros += micros;
-	// Also every ~10 s: at ~2 fps a run sees far fewer than 2048 waits.
-	static auto last_report = std::chrono::steady_clock::now();
-	const auto  now         = std::chrono::steady_clock::now();
-	if ((++total & 0x7ffu) == 0 || now - last_report > std::chrono::seconds(10)) {
-		last_report = now;
-		std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.micros > b.micros; });
-		std::fprintf(stderr, "WAIT_CALLERS total=%llu", static_cast<unsigned long long>(total));
-		for (size_t i = 0; i < entries.size() && i < 10; ++i) {
-			std::fprintf(stderr, " [rva=0x%llx n=%llu ms=%llu]", static_cast<unsigned long long>(entries[i].caller - 0x140000000ull),
-			             static_cast<unsigned long long>(entries[i].count),
-			             static_cast<unsigned long long>(entries[i].micros / 1000u));
-		}
-		std::fprintf(stderr, "\n");
-	}
-}
-
-
 void CommandScheduler::Wait(uint64_t tick) {
 	KYTY_PROFILER_BLOCK("Scheduler::Wait");
 	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-	const auto start  = std::chrono::steady_clock::now();
-	struct Report {
-		uint64_t                              caller;
-		std::chrono::steady_clock::time_point start;
-		~Report() {
-			const auto us = static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
-			TraceWaitCaller(caller, us);
-		}
-	} report {caller, start};
 	EXIT_IF(tick > CurrentTick());
 	// KYTY_TRACE_SYNC_TIMELINE: the caller of a wait outside the tagged sites, and whether it submitted the open
 	// command buffer.
@@ -439,10 +310,6 @@ void CommandScheduler::Wait(uint64_t tick) {
 	if (timeline) SyncTimeline::NoteCaller(caller);
 	if (tick == CurrentTick()) {
 		CheckActive();
-		// KYTY_TRACE_OPEN_FLUSH: what the open buffer held and how long the GPU had been idle meanwhile.
-		const bool open_trace = OpenFlushTrace::Enabled() && PerfIsGpuThread();
-		const auto open_now   = std::chrono::steady_clock::now();
-		const auto commands   = m_commands_since_submit;
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
@@ -450,21 +317,6 @@ void CommandScheduler::Wait(uint64_t tick) {
 		EXIT_IF(submitted_tick != tick);
 		if (timeline) SyncTimeline::NoteOpenFlush();
 		{ PerfScope perf_wait(PerfKind::FenceWait); m_master.Wait(tick); }
-		if (open_trace) {
-			namespace T          = OpenFlushTrace;
-			auto&          t     = T::g_totals;
-			const uint64_t wait  = T::Us(std::chrono::steady_clock::now() - open_now);
-			const uint64_t idle  = T::g_idle_seen ? T::Us(open_now - T::g_idle_since) : 0u;
-			t.flushes++;
-			t.commands += commands;
-			t.wait_us += wait;
-			t.age_us += T::Us(open_now - T::g_open_since);
-			t.idle_us += idle;
-			t.hideable_us += std::min(wait, idle);
-			t.idle_flushes += T::g_idle_seen ? 1u : 0u;
-			t.by_commands[commands == 0 ? 0 : commands <= 4 ? 1 : commands <= 16 ? 2 : commands <= 48 ? 3 : 4]++;
-			T::Report();
-		}
 		BeginNext();
 	} else {
 		// Waiting for the newest submitted work, not known finished, drains the GPU while the open buffer holds more; that
@@ -621,7 +473,6 @@ CommandBuffer& CommandScheduler::Current() {
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
-	const StageF::Zone stagef_submit(StageF::Sub::Submit); // KYTY_TRACE_STAGEF
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	// Routed before it is begun, so the begin is a packet too (the worker owns the
@@ -637,10 +488,6 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	if (!routed_async && CommandRecorder::Enabled() && &m_context.GetCommandScheduler() == this) {
 		CommandRecorder::Route(m_command.m_buffer);
 	}
-	if (OpenFlushTrace::Enabled() && &m_context.GetCommandScheduler() == this) { // KYTY_TRACE_OPEN_FLUSH
-		OpenFlushTrace::g_open_since = std::chrono::steady_clock::now();
-		OpenFlushTrace::g_idle_seen  = false;
-	}
 	if (GpuTimer::Enabled()) GpuTimer::BeginCommandBuffer(*this, m_command.m_buffer);
 	if (VirtualGpuClock::Enabled()) VirtualGpuClock::BeginCommandBuffer(*this, m_command.m_buffer); // KYTY_FIX_VIRTUAL_GPU_CLOCK
 	m_dynamic_state.Invalidate();
@@ -649,7 +496,6 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	KYTY_PROFILER_BLOCK("Scheduler::Submit");
-	const StageF::Zone stagef_submit(StageF::Sub::Submit); // KYTY_TRACE_STAGEF
 	EXIT_IF(m_command.IsInvalid());
 	if (m_pre_submit_hook && !m_in_pre_submit_hook) { // D4b step 1 (append windows)
 		m_in_pre_submit_hook = true;
@@ -693,16 +539,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		packet.debug_arg[2] = m_command.m_debug_arg2;
 		packet.debug_arg[3] = m_command.m_debug_arg3;
 		packet.debug_arg4   = m_command.m_debug_arg4;
-		packet.master       = PerfSampleIdleEnabled() ? &m_master : nullptr; // KYTY_TRACE_PERF_SAMPLE_IDLE
 		CommandRecorder::EnqueueCall(&AsyncSubmitOnWorker, &packet, sizeof(packet));
 	} else {
 		QueueLockGuard lock(graphics.queue_mutex, "commandScheduler.cpp:781");
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 		result = QueueSubmitLocked(graphics, buffer, submit);
-		if (PerfSampleIdleEnabled() && result == vk::Result::eSuccess && &m_context.GetCommandScheduler() == this) {
-			PerfSampleIdleNoteSubmitted(&m_master, tick); // KYTY_TRACE_PERF_SAMPLE_IDLE
-		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
@@ -720,7 +562,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer      = nullptr;
 	m_commands_since_submit = 0;
-	// What was recorded belongs to the submitted command buffer (KYTY_DIAG_DRAW_STATE_FILTER).
+	// What was recorded belongs to the submitted command buffer (KYTY_FIX_DRAW_STATE_FILTER).
 	m_command.InvalidateGraphicsState();
 	// KYTY_TRACE_PERF: the submission by reason, and how long a deferred interrupt
 	// waited for it.
@@ -751,12 +593,6 @@ void CommandScheduler::FlushFor(SubmitReason reason) {
 }
 
 void CommandScheduler::NoteGpuCommand() {
-	// KYTY_TRACE_OPEN_FLUSH: the first draw/dispatch of the open buffer that found the GPU idle.
-	if (OpenFlushTrace::Enabled() && !OpenFlushTrace::g_idle_seen && Active() && !m_command.IsInvalid() &&
-	    m_commands_since_submit != 0 && GpuIdle()) {
-		OpenFlushTrace::g_idle_seen  = true;
-		OpenFlushTrace::g_idle_since = std::chrono::steady_clock::now();
-	}
 	if (!Active() || m_command.IsInvalid()) return;
 	NoteGpuCommandBatched();
 }

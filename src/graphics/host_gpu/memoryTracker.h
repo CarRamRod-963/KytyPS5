@@ -2,11 +2,9 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
-#include "common/queueTrace.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +47,6 @@ public:
 	template <typename Conflict>
 	void MarkCleanPagesAsGpuModified(uint64_t vaddr, uint64_t size, Conflict&& on_conflict) {
 		CheckNotInUploadCallback();
-		const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			const uint64_t end = offset + bytes;
@@ -81,7 +78,6 @@ public:
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
-		const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
@@ -115,7 +111,6 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			const auto       address = manager->GetCpuAddr() + offset;
@@ -135,9 +130,6 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		// KYTY_TRACE_STAGEF: a query while every region it walks is clean (a lookup a resolver could make ahead),
-		// a mark as soon as a region has CPU-dirty pages to walk or the range is written.
-		const StageF::Zone stagef_tracker(is_written ? StageF::Sub::TrkMark : StageF::Sub::TrkQuery, vaddr, size);
 		if (!is_written && AllRegionsCpuClean(vaddr, size)) {
 			// The per-region early-out below would skip every region: nothing to upload.
 			return;
@@ -148,7 +140,6 @@ public:
 			if (!is_written && summary_clean) {
 				return;
 			}
-			if (StageF::Enabled()) StageF::Reclassify(); // KYTY_TRACE_STAGEF: the walk below changes state
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
@@ -181,7 +172,6 @@ public:
 	uint32_t ClaimUploadRanges(uint64_t vaddr, uint64_t size, RangeFunc&& range_func, std::vector<RegionManager*>& pending) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		const StageF::Zone stagef_tracker(StageF::Sub::TrkQuery, vaddr, size); // KYTY_TRACE_STAGEF (as a read-only upload)
 		if (AllRegionsCpuClean(vaddr, size)) {
 			return 0;
 		}
@@ -191,7 +181,6 @@ public:
 			if (!manager->MaybeModified<DirtySource::Cpu>()) {
 				return;
 			}
-			if (StageF::Enabled()) StageF::Reclassify(); // KYTY_TRACE_STAGEF: the walk below changes state
 			std::scoped_lock lock(manager->lock);
 			if (manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes, range_func,
 			                                                          true)) {
@@ -243,8 +232,6 @@ private:
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
-		// KYTY_TRACE_QUEUES: every page-tracking query and mark, by the queue it is made for.
-		const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::PageTracking);
 		ValidateRange(vaddr, size);
 		using Result = std::invoke_result_t<Func, RegionManager*, uint64_t, uint64_t>;
 		constexpr bool returns_bool = std::is_same_v<Result, bool>;

@@ -2179,8 +2179,8 @@ private:
 					continue;
 				}
 				auto r = Sample(view, t, s, c[0], ncoord >= 2 ? c[1] : 0.0f, zc, three_d, unorm, lod, m_opt.prec8);
-				// A texel of a level the capture does not hold (mips > 0 of 3D/layered images unless the capture ran with
-				// KYTY_TRACE_REF_CAPTURE_MIPS=1) reads as 0: the reference is not valid for that sample.
+				// A texel of a level the capture does not hold (mips > 0 of 3D/layered images) reads as 0: the reference is
+				// not valid for that sample.
 				if (!r.ok) Unsupported(inst, " (sampled mip/texel not captured)");
 				if (tracing && static_cast<int>(l) == trace_lane) {
 					std::printf("    SAMPLE pc=%04x img%u %s %ux%ux%u coord=(%.6g,%.6g,%.6g) lod=%g | S# clamp=%u/%u/%u mag=%u min=%u z=%u mip=%u mode=%u unnorm=%d | -> %.6g %.6g %.6g %.6g\n",

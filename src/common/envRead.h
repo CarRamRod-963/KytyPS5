@@ -65,12 +65,6 @@ namespace Common::EnvRead {
 	return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
 }
 
-// KYTY_TRACE_AUDIT_FRAME=<n> (0: not set; debugSample.h asks another question: whether it is set at all).
-[[nodiscard]] inline uint32_t AuditFrame() {
-	const char* value = std::getenv("KYTY_TRACE_AUDIT_FRAME");
-	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
-}
-
 // KYTY_TRACE_FRAME_RANGE=<first>-<last>; {1, 0} when not set or not a range.
 [[nodiscard]] inline std::pair<uint32_t, uint32_t> FrameRange() {
 	std::pair<uint32_t, uint32_t> range {1u, 0u};
@@ -111,9 +105,9 @@ namespace Common::EnvRead {
 	return text == nullptr || (text[0] != '\0' && !(text[0] == '0' && text[1] == '\0'));
 }
 
-// KYTY_DIAG_DCC_GPU_CLEAR_CHECK: the level; 3 when not set, 0 off.
+// KYTY_FIX_DCC_GPU_CLEAR_CHECK: the level; 3 when not set, 0 off.
 [[nodiscard]] inline uint32_t DccGpuClearCheck() {
-	const char* value = std::getenv("KYTY_DIAG_DCC_GPU_CLEAR_CHECK");
+	const char* value = std::getenv("KYTY_FIX_DCC_GPU_CLEAR_CHECK");
 	if (value == nullptr) return 3u;
 	return value[0] >= '1' && value[0] <= '9' ? static_cast<uint32_t>(value[0] - '0') : 0u;
 }
@@ -135,22 +129,8 @@ namespace Common::EnvRead {
 	return value != nullptr && value[0] == '1';
 }
 
-[[nodiscard]] inline bool SrtReads() {
-	const char* value = ShaderEnv::Read("KYTY_TRACE_SRT_READS");
-	return value != nullptr && value[0] == '1';
-}
-
-[[nodiscard]] inline bool FastAdoptTime() {
-	const char* value = ShaderEnv::Read("KYTY_TRACE_FAST_ADOPT_TIME");
-	return value != nullptr && value[0] == '1';
-}
-
 [[nodiscard]] inline bool IndirectImage() {
 	return ShaderEnv::Read("KYTY_TRACE_INDIRECT_IMAGE") != nullptr;
-}
-
-[[nodiscard]] inline bool IndirectRanges() {
-	return ShaderEnv::Read("KYTY_TRACE_INDIRECT_RANGES") != nullptr;
 }
 
 [[nodiscard]] inline bool IndirectCounts() {

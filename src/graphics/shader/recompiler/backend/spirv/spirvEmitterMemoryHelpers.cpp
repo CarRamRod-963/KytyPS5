@@ -37,17 +37,8 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 		return value;
 	}
 	if (state.shader_data_uniform_variable != 0) {
-		// KYTY_PERF_UNIFORM_CONST_BUFFERS: dword_index < ShaderDataDwords(), the bound size.
+		// Uniform const buffers (ShaderIR.h): dword_index < ShaderDataDwords(), the bound size.
 		return LoadUniformDword(state, state.shader_data_uniform_variable, dword_index);
-	}
-	if (state.shader_data_storage_variable != 0) {
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.shader_data_storage_variable,
-		                          ConstantU32(state, 0), ConstantU32(state, dword_index));
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
 	}
 	return ConstantU32(state, 0);
 }

@@ -17,10 +17,6 @@
 
 namespace Libs::Graphics {
 
-// KYTY_DIAG_MIP_TAIL_SLICES=1 (textureCache.cpp): a single-level image inside the mip-tail block
-// of a container slice is that container's mip of the same extent, whatever its offset in the block.
-bool MipTailSlicesEnabled();
-
 enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Rotate2_10_10_10 };
 
 enum class VideoOutCompression : uint8_t {
@@ -246,12 +242,18 @@ struct ImageInfo {
 		}
 		if ((address_delta - layout.offset) % slice_stride != 0) {
 			// PS5 packs the smallest levels into one tail block per slice at offsets of their own;
-			// the container layout lists them all at the block start. The extent names the level.
+			// the container layout lists them all at the block start. The extent names the level: a single-level image
+			// inside the mip-tail block of a container slice is that container's mip of the same extent, whatever its
+			// offset in the block. Hardware behaviour, not a workaround (GFX10 places the smallest levels of a slice in
+			// one tail block at offsets of their own, tile.cpp Gen5Standard4KBOffsetInBlock; a single-level T# at such an
+			// offset reads that level's bytes). The rule takes any offset in the tail; every observed view sat exactly at
+			// its level's position (+0x800/+0x600/+0x500/+0x400), so an exact-offset check is the remaining hardening,
+			// not a change of result on the game's data.
 			const bool tail_level =
 			    (level > 0 && container.mip_layout[level - 1].offset == layout.offset) ||
 			    (level + 1 < container.resources.levels && container.mip_layout[level + 1].offset == layout.offset);
 			const auto in_slice = (address_delta - layout.offset) % slice_stride;
-			if (!MipTailSlicesEnabled() || !tail_level || resources.layers != 1 ||
+			if (!tail_level || resources.layers != 1 ||
 			    in_slice >= layout.size / container.resources.layers) {
 				return -1;
 			}

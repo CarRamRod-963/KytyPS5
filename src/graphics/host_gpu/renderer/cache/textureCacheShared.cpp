@@ -11,7 +11,6 @@
 #include "common/onceValue.h"
 #include "common/overlayStats.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -27,8 +26,6 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -52,7 +49,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 // One guest memory under several images: KYTY_FIX_IMAGE_MEMORY_OWNER, KYTY_FIX_SHARED_IMAGE_MEMORY (+_DIRECT), both off by
-// default and the proper implementations KYTY_DIAG_ALIAS_SYNC waits for (notes\LISTA-ZMIAN-Z-DEKOMPILACJI.md, D4). Nothing
+// default and the proper implementations KYTY_WORKAROUND_ALIAS_SYNC waits for (notes\LISTA-ZMIAN-Z-DEKOMPILACJI.md, D4). Nothing
 // here runs while their gates (textureCacheShared.h, asked in textureCache.cpp) are off.
 namespace Libs::Graphics {
 
@@ -236,7 +233,7 @@ void TextureCache::OwnerCensusSetBinding(const OwnerCensusBinding* binding) {
 	t_owner_census_binding = binding;
 }
 
-// KYTY_FIX_IMAGE_MEMORY_OWNER (D4c step S1; 0 = KYTY_DIAG_ALIAS_SYNC as before, 1 on, 2 on with checks): one guest
+// KYTY_FIX_IMAGE_MEMORY_OWNER (D4c step S1; 0 = KYTY_WORKAROUND_ALIAS_SYNC as before, 1 on, 2 on with checks): one guest
 // memory under several images. The game describes the same memory with other extents and formats (dynamic resolution
 // views of one allocation, transient memory reused by later passes); each description is its own host image here, so
 // the bytes one of them writes are what the others must show over the same addresses, in their own layouts. A map of
@@ -263,7 +260,7 @@ void TextureCache::OwnerCensusSetBinding(const OwnerCensusBinding* binding) {
 // Images it keeps coherent: single-sample, uncompressed, one level and layer, not a volume, texels of the host format's
 // size, and either tiled (level 0 outside the mip tail and block-aligned, 1x1 texel elements; moved through the tiler)
 // or guest-linear without a colour transform (rows moved by plain image/buffer copies with the guest pitch as row
-// length; windows aligned to 256 bytes). Other images keep KYTY_DIAG_ALIAS_SYNC's
+// length; windows aligned to 256 bytes). Other images keep KYTY_WORKAROUND_ALIAS_SYNC's
 // copy as before (AliasSyncSkipsImage skips only the images the map covers; copies counted per reason:
 // alias_sync_excluded) and are counted when bytes images wrote reach their memory (excluded_stale).
 // =2, all must stay 0:

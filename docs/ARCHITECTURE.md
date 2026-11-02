@@ -215,7 +215,8 @@ D1/D2 (`KYTY_DIAG_BINDLESS_EAGER`).
 All settings are environment variables named `KYTY_*`, read once where they are used. Their defaults live in the code:
 
 - `common/envDefaults.h` holds the table of settings that used to come from a launch script, each marked `config`
-  (ordinary setting or measured performance switch), `correct` (hardware behaviour, confirmed), `unproven` (probably
+  (ordinary setting or measured performance switch), `correct` (hardware behaviour, confirmed; no entry now - such
+  behaviour is no switch any more), `unproven` (probably
   hardware behaviour, exactness check open) or `workaround` (a logged approximation that stays until its replacement
   lands, with its work item). `Common::EnvOrDefault` returns the environment value or the table's default and prints
   every entry once at start (`ENV_DEFAULT KYTY_X=value source=env|code kind=…`), so each log lists the settings the run
@@ -224,8 +225,9 @@ All settings are environment variables named `KYTY_*`, read once where they are 
   that made it the default in the comment above.
 - The environment always wins (`KYTY_X=0` turns a switch off); `KYTY_ENV_DEFAULTS=0` ignores the whole table (the unit
   tests use it to check the strict paths).
-- Naming: `KYTY_FIX_*` corrections, `KYTY_PERF_*` performance changes with an exact result, `KYTY_DIAG_*` diagnostics
-  and approximations (some older ones are hardware behaviour and keep the name for history), `KYTY_SDK_FIX_*` edge
+- Naming: `KYTY_FIX_*` corrections, `KYTY_PERF_*` performance changes with an exact result, `KYTY_WORKAROUND_*`
+  approximations that stay on until their replacement lands (`=0` turns one off), `KYTY_DIAG_*` diagnostic tools (off by
+  default; a few older ones are still approximations), `KYTY_SDK_FIX_*` edge
   cases of texture sampling, `KYTY_TRACE_*` / `KYTY_CAPTURE_*` diagnostics only, off by default.
 
 ## 7. Measurement and checking built into the emulator

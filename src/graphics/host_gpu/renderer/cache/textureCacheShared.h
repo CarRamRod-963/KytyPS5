@@ -15,9 +15,9 @@
 // gates stay here so that the main path's only cost is the one test it always had.
 namespace Libs::Graphics {
 
-// KYTY_FIX_IMAGE_MEMORY_OWNER (D4c step S1; 0 = KYTY_DIAG_ALIAS_SYNC as before, 1 on, 2 on with checks): one guest
+// KYTY_FIX_IMAGE_MEMORY_OWNER (D4c step S1; 0 = KYTY_WORKAROUND_ALIAS_SYNC as before, 1 on, 2 on with checks): one guest
 // memory under several images, every byte of it with one holder (see ImageMemoryOwners below). With it on,
-// KYTY_DIAG_ALIAS_SYNC and KYTY_FIX_SHARED_IMAGE_MEMORY are not used.
+// KYTY_WORKAROUND_ALIAS_SYNC and KYTY_FIX_SHARED_IMAGE_MEMORY are not used.
 inline uint32_t ImageMemoryOwnerMode() {
 	static const uint32_t mode = [] {
 		const char*    value = std::getenv("KYTY_FIX_IMAGE_MEMORY_OWNER");
@@ -28,7 +28,7 @@ inline uint32_t ImageMemoryOwnerMode() {
 	return mode;
 }
 
-// KYTY_FIX_SHARED_IMAGE_MEMORY (D4 step K1; 0 = KYTY_DIAG_ALIAS_SYNC as before, 1 on, 2 check; live A/B switch
+// KYTY_FIX_SHARED_IMAGE_MEMORY (D4 step K1; 0 = KYTY_WORKAROUND_ALIAS_SYNC as before, 1 on, 2 check; live A/B switch
 // SharedImageMemory): one guest memory under several images. The game describes the same memory with other extents
 // (dynamic resolution: one allocation of the largest size, smaller views of it) and with other formats (transient
 // memory reused by later passes of the frame). Each description is its own host image here, so the bytes one of them
@@ -80,7 +80,7 @@ namespace ImageMemoryOwners {
 bool     Followed(const Image& image);      // the images KYTY_FIX_IMAGE_MEMORY_OWNER keeps coherent
 bool     KnownAlone(const Image& image);    // known to have no other image over its memory
 uint32_t ExcludedIndex(const Image& image); // why it does not keep `image` coherent (Excluded index)
-// KYTY_FIX_IMAGE_MEMORY_OWNER: KYTY_DIAG_ALIAS_SYNC copies into images the map does not keep coherent, per reason.
+// KYTY_FIX_IMAGE_MEMORY_OWNER: KYTY_WORKAROUND_ALIAS_SYNC copies into images the map does not keep coherent, per reason.
 inline std::array<std::atomic<uint64_t>, 12> g_alias_sync_copies {};
 } // namespace ImageMemoryOwners
 

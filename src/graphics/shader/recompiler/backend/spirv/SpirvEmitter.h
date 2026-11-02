@@ -69,7 +69,7 @@ void SetSpirvFormattedSwitchReference(bool enabled);
 
 // Whether the emitter can read an image whose translated fields are `image` with the conversion format `format`
 // (spirvEmitterImage.cpp, ImageConversionFormat, which ends the emulator otherwise). False for a conversion this run's
-// format switches do not make: a journal record from a run with another KYTY_DIAG_RT_11_11_10_FLOAT, which
+// format switches do not make: a journal record from a run with another KYTY_FIX_RT_11_11_10_FLOAT, which
 // the precompiler rejects (ShaderPrecompiler::CompileModule).
 bool ImageConversionEmittable(const IR::ImageResource& image, Prospero::BufferFormat format);
 

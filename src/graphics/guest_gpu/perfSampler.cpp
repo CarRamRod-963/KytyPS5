@@ -354,14 +354,14 @@ void PerfDumpCurrentStack(const char* label) {
 // resolution with the linker map. The thread is resumed before any analysis, so the sampler never
 // takes a lock while the GPU thread is suspended. =all: every thread instead (StartAllThreadsSampler).
 namespace {
-// The sampler of one thread (the calling one): its lines start with `prefix`; idle_filter: KYTY_TRACE_PERF_SAMPLE_IDLE applies.
-void StartThreadSampler(const char* prefix, bool idle_filter) {
+// The sampler of one thread (the calling one): its lines start with `prefix`.
+void StartThreadSampler(const char* prefix) {
 	HANDLE thread = nullptr;
 	if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread,
 	                     THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) {
 		return;
 	}
-	std::thread([thread, prefix, idle_filter] {
+	std::thread([thread, prefix] {
 		Common::HostException::PassAccessViolations(true); // a bad unwound frame ends at UnwindCopiedStack's __except
 		auto*       module = GetModuleHandleW(nullptr);
 		MODULEINFO  info {};
@@ -386,8 +386,6 @@ void StartThreadSampler(const char* prefix, bool idle_filter) {
 		std::map<std::pair<uint64_t, uint64_t>, uint32_t> callers;
 		std::unordered_set<uint64_t> seen;
 		uint32_t samples = 0;
-		uint32_t all_samples = 0; // KYTY_TRACE_PERF_SAMPLE_IDLE: idle and busy
-		const bool idle_only = idle_filter && PerfSampleIdleEnabled();
 		auto     window  = GetTickCount64();
 		const auto is_return = [&](uint64_t address) {
 			if (address < base + 0x1000u || address >= end) return false;
@@ -418,11 +416,6 @@ void StartThreadSampler(const char* prefix, bool idle_filter) {
 			}
 			ResumeThread(thread);
 			if (!ok) continue;
-			if (idle_only) {
-				all_samples++;
-				// KYTY_TRACE_PERF_SAMPLE_IDLE: kept only while the host GPU has nothing left to run.
-				if (!PerfSampleGpuIdleNow()) continue;
-			}
 			samples++;
 			const auto rip = static_cast<uint64_t>(context.Rip);
 			if (rip >= base && rip < end) {
@@ -474,17 +467,7 @@ void StartThreadSampler(const char* prefix, bool idle_filter) {
 				return sorted;
 			};
 			std::fprintf(stderr, "%s samples=%u\n", prefix, samples);
-			if (idle_only) {
-				std::fprintf(stderr, "%s_IDLE kept=%u of=%u\n", prefix, samples, all_samples);
-				all_samples = 0;
-			}
-			// KYTY_TRACE_PERF_SAMPLE_FULL=1: every sampled instruction, so offline tools can sum whole functions (the top
-			// 60 instructions alone cover a small share of the samples).
-			static const bool full = [] {
-				const char* value = std::getenv("KYTY_TRACE_PERF_SAMPLE_FULL");
-				return value != nullptr && value[0] == '1';
-			}();
-			for (const auto& [rva, count]: top(exclusive, full ? ~size_t {0} : size_t {60}))
+			for (const auto& [rva, count]: top(exclusive, 60))
 				std::fprintf(stderr, "%s excl rva=0x%llx n=%u\n", prefix, static_cast<unsigned long long>(rva), count);
 			for (const auto& [rva, count]: top(inclusive, 150))
 				std::fprintf(stderr, "%s incl rva=0x%llx n=%u\n", prefix, static_cast<unsigned long long>(rva), count);
@@ -543,7 +526,7 @@ void PerfSamplerStartForCurrentThread() {
 		return;
 	}
 	if (flag == nullptr || flag[0] != '1') return;
-	StartThreadSampler("PERF_SAMPLE", true);
+	StartThreadSampler("PERF_SAMPLE");
 }
 
 

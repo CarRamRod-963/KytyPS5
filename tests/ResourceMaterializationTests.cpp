@@ -211,7 +211,7 @@ void TestNativeNestedSrtRefresh() {
   auto plan = ExtractResourcePlan(program);
   // Upstream compiled an x86 walker (ResourcePlan::srt_code) for this nested user-data tree. Ours replaced that
   // walker with the SRT tape (ResourcePlan::srt_tape, SrtTape.h), the dense evaluator MaterializeResources uses
-  // instead of SrtWalker. Equivalent expectation: this tree gets a tape (unless KYTY_DIAG_SRT_TAPE=0 turns tapes off).
+  // instead of SrtWalker. Equivalent expectation: this tree gets a tape (unless KYTY_FIX_SRT_TAPE=0 turns tapes off).
   Check(!SrtTapeEnabled() || (plan.srt_tape != nullptr && plan.srt_tape->Matches(plan)),
         "nested user-data tree did not build an SRT tape");
   ResourceSnapshot snapshot;

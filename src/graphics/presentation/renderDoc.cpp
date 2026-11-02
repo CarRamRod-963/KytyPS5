@@ -47,15 +47,10 @@ static std::atomic_bool            g_unavailable_log = false;
 		std::fprintf(stderr, __VA_ARGS__);                                                         \
 	} while (false)
 
-// KYTY_TRACE_RENDERDOC_FLIPS=<n> (default 2): guest flips a capture spans. A captured guest frame can take
-// minutes (RenderDoc diffs every persistently mapped allocation at each submit), so 1 ends it sooner.
+// Guest flips a capture spans. A captured guest frame can take minutes (RenderDoc diffs every persistently mapped
+// allocation at each submit).
 static uint32_t CaptureFlips() {
-	static const uint32_t flips = [] {
-		const char* value = std::getenv("KYTY_TRACE_RENDERDOC_FLIPS");
-		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 2ul;
-		return static_cast<uint32_t>(n != 0 ? n : 2ul);
-	}();
-	return flips;
+	return 2u;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

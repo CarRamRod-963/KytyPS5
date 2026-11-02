@@ -99,7 +99,7 @@ pixel shaders select their textures at run time from descriptor tables in GPU me
 (`KYTY_BINDLESS`, on); see [ARCHITECTURE.md](ARCHITECTURE.md). Some of these images are also read back by the CPU (the
 emulator sees CPU reads of their memory): linear images are written back to guest memory on the CPU's first read
 (`the linear readback`, on). Workarounds still active here:
-`KYTY_DIAG_WATERFALL_POINTER_RECORD0` (the material table of some terrain shaders, item M42),
+`KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0` (the material table of some terrain shaders, item M42),
 `KYTY_DIAG_BINDLESS_EAGER` and related bindless entries (a newly streamed texture may show a placeholder for 1–3
 frames).
 
@@ -156,9 +156,9 @@ water writes `0x4C`, and lighting classifies tiles by `(stencil & 0x48) == 0x48`
 **In the emulator.** This pass is where the CPU cost per draw dominates: every draw's registers, shader programs,
 render targets, pipeline, textures and buffers are resolved before it is recorded. Most of that work runs on
 preparation workers in parallel with the GPU thread (see [ARCHITECTURE.md](ARCHITECTURE.md)). Colour compression and
-depth/stencil metadata are emulated with workarounds that are still on: `KYTY_DIAG_DCC_FAST_CLEAR` and related A5
-entries (simplified DCC clears), and the D8 stencil group (`KYTY_DIAG_STENCIL_PLANE_SYNC`,
-`KYTY_DIAG_PRESERVE_STENCIL`, `KYTY_DIAG_HTILE_FULL_RANGE`, …), which keep stencil as copies and treat HTILE as
+depth/stencil metadata are emulated with workarounds that are still on: `KYTY_WORKAROUND_DCC_FAST_CLEAR` and related A5
+entries (simplified DCC clears), and the D8 stencil group (`KYTY_WORKAROUND_STENCIL_PLANE_SYNC`,
+`KYTY_WORKAROUND_PRESERVE_STENCIL`, `KYTY_WORKAROUND_HTILE_FULL_RANGE`, …), which keep stencil as copies and treat HTILE as
 "full range".
 
 ## 7. Shadows
@@ -181,7 +181,7 @@ dispatches (identical results). Fix M122: the emulator recognised an HTILE clear
 tracked "cleared" only for the first 64 slices, so far pages were redrawn over stale depth and a dark patch with
 straight page edges stayed on the distant landscape for hundreds of frames after cutscenes. Clears are now tracked per
 slice (`KYTY_FIX_HTILE_SLICE_CLEAR`, on; `=2` found 0 differences on 2.7 M checks; cost below 0.01 ms). HTILE itself
-is still emulated as "full range" (`KYTY_DIAG_HTILE_FULL_RANGE`, workaround D8).
+is still emulated as "full range" (`KYTY_WORKAROUND_HTILE_FULL_RANGE`, workaround D8).
 
 ## 8. Ambient light, probes and RTGI
 
@@ -237,7 +237,7 @@ stencil plane with a compute shader that treats it as a buffer.
 
 **In the emulator.** See the stencil-plane fix in section 9. Tessellation is on by default (`--no-tessellation` turns
 it off). Open: `Deferred wetness` still reads the first plane for both of its stencil bindings
-(`KYTY_DIAG_PRESERVE_STENCIL` is still a workaround), so some interiors may look wet.
+(`KYTY_WORKAROUND_PRESERVE_STENCIL` is still a workaround), so some interiors may look wet.
 
 ## 11. Volumetric fog and clouds
 

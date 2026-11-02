@@ -40,9 +40,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDrawPlan.h"
 #include "graphics/host_gpu/renderer/renderDrawTrace.h"
-#include "graphics/host_gpu/renderer/sceneAudit.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -163,12 +160,12 @@ static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::Po
 	return std::ldexp(guest_factor, host_depth_bits + offset.neg_num_db_bits);
 }
 
-// KYTY_DIAG_DRAW_STATE_FILTER (default on, =0 off, logged once): a draw records only the dynamic-state
+// KYTY_FIX_DRAW_STATE_FILTER (default on, =0 off, logged once): a draw records only the dynamic-state
 // commands and the graphics pipeline bind that change what its command buffer already holds
 // (CommandBuffer::GraphicsState has the rules), and the draw state object is reused instead of
 // being zero-initialised for every draw (DrawStateHolder). With it unset every command is recorded
 // as before.
-// KYTY_DIAG_DRAW_STATE_FILTER_VERIFY=1 (needs the filter): records every command exactly as without
+// KYTY_FIX_DRAW_STATE_FILTER_VERIFY=1 (needs the filter): records every command exactly as without
 // the filter and only counts, per kind, the commands the filter would have skipped; the counters
 // are printed every 100000 draws. Compare renderings of FILTER=1 and FILTER=1 with VERIFY=1 to
 // check the filter.
@@ -193,15 +190,15 @@ const DrawStateFilterOptions& DrawStateFilterConfig() {
 	static constinit Common::OnceObject<DrawStateFilterOptions> options_once;
 	const DrawStateFilterOptions& options = options_once.Get([] {
 		DrawStateFilterOptions result;
-		const char*            value = std::getenv("KYTY_DIAG_DRAW_STATE_FILTER");
+		const char*            value = std::getenv("KYTY_FIX_DRAW_STATE_FILTER");
 		if (value == nullptr || value[0] != '0') {  // default on; =0 turns it off
 			result.enabled = true;
-			std::fprintf(stderr, "DIAG_DRAW_STATE_FILTER enabled\n");
-			const char* verify = std::getenv("KYTY_DIAG_DRAW_STATE_FILTER_VERIFY");
+			std::fprintf(stderr, "FIX_DRAW_STATE_FILTER enabled\n");
+			const char* verify = std::getenv("KYTY_FIX_DRAW_STATE_FILTER_VERIFY");
 			if (verify != nullptr && verify[0] == '1') {
 				result.verify = true;
 				std::fprintf(stderr,
-				             "DIAG_DRAW_STATE_FILTER_VERIFY enabled: every command is recorded, the "
+				             "FIX_DRAW_STATE_FILTER_VERIFY enabled: every command is recorded, the "
 				             "ones the filter would skip are counted\n");
 			}
 		}
@@ -223,7 +220,7 @@ DrawStateFilterStats& DrawStateStats() {
 
 void ReportDrawStateStats(const DrawStateFilterStats& stats) {
 	// kind=would_skip/calls
-	std::string line = fmt::format("DIAG_DRAW_STATE_FILTER_VERIFY draws={}", stats.draws);
+	std::string line = fmt::format("FIX_DRAW_STATE_FILTER_VERIFY draws={}", stats.draws);
 	for (uint32_t kind = 0; kind < kDynStateKinds; kind++) {
 		if (stats.calls[kind] != 0) {
 			line += fmt::format(" {}={}/{}", kDynStateNames[kind], stats.skippable[kind],
@@ -479,7 +476,7 @@ static bool OwnerDrawRect(const ShaderVertexInputInfo& vs_input_info, const Rend
 	return x1 > x0 && y1 > y0;
 }
 
-// The commands of a draw's dynamic state, then its attachment feedback loop (KYTY_DIAG_DRAW_STATE_FILTER: only those that
+// The commands of a draw's dynamic state, then its attachment feedback loop (KYTY_FIX_DRAW_STATE_FILTER: only those that
 // change what `known` says the command buffer holds; a recorded command is remembered in `known`). The order and the
 // values are those recorded before the split (dynamic state, then feedback loop). `sink`: the command buffer (today's
 // calls, or the recording thread's with the record packets).
@@ -631,7 +628,7 @@ static void EmitGraphicsDynamicParams(DynState& known, vk::CommandBuffer sink, c
 }
 
 // Binds the pipeline of a draw unless the command buffer holds it already
-// (KYTY_DIAG_DRAW_STATE_FILTER). Compute pipelines are another bind point and never get here.
+// (KYTY_FIX_DRAW_STATE_FILTER). Compute pipelines are another bind point and never get here.
 static void EmitGraphicsPipelineBind(DynState& known, vk::CommandBuffer sink, vk::Pipeline pipeline) {
 	DynamicStateRecorder rec(known);
 	if (rec.Needs(DynState::PipelineBind, [&] { return known.pipeline == pipeline; })) {
@@ -818,7 +815,7 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 namespace {
 // The draw state of a draw: `DrawRenderState state {};` zero-initialised and constructed about 12 KB
 // for every draw (three vertex stages, eight color targets), almost all of which is written before
-// anything reads it. With KYTY_DIAG_DRAW_STATE_FILTER the thread's one DrawRenderState is reused
+// anything reads it. With KYTY_FIX_DRAW_STATE_FILTER the thread's one DrawRenderState is reused
 // and only what PrepareDrawRenderState reads without writing is reset:
 //  - vertex_info: GetGraphicsPrograms resets every entry it uses (`info = {}` in
 //    ShaderGetStaticVertexInputInfo, the NGG branch of PrepareProgram and
@@ -862,7 +859,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
-	const StageF::Zone stagef_targets(StageF::Sub::EvTargets); // M26
 	KYTY_PROFILER_BLOCK("Draw::AcquireRenderTargets");
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
@@ -913,7 +909,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
-		// KYTY_DIAG_HTILE_FULL_RANGE=1 (logged APPROXIMATION): the host never writes HTILE contents,
+		// KYTY_WORKAROUND_HTILE_FULL_RANGE=1 (logged APPROXIMATION): the host never writes HTILE contents,
 		// but shaders read its per-tile min/max depth (e.g. to enqueue shadow-resolve tiles). Once per
 		// frame and HTILE address, the guest HTILE is filled with "expanded, full depth range"
 		// (ZMask=0xF, MinZ=0, MaxZ=0x3FFF), so such tests are conservative instead of empty.
@@ -921,9 +917,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool htile_full_range = htile_full_range_once.Get([] {
 			// Default from Common::EnvDefaults; workaround: D8 (stencil /
 			// HTILE), to be replaced by the proper implementation; =0 turns it off.
-			const char* value = Common::EnvOrDefault("KYTY_DIAG_HTILE_FULL_RANGE");
+			const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_HTILE_FULL_RANGE");
 			const bool  on    = value != nullptr && value[0] == '1';
-			if (on) std::fprintf(stderr, "DIAG_HTILE_FULL_RANGE APPROXIMATION enabled\n");
+			if (on) std::fprintf(stderr, "WORKAROUND_HTILE_FULL_RANGE APPROXIMATION enabled\n");
 			return on;
 		});
 		if (htile_full_range && metadata.kind == ImageMetadataKind::Htile && metadata.range.size >= 4u &&
@@ -941,7 +937,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				}
 				static std::atomic_uint logged {0};
 				if (logged.fetch_add(1) < 4u) {
-					std::fprintf(stderr, "DIAG_HTILE_FULL_RANGE fill addr=0x%llx size=0x%llx\n",
+					std::fprintf(stderr, "WORKAROUND_HTILE_FULL_RANGE fill addr=0x%llx size=0x%llx\n",
 					             static_cast<unsigned long long>(metadata.range.address),
 					             static_cast<unsigned long long>(size));
 				}
@@ -1396,21 +1392,6 @@ static void NoteAsyncDraw(bool skipped) {
 	}
 }
 
-// KYTY_FIX_NO_OUTPUT_DRAWS=1 (default off; read once, logged once): a draw without color, depth or stencil work and
-// without pixel shader effects still runs when one of its vertex stages writes memory, and an HTILE expand or
-// resummarize draw (DB_RENDER_CONTROL DEPTH/STENCIL_COMPRESS_DISABLE, RESUMMARIZE_ENABLE) of a depth surface whose
-// fast clear the host has not applied yet binds the surface, so the deferred clear reaches the depth image as the
-// expand writes it into memory on the PS5. Without it such draws are dropped as before.
-static bool FixNoOutputDraws() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_FIX_NO_OUTPUT_DRAWS");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "FIX_NO_OUTPUT_DRAWS enabled\n");
-		return on;
-	}();
-	return enabled;
-}
-
 // A shader stage with effects outside the pipeline: buffer/image stores or atomics, address (BDA/global) writes, GDS.
 static bool StageWritesMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
 	if (program.has_address_writes || program.info.uses_gds) {
@@ -1463,83 +1444,17 @@ static NoOutputDraw ClassifyNoOutputDraw(const CommandBuffer& buffer, const Draw
 
 static const char* NoOutputDropReason(const NoOutputDraw& draw) {
 	if (draw.counted) return "render state (no output): occlusion query draw, not counted (KYTY_FIX_OCCLUSION_QUERIES off)";
-	if (draw.vertex_writes) return "render state (no output): vertex stages write memory (KYTY_FIX_NO_OUTPUT_DRAWS off)";
-	if (draw.pending_clear) {
-		return "render state (no output): HTILE expand of a fast-cleared depth surface (KYTY_FIX_NO_OUTPUT_DRAWS off)";
-	}
+	// Running these (vertex stage writes; the expand binding the surface so its pending fast clear lands) left the
+	// game on its loading screen: they stay dropped.
+	if (draw.vertex_writes) return "render state (no output): vertex stages write memory (not run)";
+	if (draw.pending_clear) return "render state (no output): HTILE expand of a fast-cleared depth surface (not run)";
 	if (draw.db_metadata_op) return "render state (no effect): HTILE expand/resummarize, the host depth is never compressed";
 	return "render state (no effect): no color/depth/stencil work, no shader effects, no occlusion query";
 }
 
-// The register state behind a draw without output, as a JSON object (scene audit "skip_state", DRAW_DROP state=).
-static std::string DescribeNoOutputDraw(const CommandBuffer& buffer, const DrawCallInfo& draw,
-                                        const DrawRenderState& state, const NoOutputDraw& no_output) {
-	const auto& regs = buffer.GetRegisters();
-	const auto& sh   = regs.GetShaderRegisters();
-	const auto& dc   = regs.GetDepthControl();
-	const auto& rc   = regs.GetRenderControl();
-	const auto& ro   = regs.GetDepthRenderOverride();
-	const auto& z    = regs.GetDepthRenderTarget();
-	const auto& dsc  = sh.db_shader_control;
-	std::string vertex;
-	for (uint32_t i = 0; i < state.programs.VertexStageCount(); i++) {
-		const auto* program = state.vertex_info[i].stage.program;
-		if (program == nullptr) continue;
-		vertex += fmt::format("{}{{\"type\":{},\"h\":\"{:016x}\",\"writes\":{}}}", vertex.empty() ? "" : ",",
-		                      static_cast<uint32_t>(program->stage), program->shader_hash,
-		                      StageWritesMemory(*program) ? "true" : "false");
-	}
-	const uint64_t ps_addr = buffer.GetShaders().GetPs().ps_regs.data_addr;
-	uint64_t       ps_hash = 0;
-	if (ps_addr != 0) {
-		(void)ShaderLookupMapped(ps_addr, nullptr, &ps_hash);
-	}
-	uint32_t col_format = 0;
-	for (uint32_t slot = 0; slot < 8u; slot++) {
-		col_format |= (static_cast<uint32_t>(sh.target_output_mode[slot]) & 0xfu) << (slot * 4u);
-	}
-	return fmt::format(
-	    "{{\"count\":{},\"inst\":{},\"indexed\":{},\"prim\":{},\"vertex\":[{}],\"ps_addr\":\"0x{:x}\",\"ps\":\"{:016x}\","
-	    "\"rt_mask\":\"0x{:08x}\",\"shader_mask\":\"0x{:08x}\",\"col_format\":\"0x{:08x}\",\"color_out\":\"0x{:x}\","
-	    "\"cb_mode\":{},\"db_shader\":{{\"kill\":{},\"z_export\":{},\"mask_export\":{},\"exec_on_noop\":{}}},"
-	    "\"z\":{{\"test\":{},\"write\":{},\"func\":{},\"bounds\":{},\"stencil\":{}}},"
-	    "\"render_control\":{{\"depth_clear\":{},\"stencil_clear\":{},\"resummarize\":{},\"depth_compress_disable\":{},"
-	    "\"stencil_compress_disable\":{},\"copy_depth\":{},\"copy_stencil\":{}}},"
-	    "\"render_override\":{{\"z_valid\":{},\"z_dirty\":{},\"stencil_valid\":{},\"stencil_dirty\":{}}},"
-	    "\"depth_target\":{{\"z_format\":{},\"stencil_format\":{},\"z_read\":\"0x{:x}\",\"z_write\":\"0x{:x}\","
-	    "\"htile\":\"0x{:x}\",\"htile_on\":{},\"slice\":{},\"size\":[{},{}]}},"
-	    "\"query_open\":{},\"vertex_writes\":{},\"htile_op\":{},\"pending_clear\":{}}}",
-	    draw.index_count, draw.instance_count, draw.IsIndexed() ? "true" : "false",
-	    static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()), vertex, ps_addr, ps_hash,
-	    regs.GetRenderTargetMask(), sh.m_cbShaderMask, col_format, DrawColorOutputMask(regs),
-	    static_cast<uint32_t>(regs.GetColorControl().mode), dsc.shader_kill_enable ? "true" : "false",
-	    dsc.shader_z_export_enable ? "true" : "false", dsc.shader_mask_export_enable ? "true" : "false",
-	    dsc.shader_execute_on_noop ? "true" : "false", dc.z_enable ? "true" : "false",
-	    dc.z_write_enable ? "true" : "false", static_cast<uint32_t>(dc.zfunc), dc.depth_bounds_enable ? "true" : "false",
-	    dc.stencil_enable ? "true" : "false", rc.depth_clear_enable ? "true" : "false",
-	    rc.stencil_clear_enable ? "true" : "false", rc.resummarize_enable ? "true" : "false",
-	    rc.depth_compress_disable ? "true" : "false", rc.stencil_compress_disable ? "true" : "false",
-	    rc.copy_depth_to_color ? "true" : "false", rc.copy_stencil_to_color ? "true" : "false",
-	    ro.force_z_valid ? "true" : "false", ro.force_z_dirty ? "true" : "false",
-	    ro.force_stencil_valid ? "true" : "false", ro.force_stencil_dirty ? "true" : "false",
-	    static_cast<uint32_t>(z.z_info.format), static_cast<uint32_t>(z.stencil_info.format), z.z_read_base_addr,
-	    z.z_write_base_addr, z.htile_data_base_addr, z.z_info.htile_acceleration ? "true" : "false",
-	    z.depth_view.slice_start, static_cast<uint32_t>(z.size.x_max) + 1u, static_cast<uint32_t>(z.size.y_max) + 1u,
-	    no_output.counted ? "true" : "false", no_output.vertex_writes ? "true" : "false",
-	    no_output.db_metadata_op ? "true" : "false", no_output.pending_clear ? "true" : "false");
-}
-
-// A draw PrepareDrawRenderState left out: its reason and (KYTY_TRACE_AUDIT_FRAME, KYTY_TRACE_DRAW_DROPS) the register
-// state that decided it.
-static void TraceRenderStateDrop(const char* fallback, const CommandBuffer& buffer, const DrawCallInfo& draw,
-                                 const DrawRenderState& state) {
-	const char* reason = state.drop_reason != nullptr ? state.drop_reason : fallback;
-	if (!SceneAudit::Enabled() && !DrawDropTraceRequested()) {
-		TraceDrawDrop(reason, buffer);
-		return;
-	}
-	const auto detail = DescribeNoOutputDraw(buffer, draw, state, ClassifyNoOutputDraw(buffer, state));
-	TraceDrawDrop(reason, buffer, &detail);
+// A draw PrepareDrawRenderState left out, with its reason.
+static void TraceRenderStateDrop(const char* fallback, const CommandBuffer& buffer, const DrawRenderState& state) {
+	TraceDrawDrop(state.drop_reason != nullptr ? state.drop_reason : fallback, buffer);
 }
 
 // Project C, stage C1 step 1: a draw whose render target search reads the same registers as the previous draw's (the CB
@@ -1706,16 +1621,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		// Nothing to write and no pixel shader effects: what the PS5 still does with such a draw (NoOutputDraw).
 		const auto no_output = ClassifyNoOutputDraw(buffer, state);
-		const bool expand_clear = no_output.pending_clear && FixNoOutputDraws();
-		if (expand_clear) {
-			// The surface is bound with its tests off: the attachment applies the pending fast clear.
-			ResolveRenderDepthTarget(buffer, state.depth_info, true);
-		}
 		// KYTY_FIX_OCCLUSION_QUERIES: the draw runs without attachments and the open host query counts its samples.
 		if (no_output.counted && m_context.GetOcclusionQueries().Enabled()) {
-			return true;
-		}
-		if ((no_output.vertex_writes && FixNoOutputDraws()) || (expand_clear && state.depth_info.image_id)) {
 			return true;
 		}
 		state.drop_reason = NoOutputDropReason(no_output);
@@ -2054,11 +1961,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable,
                                          const DrawIndirectSource* indirect) {
-	// KYTY_TRACE_AUDIT_FRAME: before anything of this draw is bound (it can submit the scheduler and wait).
-	if (SceneAudit::Enabled()) SceneAudit::OnCommandStart(m_context);
 	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
-		if (SceneAudit::Enabled()) SceneAudit::RecordSkipped("draw", "replaced: depth copied to color (render control)");
 		return;
 	}
 	const auto vertex_stages =
@@ -2132,7 +2036,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (async_pipeline == nullptr && !failed) {
 			NoteAsyncDraw(true);
 			m_async_skipped_draws++;
-			if (SceneAudit::Enabled()) SceneAudit::RecordSkipped("draw", "pipeline being created in the background");
 			return;
 		}
 	}
@@ -2265,7 +2168,6 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	const auto&               index_source             = plan.index_source;
 	const DrawIndirectSource* indirect                 = plan.indirect ? &*plan.indirect : nullptr;
 	plan.regs.Capture(buffer);
-	auto&       ucfg             = buffer.GetUserConfig();
 	const auto  vertex_stages    = plan.vertex_stages;
 	const bool  mesh_active      = plan.mesh_active;
 	const auto  mesh_groups      = plan.mesh_groups;
@@ -2296,33 +2198,14 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	commit_census.reset();
 	// Resource preparation (ExecutePreparedDraw) may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest memory.
-	const StageF::Zone stagef_record(StageF::Sub::Record); // KYTY_TRACE_STAGEF: to the end of the draw
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	std::optional<StageF::Zone> stagef_part; // KYTY_TRACE_STAGEF: rec_vtx / rec_dyn / rec_begin
 	if (!mesh_active) {
-		stagef_part.emplace(StageF::Sub::RecVtx);
 		const DispatchSubTimer vtx_census(DispatchSub::CVtx); // KYTY_TRACE_DRAW_CENSUS
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
-		stagef_part.reset();
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
-	}
-	// KYTY_TRACE_AUDIT_FRAME: the draw's bindings, targets and full copies of what it reads (before the commit, like
-	// the image dumps below).
-	if (SceneAudit::Enabled()) {
-		std::array<SceneAudit::Stage, 4> audit_stages {};
-		uint32_t                         audit_count = 0;
-		for (uint32_t i = 0; i < vertex_stages.size() && audit_count < 3u; i++) {
-			audit_stages[audit_count++] = {&state.vertex_info[i].stage, &bindings.vertex[i]};
-		}
-		if (state.ps_active && bindings.pixel) {
-			audit_stages[audit_count++] = {&state.ps_input_info.stage, &*bindings.pixel};
-		}
-		SceneAudit::RecordDraw(m_context, audit_stages.data(), audit_count, state.color_info, state.color_count,
-		                       &state.depth_info, draw.index_count, draw.instance_count, draw.IsIndexed(),
-		                       indirect != nullptr, mesh_active);
 	}
 	// Image dumps run before the bindings are committed: the dump leaves an image in a transfer
 	// layout, and CommitBindings transitions it back to the layout its descriptor names.
@@ -2374,13 +2257,10 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
-		stagef_part.emplace(StageF::Sub::RecVtx);
 		const DispatchSubTimer index_census(DispatchSub::CIndex); // KYTY_TRACE_DRAW_CENSUS
 		CommitIndexBuffer(vk_buffer, index_binding);
-		stagef_part.reset();
 	}
 
-	stagef_part.emplace(StageF::Sub::RecDyn);
 	commit_census.emplace(DispatchSub::CDyn); // KYTY_TRACE_DRAW_CENSUS
 	{
 		// The values here; their commands here or, with the record packets, on the recording thread (one packet).
@@ -2393,7 +2273,6 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	}
 	commit_census.reset();
 
-	stagef_part.reset();
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -2402,10 +2281,8 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		m_context.GetCommandScheduler().EndRendering();
 		FullMemoryBarrier(m_context.GetCommandScheduler().Current().Handle());
 	}
-	stagef_part.emplace(StageF::Sub::RecBegin);
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	BindGraphicsPipeline(buffer, vk_buffer, pipeline.pipeline);
-	stagef_part.emplace(StageF::Sub::RecIssue);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
@@ -2556,9 +2433,6 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	if (!skip_draw && buffer.IsRendering()) {
 		occlusion.BeforeDraw(buffer.Handle());
 	}
-	if (skip_draw && SceneAudit::Enabled()) {
-		SceneAudit::NoteSkipped("KYTY_DIAG_SKIP_PS_HASHES / SKIP_VS_HASHES / SKIP_DRAW_MARKERS: draw not issued");
-	}
 	const auto draw_cmd = buffer.Handle();
 	// KYTY_TRACE_GPU_TIME=1: GPU time of this draw, keyed by its vertex and pixel shaders.
 	const bool draw_label = !skip_draw && GpuTimer::LabelsEnabled();
@@ -2567,22 +2441,6 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		                     state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0ull);
 	}
 	const uint32_t gpu_time = skip_draw ? ~0u : GpuTimer::BeginCommand(draw_cmd);
-	if (CmdSignature::Enabled()) { // KYTY_TRACE_CMD_SIGNATURE: the draw command and its arguments
-		if (skip_draw) {
-			CmdSignature::FoldWords(CmdSignature::Kind::Draw, {~0ull});
-		} else if (mesh_active) {
-			CmdSignature::FoldWords(CmdSignature::Kind::DrawMesh, {mesh_groups, draw.instance_count});
-		} else if (indirect != nullptr) {
-			CmdSignature::FoldWords(CmdSignature::Kind::DrawIndirect,
-			                        {indirect->args_addr, indirect->count_addr, indirect->max_count, indirect->stride,
-			                         draw.IsIndexed() ? 1u : 0u});
-		} else {
-			CmdSignature::FoldWords(CmdSignature::Kind::Draw,
-			                        {static_cast<uint64_t>(ucfg.GetPrimType()), draw.IsIndexed() ? 1u : 0u,
-			                         draw.index_count, draw.instance_count, emit.first_vertex,
-			                         static_cast<uint32_t>(emit.vertex_offset), emit.first_instance});
-		}
-	}
 	if (skip_draw) {
 	} else if (mesh_active) {
 		draw_cmd.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
@@ -2899,7 +2757,6 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 			}
 		}
 	}
-	stagef_part.emplace(StageF::Sub::RecPost);
 	if (DebugRtCollecting()) {
 		const auto vs_hash = vertex_stages.front().stage.program->shader_hash;
 		const auto ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0ull;
@@ -3187,8 +3044,6 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	m_current_slot = NextDrawSlot();
-	const StageF::EventScope stagef_event; // KYTY_TRACE_STAGEF
-	const CmdSignature::EventScope cmd_signature_event(CmdSignature::EventKind::Draw); // KYTY_TRACE_CMD_SIGNATURE
 	if (args.index_count == 0 || args.instance_count == 0) {
 		TraceDrawDrop("zero index/instance count", buffer);
 		return true;
@@ -3272,7 +3127,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		render_state = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	}
 	if (!render_state) {
-		TraceRenderStateDrop("render state (targets/shaders)", buffer, draw, state);
+		TraceRenderStateDrop("render state (targets/shaders)", buffer, state);
 		ResetBindings();
 		return true;
 	}
@@ -3328,8 +3183,6 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	m_current_slot = NextDrawSlot();
-	const StageF::EventScope stagef_event; // KYTY_TRACE_STAGEF
-	const CmdSignature::EventScope cmd_signature_event(CmdSignature::EventKind::Draw); // KYTY_TRACE_CMD_SIGNATURE
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		TraceDrawDrop("zero vertex/instance count", buffer);
 		return true;
@@ -3378,7 +3231,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		render_state = PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
 	}
 	if (!render_state) {
-		TraceRenderStateDrop("render state (targets/shaders)", buffer, draw, state);
+		TraceRenderStateDrop("render state (targets/shaders)", buffer, state);
 		ResetBindings();
 		return true;
 	}
@@ -3543,8 +3396,6 @@ const char* RenderExecutor::DrawIndirectGpu(uint64_t submit_id, CommandBuffer& b
 
 	Common::LockGuard lock(m_context.GetMutex());
 	m_current_slot = NextDrawSlot();
-	const StageF::EventScope stagef_event; // KYTY_TRACE_STAGEF
-	const CmdSignature::EventScope cmd_signature_event(CmdSignature::EventKind::DrawIndirect); // KYTY_TRACE_CMD_SIGNATURE
 	if (ColorOperationInstead(buffer, 0, "metadata/copy/resolve operation (gpu indirect)")) {
 		return nullptr;
 	}
@@ -3594,7 +3445,7 @@ const char* RenderExecutor::DrawIndirectGpu(uint64_t submit_id, CommandBuffer& b
 		render_state = PrepareDrawRenderState(buffer, draw, 0, state);
 	}
 	if (!render_state) {
-		TraceRenderStateDrop("render state (targets/shaders, gpu indirect)", buffer, draw, state);
+		TraceRenderStateDrop("render state (targets/shaders, gpu indirect)", buffer, state);
 		ResetBindings();
 		return nullptr;
 	}

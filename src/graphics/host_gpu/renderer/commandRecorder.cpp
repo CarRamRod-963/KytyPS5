@@ -62,17 +62,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// KYTY_TRACE_RECORD_BUSY=1 (diagnostic, default off): the worker's time making calls (Replay) and how long an
-// EnqueueCall (the scheduler's submits) waited in the ring before it ran, in the RECORD_THREAD line.
-[[nodiscard]] bool RecordBusyTrace() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_TRACE_RECORD_BUSY");
-		return value != nullptr && value[0] == '1';
-	}();
-	return on;
-}
-std::atomic<uint64_t> g_busy_ns {0}, g_enqueue_lag_ns {0}, g_enqueue_lag_max_ns {0}, g_enqueue_calls {0};
-
 // Why a thread waited for the ring (counted in the RECORD_THREAD line).
 enum class Reason : uint8_t {
 	End,         // vkEndCommandBuffer on the routed buffer
@@ -289,15 +278,6 @@ private:
 		for (;;) {
 			const uint64_t available = m_write.load(std::memory_order_acquire);
 			if (position != available) {
-				if (RecordBusyTrace()) { // KYTY_TRACE_RECORD_BUSY
-					const auto start = Clock::now();
-					position         = Replay(position, available);
-					g_busy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-					                                              Clock::now() - start)
-					                                              .count()),
-					                    std::memory_order_relaxed);
-					continue;
-				}
 				position = Replay(position, available);
 				continue;
 			}
@@ -560,14 +540,6 @@ void Recorder::Report(bool is_final) {
 	             drains[6] - m_last_drains[6], drains[7] - m_last_drains[7],
 	             static_cast<double>(wait - m_last_wait) / 1000.0, wakes - m_last_wakes,
 	             m_max_ring.exchange(0, std::memory_order_relaxed), cmds);
-	if (RecordBusyTrace()) { // KYTY_TRACE_RECORD_BUSY (per interval; steady_clock ticks are ns here)
-		const uint64_t calls = g_enqueue_calls.exchange(0, std::memory_order_relaxed);
-		const uint64_t lag   = g_enqueue_lag_ns.exchange(0, std::memory_order_relaxed);
-		std::fprintf(stderr, "RECORD_BUSY s=%.1f busy_ms=%.1f enqueue_calls=%" PRIu64 " lag_avg_us=%.1f lag_max_us=%.1f\n", seconds,
-		             static_cast<double>(g_busy_ns.exchange(0, std::memory_order_relaxed)) / 1e6, calls,
-		             calls != 0 ? static_cast<double>(lag) / static_cast<double>(calls) / 1e3 : 0.0,
-		             static_cast<double>(g_enqueue_lag_max_ns.exchange(0, std::memory_order_relaxed)) / 1e3);
-	}
 	m_last_cmds   = cmds;
 	m_last_bytes  = bytes;
 	m_last_wakes  = wakes;
@@ -1612,18 +1584,7 @@ void EnqueueCall(void (*call)(const void* blob), const void* blob, size_t bytes)
 	EXIT_IF(g_recorder == nullptr || call == nullptr || bytes == 0 || bytes > UINT32_MAX);
 	Packet      packet(ArrayBytes<uint8_t>(static_cast<uint32_t>(bytes)));
 	const auto* copy = packet.Copy(static_cast<const uint8_t*>(blob), static_cast<uint32_t>(bytes));
-	if (RecordBusyTrace()) { // KYTY_TRACE_RECORD_BUSY: the time from here until the worker runs it
-		const auto queued = Clock::now().time_since_epoch().count();
-		packet.Commit([=] {
-			const auto lag = static_cast<uint64_t>(Clock::now().time_since_epoch().count() - queued);
-			g_enqueue_lag_ns.fetch_add(lag, std::memory_order_relaxed);
-			g_enqueue_calls.fetch_add(1, std::memory_order_relaxed);
-			if (lag > g_enqueue_lag_max_ns.load(std::memory_order_relaxed)) g_enqueue_lag_max_ns.store(lag, std::memory_order_relaxed);
-			call(copy);
-		});
-	} else {
-		packet.Commit([=] { call(copy); });
-	}
+	packet.Commit([=] { call(copy); });
 	g_recorder->PublishPending();
 }
 

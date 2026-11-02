@@ -130,10 +130,10 @@ public:
 		m_gpu_modified = true;
 		content_serial = NextContentSerial();
 	}
-	// KYTY_DIAG_ALIAS_SYNC: the write that produced this image's contents (monotonic over all
+	// KYTY_WORKAROUND_ALIAS_SYNC: the write that produced this image's contents (monotonic over all
 	// images), so same-address aliases of another extent can take over newer data.
 	uint64_t content_serial = 0;
-	// KYTY_DIAG_STENCIL_PLANE_SYNC: content_serial of the last shader (storage) write, not of host-side copies.
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC: content_serial of the last shader (storage) write, not of host-side copies.
 	uint64_t shader_write_serial = 0;
 	// content_serial last copied into a buffer that reads this image's memory.
 	uint64_t buffer_sync_serial = 0;
@@ -145,9 +145,9 @@ public:
 	bool     read_lifted  = false; // armed, but a page of it was opened without a serve (the next write closes it)
 	uint64_t read_address = 0;
 	uint64_t read_size    = 0;
-	// KYTY_DIAG_PRESERVE_STENCIL: the stencil was restored on the GPU; skip the guest-memory refresh.
+	// KYTY_WORKAROUND_PRESERVE_STENCIL: the stencil was restored on the GPU; skip the guest-memory refresh.
 	bool stencil_restored = false;
-	// KYTY_DIAG_PRESERVE_STENCIL: guest stencil plane currently held by this depth image's stencil aspect.
+	// KYTY_WORKAROUND_PRESERVE_STENCIL: guest stencil plane currently held by this depth image's stencil aspect.
 	uint64_t stencil_plane_address = 0;
 	static uint64_t NextContentSerial() noexcept { return ++s_content_serial; }
 	static inline uint64_t s_content_serial = 0;

@@ -1,9 +1,7 @@
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include "common/envRead.h"
-#include "common/queueTrace.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -202,7 +200,7 @@ uint32_t ThreadKind() {
 }
 
 uint64_t Rva(uint64_t address) {
-	// The executable's preferred base (as KYTY_TRACE_WAIT_CALLERS prints it).
+	// The executable's preferred base.
 	return address >= 0x140000000ull ? address - 0x140000000ull : address;
 }
 
@@ -337,11 +335,6 @@ SiteScope::~SiteScope() {
 }
 
 WaitScope::WaitScope(Site site, uint64_t tick, uint64_t current_tick, uint64_t known_tick) {
-	if (StageF::Enabled()) m_stagef = StageF::Push(StageF::Sub::Wait); // KYTY_TRACE_STAGEF
-	if (Common::QueueTrace::Enabled() && Common::QueueTrace::GpuWaitBegin()) { // KYTY_TRACE_QUEUES (GPU thread only)
-		m_queues         = true;
-		m_queue_start_ns = NowNs();
-	}
 	if (!Enabled()) return;
 	m_on       = true;
 	m_site     = site != Site::None ? site : t_site;
@@ -352,8 +345,6 @@ WaitScope::WaitScope(Site site, uint64_t tick, uint64_t current_tick, uint64_t k
 }
 
 WaitScope::~WaitScope() {
-	if (m_stagef) StageF::Pop(); // KYTY_TRACE_STAGEF
-	if (m_queues) Common::QueueTrace::GpuWaitEnd(NowNs() - m_queue_start_ns);
 	if (!m_on) return;
 	const auto     end    = NowNs();
 	const auto     ns     = end - m_start_ns;

@@ -1,6 +1,5 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/shaderEnv.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -171,19 +170,6 @@ Decoder::Operand MakeM0Operand() {
 	Decoder::Operand operand;
 	operand.kind = Decoder::OperandKind::M0;
 	return operand;
-}
-
-// KYTY_DIAG_GDS_M0_BASE=1: a DS instruction on GDS addresses M0[31:16] (base) + its address, as
-// DS_APPEND/DS_CONSUME already do; without it GDS counters land at their unbased offsets.
-static bool GdsM0BaseRequested() {
-	static const bool enabled = [] {
-		// Default from Common::EnvDefaults: hardware behaviour, not a workaround
-		// (GCN3 ISA 3.7 "M# Memory Descriptor": for GDS M0 holds {base[15:0], size[15:0]}, M0[31:16] the base; RDNA2 ISA
-		// DS_APPEND/DS_CONSUME: "M0.base ... will have the physical GDS address"); =0 turns it off.
-		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_GDS_M0_BASE");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
 }
 
 Decoder::Operand MakeImmediate(uint32_t value) {
@@ -660,8 +646,11 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	}
 }
 
+// A DS instruction on GDS addresses M0[31:16] (base) + its address, as DS_APPEND/DS_CONSUME already do (hardware
+// behaviour: GCN3 ISA 3.7 "M# Memory Descriptor": for GDS M0 holds {base[15:0], size[15:0]}, M0[31:16] the base; RDNA2
+// ISA DS_APPEND/DS_CONSUME: "M0.base ... will have the physical GDS address").
 IR::U32 Translator::DsAddress(const Decoder::Instruction& inst, IR::U32 address) {
-	if (!inst.gds || !GdsM0BaseRequested()) return address;
+	if (!inst.gds) return address;
 	const auto base = ir.ShiftRightLogical(ReadU32(MakeM0Operand()), IR::U32(IR::Value(16u)));
 	return ir.IAdd(address, base);
 }

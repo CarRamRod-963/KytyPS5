@@ -31,12 +31,6 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 // CompileSPV for the background compiles (shaderPrecompile.h): null instead of an exit when the driver refuses it.
 vk::ShaderModule TryCompileSPV(std::span<const uint32_t> code, vk::Device device);
 
-// KYTY_TRACE_VK_NAMES=1 (diagnostic): Vulkan objects get their debug names (guest address of buffers and images)
-// without the graphics debug dump, so external tools (RenderDoc) can map them to guest memory.
-inline bool VulkanNamesEnabled() {
-	static const bool on = std::getenv("KYTY_TRACE_VK_NAMES") != nullptr;
-	return on;
-}
 [[nodiscard]] constexpr bool IsHdrSwapchainFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eA2B10G10R10UnormPack32:
@@ -48,7 +42,7 @@ inline bool VulkanNamesEnabled() {
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!(Config::GraphicsDebugDumpEnabled() || VulkanNamesEnabled()) || device == nullptr || handle == nullptr ||
+	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

@@ -15,7 +15,6 @@
 #include "common/onceValue.h"
 #include "common/overlayStats.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -30,8 +29,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -203,7 +200,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	if (DccGpuClearCheckLevel() > 0 || DccGpuAllMode() != 0) {
 		m_dcc_resolver = std::make_unique<DccClearResolver>(graphics, scheduler, DccGpuAllMode() == 2);
 		if (DccGpuClearCheckLevel() > 0) {
-			std::fprintf(stderr, "DIAG_DCC_GPU_CLEAR_CHECK level=%u conditional_rendering=%s\n", DccGpuClearCheckLevel(),
+			std::fprintf(stderr, "FIX_DCC_GPU_CLEAR_CHECK level=%u conditional_rendering=%s\n", DccGpuClearCheckLevel(),
 			             m_dcc_resolver->Available() ? "yes" : "no (CPU path)");
 		}
 		if (DccGpuAllMode() != 0) {
@@ -212,7 +209,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		}
 	}
 	// The observer forgets checked slices whose keys are written again (OnDccMetaWrite): a check skipped as already
-	// done is exact only with it (KYTY_PERF_DCC_GPU_ALL needs it even with KYTY_DIAG_DCC_KNOWN_KEYS off).
+	// done is exact only with it (KYTY_PERF_DCC_GPU_ALL needs it even with KYTY_FIX_DCC_KNOWN_KEYS off).
 	// KYTY_FIX_DCC_KEY_0X10: GPU writes over a color surface after its clear-to-pixel store end that store's entry.
 	if (DccKnownKeysEnabled() || DccGpuClearCheckLevel() > 0 || DccGpuAllMode() != 0 || DccKey10FixEnabled()) {
 		m_buffer_cache.SetGpuWriteObserver([this](uint64_t address, uint64_t size) {
@@ -298,7 +295,6 @@ static bool EvictReuseTrace() {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const StageF::Zone stagef_create(StageF::Sub::Create); // KYTY_TRACE_STAGEF
 	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ImageCreate); // KYTY_TRACE_STARTUP
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id; // bindless table refresh events (the bindless layout log)
@@ -375,7 +371,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	ImageStartCount(image.info.data.address).fetch_add(1, std::memory_order_release); // common/lookupMemo.h
 	image.registered = true;
-	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // KYTY_TRACE_STAGEF
+	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // the registry epoch (drawRepeat.h)
 	{
 		const LruGuard lru_guard;
 		image.lru_id = m_lru_cache.Insert(id, m_gc_tick);
@@ -405,7 +401,6 @@ void TextureCache::UnregisterImage(ImageId id) {
 		g_unregister_reasons[why]++;
 		g_unregister_keys[key]++;
 	}
-	if (TexWin::Enabled()) TexWin::NoteImageGone(TexWin::ImageKey(id.index, id.generation), image.info.data.address);
 	if (image.bindless_pinned) {
 		image.bindless_pinned = false;
 		if (on_bindless_unregister)
@@ -441,7 +436,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		ImageStartCount(image.info.data.address).fetch_add(1, std::memory_order_release);
 		std::fprintf(stderr, "IMAGE_START_UNDERFLOW addr=0x%llx\n", static_cast<unsigned long long>(image.info.data.address));
 	}
-	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // KYTY_TRACE_STAGEF
+	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // the registry epoch (drawRepeat.h)
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -675,23 +670,7 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 
 static bool TraceImageSyncAddr(uint64_t address);
 
-bool MipTailSlicesEnabled() {
-	static constinit Common::OnceValue<bool> enabled_once;
-	const bool enabled = enabled_once.Get([] {
-		// Default from Common::EnvDefaults: hardware behaviour, not a workaround
-		// (GFX10 places the smallest levels of a slice in one tail block at offsets of their own, tile.cpp
-		// Gen5Standard4KBOffsetInBlock; a single-level T# at such an offset reads that level's bytes). The rule takes any
-		// offset in the tail; every observed view sat exactly at its level's position (+0x800/+0x600/+0x500/+0x400), so
-		// an exact-offset check is the remaining hardening, not a change of result on the game's data. =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_MIP_TAIL_SLICES");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "DIAG_MIP_TAIL_SLICES enabled\n");
-		return on;
-	});
-	return enabled;
-}
-
-// KYTY_DIAG_ALIAS_SYNC=1: logged APPROXIMATION for dynamic resolution. A guest surface used with
+// KYTY_WORKAROUND_ALIAS_SYNC=1: logged APPROXIMATION for dynamic resolution. A guest surface used with
 // several extents (or same-size formats) at one address is cached as separate images; before one
 // of them is used, the overlapping top-left region is copied from the alias written most recently.
 static bool AliasSyncEnabled() {
@@ -700,9 +679,9 @@ static bool AliasSyncEnabled() {
 		// Default from Common::EnvDefaults; workaround: D4/D5 (shared image
 		// memory), to be replaced by the proper implementation; =0 turns it off. With KYTY_FIX_IMAGE_MEMORY_OWNER on it
 		// acts only on the images that map does not keep coherent (AliasSyncSkipsImage), counted there.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_ALIAS_SYNC");
+		const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_ALIAS_SYNC");
 		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "DIAG_ALIAS_SYNC APPROXIMATION enabled\n");
+		if (on) std::fprintf(stderr, "WORKAROUND_ALIAS_SYNC APPROXIMATION enabled\n");
 		return on;
 	});
 	return enabled;
@@ -812,7 +791,7 @@ bool TextureCache::SyncExtentAliases(ImageId id) {
 	static uint32_t logged = 0;
 	if (logged < 24u) {
 		++logged;
-		std::fprintf(stderr, "DIAG_ALIAS_SYNC addr=0x%llx %ux%u %s <- %ux%u %s\n",
+		std::fprintf(stderr, "WORKAROUND_ALIAS_SYNC addr=0x%llx %ux%u %s <- %ux%u %s\n",
 		             static_cast<unsigned long long>(image.info.data.address), image.backing.extent.width,
 		             image.backing.extent.height, vk::to_string(image.backing.format).c_str(),
 		             source.backing.extent.width, source.backing.extent.height,
@@ -826,9 +805,9 @@ static bool PreserveStencilEnabled() {
 	const bool enabled = enabled_once.Get([] {
 		// Default from Common::EnvDefaults; workaround: D8 (stencil / HTILE), to
 		// be replaced by the proper implementation; =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_PRESERVE_STENCIL");
+		const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_PRESERVE_STENCIL");
 		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "DIAG_PRESERVE_STENCIL APPROXIMATION enabled\n");
+		if (on) std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL APPROXIMATION enabled\n");
 		return on;
 	});
 	return enabled;
@@ -839,7 +818,7 @@ static uint64_t StencilPlaneKey(uint64_t depth_address, uint64_t plane, uint32_t
 }
 
 // KYTY_FIX_STENCIL_PLANE_WRITES (M119, default off; =1 on, =2 on and every redirected write logged): PS5 keeps each
-// stencil plane in its own memory, the host keeps one stencil aspect per depth image (KYTY_DIAG_PRESERVE_STENCIL swaps
+// stencil plane in its own memory, the host keeps one stencil aspect per depth image (KYTY_WORKAROUND_PRESERVE_STENCIL swaps
 // planes in and out). A guest-side write to a plane - its guest bytes uploaded after a buffer or CPU write, or a fill
 // turned into a clear - used to land on the depth image's stencil aspect whatever plane it held: at Atsu's house the
 // game's fill of the interior-volume plane (0x5061360000) was uploaded over plane A (0x5004850000, the G-buffer classes
@@ -873,16 +852,16 @@ static void NoteStencilPlaneRedirect(const char* what, const Image& depth, uint6
 	}
 }
 
-// KYTY_DIAG_STENCIL_PLANE_SYNC: 1 = shader reads of a plane get its contents, 2 = also a plane written by a shader
+// KYTY_WORKAROUND_STENCIL_PLANE_SYNC: 1 = shader reads of a plane get its contents, 2 = also a plane written by a shader
 // is loaded into the depth image at swap-in.
 int TextureCache::StencilPlaneSyncLevel() {
 	static constinit Common::OnceValue<int> level_once;
 	const int level = level_once.Get([] {
 		// Default from Common::EnvDefaults; workaround: D8 (stencil / HTILE), to
 		// be replaced by the proper implementation; =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_STENCIL_PLANE_SYNC");
+		const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_STENCIL_PLANE_SYNC");
 		const int   on    = value != nullptr && value[0] >= '1' && value[0] <= '9' ? value[0] - '0' : 0;
-		if (on != 0) std::fprintf(stderr, "DIAG_STENCIL_PLANE_SYNC level %d\n", on);
+		if (on != 0) std::fprintf(stderr, "WORKAROUND_STENCIL_PLANE_SYNC level %d\n", on);
 		return on;
 	});
 	return PreserveStencilEnabled() ? level : 0;
@@ -976,7 +955,7 @@ bool TextureCache::SwapStencilPlane(Image& depth, uint64_t plane_address) {
 			m_stencil_plane_saved_serial[key(plane_address)] = newer.shader_write_serial;
 			static std::atomic_uint logged {0};
 			if (logged.fetch_add(1) < 8u) {
-				std::fprintf(stderr, "DIAG_STENCIL_PLANE_SYNC plane 0x%llx loaded from a shader-written %ux%u image\n",
+				std::fprintf(stderr, "WORKAROUND_STENCIL_PLANE_SYNC plane 0x%llx loaded from a shader-written %ux%u image\n",
 				             static_cast<unsigned long long>(plane_address), newer.backing.extent.width,
 				             newer.backing.extent.height);
 			}
@@ -993,7 +972,7 @@ bool TextureCache::SwapStencilPlane(Image& depth, uint64_t plane_address) {
 	command.pipelineBarrier2(dependency);
 	static uint32_t logged = 0;
 	if (++logged % 100u == 1u) {
-		std::fprintf(stderr, "DIAG_PRESERVE_STENCIL plane swap #%u depth=0x%llx 0x%llx -> 0x%llx\n", logged,
+		std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL plane swap #%u depth=0x%llx 0x%llx -> 0x%llx\n", logged,
 		             static_cast<unsigned long long>(depth.info.data.address),
 		             static_cast<unsigned long long>(previous), static_cast<unsigned long long>(plane_address));
 	}
@@ -1011,7 +990,7 @@ bool TextureCache::SyncStencilPlaneReader(uint64_t plane_address, ImageId reader
 	// reach guest memory). Its guest-memory state is consumed as for a GPU write; otherwise the refresh when it is
 	// bound (FindTexture) uploads the stale guest bytes over the copy: the game's reader image is created anew every
 	// frame, and a new image starts CPU-dirty. The new content serial keeps an older same-address alias of another
-	// extent from being copied over it (KYTY_DIAG_ALIAS_SYNC).
+	// extent from being copied over it (KYTY_WORKAROUND_ALIAS_SYNC).
 	const auto synced = [&]() {
 		reader->ClearBufferModified();
 		if (reader->IsCpuDirty()) reader->RefreshComplete();
@@ -1151,7 +1130,7 @@ bool TextureCache::SyncStencilPlaneReader(uint64_t plane_address, ImageId reader
 	synced();
 	static std::atomic_uint logged {0};
 	if (logged.fetch_add(1) < 8u) {
-		std::fprintf(stderr, "DIAG_STENCIL_PLANE_SYNC read of plane 0x%llx from the %s (%ux%u -> %ux%u)\n",
+		std::fprintf(stderr, "WORKAROUND_STENCIL_PLANE_SYNC read of plane 0x%llx from the %s (%ux%u -> %ux%u)\n",
 		             static_cast<unsigned long long>(plane_address), current ? "depth stencil" : "saved copy",
 		             extent.width, extent.height, reader->backing.extent.width, reader->backing.extent.height);
 	}
@@ -1217,7 +1196,7 @@ bool TextureCache::UploadStencilPlaneToSaved(Image& depth, const Image& plane, B
 	command.pipelineBarrier2(dependency);
 	command.copyBuffer(linear.buffer, saved->Handle(), static_cast<uint32_t>(rows.size()), rows.data());
 	command.pipelineBarrier2(dependency);
-	// Newer than any 1-byte image a shader wrote at the plane address before (KYTY_DIAG_STENCIL_PLANE_SYNC=2 loads
+	// Newer than any 1-byte image a shader wrote at the plane address before (KYTY_WORKAROUND_STENCIL_PLANE_SYNC=2 loads
 	// such an image at swap-in only when it is newer than the saved copy).
 	m_stencil_plane_saved_serial[key] = Image::NextContentSerial();
 	NoteStencilPlaneRedirect("upload", depth, plane.info.data.address, bytes);
@@ -1282,7 +1261,7 @@ void TextureCache::SaveStencil(Image& depth) {
 	}
 	static uint32_t saves = 0;
 	if (++saves % 50u == 1u) {
-		std::fprintf(stderr, "DIAG_PRESERVE_STENCIL save #%u 0x%llx %ux%u\n", saves,
+		std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL save #%u 0x%llx %ux%u\n", saves,
 		             static_cast<unsigned long long>(depth.info.data.address), extent.width, extent.height);
 	}
 }
@@ -1293,7 +1272,7 @@ void TextureCache::RestoreStencil(Image& depth) {
 	    m_saved_stencil_extent.height != depth.backing.extent.height) {
 		static uint32_t misses = 0;
 		if (++misses % 50u == 1u) {
-			std::fprintf(stderr, "DIAG_PRESERVE_STENCIL restore miss #%u valid=%d saved=0x%llx %ux%u want=0x%llx %ux%u\n",
+			std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL restore miss #%u valid=%d saved=0x%llx %ux%u want=0x%llx %ux%u\n",
 			             misses, m_saved_stencil_valid ? 1 : 0, static_cast<unsigned long long>(m_saved_stencil_address),
 			             m_saved_stencil_extent.width, m_saved_stencil_extent.height,
 			             static_cast<unsigned long long>(depth.info.data.address), depth.backing.extent.width,
@@ -1331,7 +1310,7 @@ void TextureCache::RestoreStencil(Image& depth) {
 	}
 	static uint32_t logged = 0;
 	if (++logged % 50u == 1u) {
-		std::fprintf(stderr, "DIAG_PRESERVE_STENCIL restored stencil of 0x%llx %ux%u\n",
+		std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL restored stencil of 0x%llx %ux%u\n",
 		             static_cast<unsigned long long>(depth.info.data.address), depth.backing.extent.width,
 		             depth.backing.extent.height);
 	}
@@ -1794,17 +1773,6 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
-// KYTY_FIX_VIEW_LAYOUT_MATCH (D4 step K2; default 0, 1 on, 2 count only): see ResolveOverlap's equal-address branch.
-static uint32_t ViewLayoutMatchMode() {
-	static constinit Common::OnceValue<uint32_t> once;
-	return once.Get([] {
-		const char*    value = std::getenv("KYTY_FIX_VIEW_LAYOUT_MATCH");
-		const uint32_t m     = value == nullptr ? 0u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
-		if (m != 0) std::fprintf(stderr, "FIX_VIEW_LAYOUT_MATCH %s\n", m == 1 ? "on" : "count");
-		return m;
-	});
-}
-
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -1926,28 +1894,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		const bool layers_missing = !requested.IsVolume() && requested.resources.layers > cached.info.resources.layers;
 		if (!layers_missing && (requested.pixel_format != cached.info.pixel_format ||
 		                        requested.data.size <= cached.info.data.size)) {
-			// A requested level whose guest bytes differ from the cached image's same level (mip chains are stored
-			// smallest level first, so a different level count moves level 0): another layout of the same memory.
-			const bool elsewhere = !merged_id && [&] {
-				for (uint32_t level = 0; level < requested.resources.levels && level < requested.mip_layout.size(); ++level) {
-					const auto&    a       = requested.mip_layout[level];
-					const auto&    b       = cached.info.mip_layout[level];
-					const uint64_t a_layer = a.size / std::max(requested.resources.layers, 1u);
-					const uint64_t b_layer = b.size / std::max(cached.info.resources.layers, 1u);
-					if (level >= cached.info.resources.levels || a.offset != b.offset || a_layer != b_layer ||
-					    a.pitch != b.pitch || a.height != b.height) {
-						return true;
-					}
-				}
-				return false;
-			}();
-			// KYTY_FIX_VIEW_LAYOUT_MATCH (D4 step K2; 0 off, 1 on, 2 count; acts only with KYTY_FIX_SHARED_IMAGE_MEMORY,
-			// which keeps separate images over one memory coherent): such a request is not the cached image's level
-			// but an image of its own (the caller creates it).
-			if (elsewhere && ViewLayoutMatchMode() != 0u) {
-				ViewLayoutMatchNote(requested, cached);
-				if (ViewLayoutMatchMode() == 1u && SharedImageMemoryMode() != 0u) return {merged_id};
-			}
 			const auto result_id = merged_id ? merged_id : cached_id;
 			const auto result    = m_slot_images.try_get(result_id);
 			return {result != nullptr && ImageViewOps::FormatsCompatible(result->info.pixel_format,
@@ -2081,7 +2027,6 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
-	const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF: detile and copy recording
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	// KYTY_FIX_STENCIL_PLANE_WRITES: the guest bytes of a stencil plane the depth image does not hold go to that
 	// plane's saved copy, not over the plane the image holds.
@@ -2177,11 +2122,6 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		// KYTY_TRACE_TEXWIN (TW5): an upload of an image in the game's streamed-texture range, its first or again.
-		if (TexWin::Enabled()) {
-			TexWin::NoteImageUpload(TexWin::ImageKey(id.index, id.generation), image.info.data.address,
-			                        image.info.data.size);
-		}
 		// KYTY_TRACE_STARTUP: guest bytes to the GPU (staging copy and detile) of every image upload.
 		const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ImageUpload, image.info.data.size);
 		const auto [source, source_offset] =
@@ -2219,9 +2159,9 @@ bool TextureCache::DccFastClearEnabled() {
 	const bool on = on_once.Get([] {
 		// Default from Common::EnvDefaults; workaround: A5 (DCC metadata, M46),
 		// to be replaced by the proper implementation; =0 turns it off.
-		const char* value   = Common::EnvOrDefault("KYTY_DIAG_DCC_FAST_CLEAR");
+		const char* value   = Common::EnvOrDefault("KYTY_WORKAROUND_DCC_FAST_CLEAR");
 		const bool  enabled = value != nullptr && value[0] == '1';
-		if (enabled) std::fprintf(stderr, "DIAG_DCC_FAST_CLEAR enabled\n");
+		if (enabled) std::fprintf(stderr, "WORKAROUND_DCC_FAST_CLEAR enabled\n");
 		return enabled;
 	});
 	return on;
@@ -2230,9 +2170,9 @@ bool TextureCache::DccFastClearEnabled() {
 bool TextureCache::DccKnownKeysEnabled() {
 	static constinit Common::OnceValue<bool> on_once;
 	const bool on = on_once.Get([] {
-		const char* value   = std::getenv("KYTY_DIAG_DCC_KNOWN_KEYS"); // default on; =0 turns it off
+		const char* value   = std::getenv("KYTY_FIX_DCC_KNOWN_KEYS"); // default on; =0 turns it off
 		const bool  enabled = (value == nullptr || value[0] == '1') && DccFastClearEnabled();
-		if (enabled) std::fprintf(stderr, "DIAG_DCC_KNOWN_KEYS enabled\n");
+		if (enabled) std::fprintf(stderr, "FIX_DCC_KNOWN_KEYS enabled\n");
 		return enabled;
 	});
 	return on;
@@ -2257,7 +2197,7 @@ void TextureCache::ApplyDccPendingWrites() {
 	}
 	// Another GPU writer (a dispatch, draw or BDA store) may have rewritten the keys: forget them.
 	// KYTY_FIX_DCC_KEY_0X10: or the color surface after its clear-to-pixel store: forget that store. (Writes are
-	// queued for the stores too, so the keys are matched only when KYTY_DIAG_DCC_KNOWN_KEYS queued them.)
+	// queued for the stores too, so the keys are matched only when KYTY_FIX_DCC_KNOWN_KEYS queued them.)
 	const bool known_keys = DccKnownKeysEnabled();
 	for (const auto& [address, size]: pending) {
 		if (known_keys) {
@@ -2296,7 +2236,7 @@ void TextureCache::RegisterDccFill(uint64_t address, uint64_t size, uint8_t key)
 	}
 	static std::atomic_uint logged {0};
 	if (logged.fetch_add(1) < 32u) {
-		std::fprintf(stderr, "DIAG_DCC_FAST_CLEAR fill frame=%u meta=0x%llx size=0x%llx key=0x%02x clear=%d\n",
+		std::fprintf(stderr, "WORKAROUND_DCC_FAST_CLEAR fill frame=%u meta=0x%llx size=0x%llx key=0x%02x clear=%d\n",
 		             DebugPresentCount().load(), static_cast<unsigned long long>(address),
 		             static_cast<unsigned long long>(size), key, clear_key ? 1 : 0);
 	}
@@ -2381,7 +2321,7 @@ void TextureCache::ApplyDccFastClear(CommandBuffer& command, ImageId id, const I
 	if (it == m_dcc_fills.end()) return;
 	if (desc.type != BindingType::Texture) {
 		// Rendering or storage writes replace the cleared contents (and their keys). With
-		// KYTY_DIAG_DCC_KNOWN_KEYS the keys were expanded to 0xFF (MaterializeColorClear) and stay known.
+		// KYTY_FIX_DCC_KNOWN_KEYS the keys were expanded to 0xFF (MaterializeColorClear) and stay known.
 		if (DccKnownKeysEnabled()) {
 			it->second.second = 0xffu;
 		} else {
@@ -2420,7 +2360,7 @@ void TextureCache::ApplyDccFastClear(CommandBuffer& command, ImageId id, const I
 	if (logged.size() < 64u &&
 	    logged.insert({metadata.range.address, (desc.info.extent.width << 16u) | desc.info.extent.height}).second) {
 		std::fprintf(stderr,
-		             "DIAG_DCC_FAST_CLEAR apply frame=%u image=0x%llx %ux%u fmt=%s meta=0x%llx key=0x%02x color=%g,%g,%g,%g\n",
+		             "WORKAROUND_DCC_FAST_CLEAR apply frame=%u image=0x%llx %ux%u fmt=%s meta=0x%llx key=0x%02x color=%g,%g,%g,%g\n",
 		             DebugPresentCount().load(), static_cast<unsigned long long>(desc.info.data.address),
 		             desc.info.extent.width, desc.info.extent.height, vk::to_string(desc.view_info.format).c_str(),
 		             static_cast<unsigned long long>(metadata.range.address), it->second.second, clear.color.float32[0],
@@ -2435,9 +2375,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		return;
 	}
 	const auto range = desc.info.metadata.range;
-	// KYTY_DIAG_DCC_FAST_CLEAR: a surface resolved for rendering or storage writes ends its
+	// KYTY_WORKAROUND_DCC_FAST_CLEAR: a surface resolved for rendering or storage writes ends its
 	// registered clear (its contents come from those writes from now on).
-	// KYTY_DIAG_DCC_KNOWN_KEYS keeps the registration: the known keys are expanded below instead.
+	// KYTY_FIX_DCC_KNOWN_KEYS keeps the registration: the known keys are expanded below instead.
 	if (DccFastClearEnabled() && !DccKnownKeysEnabled() && desc.type != BindingType::Texture &&
 	    desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 		std::scoped_lock lock {m_lock};
@@ -2494,7 +2434,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	// KYTY_DIAG_DCC_KNOWN_KEYS=1: keys a registered fill wrote (and nothing has written since) are
+	// KYTY_FIX_DCC_KNOWN_KEYS=1: keys a registered fill wrote (and nothing has written since) are
 	// known without the download. Sampled uses leave a clear key to ApplyDccFastClear; rendering and
 	// storage uses get a clear key's color cleared into the image, then the keys become 0xFF
 	// (uncompressed) on the GPU copy of the metadata and in the registration, as the CPU path below
@@ -2567,7 +2507,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (pixel) LogDccKey10Apply("known", desc, clear.color);
 			static std::atomic_uint logged {0};
 			if (logged.fetch_add(1) < 16u) {
-				std::fprintf(stderr, "DIAG_DCC_KNOWN_KEYS expand frame=%u image=0x%llx %ux%u type=%u key=0x%02x cleared=%d\n",
+				std::fprintf(stderr, "FIX_DCC_KNOWN_KEYS expand frame=%u image=0x%llx %ux%u type=%u key=0x%02x cleared=%d\n",
 				             DebugPresentCount().load(), static_cast<unsigned long long>(desc.info.data.address),
 				             desc.info.extent.width, desc.info.extent.height, static_cast<uint32_t>(desc.type), key,
 				             1);
@@ -2683,7 +2623,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 // downloads (~64 per 5 s, ~9.5 ms a frame of GPU-thread drains: the HDR target whose keys a whole-range write of the
 // Forward Pre Water pass leaves unknown, and the two video-out surfaces after the Toolkit's retile) went to 0; 3 runs
 // 20261014-2251..2257: images correct (kimono, landmarks), 6.27-6.55 fps.
-// KYTY_DIAG_DCC_GPU_CLEAR_CHECK=<level> (logged; port of BryanKAdams 8db16e32 + c41cebee): GPU-written
+// KYTY_FIX_DCC_GPU_CLEAR_CHECK=<level> (logged; port of BryanKAdams 8db16e32 + c41cebee): GPU-written
 // DCC keys of a render target or sampled texture are checked by a compute pass that writes one predicate per clear
 // code and consumes cleared slices (0xff); the candidate clears run under conditional rendering, so the CPU never
 // drains the GPU to read the keys. 1 = render targets and textures, 2 = also storage images, 3 = also video-out
@@ -2698,7 +2638,7 @@ uint32_t TextureCache::DccGpuClearCheckLevel() {
 // KYTY_PERF_DCC_GPU_ALL=1 (default off): MaterializeColorClear checks GPU-written color metadata (DCC or CMASK keys)
 // of every binding (render target, texture, storage, video out) on the GPU, in the command stream, instead of reading
 // it back (the readback submitted and waited for everything recorded so far: ~2 per frame at ~20 ms each at the
-// torii-gate scene). It extends KYTY_DIAG_DCC_GPU_CLEAR_CHECK's check to every case that check left to the CPU read:
+// torii-gate scene). It extends KYTY_FIX_DCC_GPU_CLEAR_CHECK's check to every case that check left to the CPU read:
 // any binding type, CMASK keys, more than DccClearResolver::MaxSlices slices (checked in chunks), multisampled images;
 // and a view for which no key decodes to a clear (CMASK keys of anything but a render target with a valid clear
 // register) needs no check at all. The decision is the CPU path's: a slice clears when every key byte equals its first
@@ -2726,7 +2666,7 @@ int TextureCache::DccGpuAllMode() {
 
 bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc, uint64_t slices_address,
                                             uint64_t slice_size, uint32_t image_first, uint32_t count, bool all) {
-	// reason: KYTY_DIAG_DCC_GPU_CLEAR_CHECK's fallback counter (DCC_GPU_CHECK line); cls: KYTY_PERF_DCC_GPU_ALL's class.
+	// reason: KYTY_FIX_DCC_GPU_CLEAR_CHECK's fallback counter (DCC_GPU_CHECK line); cls: KYTY_PERF_DCC_GPU_ALL's class.
 	const auto fallback = [&](uint32_t reason, DccGpuAllClass cls) {
 		if (reason < m_dcc_gpu_fallbacks.size()) m_dcc_gpu_fallbacks[reason].fetch_add(1, std::memory_order_relaxed);
 		if (all) NoteDccGpuAllFallback(desc, cls, count);
@@ -3031,7 +2971,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
-		DrawRepeat::NoteImageRegistryChange(plane.data.address, plane.data.size); // KYTY_TRACE_STAGEF
+		DrawRepeat::NoteImageRegistryChange(plane.data.address, plane.data.size); // the registry epoch (drawRepeat.h)
 	}
 
 	return association;
@@ -3084,7 +3024,6 @@ private:
 } // namespace
 
 ImageId TextureCache::ReplayImage(ImageId id) {
-	const StageF::Zone stagef_find(StageF::Sub::FindImage); // KYTY_TRACE_STAGEF
 	if (m_scheduler.Current().IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
@@ -3121,8 +3060,6 @@ ImageId TextureCache::ReplayImageLocked(ImageId id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::TextureCache); // KYTY_TRACE_QUEUES
-	const StageF::Zone                    stagef_find(StageF::Sub::FindImage); // KYTY_TRACE_STAGEF
 	g_last_find_plain = false;
 	g_full_searches++;
 	bool plain_source = false; // the image replay's hint: result from SameBacking
@@ -3314,7 +3251,6 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
-	const StageF::Zone stagef_sync(StageF::Sub::TexSync); // KYTY_TRACE_STAGEF
 	std::unique_lock lock {m_lock};
 	auto& image = m_slot_images[id];
 	TouchImage(image);
@@ -3367,7 +3303,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
-	const StageF::Zone stagef_sync(StageF::Sub::TexSync); // KYTY_TRACE_STAGEF
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
@@ -3413,34 +3348,6 @@ static uint64_t ImagePageEpochAt(uint64_t address) {
 	    .load(std::memory_order_relaxed);
 }
 
-// KYTY_TRACE_TABLE_CENSUS (TABLE-MODE-DESIGN.md Step 0): the per-use proof a stage image set would run for one sampled
-// image, without side effects: 0 proven; 1 gone (id or generation), 2 not registered, 3 needs rebind, 4 depth or stencil,
-// 5 CPU-dirty / tracking (RefreshImage would act), 6 alias sync not proven, 7 alias-memory list set.
-uint32_t TextureCache::TableProofDry(ImageId id) {
-	std::scoped_lock lock {m_lock};
-	const auto*      image = m_slot_images.try_get(id);
-	if (image == nullptr) return 1u;
-	if (image->info.data.Empty()) return 0u; // a null image
-	if (!image->registered) return 2u;
-	if (image->binding.needs_rebind) return 3u;
-	if (image->depth_id || image->info.IsDepth() || image->info.HasStencil()) return 4u;
-	if (ImageMemoryOwnerMode() != 0u && // KYTY_FIX_IMAGE_MEMORY_OWNER: a pull pending or possible (TextureReplayReady)
-	    (image->owner_stale || (ImageMemoryOwners::Followed(*image) && !ImageMemoryOwners::KnownAlone(*image)))) {
-		return 6u;
-	}
-	if (image->track_addr != image->info.data.address || image->track_addr_end != image->info.data.End() ||
-	    image->IsMaybeCpuDirty() || image->IsBufferModified() || image->IsDefinitelyCpuDirty()) {
-		return 5u;
-	}
-	if (SharedImageMemoryMode() != 0u) { // KYTY_FIX_SHARED_IMAGE_MEMORY
-		if (SharedImagePlain(*image) && !SharedImageAlone(*image)) return 6u;
-	} else if (AliasSyncEnabled() && !AliasSyncSkipsImage(*image) &&
-	           image->alias_free_epoch != 1u + ImagePageEpochAt(image->info.data.address)) {
-		return 6u;
-	}
-	return 0u;
-}
-
 // The table sets (pipeline\descriptors.cpp): FindImage's work for a stage set's sampled images, all or none
 // under one lock: every image still exists with its generation and is registered without a pending rebind (a null
 // image: exists); then the LRU touch and access tick of each (null images: nothing, as FindImage).
@@ -3475,7 +3382,6 @@ bool TextureCache::TableTexturesReady(std::span<const ImageId> ids) {
 }
 
 bool TextureCache::ReplayTableSlotLocked(ImageId id) {
-	const StageF::Zone stagef_find(StageF::Sub::FindImage); // KYTY_TRACE_STAGEF (as ReplayImage)
 	if (m_scheduler.Current().IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
@@ -3532,8 +3438,7 @@ vk::ImageView TextureCache::FindTextureReplay(ImageId id, const ImageDesc& desc)
 	}
 	vk::ImageView fast_view = nullptr;
 	{
-		const StageF::Zone  stagef_sync(StageF::Sub::TexSync); // KYTY_TRACE_STAGEF
-		const TcReadSection lock {m_lock};                     // the LRU touch and the view (lock-free readers check neither)
+		const TcReadSection lock {m_lock}; // the LRU touch and the view (lock-free readers check neither)
 		auto*               image = m_slot_images.try_get(id);
 		const bool          ready = image != nullptr && !image->info.data.Empty() && TextureReplayReady(*image);
 		if (ready) {
@@ -3561,7 +3466,6 @@ vk::ImageView TextureCache::FindTextureReplay(ImageId id, const ImageDesc& desc)
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
-	const StageF::Zone stagef_sync(StageF::Sub::TexSync); // KYTY_TRACE_STAGEF
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
@@ -4433,7 +4337,6 @@ static bool TraceImageSyncAddr(uint64_t address) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::TextureCache); // KYTY_TRACE_QUEUES
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -4759,10 +4662,6 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
-		}
-		// KYTY_TRACE_TEXWIN (TW4): the images an unmap frees.
-		if (TexWin::Enabled() && owner->registered) {
-			TexWin::NoteUnmapFree(owner->info.data.address, owner->AccountedSize());
 		}
 		FreeImage(id);
 	}

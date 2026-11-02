@@ -110,10 +110,6 @@ private:
 	uint64_t m_current  = 0;
 	uint64_t m_known    = 0;
 	int64_t  m_start_ns = 0;
-	// KYTY_TRACE_QUEUES: the GPU thread's wait, charged to the queue it works for (queueTrace.h).
-	bool    m_queues         = false;
-	int64_t m_queue_start_ns = 0;
-	bool    m_stagef         = false; // KYTY_TRACE_STAGEF: a Wait zone of the GPU thread
 };
 
 // A reader request as sent by the requesting thread (BufferCache::ReadMemory); zero when the trace is off.

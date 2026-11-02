@@ -17,7 +17,6 @@
 #include "common/onceValue.h"
 #include "common/overlayStats.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -30,8 +29,6 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stageFLookup.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -102,7 +99,7 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 // KYTY_STAGING_BUFFER_MB / KYTY_STREAM_BUFFER_MB: sizes of the upload and stream rings (MiB). A ring
-// the work of a frame does not fit in waits for the GPU to release space (KYTY_TRACE_STREAM_WAITS).
+// the work of a frame does not fit in waits for the GPU to release space.
 uint64_t RingSize(const char* name, uint64_t fallback) {
 	const char* value = std::getenv(name);
 	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
@@ -356,7 +353,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 				m_page_table[page] = {};
 			}
 		}
-		// KYTY_TRACE_STAGEF, the resolve thread's lookups (under the guard: the resolve thread reads it there)
+		// The resolve thread's lookups (under the guard: the resolve thread reads it there)
 		DrawRepeat::NoteBufferRegistryChange();
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
@@ -1390,7 +1387,6 @@ void BufferCache::NoteSyncTimelineNeed(uint64_t vaddr, uint64_t size) {
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
-	const StageF::Zone stagef_find(StageF::Sub::FindBuffer); // KYTY_TRACE_STAGEF
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -1863,7 +1859,6 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	const StageF::Zone stagef_create(StageF::Sub::Create); // KYTY_TRACE_STAGEF
 	// The upload batch: claimed uploads hold buffer pointers (the slot storage may move) and a joined buffer copies
 	// its overlaps' contents, which must include them.
 	CommitUploadBatch(BatchCommit::CreateBuffer);
@@ -2112,7 +2107,6 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 // the image contents first. Compute shaders that copy images through raw buffers (Ghost of Yotei: CS 4337635433d63234
 // copies the sky LUTs written as images by 95c013c75f8e77ad) otherwise read stale guest bytes.
 bool BufferCache::SyncBufferFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size, bool* found_image) {
-	const StageF::Zone stagef_bufimgsync(StageF::Sub::EvBufImgSync); // M26
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (found_image != nullptr) *found_image = static_cast<bool>(selected);
 	if (!selected) {
@@ -2276,7 +2270,6 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 				updated += m_memory_tracker.CommitDeferredProtections(batch.regions);
 				protected_now = true;
 			} else {
-				const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF
 				if (UploadClobberCheck()) m_c0_staged.clear(); // KYTY_D6_C0=2/3: the staged bytes are kept
 				for (auto& copy: copies) {
 					const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -2358,7 +2351,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (!m_append_windows.empty()) { // D4b step 1 (append windows)
 		for (const auto& copy: copies) AppendNoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
-	const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -2612,9 +2604,6 @@ void BufferCache::PrefetchObtainMemo(uint64_t vaddr, uint64_t size, bool is_writ
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool image_source) {
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::BufferCache); // KYTY_TRACE_QUEUES
-	const StageF::Zone                    stagef_obtain(StageF::Sub::Obtain); // KYTY_TRACE_STAGEF
-	std::optional<StageF::Zone>           stagef_obtain_pre(std::in_place, StageF::Sub::ObtPre); // M28 measurement
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -2678,7 +2667,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (cpu_modified) {
 			const auto alignment = std::max<uint64_t>(
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-			const StageF::Zone stagef_staging(StageF::Sub::Staging); // KYTY_TRACE_STAGEF: a per-use stream copy
 			auto [mapped, offset] = Stream().Map(size, alignment, false);
 			if (mapped != nullptr) {
 				LibKernel::Memory::ReadGuestPlain(mapped, vaddr, size);
@@ -2689,14 +2677,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		found_clean = !cpu_modified;
 	}
 
-	stagef_obtain_pre.reset();
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	uint64_t   memo_uploaded  = 0; // the obtain memo
-	std::optional<StageF::Zone> stagef_obtain_sync(std::in_place, StageF::Sub::ObtSync); // M28 measurement
 	if (found_clean) {
 		// Nothing to upload; SynchronizeBuffer's remaining work for a read.
 		if (is_texel_buffer) {
@@ -2707,7 +2693,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, memo_on ? &memo_uploaded : nullptr,
 		                        UploadCaller::Obtain);
 	}
-	stagef_obtain_sync.reset();
 	bool image_over = false; // the obtain memo
 	bool image_sync = false;
 	if (!is_written && !is_texel_buffer && !image_source &&
@@ -2719,7 +2704,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (is_written) {
-		const StageF::Zone stagef_obtain_write(StageF::Sub::ObtWrite); // M28 measurement
 		NoteObtainedWrite(vaddr, size);
 	}
 	// The write memo: kept with the epochs read before the full path, in the command buffer it was noted for.
@@ -2759,23 +2743,17 @@ void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	{
-		const StageF::Zone stagef_w(StageF::Sub::ObtWDirty); // M28 measurement
 		const DispatchSubTimer dirty_timer(DispatchSub::OwDirtyAdd); // KYTY_TRACE_DISPATCH_CENSUS
 		GpuDirtyAdd(vaddr, size);
 	}
 	std::optional<DispatchSubTimer> observer_timer(std::in_place, DispatchSub::OwObserver); // KYTY_TRACE_DISPATCH_CENSUS
-	std::optional<StageF::Zone> stagef_obs; // M28 measurement
 	{ // The per-range write ticks (DropDeadRingBytes, the readback queue, KYTY_TRACE_SYNC_TIMELINE).
-		const StageF::Zone stagef_t(StageF::Sub::ObtWTick); // M28 measurement
 		NoteWriteTick(vaddr, vaddr + size, m_scheduler.CurrentTick());
 	}
-	stagef_obs.emplace(StageF::Sub::ObtWObs);
 	if (m_gpu_write_observer) m_gpu_write_observer(vaddr, size);
 	BumpHotGeneration(vaddr, size);
-	stagef_obs.reset();
 	observer_timer.reset();
 	{
-		const StageF::Zone stagef_t(StageF::Sub::ObtWGran); // M28 measurement
 		const DispatchSubTimer tick_timer(DispatchSub::OwWriteTick); // KYTY_TRACE_DISPATCH_CENSUS
 		NoteGpuWriteTick(vaddr, size);
 	}
@@ -2828,16 +2806,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
-			// KYTY_TRACE_TEXWIN (TW2): the upload source.
-			if (TexWin::Enabled()) TexWin::NoteUploadSource(TexWin::UploadSource::Buffer, vaddr, size);
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false, nullptr, UploadCaller::Image);
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
 	if (IsRegionGpuModified(vaddr, size)) {
-		// KYTY_TRACE_TEXWIN (TW2): the upload source.
-		if (TexWin::Enabled()) TexWin::NoteUploadSource(TexWin::UploadSource::GpuModified, vaddr, size);
 		return ObtainBuffer(vaddr, size, false, false, {}, true);
 	}
 
@@ -2858,8 +2832,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
-	// KYTY_TRACE_TEXWIN (TW2): the upload source (TryReadSparseBacking counts its zero-filled bytes itself).
-	if (TexWin::Enabled()) TexWin::NoteUploadSource(TexWin::UploadSource::Staging, vaddr, size);
 	if (temporary != nullptr) {
 		temporary->Flush(0, size);
 		auto* buffer = temporary.get();
@@ -3015,14 +2987,6 @@ uint32_t BufferCache::D6C0Mode() {
 		}
 		return mode;
 	});
-}
-
-std::pair<Buffer*, uint64_t> BufferCache::FindCachedBuffer(uint64_t vaddr, uint64_t size) {
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (owner == nullptr || !*owner) return {nullptr, 0};
-	auto& buffer = m_slot_buffers[*owner];
-	if (!buffer.IsInBounds(vaddr, size)) return {nullptr, 0};
-	return {&buffer, buffer.Offset(vaddr)};
 }
 
 bool BufferCache::RecordKeyedVerifyEnabled() {

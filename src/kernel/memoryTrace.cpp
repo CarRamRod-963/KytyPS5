@@ -1,7 +1,6 @@
 #include "kernel/memoryTrace.h"
 
 #include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -16,44 +15,6 @@
 
 // The logs of the resource walker's reads (memory.cpp calls them behind one test each; off unless their names are set).
 namespace Libs::LibKernel::Memory {
-
-void TraceSrtRead(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_t size) {
-	struct Entry {
-		uint64_t reads    = 0;
-		uint64_t page_mod = 0;
-		uint64_t dirty    = 0;
-	};
-	static std::map<std::pair<uint64_t, uint64_t>, Entry> entries;
-	static Entry                                          total;
-	static uint64_t                                       reported = 0;
-	total.reads++;
-	// Reads of pages the GPU did not modify are only counted (the walker reads ~10^8 times per minute).
-	if (!buffers.IsRegionGpuModified(vaddr, size)) {
-		return;
-	}
-	const bool dirty = buffers.HasGpuDirtyBytes(vaddr, size);
-	auto&      entry = entries[{Graphics::PerfMaterializeHash(), vaddr & ~uint64_t {0xfff}}];
-	for (auto* e: {&entry, &total}) {
-		if (e != &total) e->reads++;
-		e->page_mod++;
-		e->dirty += dirty ? 1u : 0u;
-	}
-	if (total.page_mod - reported < 8192u) {
-		return;
-	}
-	reported = total.page_mod;
-	std::vector<std::pair<std::pair<uint64_t, uint64_t>, Entry>> top(entries.begin(), entries.end());
-	std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.page_mod > b.second.page_mod; });
-	std::fprintf(stderr, "SRT_READS total=%llu page_mod=%llu dirty=%llu", static_cast<unsigned long long>(total.reads),
-	             static_cast<unsigned long long>(total.page_mod), static_cast<unsigned long long>(total.dirty));
-	for (size_t i = 0; i < top.size() && i < 16u; i++) {
-		std::fprintf(stderr, " [%016llx 0x%llx n=%llu mod=%llu dirty=%llu]", static_cast<unsigned long long>(top[i].first.first),
-		             static_cast<unsigned long long>(top[i].first.second), static_cast<unsigned long long>(top[i].second.reads),
-		             static_cast<unsigned long long>(top[i].second.page_mod),
-		             static_cast<unsigned long long>(top[i].second.dirty));
-	}
-	std::fprintf(stderr, "\n");
-}
 
 // KYTY_TRACE_SRT_CLASSES (diagnostic, default off): the GPU thread's SRT reads, their waits for GPU writes and the
 // Adopt work by what the word is for (shader-only or needed by the CPU) and by address region; one SRT_CLASSES line

@@ -34,7 +34,6 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 #endif
-#include <unordered_set>
 #include <cstring>
 #include <cstdio>
 #include <chrono>
@@ -54,84 +53,6 @@
 namespace Libs::Graphics {
 
 static void TraceFrameTime(uint32_t frame); // KYTY_TRACE_FRAMETIME, defined below
-
-// KYTY_TRACE_MEM_DUMP=<hex address>:<hex size>[:<depth>][,...] with KYTY_TRACE_MEM_DUMP_FRAME=<n>[,<n>...]:
-// at those presented frames the guest memory ranges are written as hex qwords to
-// <KYTY_TRACE_FRAME_DIR>/memdump_<frame>.txt, following qwords that point to readable guest memory
-// (0x200 bytes each) up to <depth> levels. Diagnostic only (game data structures).
-// Guest backing first; memory outside the backing store (executable data) is read directly when
-// the host reports it committed and readable.
-static bool DebugReadGuest(uint64_t addr, void* out, uint64_t size) {
-	if (Libs::LibKernel::Memory::TryReadBacking(addr, out, size)) return true;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	MEMORY_BASIC_INFORMATION info {};
-	if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
-	    (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) == 0 ||
-	    (info.Protect & PAGE_GUARD) != 0 ||
-	    addr + size > reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize) {
-		return false;
-	}
-	std::memcpy(out, reinterpret_cast<const void*>(addr), size);
-	return true;
-#else
-	return false;
-#endif
-}
-
-static void DebugGuestMemoryDump(uint32_t frame) {
-	static const std::string frames = [] {
-		const char* value = std::getenv("KYTY_TRACE_MEM_DUMP_FRAME");
-		return value != nullptr ? "," + std::string(value) + "," : std::string();
-	}();
-	if (frames.empty() || frames.find("," + std::to_string(frame) + ",") == std::string::npos) return;
-	const char* spec = std::getenv("KYTY_TRACE_MEM_DUMP");
-	const char* dir  = Common::EnvRead::FrameDir();
-	if (spec == nullptr || dir == nullptr) return;
-	struct Block {
-		uint64_t addr;
-		uint64_t size;
-		int      depth;
-		uint64_t parent;
-	};
-	std::vector<Block> queue;
-	for (const char* p = spec; p != nullptr && *p != 0;) {
-		char*      end  = nullptr;
-		const auto addr = std::strtoull(p, &end, 16);
-		uint64_t   size = 0x200;
-		int        depth = 0;
-		if (end != nullptr && *end == ':') size = std::strtoull(end + 1, &end, 16);
-		if (end != nullptr && *end == ':') depth = static_cast<int>(std::strtol(end + 1, &end, 10));
-		queue.push_back({addr, size, depth, 0});
-		p = (end != nullptr && *end == ',') ? end + 1 : nullptr;
-	}
-	const std::string path = std::string(dir) + "/memdump_" + std::to_string(frame) + ".txt";
-	FILE*             file = std::fopen(path.c_str(), "w");
-	if (file == nullptr) return;
-	std::unordered_set<uint64_t> visited;
-	for (size_t i = 0; i < queue.size() && i < 4000u; i++) {
-		const auto block = queue[i];
-		if (!visited.insert(block.addr).second) continue;
-		std::vector<uint64_t> words(static_cast<size_t>((block.size + 7u) / 8u));
-		if (!DebugReadGuest(block.addr, words.data(), words.size() * 8u)) {
-			std::fprintf(file, "BLOCK 0x%llx unreadable\n", static_cast<unsigned long long>(block.addr));
-			continue;
-		}
-		std::fprintf(file, "BLOCK 0x%llx size=0x%llx depth=%d parent=0x%llx\n", static_cast<unsigned long long>(block.addr),
-		             static_cast<unsigned long long>(block.size), block.depth, static_cast<unsigned long long>(block.parent));
-		for (size_t w = 0; w < words.size(); w++) {
-			if (w % 4u == 0) std::fprintf(file, "  +%03zx:", w * 8u);
-			std::fprintf(file, " %016llx", static_cast<unsigned long long>(words[w]));
-			if (w % 4u == 3u || w + 1u == words.size()) std::fprintf(file, "\n");
-			const uint64_t q = words[w];
-			uint64_t       probe = 0;
-			if (block.depth > 0 && q >= 0x100000000ull && q < 0x8000000000ull && (q & 7u) == 0 &&
-			    DebugReadGuest(q, &probe, sizeof(probe)))
-				queue.push_back({q, 0x200, block.depth - 1, block.addr + w * 8u});
-		}
-	}
-	std::fclose(file);
-	std::fprintf(stderr, "MEM_DUMP frame=%u blocks=%zu -> %s\n", frame, visited.size(), path.c_str());
-}
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -913,7 +834,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
 	const bool blit_source     = source != nullptr && !convert_source;
 	// The overlays bind their own graphics pipelines and set their own dynamic state
-	// (KYTY_DIAG_DRAW_STATE_FILTER).
+	// (KYTY_FIX_DRAW_STATE_FILTER).
 	command.InvalidateGraphicsState();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
@@ -1117,16 +1038,6 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	TraceFrameTime(DebugPresentCount().fetch_add(1) + 1);
 	SyncTimeline::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_SYNC_TIMELINE
 	Common::StartupTrace::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_STARTUP
-	DebugGuestMemoryDump(DebugPresentCount().load());
-	// KYTY_TRACE_RENDERDOC_FRAME=<n> (with --rd and RenderDoc's Vulkan layer loaded): requests the RenderDoc
-	// capture that the F1 key requests, at presented frame n.
-	if (static const uint32_t rd_frame = [] {
-		    const char* value = std::getenv("KYTY_TRACE_RENDERDOC_FRAME");
-		    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
-	    }();
-	    rd_frame != 0 && DebugPresentCount().load() == rd_frame) {
-		RenderDocRequestCapture();
-	}
 	if (DebugRtEnabled()) {
 		// Same numbering as the window title (blank frames included, first frame = 1).
 		const auto      n            = DebugPresentCount().load();
@@ -1245,35 +1156,6 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			if (const char* dir = Common::EnvRead::FrameDir(); dir != nullptr) {
 				DebugQueueFullDump(graphics, buffer.Handle(), image,
 				                   std::string(dir) + "/frame" + std::to_string(n));
-			}
-			// KYTY_TRACE_SAMPLE_ADDRS: further guest image addresses (hex, comma separated).
-			if (const char* list = std::getenv("KYTY_TRACE_SAMPLE_ADDRS"); list != nullptr) {
-				std::string text(list);
-				size_t      start = 0;
-				while (start < text.size()) {
-					const auto end     = text.find(',', start);
-					const auto token   = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-					const auto address = std::strtoull(token.c_str(), nullptr, 16);
-					m_impl->renderer.GetTextureCache().DebugDescribeRegion(token.c_str(), address, 1);
-					const auto images = m_impl->renderer.GetTextureCache().DebugImagesAt(address);
-					for (size_t k = 0; k < images.size(); ++k) {
-						DebugQueueSample(graphics, buffer.Handle(), *images[k],
-						                 "frame" + std::to_string(n) + " " + token + "#" + std::to_string(k) +
-						                     (images[k]->IsGpuModified() ? " gpu" : " cpu"));
-						// The first listed address is dumped whole, every alias; others when at most 64 MiB.
-						const char* dir = Common::EnvRead::FrameDir();
-						if (dir != nullptr && (start == 0 || images[k]->info.data.size <= (64ull << 20u))) {
-							DebugQueueFullDump(graphics, buffer.Handle(), *images[k],
-							                   std::string(dir) + "/frame" + std::to_string(n) + "_" + token +
-							                       "_alias" + std::to_string(k));
-						}
-					}
-					if (images.empty()) {
-						std::fprintf(stderr, "SAMPLE %s not cached\n", token.c_str());
-					}
-					if (end == std::string::npos) break;
-					start = end + 1;
-				}
 			}
 		}
 	}

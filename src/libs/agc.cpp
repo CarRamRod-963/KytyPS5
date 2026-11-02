@@ -20,13 +20,11 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
-#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "loader/runtimeLinker.h"
 
 #include <algorithm>
 #include <array>
@@ -35,8 +33,6 @@
 #include <cstddef>
 #include <cstring>
 #include <mutex>
-#include <set>
-#include <unordered_map>
 #include <vector>
 
 #ifdef min
@@ -2494,107 +2490,8 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[2] = tag;
 }
 
-// KYTY_TRACE_DRAW_CALLERS=<text>[|<text>...] (diagnostic): the debug marker path of each command buffer is tracked as the
-// guest records it (push/pop from guest code), and draws recorded while that path contains one of the texts log, once
-// per caller, the path, the draw kind and the guest call chain (stack scan) as <module>+<offset>.
-static const std::vector<std::string>& DrawCallerFilters() {
-	static const std::vector<std::string> filters = [] {
-		std::vector<std::string> list;
-		const char*              value = std::getenv("KYTY_TRACE_DRAW_CALLERS");
-		if (value == nullptr) return list;
-		std::string text(value);
-		size_t      start = 0;
-		while (start <= text.size()) {
-			const auto end  = text.find('|', start);
-			auto       item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-			if (!item.empty()) list.push_back(item);
-			if (end == std::string::npos) break;
-			start = end + 1;
-		}
-		return list;
-	}();
-	return filters;
-}
-
-static std::mutex& RecordMarkerMutex() {
-	static std::mutex mutex;
-	return mutex;
-}
-
-static std::unordered_map<const void*, std::vector<std::string>>& RecordMarkers() {
-	static std::unordered_map<const void*, std::vector<std::string>> markers;
-	return markers;
-}
-
-static bool IsGuestCode(uint64_t address) {
-	return Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(address) != nullptr;
-}
-
-static std::string GuestCallChain(uint64_t ret, uint64_t frame) {
-	auto*      linker   = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	const auto describe = [&](uint64_t value) -> std::string {
-		auto* program = linker->FindProgramByAddr(value);
-		if (program == nullptr) return {};
-		return fmt::format("{}+0x{:x}", Common::PathToString(program->file_name.filename()), value - program->base_vaddr);
-	};
-	std::string chain = describe(ret);
-	for (uint32_t i = 0; i < 256u; i++) {
-		const auto addr = frame + uint64_t {i} * 8u;
-		if (!Graphics::HostMemoryIsReadable(addr)) break;
-		const auto value = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
-		const auto text  = describe(value);
-		if (!text.empty()) chain += fmt::format(" [{}]{}", i, text);
-	}
-	return chain;
-}
-
-static void RecordMarkerPush(const void* buf, const char* str, uint64_t ret) {
-	if (DrawCallerFilters().empty() || buf == nullptr || !IsGuestCode(ret)) return;
-	std::scoped_lock lock(RecordMarkerMutex());
-	RecordMarkers()[buf].emplace_back(str != nullptr ? str : "");
-}
-
-static void RecordMarkerPop(const void* buf, uint64_t ret) {
-	if (DrawCallerFilters().empty() || buf == nullptr || !IsGuestCode(ret)) return;
-	std::scoped_lock lock(RecordMarkerMutex());
-	auto& stack = RecordMarkers()[buf];
-	if (!stack.empty()) stack.pop_back();
-}
-
-static void TraceDrawCaller(const void* buf, const char* kind, uint64_t ret, uint64_t frame) {
-	const auto& filters = DrawCallerFilters();
-	if (filters.empty() || buf == nullptr) return;
-	std::string path;
-	{
-		std::scoped_lock lock(RecordMarkerMutex());
-		const auto       it = RecordMarkers().find(buf);
-		if (it == RecordMarkers().end()) return;
-		for (const auto& marker: it->second) {
-			if (!path.empty()) path += '>';
-			path += marker;
-		}
-	}
-	if (std::none_of(filters.begin(), filters.end(),
-	                 [&](const std::string& f) { return path.find(f) != std::string::npos; })) {
-		return;
-	}
-	static std::mutex         mutex;
-	static std::set<uint64_t> seen;
-	{
-		std::scoped_lock lock(mutex);
-		if (seen.size() >= 64u || !seen.insert(ret).second) return;
-	}
-	std::fprintf(stderr, "DRAW_CALLER marker=[%s] kind=%s ret=%s\n", path.c_str(), kind,
-	             GuestCallChain(ret, frame).c_str());
-}
-
-#define KYTY_TRACE_DRAW_CALLER(kind)                                                                                   \
-	TraceDrawCaller(buf, kind, reinterpret_cast<uint64_t>(__builtin_return_address(0)),                                 \
-	                reinterpret_cast<uint64_t>(__builtin_frame_address(0)))
-
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
                                         const volatile void* index_addr, uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndex");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
@@ -2632,7 +2529,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
                                                       const volatile void* index_addr,
                                                       const volatile void* object_ids,
                                                       uint32_t instance_count, uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndexMultiInstanced");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
@@ -2707,7 +2603,6 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
                                             uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndexAuto");
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
@@ -2735,7 +2630,6 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
                                               uint32_t index_count, uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndexOffset");
 	PRINT_NAME();
 
 	AgcTrace("\t index_offset = 0x%" PRIx32 "\n"
@@ -2790,7 +2684,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndexIndirect");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
@@ -2818,7 +2711,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndirect");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
@@ -2848,7 +2740,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
                                                 uint32_t             max_count_or_count,
                                                 const volatile void* count_addr,
                                                 uint32_t stride_in_bytes, uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndirectMulti");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
@@ -2910,7 +2801,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
                                                      uint32_t             max_count_or_count,
                                                      const volatile void* count_addr,
                                                      uint32_t stride_in_bytes, uint64_t modifier) {
-	KYTY_TRACE_DRAW_CALLER("DrawIndexIndirectMulti");
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
@@ -4063,59 +3953,7 @@ uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	}
 }
 
-// KYTY_TRACE_MARKER_CALLERS=<text>[|<text>...] (diagnostic): a debug marker whose text contains one of the texts logs,
-// once per (marker, caller), the guest return address and the code addresses found on the caller's stack (a
-// stack-scan backtrace, so some entries are stale) as <module>+<offset>, to find the game code that issues a pass.
-static void TraceMarkerCaller(const char* str, uint64_t ret, uint64_t frame) {
-	static const std::vector<std::string> filters = [] {
-		std::vector<std::string> list;
-		const char*              value = std::getenv("KYTY_TRACE_MARKER_CALLERS");
-		if (value == nullptr) return list;
-		std::string text(value);
-		size_t      start = 0;
-		while (start <= text.size()) {
-			const auto end  = text.find('|', start);
-			auto       item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-			if (!item.empty()) list.push_back(item);
-			if (end == std::string::npos) break;
-			start = end + 1;
-		}
-		return list;
-	}();
-	if (filters.empty() || str == nullptr) return;
-	auto* linker = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	if (linker->FindProgramByAddr(ret) == nullptr) return;
-	const std::string marker(str);
-	if (std::none_of(filters.begin(), filters.end(),
-	                 [&](const std::string& f) { return marker.find(f) != std::string::npos; })) {
-		return;
-	}
-	static std::mutex                                 mutex;
-	static std::set<std::pair<std::string, uint64_t>> seen;
-	{
-		std::scoped_lock lock(mutex);
-		if (seen.size() >= 64u || !seen.insert({marker, ret}).second) return;
-	}
-	const auto describe = [&](uint64_t value) -> std::string {
-		auto* program = linker->FindProgramByAddr(value);
-		if (program == nullptr) return {};
-		return fmt::format("{}+0x{:x}", Common::PathToString(program->file_name.filename()), value - program->base_vaddr);
-	};
-	std::string chain = describe(ret);
-	for (uint32_t i = 0; i < 256u; i++) {
-		const auto addr = frame + uint64_t {i} * 8u;
-		if (!Graphics::HostMemoryIsReadable(addr)) break;
-		const auto value = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
-		const auto text  = describe(value);
-		if (!text.empty()) chain += fmt::format(" [{}]{}", i, text);
-	}
-	std::fprintf(stderr, "MARKER_CALLER marker=[%s] ret=%s\n", str, chain.c_str());
-}
-
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t /*color*/) {
-	RecordMarkerPush(buf, str, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -4141,26 +3979,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, ui
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbPushMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbSetMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	RecordMarkerPush(buf, str, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-	TraceMarkerCaller(str, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	                  reinterpret_cast<uint64_t>(__builtin_frame_address(0)));
 	return AgcDcbPushMarker(buf, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
-	RecordMarkerPop(buf, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -4178,7 +4008,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
-	RecordMarkerPop(buf, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	return AgcDcbPopMarker(buf);
 }
 

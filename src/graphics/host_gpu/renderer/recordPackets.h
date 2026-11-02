@@ -24,7 +24,7 @@
 //  - a draw's dynamic state (viewports, scissors, depth/stencil, blend constants, color write enables, feedback loop) and
 //    its graphics pipeline bind: the GPU thread computes the values from the draw's registers as before, the packet
 //    carries them, and the recording thread decides with its own copy of what the command buffer holds
-//    (KYTY_DIAG_DRAW_STATE_FILTER's GraphicsState rules) which commands to make, at the same place of the stream.
+//    (KYTY_FIX_DRAW_STATE_FILTER's GraphicsState rules) which commands to make, at the same place of the stream.
 // Lifetimes: everything a packet names is copied into it by value, or is a Vulkan object that lives until the GPU
 // finished the tick of its use (image views, samplers, buffers, pipelines, templates, set layouts: the existing tick and
 // drain rules; a queued descriptor write is in the ring before the submission of the tick its image could be freed after).

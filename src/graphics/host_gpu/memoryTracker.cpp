@@ -84,7 +84,6 @@ RangeSet MemoryTracker::TakeBdaSync() {
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkQuery, vaddr, size); // KYTY_TRACE_STAGEF
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (!manager->MaybeModified<DirtySource::Cpu>()) {
 			return false;
@@ -96,7 +95,6 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkQuery, vaddr, size); // KYTY_TRACE_STAGEF
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (!manager->MaybeModified<DirtySource::Gpu>()) {
 			return false;
@@ -108,7 +106,6 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
@@ -117,7 +114,6 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
@@ -129,7 +125,6 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
@@ -141,8 +136,7 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool MemoryTracker::ReleaseGpuToCpu(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
-	bool               merged = true;
+	bool merged = true;
 	// As MarkRegionAsCpuModified: a missing region is created (UnmarkRegionAsGpuModified would skip it; it holds no
 	// GPU-modified page, so its unmark changes nothing).
 	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -160,7 +154,6 @@ bool MemoryTracker::ReleaseGpuToCpu(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	NoteGpuCleanRange(vaddr, size); // the write memo
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);
@@ -188,7 +181,6 @@ uint32_t MemoryTracker::CommitDeferredProtections(std::vector<RegionManager*>& p
 	if (pending.empty()) {
 		return 0;
 	}
-	const StageF::Zone stagef_tracker(StageF::Sub::TrkMark); // KYTY_TRACE_STAGEF
 	std::sort(pending.begin(), pending.end(),
 	          [](const RegionManager* a, const RegionManager* b) { return a->GetCpuAddr() < b->GetCpuAddr(); });
 	uint32_t updated = 0;

@@ -12,7 +12,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/refCapture.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/sceneAudit.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
@@ -298,92 +297,6 @@ void Poll(RenderContext& context, uint64_t next_hash) {
 	last_hash = next_hash;
 }
 } // namespace GuestWatch
-
-// KYTY_TRACE_CS_RES=1: in traced frames one CS_RES line per dispatch: hash, marker,
-// whether it writes through addresses, and its buffer ranges
-// (W = written, r = read), to find the dispatch that produces a draw's data.
-void CsResTrace(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                       const ShaderRecompiler::IR::ResourceSnapshot& resources, const char* kind, uint32_t gx,
-                       uint32_t gy, uint32_t gz) {
-	static constinit Common::OnceValue<bool> on_once;
-	const bool on = on_once.Get([&] { return std::getenv("KYTY_TRACE_CS_RES") != nullptr; });
-	if (!on || !(DebugFrameRange() || DebugStencilWindow())) return;
-	std::string line;
-	char        part[96];
-	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
-		const auto v = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (v.Base48() == 0) continue;
-		std::snprintf(part, sizeof(part), " %s%llx/%llx%s", program.info.buffers[i].written ? "W" : "r",
-		              static_cast<unsigned long long>(v.Base48()), static_cast<unsigned long long>(v.GetSize()),
-		              v.OutOfBounds() != 3u ? (v.OutOfBounds() == 2u ? "[oob2]" : v.OutOfBounds() == 1u ? "[oob1]" : "[oob0]") : "");
-		line += part;
-	}
-	// Images: Wi = written, ri = read (base address and extent from the T#).
-	for (uint32_t j = 0; j < program.info.images.size() && j < resources.images.size(); j++) {
-		const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[j]);
-		if (r.Base40() == 0) continue;
-		std::snprintf(part, sizeof(part), " %si%llx/%ux%u", program.info.images[j].written ? "W" : "r",
-		              static_cast<unsigned long long>(r.Base40()), static_cast<uint32_t>(r.Width5()) + 1u,
-		              static_cast<uint32_t>(r.Height5()) + 1u);
-		line += part;
-	}
-	std::fprintf(stderr, "CS_RES frame=%u kind=%s hash=%016llx groups=%u,%u,%u addrw=%d dma=%d%s marker=[%s]\n",
-	             DebugPresentCount().load(), kind,
-	             static_cast<unsigned long long>(program.shader_hash), gx, gy, gz, program.has_address_writes ? 1 : 0,
-	             program.info.uses_dma ? 1 : 0, line.c_str(), DebugMarkerPath().c_str());
-}
-
-
-// KYTY_TRACE_CS_OUT=<hex,...>: after the first 4 dispatches (any frame) of a listed compute shader,
-// one CS_BIND line per image binding (read/write, address, cache image id, backing extent/format)
-// and the written images as the GPU holds them right after the dispatch
-// (<KYTY_TRACE_FRAME_DIR>/csout_<hash>_<n>_b<binding>_<addr>_<WxH>_<fmt>.raw; needs KYTY_TRACE_FLIPS).
-void CsOutTrace(RenderContext& context, vk::CommandBuffer vk_buffer, const PreparedBindings& bindings,
-                       const ShaderRecompiler::IR::CompiledShaderInfo& program, const char* kind) {
-	static constinit Common::OnceObject<std::string> list_once;
-	const std::string& list = list_once.Get([] {
-		const char* value = std::getenv("KYTY_TRACE_CS_OUT");
-		return value != nullptr ? std::string(value) : std::string();
-	});
-	if (list.empty()) return;
-	char text[17];
-	std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(program.shader_hash));
-	if (list.find(text) == std::string::npos) return;
-	static std::unordered_map<uint64_t, unsigned> counts;
-	const auto n = counts[program.shader_hash]++;
-	if (n >= 4u) return;
-	auto& cache = context.GetTextureCache();
-	for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
-		const auto& b = bindings.images[i];
-		if (!b.image_id) continue;
-		auto& image = cache.GetImage(b.image_id);
-		std::fprintf(stderr, "CS_BIND %s hash=%s n=%u frame=%u b%u %s addr=%llx id=%u extent=%ux%u fmt=%s\n", kind, text, n,
-		             DebugPresentCount().load(), i, program.info.images[i].written ? "W" : "r",
-		             static_cast<unsigned long long>(b.desc.info.data.address), b.image_id.index,
-		             image.backing.extent.width, image.backing.extent.height, vk::to_string(image.backing.format).c_str());
-	}
-	const char* dir = Common::EnvRead::FrameDir();
-	if (dir == nullptr) return;
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	vk_buffer.pipelineBarrier2(dependency);
-	// KYTY_TRACE_CS_OUT_INPUTS=1: the read images too (csin_..., as they are after the dispatch).
-	static const bool inputs = std::getenv("KYTY_TRACE_CS_OUT_INPUTS") != nullptr;
-	for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
-		if ((!program.info.images[i].written && !inputs) || !bindings.images[i].image_id) continue;
-		auto& image = cache.GetImage(bindings.images[i].image_id);
-		char  name[200];
-		std::snprintf(name, sizeof(name), "%s/%s_%s_%u_b%u_%llx", dir, program.info.images[i].written ? "csout" : "csin",
-		              text, n, i, static_cast<unsigned long long>(bindings.images[i].desc.info.data.address));
-		DebugQueueFullDump(context.GetGraphics(), vk_buffer, image, name, false);
-	}
-}
 
 // KYTY_TRACE_CS_IMAGE_DUMP=<hex,...>: at the listed direct dispatches (3 per shader once 1000
 // frames were presented), every bound image as the GPU sees it before the dispatch, to

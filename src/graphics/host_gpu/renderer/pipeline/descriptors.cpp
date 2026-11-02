@@ -35,10 +35,7 @@
 #include "graphics/host_gpu/renderer/recordPackets.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/host_gpu/renderer/stageFLookup.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -95,11 +92,9 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	}
 	switch (kind) {
 		case BindingKind::Samplers: return vk::DescriptorType::eSampler;
-		// KYTY_PERF_UNIFORM_CONST_BUFFERS: constant-index reads only (ShaderIR.h UniformConstBuffers).
-		case BindingKind::FlattenedSrtUniform: return vk::DescriptorType::eUniformBuffer;
-		case BindingKind::ShaderData:
-			return ShaderRecompiler::IR::UniformConstBuffers() ? vk::DescriptorType::eUniformBuffer
-			                                                   : vk::DescriptorType::eStorageBuffer;
+		// Uniform const buffers: constant-index reads only (ShaderIR.h ReadConstUniform).
+		case BindingKind::FlattenedSrtUniform:
+		case BindingKind::ShaderData: return vk::DescriptorType::eUniformBuffer;
 		case BindingKind::Buffers:
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
@@ -260,7 +255,7 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
-// KYTY_DIAG_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): IsSupportedDepthTextureEncoding compares words 4-7 whole. RDNA2
+// KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): IsSupportedDepthTextureEncoding compares words 4-7 whole. RDNA2
 // ISA table 45 (8.2.6 Image Resource) defines them per field, and for a non-array 1D/2D T# (types 8 and 9, the 128-bit
 // resource kinds) the texture unit does not use: in word 4, DEPTH [12:0] and PITCH[13] [13] (depth-1 of a 3D map, the
 // last slice of an array; for 1D/2D the low bits of pitch-1, which only a linear surface with a custom pitch uses - Mesa
@@ -269,7 +264,7 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 // [31:24], which the table does not list; in words 6-7 with COMPRESSION_EN (word 6 [21]) = 0, everything: no metadata is
 // read, so META_ADDR, write compression, ALPHA_IS_ON_MSB, the color transform, the block sizes, ITERATE_256 (compressed
 // MSAA depth only), the LLC policy [9:8] and the MIP stats id [7:0] change nothing a sample returns. Still used:
-// BASE_ARRAY (word 4 [28:16]; the view takes it, see KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL), MAX_MIP and PERF_MOD (word 5,
+// BASE_ARRAY (word 4 [28:16]; the view takes it, see KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL), MAX_MIP and PERF_MOD (word 5,
 // accepted by the strict check as they are), CORNER_SAMPLES (word 5 [23], where texels sit: not emulated) and, with
 // COMPRESSION_EN = 1, the HTILE encoding the strict check knows. The verdict: the strict check on a copy with the unused
 // fields cleared. Seen in the game's logs (9 runs, 2D depth T#s at 0x5002870000 and 0x508f360000): five
@@ -305,9 +300,9 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	if (resource_ok && encoding_ok && view_ok) {
 		return;
 	}
-	// KYTY_DIAG_DEPTH_ENCODING_LENIENT=1 (logged APPROXIMATION): a sampled depth descriptor whose
+	// KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT=1 (logged APPROXIMATION): a sampled depth descriptor whose
 	// unused words carry other data (seen: word 4 = 1.0f after a 2D depth T#) is bound anyway; the
-	// view clamps an out-of-range base layer (KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL).
+	// view clamps an out-of-range base layer (KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL).
 	// =0 (stage 2 pack 2, #15; before: every such descriptor stopped the emulator): a descriptor that differs only in
 	// fields the texture unit does not use for it (DepthEncodingFieldsVerdict, RDNA2 ISA table 45) is the hardware's T#
 	// and is bound as such (logged DEPTH_ENCODING_FIELDS, no approximation); CORNER_SAMPLES = 1 and anything else still
@@ -315,7 +310,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	static const bool lenient = [] {
 		// Default from Common::EnvDefaults; workaround: D8 (stencil / HTILE), to
 		// be replaced by the proper implementation; =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_DEPTH_ENCODING_LENIENT");
+		const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT");
 		return value != nullptr && value[0] == '1';
 	}();
 	const auto fields = !encoding_ok && resource_ok && view_ok ? DepthEncodingFieldsVerdict(descriptor, resource.r128)
@@ -333,7 +328,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 		static std::atomic_uint logged {0};
 		if (logged.fetch_add(1) < 8u) {
 			std::fprintf(stderr,
-			             "DIAG_DEPTH_ENCODING_LENIENT APPROXIMATION addr=0x%llx r128=%d dwords=%08x,%08x,%08x,%08x,"
+			             "WORKAROUND_DEPTH_ENCODING_LENIENT APPROXIMATION addr=0x%llx r128=%d dwords=%08x,%08x,%08x,%08x,"
 			             "%08x,%08x,%08x,%08x fields=%s\n",
 			             static_cast<unsigned long long>(descriptor.Base40()), resource.r128 ? 1 : 0,
 			             descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
@@ -632,7 +627,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 				// 1D/2D view's BASE_ARRAY naming a layer the image does not have (junk: 7967, 7710, 514, 122 logged)
 				// selects no slice: an image of one layer is read at that layer (exact; every case in the game's data,
 				// 28.10: clamp_layer=10/0). An image of more layers stops the emulator: which slice the texture unit
-				// reads then is not established. (The layer part of KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL, M48, until 28.10.)
+				// reads then is not established. (The layer part of KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL, M48, until 28.10.)
 				if (image_layers > 1u) {
 					EXIT("texture base layer %u is out of bounds of an image of %u layers\n", view.base_layer, image_layers);
 				}
@@ -673,7 +668,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 				// 1D/2D view's BASE_ARRAY naming a layer the image does not have (junk: 7967, 7710, 514, 122 logged)
 				// selects no slice: an image of one layer is read at that layer (exact; every case in the game's data,
 				// 28.10: clamp_layer=10/0). An image of more layers stops the emulator: which slice the texture unit
-				// reads then is not established. (The layer part of KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL, M48, until 28.10.)
+				// reads then is not established. (The layer part of KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL, M48, until 28.10.)
 				if (image_layers > 1u) {
 					EXIT("texture base layer %u is out of bounds of an image of %u layers\n", view.base_layer, image_layers);
 				}
@@ -910,7 +905,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	// shader converts back).
 	const auto format         = ShaderRecompiler::IR::ReadsDepthBits(resource) ? Prospero::BufferFormat::k16UNorm
 	                                                                           : descriptor.Format();
-	// KYTY_TRACE_PERF (PERF workaround_hits fmt30, KYTY_DIAG_RT_11_11_10_FLOAT): a T# of format 30, or of format 36
+	// KYTY_TRACE_PERF (PERF workaround_hits fmt30, KYTY_FIX_RT_11_11_10_FLOAT): a T# of format 30, or of format 36
 	// (10_11_11_FLOAT) over the memory of a target programmed as format 30.
 	Common::WorkaroundHits::NoteFmt30Texture(static_cast<uint32_t>(format), address);
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
@@ -919,7 +914,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	const bool sampled_numeric_class =
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	// (As upstream 56738aa4e: the materialization types a format the shader decodes from its backing - 11_11_10 UNorm
-	// through R32_UINT when KYTY_DIAG_RT_11_11_10_FLOAT=0 - by the backing's class; every other format remaps to itself.)
+	// through R32_UINT when KYTY_FIX_RT_11_11_10_FLOAT=0 - by the backing's class; every other format remaps to itself.)
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		if (soft_resolve) return TextureDescribe::SoftNull;
@@ -982,7 +977,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	// (Upstream 8c7fe539b marks DCC here, before the mip view, for its compact mip-tail sizes; ours marks it with the
 	// DCC range below.)
 	if (levels > physical_levels) {
-		// KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL=1: logged APPROXIMATION. A view whose LAST_LEVEL
+		// KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL=1: logged APPROXIMATION. A view whose LAST_LEVEL
 		// exceeds the allocated MAX_MIP (partially resident streaming textures) keeps only the
 		// allocated mips.
 		static constinit Common::OnceValue<bool> clamp_last_level_once;
@@ -990,7 +985,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 			// Default from Common::EnvDefaults: probably hardware behaviour (M48),
 			// exactness check open: RDNA2 ISA table 45 says MAX_MIP describes the resource and BASE/LAST_LEVEL the view,
 			// but not that the texture unit clamps the view's LOD to MAX_MIP; =0 turns it off.
-			const char* value = Common::EnvOrDefault("KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL");
+			const char* value = Common::EnvOrDefault("KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL");
 			return value != nullptr && value[0] == '1';
 		});
 		const bool resolved = ResolveTextureMipView(desc.info, physical_levels,
@@ -1000,7 +995,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 			static std::atomic_uint logged {0};
 			if (logged.fetch_add(1) < 8u) {
 				std::fprintf(stderr,
-				             "DIAG_TEXTURE_CLAMP_LAST_LEVEL APPROXIMATION base=%u last=%u max=%u extent=%ux%u\n",
+				             "FIX_TEXTURE_CLAMP_LAST_LEVEL APPROXIMATION base=%u last=%u max=%u extent=%ux%u\n",
 				             base_level, last_level, max_mip, width, height);
 			}
 			// KYTY_TRACE_PERF (PERF workaround_hits clamp_mip): views cut at MAX_MIP, and those whose BASE_LEVEL is past it.
@@ -1112,23 +1107,16 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	}
 	const auto alignment =
 	    tile == Prospero::TileMode::kLinear ? 256u : desc.info.tiling.block.block_size;
-	// KYTY_DIAG_TEXTURE_ALLOW_MISALIGNED=1: logged APPROXIMATION. A texture whose base is less
-	// aligned than its swizzle block is bound at its address (swizzle math is base-relative).
-	static constinit Common::OnceValue<bool> allow_misaligned_once;
-	const bool allow_misaligned = allow_misaligned_once.Get([] {
-		// Default from Common::EnvDefaults: hardware behaviour, not a workaround
-		// (RDNA2 ISA table 45: the T# base address is "256-byte aligned", nothing more; texel addresses are the base plus
-		// the swizzle offset of the coordinates, as here). Every logged case (16,640 on 12-13.10) was SW_4KB_S (no XOR)
-		// at a mip-tail position. =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_TEXTURE_ALLOW_MISALIGNED");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
-	});
+	// A texture whose base is less aligned than its swizzle block (but 256-byte aligned) is bound at its address
+	// (swizzle math is base-relative). Hardware behaviour, not a workaround (RDNA2 ISA table 45: the T# base address is
+	// "256-byte aligned", nothing more; texel addresses are the base plus the swizzle offset of the coordinates, as
+	// here). Every logged case (16,640 on 12-13.10) was SW_4KB_S (no XOR) at a mip-tail position.
 	const bool misaligned = desc.info.data.size != 0 && alignment != 0 &&
 	                        (address & (static_cast<uint64_t>(alignment) - 1u)) != 0 && (address & 0xffu) == 0u;
-	if (misaligned && allow_misaligned) {
+	if (misaligned) {
 		static std::atomic_uint logged {0};
 		if (logged.fetch_add(1) < 64)
-			std::fprintf(stderr, "DIAG_TEXTURE_ALLOW_MISALIGNED APPROXIMATION addr=0x%016llx align=0x%x format=%u tile=%u "
+			std::fprintf(stderr, "TEXTURE_MISALIGNED_BASE addr=0x%016llx align=0x%x format=%u tile=%u "
 			             "extent=%ux%ux%u levels=%u size=0x%llx storage=%u\n",
 			             static_cast<unsigned long long>(address), static_cast<uint32_t>(alignment),
 			             static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height, depth,
@@ -1184,7 +1172,6 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               uint32_t                                     compare_funcs) {
-	const StageF::Zone stagef_decode(StageF::Sub::Decode); // KYTY_TRACE_STAGEF
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -1479,42 +1466,16 @@ void BuildResolveRecord(RenderContext& renderer, const ShaderRecompiler::IR::Res
 
 } // namespace StageF
 
-// KYTY_TRACE_TEXWIN (TW1): a resolved T# of the game's streamed-texture range: its BASE_LEVEL, its full chain and the
-// span of its levels BASE_LEVEL..last in the guest layout (what the host would hold if it followed BASE_LEVEL; a prefix
-// of the chain when the span starts at the base address, as in tiled layouts, which keep the coarse levels first).
-static void NoteTexWinResolve(const ShaderRecompiler::IR::ImageResource& resource,
-                              const ShaderTextureResource& descriptor, const ImageInfo& info) {
-	const auto levels = std::min<uint32_t>(info.resources.levels, static_cast<uint32_t>(info.mip_layout.size()));
-	if (levels == 0) return;
-	const uint32_t base_level = descriptor.BaseLevel();
-	const uint32_t first      = std::min(base_level, levels - 1u);
-	uint64_t       begin      = UINT64_MAX;
-	uint64_t       end        = 0;
-	for (uint32_t level = first; level < levels; level++) {
-		const auto& mip = info.mip_layout[level];
-		begin           = std::min(begin, mip.offset);
-		end             = std::max(end, mip.offset + mip.size);
-	}
-	const bool all_levels = first == 0;
-	const bool excluded   = resource.written || info.resources.layers != 1 || info.IsVolume() || info.samples != 1 ||
-	                      info.HasMetadata();
-	TexWin::NoteResolve(info.data.address, info.data.size, base_level, all_levels ? info.data.size : end - begin,
-	                    all_levels || begin == 0, excluded);
-}
-
 // ResolveTexture after the description: the texture cache lookup (FindImage may adjust desc) and the checks against
 // the found image (also for a cached description).
 TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
                                                    const ShaderTextureResource& descriptor, TextureCache::ImageDesc& desc,
                                                    bool shader_conversion, vk::Format pixel_format,
                                                    vk::Format view_format) {
-	const StageF::Zone stagef_tail(StageF::Sub::TexSync); // KYTY_TRACE_STAGEF: the lookup and the checks after it
 	auto&      texture_cache = m_context.GetTextureCache();
 	const bool storage       = resource.written;
 	const auto address       = descriptor.Base40();
 	const auto format        = descriptor.Format();
-	// KYTY_TRACE_TEXWIN (TW1): the T#'s own description, before FindImage adjusts it.
-	if (TexWin::Enabled() && TexWin::InTexman(address)) NoteTexWinResolve(resource, descriptor, desc.info);
 	ImageId    id;
 	{
 		KYTY_PROFILER_BLOCK("ResolveTexture::FindImage");
@@ -1523,16 +1484,16 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	KYTY_PROFILER_BLOCK("ResolveTexture::Tail");
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	// KYTY_DIAG_STENCIL_ALIAS_COPY=1: logged APPROXIMATION for dynamic resolution. A stencil plane
+	// KYTY_WORKAROUND_STENCIL_ALIAS_COPY=1: logged APPROXIMATION for dynamic resolution. A stencil plane
 	// sampled at an extent other than its depth target's is cached as a separate R8 image nothing
 	// writes; copy the overlapping top-left region of the depth image's stencil into it first.
 	static constinit Common::OnceValue<bool> stencil_alias_copy_once;
 	const bool stencil_alias_copy = stencil_alias_copy_once.Get([] {
 		// Default from Common::EnvDefaults; workaround: D8 (stencil / HTILE), to
 		// be replaced by the proper implementation; =0 turns it off.
-		const char* value = Common::EnvOrDefault("KYTY_DIAG_STENCIL_ALIAS_COPY");
+		const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_STENCIL_ALIAS_COPY");
 		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "DIAG_STENCIL_ALIAS_COPY APPROXIMATION enabled\n");
+		if (on) std::fprintf(stderr, "WORKAROUND_STENCIL_ALIAS_COPY APPROXIMATION enabled\n");
 		return on;
 	});
 	if (stencil_alias_copy && address == 0x5004850000ull) {
@@ -1546,7 +1507,7 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 			             static_cast<unsigned long long>(image->info.data.size), association ? 1 : 0);
 		}
 	}
-	// KYTY_DIAG_STENCIL_PLANE_SYNC=1: a read of a guest stencil plane through a plain 1-byte image gets the plane's
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC=1: a read of a guest stencil plane through a plain 1-byte image gets the plane's
 	// current contents (owning depth image's stencil aspect, or its saved copy when the depth image holds the other
 	// plane); see TextureCache::SyncStencilPlaneReader.
 	bool stencil_plane_synced = false;
@@ -1568,14 +1529,14 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	}
 	if (stencil_association && storage) {
 		// A storage view of the associated depth/stencil image is invalid Vulkan (no storage usage or format support):
-		// the stencil shadow takes the write (KYTY_DIAG_STENCIL_STORAGE_SHADOW), else a null storage image is bound
+		// the stencil shadow takes the write (KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW), else a null storage image is bound
 		// (logged APPROXIMATION below).
 		static const bool shadow_stencil = [] {
 			// Default from Common::EnvDefaults; workaround: D8 (stencil /
 			// HTILE), to be replaced by the proper implementation; =0 turns it off.
-			const char* value = Common::EnvOrDefault("KYTY_DIAG_STENCIL_STORAGE_SHADOW");
+			const char* value = Common::EnvOrDefault("KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW");
 			const bool  on    = value != nullptr && value[0] == '1';
-			if (on) std::fprintf(stderr, "DIAG_STENCIL_STORAGE_SHADOW APPROXIMATION enabled\n");
+			if (on) std::fprintf(stderr, "WORKAROUND_STENCIL_STORAGE_SHADOW APPROXIMATION enabled\n");
 			return on;
 		}();
 		if (shadow_stencil) {
@@ -1641,7 +1602,7 @@ void RenderExecutor::CopyStencilToAlias(ImageId depth_id, ImageId target_id) {
 	if (width == 0u || height == 0u) return;
 	static std::atomic_uint logged {0};
 	if (logged.fetch_add(1) < 8u) {
-		std::fprintf(stderr, "DIAG_STENCIL_ALIAS_COPY addr=0x%llx depth=%ux%u alias=%ux%u\n",
+		std::fprintf(stderr, "WORKAROUND_STENCIL_ALIAS_COPY addr=0x%llx depth=%ux%u alias=%ux%u\n",
 		             static_cast<unsigned long long>(target.info.data.address), depth.backing.extent.width,
 		             depth.backing.extent.height, target.backing.extent.width, target.backing.extent.height);
 	}
@@ -1745,7 +1706,7 @@ void RenderExecutor::FlushStencilShadows(vk::CommandBuffer command) {
 	}
 	static std::atomic_uint logged {0};
 	if (!m_stencil_shadows.empty() && logged.fetch_add(1) < 4u) {
-		std::fprintf(stderr, "DIAG_STENCIL_STORAGE_SHADOW copied %zu shadow(s) to stencil\n",
+		std::fprintf(stderr, "WORKAROUND_STENCIL_STORAGE_SHADOW copied %zu shadow(s) to stencil\n",
 		             m_stencil_shadows.size());
 	}
 	m_stencil_shadows.clear();
@@ -1755,7 +1716,6 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
-	const StageF::Zone stagef_sampler(StageF::Sub::Sampler); // KYTY_TRACE_STAGEF
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
@@ -2398,7 +2358,6 @@ struct BindlessSplit {
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
-	const StageF::Zone stagef_bindless(StageF::Sub::EvBindless); // M26
 	BindlessSplit      bsplit; // KYTY_TRACE_LONG_PREP
 	prepared.bindless_patches.clear();
 	prepared.bindless_images.clear();
@@ -3546,15 +3505,7 @@ void RenderExecutor::PrepareTablesFrame(uint64_t frame) {
 // program's resource), and, while the image-page epochs of the description's range sum to the same value (every
 // registration change of an image over a page bumps it), FindImage's search sees the same candidates and picks the same
 // image: only its LRU touch and access tick are replayed (ReplayImage). A store is skipped when the global registry epoch
-// moved during the resolve. Trace and experiment switches of the resolve's tail that act on found images turn it off.
-static bool ImageReplayUsable() {
-	static constinit Common::OnceValue<bool> once;
-	return once.Get([] {
-		const bool off = TexWin::Enabled();
-		if (off) std::fprintf(stderr, "Image replay off: KYTY_TRACE_TEXWIN is set\n");
-		return !off;
-	});
-}
+// moved during the resolve.
 
 namespace {
 struct ImageReplaySlot {
@@ -3630,14 +3581,13 @@ static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const
 static bool TableSetsUsable() {
 	static constinit Common::OnceValue<bool> once;
 	return once.Get([] {
-		for (const char* trace: {"KYTY_TRACE_TEX_ADDRS", "KYTY_TRACE_TEX_HASH", "KYTY_TRACE_TEX_WRITES_EXTENT",
-		                         "KYTY_TRACE_AUDIT_FRAME"}) {
+		for (const char* trace: {"KYTY_TRACE_TEX_ADDRS", "KYTY_TRACE_TEX_HASH", "KYTY_TRACE_TEX_WRITES_EXTENT"}) {
 			if (std::getenv(trace) != nullptr) {
 				std::fprintf(stderr, "Table sets off: %s is set\n", trace);
 				return false;
 			}
 		}
-		return !TexWin::Enabled();
+		return true;
 	});
 }
 
@@ -3835,7 +3785,6 @@ struct BindSplit {
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
-	const StageF::Zone stagef_bindimg(StageF::Sub::EvBindImg); // M26
 	BindSplit bind_split; // KYTY_TRACE_LONG_PREP
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
@@ -3877,66 +3826,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	const bool image_replay = ImageReplayUsable();
 	bind_split.Mark(1);
-	// KYTY_TRACE_TABLE_CENSUS: the stage's set key and a dry run of the would-hit proof.
-	const bool                   census = TableCensusEnabled();
-	std::vector<uint32_t>        census_words;
-	const TableCensusSet*        census_set = nullptr;
-	bool                         census_proven = false;
-	TableCensusCounts*           census_counts = nullptr;
-	std::chrono::steady_clock::time_point census_loop_start {};
-	prepared.census_hit = false;
-	if (census) {
-		const uint32_t frame = DebugPresentCount().load();
-		census_counts        = &TableCensus().counts[program.stage == ShaderType::Compute ? 1 : 0];
-		census_counts->stages++;
-		census_words.reserve(program.info.images.size() * 9u + program.info.samplers.size() * 4u + 1u);
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			census_words.insert(census_words.end(), snapshot.images[i].dwords.begin(), snapshot.images[i].dwords.end());
-			census_words.push_back(ImageCompareFuncs(program, snapshot, i));
-		}
-		for (const auto& sampler: program.info.samplers) {
-			const auto& value = snapshot.samplers[sampler.snapshot_index];
-			census_words.insert(census_words.end(), value.dwords.begin(), value.dwords.begin() + 4);
-		}
-		census_words.push_back(m_soft_texture_resolve ? 1u : 0u);
-		auto& list = TableCensus().sets[&program];
-		for (const auto& set: list) {
-			if (set.frame + 1u >= frame && set.words == census_words) {
-				census_set = &set;
-				break;
-			}
-		}
-		if (census_set != nullptr) {
-			census_counts->would_hit++;
-			census_counts->hit_same_frame += census_set->frame == frame ? 1u : 0u;
-			const auto proof_start = std::chrono::steady_clock::now();
-			bool       all_memo = true, ok = true;
-			for (size_t i = 0; i < census_set->ids.size(); i++) {
-				if (census_set->memo[i] == 0u) {
-					all_memo = false;
-					continue;
-				}
-				const auto& range = census_set->ranges[i];
-				if (DrawRepeat::ImagePageEpochSum(range.first, range.second) != census_set->page_sums[i]) {
-					census_counts->page_changed++;
-					ok = false;
-					continue;
-				}
-				const auto reason = m_context.GetTextureCache().TableProofDry(census_set->ids[i]);
-				if (reason != 0u) {
-					census_counts->proof_fail[reason & 7u]++;
-					ok = false;
-				}
-			}
-			census_counts->proof_ns += static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proof_start).count());
-			census_counts->all_memo += all_memo ? 1u : 0u;
-			census_proven = ok;
-		}
-		census_loop_start = std::chrono::steady_clock::now();
-	}
 	// The table sets: per slot, whether the binding may become a set member (g_slot_exact).
 	static thread_local std::vector<uint8_t> table_exact;
 	table_exact.assign(program.info.images.size(), 0u);
@@ -3949,15 +3839,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		const auto     resolve       = [&] {
 			return ResolveTexture(program.info.images[i], snapshot.images[i], compare_funcs);
 		};
-		TextureBinding binding;
-		if (image_replay) {
-			binding = ResolveTextureReplay(m_context.GetTextureCache(), m_soft_texture_resolve, program, i, snapshot.images[i],
-			                               compare_funcs, resolve);
-		} else {
-			(void)TextureCache::TakeLastFindImagePlain();
-			binding      = resolve();
-			g_slot_exact = TextureCache::TakeLastFindImagePlain();
-		}
+		TextureBinding binding = ResolveTextureReplay(m_context.GetTextureCache(), m_soft_texture_resolve, program, i,
+		                                              snapshot.images[i], compare_funcs, resolve);
 		if (i < table_exact.size()) table_exact[i] = g_slot_exact ? 1u : 0u;
 		if (DescriptorTrace::ImageBindingsTraced()) DescriptorTrace::ImageBinding(m_context, program, i, binding);
 		if (DebugDepthStorageNulled()) {
@@ -4101,50 +3984,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		TableSetsReport();
 	}
-	if (census) {
-		// KYTY_TRACE_TABLE_CENSUS: today's image and sampler work, the exactness pre-check and the stored set.
-		const auto loop_ns = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - census_loop_start).count());
-		census_counts->loop_ns_all += loop_ns;
-		auto& cache = m_context.GetTextureCache();
-		if (census_set != nullptr) {
-			census_counts->loop_ns_hit += loop_ns;
-			if (census_proven) {
-				census_counts->proof_ok++;
-				prepared.census_hit = true;
-				for (size_t i = 0; i < census_set->ids.size() && i < prepared.images.size(); i++) {
-					if (census_set->memo[i] != 0u && !(census_set->ids[i] == prepared.images[i].image_id)) {
-						census_counts->held_differs++;
-						break;
-					}
-				}
-			}
-		}
-		TableCensusSet fresh;
-		fresh.words = std::move(census_words);
-		fresh.frame = DebugPresentCount().load();
-		for (const auto& binding: prepared.images) {
-			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			const bool memo    = !storage && binding.desc.type == TextureCache::BindingType::Texture &&
-			                  (binding.desc.info.data.Empty() || cache.ImageReplayable(binding.image_id));
-			census_counts->slots++;
-			census_counts->slots_storage += storage ? 1u : 0u;
-			census_counts->slots_other += !storage && !memo ? 1u : 0u;
-			fresh.ids.push_back(binding.image_id);
-			fresh.ranges.emplace_back(binding.desc.info.data.address, binding.desc.info.data.size);
-			fresh.page_sums.push_back(DrawRepeat::ImagePageEpochSum(binding.desc.info.data.address, binding.desc.info.data.size));
-			fresh.memo.push_back(memo ? 1u : 0u);
-		}
-		auto& list = TableCensus().sets[&program];
-		auto  same = std::find_if(list.begin(), list.end(), [&](const TableCensusSet& set) { return set.words == fresh.words; });
-		if (same != list.end()) {
-			*same = std::move(fresh);
-		} else {
-			if (list.size() >= 8u) list.pop_back();
-			list.insert(list.begin(), std::move(fresh));
-		}
-		TableCensusReport();
-	}
 	bind_split.Mark(5);
 	// A stage without bindless heaps (or with the table off) skips the binder lock block below: its PrepareBindlessHeaps only
 	// clears the stage's bindless lists.
@@ -4212,7 +4051,6 @@ static std::optional<std::pair<uint64_t, uint64_t>> VSharpRange(RenderContext&  
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
-	const StageF::Zone stagef_find(StageF::Sub::FindBuffer); // KYTY_TRACE_STAGEF: V# decode (cache lookups nest)
 	auto& cache = m_context.GetBufferCache();
 	// Each storage-buffer binding's memo entry is fetched now, for the ObtainBuffer of this stage's RebindBuffers (once per call).
 	const auto prefetch_memo = [&](const PreparedBindings::BufferSource& source,
@@ -4317,7 +4155,6 @@ static void CollectAppendBindings(const PreparedBindings& prepared, std::vector<
                                   std::vector<std::pair<uint64_t, uint64_t>>*           unqualified);
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
-	const StageF::Zone stagef_rebindbuf(StageF::Sub::EvRebindBuf); // M26
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -4401,7 +4238,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		}
 	}
 	const bool srt_uniform = layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrtUniform)] != 0;
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: words uploaded once, padded with zeros to whole uvec4 elements; the uniform view
+	// Uniform const buffers (ShaderIR.h): words uploaded once, padded with zeros to whole uvec4 elements; the uniform view
 	// covers the padded words (the uvec4 elements the shader declares lie inside: every ReadConst slot is below the
 	// plan's SRT read count, which the flat buffer always holds), the storage view the words themselves.
 	const auto upload_uniform = [&](std::span<const uint32_t> words, vk::DescriptorBufferInfo* storage_view,
@@ -4438,16 +4275,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	sub_timer.emplace(DispatchSub::DataUpload);
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		if (ShaderRecompiler::IR::UniformConstBuffers()) {
-			upload_uniform(prepared.shader_data, nullptr, &prepared.shader_data_buffer);
-		} else {
-			prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
-		}
+		upload_uniform(prepared.shader_data, nullptr, &prepared.shader_data_buffer);
 	}
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
-	const StageF::Zone stagef_imgloop(StageF::Sub::EvImgLoop); // M26
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -4455,18 +4287,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	// KYTY_TRACE_TABLE_CENSUS: RebindImages' part of a would-hit stage's work (the ceiling).
-	struct CensusRebindTimer {
-		bool                                  on;
-		uint32_t                              kind;
-		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-		~CensusRebindTimer() {
-			if (on) {
-				TableCensus().counts[kind].rebind_ns_hit += static_cast<uint64_t>(
-				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-			}
-		}
-	} census_rebind {prepared.census_hit, program.stage == ShaderType::Compute ? 1u : 0u};
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	const auto rebind_image_slot = [&](uint32_t i) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
@@ -4504,8 +4324,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
-		if (DescriptorTrace::AuditFrame() != 0) DescriptorTrace::AuditImageBinding(m_context, program, i, binding, image, resource.written);
-		// KYTY_DIAG_DCC_FAST_CLEAR: after the view's contents are final for this use.
+		// KYTY_WORKAROUND_DCC_FAST_CLEAR: after the view's contents are final for this use.
 		if (TextureCache::DccFastClearEnabled()) {
 			texture_cache.ApplyDccFastClear(m_context.GetCommandScheduler().Current(), binding.image_id, binding.desc);
 		}
@@ -5103,12 +4922,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	const StageF::Zone stagef_record(StageF::Sub::Record); // KYTY_TRACE_STAGEF
-	// KYTY_TRACE_STAGEF: the record zone split (rec_cpre / rec_scan / rec_desc / rec_transit / rec_emit).
-	std::optional<StageF::Zone> stagef_part;
-	stagef_part.emplace(StageF::Sub::RecCPre);
 	std::optional<DispatchSubTimer> census_part(std::in_place, DispatchSub::BPre); // KYTY_TRACE_DRAW_CENSUS
-	if (CmdSignature::Enabled()) FoldCommitSignature(pipeline_bind_point, prepared_bindings); // KYTY_TRACE_CMD_SIGNATURE
 	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
@@ -5315,15 +5129,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	};
 	// The record packets, with the recording thread's heap sets.
 	const bool packet = RecordPacketsCommit();
-	stagef_part.emplace(StageF::Sub::RecScan);
 	census_part.emplace(DispatchSub::BScan);
 	// Nothing to scan unless a stage reads scalar resources (the scan skips the others anyway).
 	if (has_scalar_reads) {
 		KYTY_PROFILER_BLOCK("Commit::OverlapScan");
 		scan_scalar_reads(report_image_overlap, report_buffer_overlap);
 	}
-	stagef_part.reset();
-	stagef_part.emplace(StageF::Sub::RecDesc);
 		census_part.emplace(DispatchSub::BDesc);
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
@@ -5336,8 +5147,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
-		stagef_part.reset();
-		stagef_part.emplace(StageF::Sub::RecTransit);
 		census_part.emplace(DispatchSub::BTransit);
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
@@ -5428,8 +5237,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		}
-		stagef_part.reset();
-		stagef_part.emplace(StageF::Sub::RecDesc);
 		census_part.emplace(DispatchSub::BDesc);
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -5529,8 +5336,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	stagef_part.reset();
-	stagef_part.emplace(StageF::Sub::RecEmit);
 	census_part.emplace(DispatchSub::BEmit);
 	if (packet) {
 		// The template is made once per pipeline, from the same stage order as the writes.
@@ -5576,9 +5381,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (header.push_bytes != 0 || header.descriptor_bytes != 0 || header.bindless_set) {
 			const size_t total = sizeof(header) + header.push_bytes + header.descriptor_bytes;
 			static thread_local std::vector<uint8_t> direct_packet;
-			std::optional<StageF::Zone> stagef_ring(std::in_place, StageF::Sub::RecRing); // KYTY_TRACE_STAGEF
 			auto*      out    = static_cast<uint8_t*>(CommandRecorder::ReserveCall(vk_buffer, total));
-			stagef_ring.reset();
 			const bool direct = out == nullptr;
 			if (direct) {
 				direct_packet.resize(total);
@@ -5596,15 +5399,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			std::memcpy(out, &header, sizeof(header));
 			if (header.push_bytes != 0) std::memcpy(out + sizeof(header), push_data.dwords.data(), header.push_bytes);
 			if (header.descriptor_bytes != 0) {
-				const StageF::Zone stagef_fill(StageF::Sub::RecFill); // KYTY_TRACE_STAGEF
-				const uint32_t     filled =
+				const uint32_t filled =
 				    FillCommitPacket(m_context, out + sizeof(header) + header.push_bytes, prepared_bindings);
 				EXIT_IF(filled != header.descriptor_bytes);
 			}
 			if (direct) {
 				RunCommitPacket(out);
 			} else {
-				const StageF::Zone stagef_commit(StageF::Sub::RecRing); // KYTY_TRACE_STAGEF
 				CommandRecorder::CommitCall(RunCommitPacket);
 			}
 		}
@@ -5638,7 +5439,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set, 0, nullptr);
 	}
 	}
-	stagef_part.reset();
 	census_part.reset();
 	// The bindless heaps prepared for this draw are read by the commands recorded at this tick.
 	{

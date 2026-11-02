@@ -1,5 +1,4 @@
 #include "common/assert.h"
-#include "common/shaderEnv.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 
@@ -218,27 +217,6 @@ Value ResolveActiveU32(Value value, Value active) {
 		value = inst->Arg(1);
 	}
 	return {};
-}
-
-// KYTY_DIAG_INDIRECT_FORMATTED_STORES=1 (every shader) or <hex hash,...> (only those shaders).
-bool IndirectFormattedStores(uint64_t shader_hash) {
-	static const std::string value = [] {
-		// Default from Common::EnvDefaults: hardware behaviour, not a workaround
-		// (RDNA2 MUBUF BUFFER_STORE_FORMAT_*: address, bounds and data/number format from the V# the GPU selected, read
-		// at run time with the bound-buffer encoder; still dropped and logged: D16 stores, channels wider than 32 bits).
-		// It acts on a formatted store through a descriptor the tracker cannot resolve (ResourceTracking; any other such
-		// store stops translation).
-		// =0 turns it off (before, "0" was taken as a hash list and matched nearly every shader).
-		const char* text = Common::ShaderEnv::Read("KYTY_DIAG_INDIRECT_FORMATTED_STORES");
-		std::string result = text != nullptr && std::strcmp(text, "0") != 0 ? std::string(text) : std::string();
-		if (!result.empty()) std::fprintf(stderr, "DIAG_INDIRECT_FORMATTED_STORES APPROXIMATION enabled (%s)\n", result.c_str());
-		return result;
-	}();
-	if (value.empty()) return false;
-	if (value == "1") return true;
-	char text[17];
-	std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(shader_hash));
-	return value.find(text) != std::string::npos;
 }
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {

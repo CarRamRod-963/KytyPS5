@@ -21,7 +21,6 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -631,27 +630,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
-
-	// KYTY_TRACE_TEXWIN (stage S0 of notes\TEKSTURY-STREAMING-PROJEKT.md, for S2b): what the device offers for sparse
-	// residency images (the features and properties queried above) and whether the graphics family binds sparse memory.
-	if (TexWin::Enabled()) {
-		const auto& features = supported_features2.features;
-		const auto& sparse   = properties2.properties.sparseProperties;
-		const auto  families = physical_device.getQueueFamilyProperties();
-		const bool  queue_sparse =
-		    queue_family < families.size() &&
-		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
-		std::fprintf(stderr,
-		             "TEXWIN sparse binding=%d residency_buffer=%d residency_image2d=%d residency_image3d=%d "
-		             "residency_aliased=%d std2d_block_shape=%d std3d_block_shape=%d aligned_mip_size=%d "
-		             "nonresident_strict=%d queue_sparse=%d device=%s\n",
-		             features.sparseBinding ? 1 : 0, features.sparseResidencyBuffer ? 1 : 0,
-		             features.sparseResidencyImage2D ? 1 : 0, features.sparseResidencyImage3D ? 1 : 0,
-		             features.sparseResidencyAliased ? 1 : 0, sparse.residencyStandard2DBlockShape ? 1 : 0,
-		             sparse.residencyStandard3DBlockShape ? 1 : 0, sparse.residencyAlignedMipSize ? 1 : 0,
-		             sparse.residencyNonResidentStrict ? 1 : 0, queue_sparse ? 1 : 0,
-		             properties2.properties.deviceName.data());
-	}
 
 	// Exact half <-> float conversions in hardware (spirvEmitterAluHelpers.cpp): shaderFloat16 and
 	// the 16-bit RoundingModeRTE and SignedZeroInfNanPreserve modes, which the modules declare without declaring 32-bit
@@ -1357,7 +1335,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		// KYTY_DIAG_DCC_GPU_CLEAR_CHECK / KYTY_PERF_DCC_GPU_ALL: conditional rendering for the GPU-side DCC clear
+		// KYTY_FIX_DCC_GPU_CLEAR_CHECK / KYTY_PERF_DCC_GPU_ALL: conditional rendering for the GPU-side DCC clear
 		// check; the default device stays identical without the switches.
 		if ((Common::EnvRead::DccGpuClearCheck() != 0u || Common::EnvRead::DccGpuAll() != 0) &&
 		    HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {

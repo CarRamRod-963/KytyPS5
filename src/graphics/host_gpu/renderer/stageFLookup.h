@@ -18,7 +18,6 @@
 // ClampRangeSize takes), never while holding the buffer lock.
 //
 // KYTY_TRACE_PERF=1: a "PERF stagef_lookup" line every ~5 s (used, misses by reason, the resolve thread's batches).
-// KYTY_TRACE_STAGEF: on a used result the buf zone (FindBuffers) holds only the record checks.
 //
 namespace Libs::Graphics {
 

@@ -76,30 +76,6 @@ std::string TakeImageUnregisterStats() {
 	return line + "]";
 }
 
-// Every such request counted; the first 32 distinct (address, levels) pairs and one line per 4096 logged.
-void ViewLayoutMatchNote(const ImageInfo& requested, const Image& cached) {
-	static std::atomic<uint64_t>                           count {0};
-	static std::mutex                                      mutex;
-	static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> seen;
-	const auto                                             n = count.fetch_add(1, std::memory_order_relaxed) + 1u;
-	bool                                                   log = (n & 0xfffu) == 0u;
-	{
-		std::scoped_lock lock(mutex);
-		log |= seen.size() < 32u &&
-		       seen.insert({requested.data.address, requested.resources.levels, cached.info.resources.levels}).second;
-	}
-	if (!log) return;
-	std::fprintf(stderr,
-	             "FIX_VIEW_LAYOUT_MATCH separate=%llu frame=%u requested 0x%llx %ux%u L%u x%u level0 at +0x%llx | cached %ux%u "
-	             "L%u x%u level0 at +0x%llx\n",
-	             static_cast<unsigned long long>(n), DebugPresentCount().load(),
-	             static_cast<unsigned long long>(requested.data.address), requested.extent.width, requested.extent.height,
-	             requested.resources.levels, requested.resources.layers,
-	             static_cast<unsigned long long>(requested.mip_layout[0].offset), cached.info.extent.width,
-	             cached.info.extent.height, cached.info.resources.levels, cached.info.resources.layers,
-	             static_cast<unsigned long long>(cached.info.mip_layout[0].offset));
-}
-
 namespace {
 
 const char* DccGpuAllClassName(uint32_t value) {

@@ -351,7 +351,8 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 }
 
 // The guest address alignment of the image data (descriptors.cpp). Upstream also aligns rebased compact mip-tail
-// views here (8c7fe539b, 3a925efdd); not taken (SESJA-SYNC1): our mip-tail views are KYTY_DIAG_MIP_TAIL_SLICES.
+// views here (8c7fe539b, 3a925efdd); not taken (SESJA-SYNC1): our mip-tail views are the mip-tail slices of
+// ImageInfo (imageInfo.h).
 uint32_t ImageInfo::DataAlignment() const {
 	return tile_mode == Prospero::TileMode::kLinear ? 256u : tiling.block.block_size;
 }

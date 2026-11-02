@@ -3,7 +3,6 @@
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -22,7 +21,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <map>
 #include <string>
 #include <tuple>
 #include <mutex>
@@ -296,28 +294,11 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 // DB_ALPHA_TO_MASK (upstream 13b291f99) and PA_CL_UCP_* (upstream feed075a9) are implemented below; their former
 // ignore helpers are gone.
 
-// KYTY_TRACE_OBJPRIM=1: every new value of the two ObjPrimID registers (the first 32), with the context they land in.
-static void TraceObjprimRegister(const char* name, uint32_t value) {
-	static const bool trace = [] {
-		const char* env = std::getenv("KYTY_TRACE_OBJPRIM");
-		return env != nullptr && env[0] == '1';
-	}();
-	if (!trace) return;
-	static std::atomic_uint lines {0};
-	static std::atomic_uint last_payload {UINT32_MAX};
-	static std::atomic_uint last_objprim {UINT32_MAX};
-	auto& last = name[0] == 'V' ? last_payload : last_objprim;
-	if (last.exchange(value) == value || lines.fetch_add(1) >= 32u) return;
-	std::fprintf(stderr, "OBJPRIM_REG %s=0x%x\n", name, value);
-}
-
 static void HwCtxSetDrawPayloadControlValue(CommandProcessor& cp, uint32_t value) {
-	TraceObjprimRegister("VGT_DRAW_PAYLOAD_CNTL", value);
 	cp.GetCtx().SetDrawPayloadControl(value);
 }
 
 static void HwCtxSetObjprimIdControlValue(CommandProcessor& cp, uint32_t value) {
-	TraceObjprimRegister("PA_CL_OBJPRIM_ID_CNTL", value);
 	cp.GetCtx().SetObjprimIdControl(value);
 }
 
@@ -1562,39 +1543,6 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	const uint32_t predicate = cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr));
 	// BDA sync epoch: the block depends on guest memory the guest may have written.
 	cp.PublishDirtyRegions();
-	// KYTY_TRACE_COND_EXEC=1: for each predicate address (first 32), the packets of the conditional
-	// block (type-3 opcodes in order, first 32) and the predicate values seen (every 64th use).
-	static constinit Common::OnceValue<bool> trace_once;
-	const bool trace = trace_once.Get([&] { return std::getenv("KYTY_TRACE_COND_EXEC") != nullptr; });
-	if (trace) {
-		static std::map<uint64_t, uint64_t> uses;
-		auto&                               n = uses[addr];
-		if (uses.size() <= 32u && (n++ % 64u) == 0) {
-			std::string ops;
-			for (uint32_t i = payload_dw, k = 0; i < payload_dw + exec_count && k < 32u; k++) {
-				const uint32_t header = buffer[i];
-				if ((header >> 30u) != 3u) {
-					ops += " t" + std::to_string(header >> 30u);
-					i++;
-					continue;
-				}
-				char op[16];
-				std::snprintf(op, sizeof(op), " %02x", (header >> 8u) & 0xffu);
-				ops += op;
-				i += KYTY_PM4_LEN(header);
-			}
-			std::fprintf(stderr, "COND_EXEC addr=0x%llx use=%llu value=%u exec_dw=%u ops=[%s ]\n",
-			             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(n), predicate, exec_count,
-			             ops.c_str());
-			if (n == 1) {
-				std::fprintf(stderr, "COND_EXEC_RAW addr=0x%llx", static_cast<unsigned long long>(addr));
-				for (uint32_t i = 0; i < exec_count && i < 64u; i++) {
-					std::fprintf(stderr, " %08x", buffer[payload_dw + i]);
-				}
-				std::fprintf(stderr, "\n");
-			}
-		}
-	}
 	if (predicate == 0) {
 		return payload_dw + exec_count;
 	}
@@ -2223,34 +2171,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	cp.WaitForPendingWrites(indirect_buffer, uint64_t {indirect_num_dw} * 8u);
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-
-	// KYTY_TRACE_SH_INDIRECT=1 (diagnostic): register blocks that set COMPUTE_PGM_LO to 0, and blocks whose bytes
-	// differ from the backing store (GPU-written, not yet synced to guest memory), are logged with their pairs.
-	static constinit Common::OnceValue<bool> trace_sh_once;
-	const bool trace_sh = trace_sh_once.Get([&] { return std::getenv("KYTY_TRACE_SH_INDIRECT") != nullptr; });
-	if (trace_sh) {
-		bool     pgm_zero = false;
-		uint32_t pgm_lo   = 0xffffffffu;
-		for (uint32_t i = 0; i < indirect_num_dw; i++) {
-			if (NormalizeRegisterOffset(indirect_buffer[i * 2]) == Pm4::COMPUTE_PGM_LO) {
-				pgm_lo   = indirect_buffer[i * 2 + 1];
-				pgm_zero = pgm_lo == 0;
-			}
-		}
-		std::vector<uint32_t> synced(indirect_num_dw * 2u);
-		const bool ok = Libs::LibKernel::Memory::TryReadBufferBacking(indirect_address, synced.data(), synced.size() * 4u);
-		const bool differs = ok && std::memcmp(synced.data(), indirect_buffer, synced.size() * 4u) != 0;
-		static std::atomic<uint32_t> logged {0};
-		if ((pgm_zero || differs) && logged.fetch_add(1) < 64u) {
-			std::fprintf(stderr, "SH_INDIRECT addr=0x%llx regs=%u pgm_lo=0x%08x synced_ok=%d differs=%d frame=%u\n",
-			             static_cast<unsigned long long>(indirect_address), indirect_num_dw, pgm_lo, ok ? 1 : 0,
-			             differs ? 1 : 0, DebugPresentCount().load());
-			for (uint32_t i = 0; i < indirect_num_dw && i < 16u; i++) {
-				std::fprintf(stderr, "  [%u] off=0x%08x val=0x%08x synced off=0x%08x val=0x%08x\n", i, indirect_buffer[i * 2],
-				             indirect_buffer[i * 2 + 1], ok ? synced[i * 2] : 0u, ok ? synced[i * 2 + 1] : 0u);
-			}
-		}
-	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

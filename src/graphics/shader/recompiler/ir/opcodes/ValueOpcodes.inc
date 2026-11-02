@@ -376,6 +376,6 @@ VALUE_OPCODE(HalfToF32Arith, F32, U32)
 VALUE_OPCODE(F32ToHalfArith, U32, F32)
 
 // KYTY_DIAG_WATERFALL_RECORD0_CENSUS (diagnostic, workaround W11's counter): the two address dwords a waterfall reads
-// with ReadFirstLane, the same two fields of record 0 (KYTY_DIAG_WATERFALL_POINTER_RECORD0) and the lanes counted (the
+// with ReadFirstLane, the same two fields of record 0 (KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0) and the lanes counted (the
 // read's mask). Counts per wave the lanes and those whose address differs (BindlessBindings.h WaterfallRecord0CensusWord).
 VALUE_OPCODE(WaterfallRecord0Census, Void, U32, U32, U32, U32, U1)

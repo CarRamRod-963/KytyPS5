@@ -18,7 +18,7 @@ How to read them:
 | Code | What it is |
 |---|---|
 | D1 | Textures the GPU selects while drawing (bindless): every texture a draw can pick is translated before the draw. Also the null textures that stand in for unresolved ones. |
-| D4 | Several images over the same guest memory (transient memory, dynamic resolution). `KYTY_DIAG_ALIAS_SYNC` is the workaround. Steps: K0 the page event log of `KYTY_D6_C0=2/3`, K1 `KYTY_FIX_SHARED_IMAGE_MEMORY`, K2 `KYTY_FIX_VIEW_LAYOUT_MATCH`. |
+| D4 | Several images over the same guest memory (transient memory, dynamic resolution). `KYTY_WORKAROUND_ALIAS_SYNC` is the workaround. Steps: K0 the page event log of `KYTY_D6_C0=2/3`, K1 `KYTY_FIX_SHARED_IMAGE_MEMORY` (a K2 view-layout match was tried and removed). |
 | D4b | Tracking what the GPU really wrote. Step 1 is the append windows: the bytes of an append pool the GPU did not write are released. |
 | D4c | One holder for every byte of guest memory under several images: S0 what the recompiler knows of a written binding, S1 `KYTY_FIX_IMAGE_MEMORY_OWNER`. |
 | D5 | Keeping the contents of render targets across a resolution change; goes together with D4. |
@@ -39,10 +39,9 @@ How to read them:
 | M06 | The BDA fallback: a mapped direct-memory page without a buffer gets a BDA table entry (D6 step K4). |
 | M14 | Images that hold only the mip levels in use (its step S2). |
 | M21 | Smaller SPIR-V: step A is the branchless raw dword read. |
-| M26, M28 | Measurement zones of `KYTY_TRACE_STAGEF`. |
 | M42 | Approximations for lane exchange and waterfall pointers. |
 | M46 | DCC keys in general: keys per access, metadata belongs to the owner of the memory. |
-| M48 | Switches that turned out to be correct hardware behaviour and so became defaults (kinds `correct` and `unproven` in `envDefaults.h`). |
+| M48 | Switches that turned out to be correct hardware behaviour and so became defaults: the confirmed ones are always on without a switch now, the `unproven` ones are `KYTY_FIX_*` entries of `envDefaults.h`. |
 | M109 | Crash report for a V# at an invalid address. |
 | M110 | Atomics on the same dword return their old values in lane order, as the hardware does. |
 | M115 | One shader translating differently between sessions (empty and filled formatted buffers). |
@@ -62,11 +61,10 @@ How to read them:
 | S0, S1, S2 | Draw phases in parallel: S0 measurement, S1 splitting a draw into preparation and commit on one thread, S2 preparation on a worker (steps B.3 to B.6b). The same letters also number the steps of other projects (D4c, texture streaming). |
 | O1 | Record packets: commits written into the record ring, the calls made by the record worker. |
 | P2, P3 | Multi-threaded draw preparation: P2 `KYTY_PERF_PLAN_STAGES`, P3 reading ahead after the GPU thread parsed the packet. |
-| Stage F | Helper threads running the GPU thread's lookups ahead: F0 the census (`KYTY_TRACE_STAGEF`), F2 the scout's lookups, F3 the render target inputs. Not the same as the F1 below. |
+| Stage F | Helper threads running the GPU thread's lookups ahead: F0 the census (removed), F2 the scout's lookups, F3 the render target inputs. Not the same as the F1 below. |
 | F1 | Grouped IndirectBuffer reads in the recompiler (one bounds check, several loads). |
 | T1 | Table sets: a stage's image set kept by its program and the words its images and samplers read. |
 | E1, E2c, E5 | Bindless steps: E1 tables over 1 MiB and refresh events, E2c the heap path gone, E5 `KYTY_PERF_BINDLESS_CLASSES`. |
 | C9 | Bindless: the list path of tables over 1 MiB. |
-| TW1 to TW5 | Counters of `KYTY_TRACE_TEXWIN`, stage S0 of texture streaming (S2b: its sparse part). |
 | B1 | In the specialization census: compiling at `AgcCreateShader`, built and dropped. Not the D6 B1 above. |
 | K1 | "Active project step K1": timing the parts of a draw's front. "The K1 black-particles hunt": the wave64 pair rule. |

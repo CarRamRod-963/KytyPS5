@@ -18,7 +18,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 bool SrtTapeEnabled() {
 	static const bool enabled = [] {
-		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_SRT_TAPE");
+		const char* value = Common::ShaderEnv::Read("KYTY_FIX_SRT_TAPE");
 		// Default on: 4.0M verified materializations, 0 mismatches; flyover 2.84 -> 3.22
 		// fps. "0" turns it off.
 		return value == nullptr || value[0] != '0';
@@ -28,7 +28,7 @@ bool SrtTapeEnabled() {
 
 bool SrtTapeVerifyEnabled() {
 	static const bool enabled = [] {
-		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_SRT_TAPE_VERIFY");
+		const char* value = Common::ShaderEnv::Read("KYTY_FIX_SRT_TAPE_VERIFY");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
 	return enabled;

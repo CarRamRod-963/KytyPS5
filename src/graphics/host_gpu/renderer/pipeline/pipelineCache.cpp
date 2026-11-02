@@ -11,7 +11,6 @@
 #include "common/lookupMemo.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
-#include "common/queueTrace.h"
 #include "common/startupTrace.h"
 #include "common/threads.h"
 #include "common/shaderEnv.h"
@@ -27,7 +26,6 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stageFLookup.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -90,7 +88,6 @@ struct ResolvedStage {
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint8_t>                         null_share_kinds;
 	StageF::ResolveRecordPtr                     record; // FindBuffers' sources, found ahead
-	StageF::ResolveStamp                         stamp;  // KYTY_TRACE_STAGEF: the registries when it was made
 };
 // Why the execution thread materialized a stage itself.
 enum class ResolveMiss : uint32_t { NoResolution, Refused, Stale, NoMatch, Taken, Count };
@@ -169,7 +166,6 @@ ResolveMiss TakeResolvedStage(ResolvedStages& results, ShaderType stage, const S
 		std::swap(out, r.resources);
 		std::swap(out_specialization, r.specialization);
 		ShaderRecompiler::IR::ApplyNullFormattedShare(plan, r.null_share_kinds, out_specialization); // in draw order
-		if (StageF::Enabled()) StageF::NoteAdopted(r.stamp);
 		std::swap(out_record, r.record);
 		g_resolve_stats.taken.fetch_add(1, std::memory_order_relaxed);
 		return ResolveMiss::Taken;
@@ -257,36 +253,6 @@ std::string PipelineCacheTitleId() {
 }
 
 
-
-// KYTY_TRACE_STAGEF: the GPU thread's own MaterializeResources calls by shader and zone; every 4096 calls one
-// SRT_WALK_TOP line names the 12 costliest (shader/zone=ms/calls) of those calls and starts over. GPU thread only.
-static void NoteSrtWalk(uint64_t hash, uint64_t nanos) {
-	struct Entry {
-		uint64_t nanos = 0;
-		uint32_t calls = 0;
-	};
-	static std::unordered_map<uint64_t, Entry> walks;
-	static uint32_t                            total = 0;
-	auto& entry = walks[hash];
-	entry.nanos += nanos;
-	entry.calls++;
-	if ((++total & 4095u) != 0) return;
-	std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> rows;
-	uint64_t                                              sum = 0;
-	for (const auto& [shader, walk]: walks) {
-		rows.emplace_back(walk.nanos, shader, walk.calls);
-		sum += walk.nanos;
-	}
-	std::ranges::sort(rows, std::greater<>());
-	std::string line;
-	for (size_t i = 0; i < rows.size() && i < 12; i++) {
-		const auto& [ns, shader, calls] = rows[i];
-		line += fmt::format(" {:016x}={:.1f}ms/{}", shader, static_cast<double>(ns) / 1e6, calls);
-	}
-	std::fprintf(stderr, "SRT_WALK_TOP calls=4096 ms=%.1f shaders=%zu%s\n", static_cast<double>(sum) / 1e6, walks.size(),
-	             line.c_str());
-	walks.clear();
-}
 
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -580,8 +546,6 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
-		const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::PipelineCache); // KYTY_TRACE_QUEUES
-		const StageF::Zone                    stagef_find(StageF::Sub::ProgFind); // KYTY_TRACE_STAGEF
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -659,21 +623,8 @@ struct PipelineCache::ProgramCache {
 				if (!resolved) {
 					KYTY_PROFILER_BLOCK("MaterializeResources");
 					const auto walk_begin = std::chrono::steady_clock::now(); // PERF_RESOLVE_STAGES
-					{
-						// KYTY_TRACE_STAGEF: the top shaders.
-						const StageF::Zone stagef_walk(StageF::Sub::SrtWalk);
-						const auto walk_start = StageF::Enabled() ? std::chrono::steady_clock::now()
-						                                          : std::chrono::steady_clock::time_point {};
-						EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-						    entry->second.resource_plan, runtime, out_resources,
-						    out_specialization));
-						if (StageF::Enabled()) {
-							NoteSrtWalk(params.hash,
-							            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-							                                      std::chrono::steady_clock::now() - walk_start)
-							                                      .count()));
-						}
-					}
+					EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, out_resources,
+					                                                    out_specialization));
 					const size_t kind = std::is_same_v<InputInfo, ShaderComputeInputInfo> ? 1u : 0u;
 					g_resolve_stats.walks[kind][static_cast<size_t>(take)].fetch_add(1, std::memory_order_relaxed);
 					g_resolve_stats.walk_ns[kind][static_cast<size_t>(take)].fetch_add(
@@ -682,7 +633,6 @@ struct PipelineCache::ProgramCache {
 					                              .count()),
 					    std::memory_order_relaxed);
 				}
-				if (StageF::Enabled()) StageF::NoteStage(true, resolved, resolved); // KYTY_TRACE_STAGEF
 				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) { // KYTY_TRACE_DISPATCH_CENSUS
 					t_compute_program_path = resolved ? 3u : 2u;
 				}
@@ -704,7 +654,6 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		const StageF::Zone stagef_compile(StageF::Sub::Compile); // KYTY_TRACE_STAGEF: a program miss, to the end
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) t_compute_program_path = 4u; // KYTY_TRACE_DISPATCH_CENSUS
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -902,8 +851,6 @@ struct PipelineCache::ProgramCache {
 		if (!use_reused && !translated.has_value()) {
 			translate();
 		}
-		PipelineTrace::TraceSpecialization(params.hash, stage_name, LastSpecialization(entry->second.permutations),
-		                                   entry->second.permutations.size(), entry->second.specialization, push_data_cursor);
 		ShaderRecompiler::IR::NoteNullShareVariant(entry->second.resource_plan,
 		                                           entry->second.specialization); // the null share journal
 		{
@@ -1067,7 +1014,6 @@ struct PipelineCache::ProgramCache {
 		r.user_data_count = params.user_data_count;
 		std::copy_n(params.user_data.begin(), params.user_data_count, r.user_data.begin());
 		r.taken = false;
-		if (StageF::Enabled()) r.stamp = StageF::TakeResolveStamp(); // before the reads
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = std::span<const uint32_t>(r.user_data.data(), r.user_data_count),
 		    .shader_base                = r.shader_base,
@@ -1125,7 +1071,6 @@ struct PipelineCache::ProgramCache {
 		for (uint32_t i = 0; i < results.count; i++) {
 			auto& r = results.stages[i];
 			r.taken = true;
-			if (StageF::Enabled()) StageF::NoteAdopted(r.stamp);
 		}
 		g_resolve_stats.taken.fetch_add(results.count, std::memory_order_relaxed);
 		return true;
@@ -1572,22 +1517,6 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-// KYTY_PERF_PCACHE_SKIP_UNCHANGED=1 (default off): a save whose driver-cache data has the size the cache file
-// already holds writes nothing (see Save). Without it every periodic save and the quit save rewrote the whole
-// file (1.86 GB at the time) although only cache hits had happened since the last write.
-static bool PcacheSkipUnchanged() {
-	static constinit Common::OnceValue<bool> enabled_once;
-	return enabled_once.Get([] {
-		const char* value = std::getenv("KYTY_PERF_PCACHE_SKIP_UNCHANGED");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) {
-			std::fprintf(stderr, "PERF_PCACHE_SKIP_UNCHANGED enabled (an unchanged driver cache is not rewritten)\n");
-			std::fflush(stderr);
-		}
-		return on;
-	});
-}
-
 // The driver cache is otherwise written only at shutdown; save it every two minutes so a
 // session that ends abnormally keeps its compiled pipelines.
 void PipelineCache::SaveIfDue() {
@@ -1635,17 +1564,9 @@ bool PipelineCache::Save(bool background) {
 	// The warm list: the pipelines created before this point are in the data fetched below.
 	std::vector<uint64_t> warm_entries;
 	if (m_warm != nullptr) warm_entries = m_warm->TakeMarked();
-	// KYTY_PERF_PCACHE_SKIP_UNCHANGED: the payload size the cache file holds now (the last save's, else the loaded
-	// one; the previous save thread was joined above), 0 when unknown.
-	const uint64_t file_payload_bytes =
-	    PcacheSkipUnchanged() ? (m_cache_saved_bytes->load(std::memory_order_relaxed) != 0
-	                                 ? m_cache_saved_bytes->load(std::memory_order_relaxed)
-	                                 : m_driver_cache_loaded_bytes)
-	                          : 0;
 	auto write = [device = m_graphics.device, cache = m_driver_cache, path = m_driver_cache_path,
 	              signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), warm = m_warm,
-	              warm_entries = std::move(warm_entries), cache_saved_bytes = m_cache_saved_bytes,
-	              file_payload_bytes]() mutable {
+	              warm_entries = std::move(warm_entries), cache_saved_bytes = m_cache_saved_bytes]() mutable {
 		uint64_t   saved_bytes = 0;
 		const auto save_begin  = std::chrono::steady_clock::now(); // KYTY_TRACE_STARTUP
 		double     fetch_ms    = 0.0;
@@ -1658,22 +1579,6 @@ bool PipelineCache::Save(bool background) {
 				result = device.getPipelineCacheData(cache, &size, nullptr);
 				if (result != vk::Result::eSuccess || size == 0) {
 					break;
-				}
-				// KYTY_PERF_PCACHE_SKIP_UNCHANGED: the driver cache only grows (entries are added, never
-				// replaced), so data of the size the file already holds is the file's data: nothing is fetched,
-				// hashed or written (it was ~1.86 GB rewritten every 2 minutes of play and at every quit).
-				// The file holds every pipeline the cache holds, so the warm list commits as after a write.
-				if (attempt == 0 && file_payload_bytes != 0 && size == file_payload_bytes) {
-					PipelineCacheLog("Vulkan pipeline cache: unchanged ({} bytes), {} not rewritten", size,
-					                 Common::PathToString(path));
-					if (Common::StartupTrace::Enabled()) {
-						std::fprintf(stderr, "STARTUP_PCACHE_SAVE bytes=%zu unchanged total_ms=%.0f\n", size,
-						             MillisecondsSince(save_begin));
-						std::fflush(stderr);
-					}
-					saved_bytes = size;
-					cache_saved_bytes->store(size, std::memory_order_relaxed);
-					return true;
 				}
 				// Headroom: other threads (background compiles, the GPU thread) may add entries in between.
 				payload.resize(size + (size_t {128} << 20u));
@@ -1837,7 +1742,7 @@ static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::Vert
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
 		// Upstream b4406b046: COLOR_11_11_10 UNORM targets get packed exports with exact rounding (their backing is
-		// remapped in TextureGetRenderTargetFormat). Only without KYTY_DIAG_RT_11_11_10_FLOAT (default on, M48), which
+		// remapped in TextureGetRenderTargetFormat). Only without KYTY_FIX_RT_11_11_10_FLOAT (default on, M48), which
 		// takes these targets as packed unsigned floats instead.
 		for (uint32_t export_index = 0; export_index < 8u && !Prospero::Diagnostic111110UnormAsFloat(); export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
@@ -1970,7 +1875,6 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
     const ShaderIndirectDrawInfo& indirect_draw) {
-	const StageF::Zone stagef_progs(StageF::Sub::EvProgs); // M26
 	std::array<ShaderParams, 3> vertex_params;
 	ShaderParams                pixel_params;
 	uint32_t                    push_data_cursor = 0;
@@ -2186,7 +2090,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
 		// Upstream b4406b046: a packed 11-11-10 UNorm export writes one 32-bit channel (not with
-		// KYTY_DIAG_RT_11_11_10_FLOAT, see GraphicsProgramInputs).
+		// KYTY_FIX_RT_11_11_10_FLOAT, see GraphicsProgramInputs).
 		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm &&
 		    !Prospero::Diagnostic111110UnormAsFloat()) {
 			static_params.color_mask[slot] = 1u;
@@ -2326,7 +2230,6 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 }
 
 void PipelineCache::PipelineHousekeeping() {
-	const StageF::Zone stagef_housekeeping(StageF::Sub::PipeCreate); // KYTY_TRACE_STAGEF
 	StartBackgroundCompiles();
 	SaveIfDue();
 }
@@ -2346,8 +2249,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::PipelineCache); // KYTY_TRACE_QUEUES
-	const StageF::Zone                    stagef_find(StageF::Sub::PipeFind); // KYTY_TRACE_STAGEF
 	PipelineHousekeeping();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 	GraphicsPipelineKey key = MakeGraphicsPipelineKey(colors, depth, vertex_info, command, ps_input_info, topology,
@@ -2367,7 +2268,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (found.pipeline == nullptr) RecreateGraphicsPipeline(found, key, vertex_info, ps_input_info, programs);
 		return found;
 	}
-	const StageF::Zone stagef_create(StageF::Sub::PipeCreate); // KYTY_TRACE_STAGEF: a miss, to the end
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -2472,8 +2372,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool* failed) {
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::PipelineCache); // KYTY_TRACE_QUEUES
-	const StageF::Zone                    stagef_find(StageF::Sub::PipeFind); // KYTY_TRACE_STAGEF
 	PipelineHousekeeping();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(GfxAsync)", profiler::colors::DeepOrangeA200);
 	auto& stats = g_table_async;
@@ -2584,8 +2482,6 @@ PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
-	const Common::QueueTrace::SharedScope queue_trace(Common::QueueTrace::Shared::PipelineCache); // KYTY_TRACE_QUEUES
-	const StageF::Zone                    stagef_find(StageF::Sub::PipeFind); // KYTY_TRACE_STAGEF
 	PipelineHousekeeping();
 
 	EXIT_IF(!compute_program);
@@ -2597,7 +2493,6 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		if (found.pipeline == nullptr) RecreateComputePipeline(found, input_info, compute_program);
 		return found;
 	}
-	const StageF::Zone stagef_create(StageF::Sub::PipeCreate); // KYTY_TRACE_STAGEF: a miss, to the end
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);

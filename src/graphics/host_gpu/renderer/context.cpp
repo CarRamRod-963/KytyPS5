@@ -3,7 +3,6 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/cmdSignature.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -41,7 +40,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	// A new command buffer starts without any pipeline or dynamic state (KYTY_DIAG_DRAW_STATE_FILTER).
+	// A new command buffer starts without any pipeline or dynamic state (KYTY_FIX_DRAW_STATE_FILTER).
 	InvalidateGraphicsState();
 }
 
@@ -78,30 +77,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
-	if (CmdSignature::Enabled()) {
-		// KYTY_TRACE_CMD_SIGNATURE: the render pass's size, layers, and each attachment's layout, load op and clear
-		// value (not its view: a handle).
-		std::array<uint64_t, 4 + (RENDER_COLOR_ATTACHMENTS_MAX + 1) * 4> words {};
-		size_t                                                           count = 0;
-		words[count++] = state.width;
-		words[count++] = state.height;
-		words[count++] = state.num_layers;
-		words[count++] = state.num_color_attachments;
-		const auto attachment_words = [&](const RenderAttachment& attachment) {
-			words[count++] = static_cast<uint64_t>(attachment.image_layout) |
-			                 (uint64_t {attachment.is_clear} << 32u) | (uint64_t {attachment.has_depth} << 33u) |
-			                 (uint64_t {attachment.depth_clear} << 34u) | (uint64_t {attachment.has_stencil} << 35u) |
-			                 (uint64_t {attachment.stencil_clear} << 36u) | (uint64_t {attachment.image_view ? 1u : 0u} << 37u);
-			words[count++] = attachment.clear_value[0] | (uint64_t {attachment.clear_value[1]} << 32u);
-			words[count++] = attachment.clear_value[2] | (uint64_t {attachment.clear_value[3]} << 32u);
-			words[count++] = 0;
-		};
-		for (uint32_t i = 0; i < state.num_color_attachments; i++) {
-			attachment_words(state.color_attachments[i]);
-		}
-		attachment_words(state.depth_stencil_attachment);
-		CmdSignature::Fold(CmdSignature::Kind::BeginRendering, words.data(), count * sizeof(uint64_t));
-	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {

@@ -80,12 +80,6 @@ bool NullFormattedStickyEnabled() {
 	return on;
 }
 
-// KYTY_TRACE_SRT_READS=1: the ordinary-read hook traces the walker's reads; the ahead reader bypasses it.
-bool TraceSrtReadsEnabled() {
-	static const bool on = Common::EnvRead::SrtReads();
-	return on;
-}
-
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
@@ -969,13 +963,6 @@ constexpr uint64_t MaxIndirectRangeBytes   = uint64_t {256} << 20u;
 // read-only buffer to min(256 MiB, maxStorageBufferRange - alignment + 1), and Vulkan guarantees 2^27 for the range).
 constexpr uint64_t UnboundedTableBoundBytes = (uint64_t {1} << 27u) - 256u;
 
-// KYTY_TRACE_INDIRECT_RANGES=1: per shader and record-keyed source, the record count and the ranges whenever they
-// change (first 256 distinct lines; the tracker prints INDIRECT_RANGE_ACCESS for every access).
-bool TraceIndirectRangesEnabled() {
-	static const bool on = Common::EnvRead::IndirectRanges();
-	return on;
-}
-
 // The guest bytes the BDA accesses of `range` can touch through the candidate V# `value`, as [address, address + size)
 // widened to whole dwords (size 0: the V# admits no access). Mirrors PrepareIndirectBuffer, CalculateBufferAddress and
 // IndirectBufferInBounds (spirvEmitterMemory.cpp): every vector BDA access needs a nonzero data format and record
@@ -1038,7 +1025,6 @@ bool MaterializeIndirectRanges(const ResourcePlan& program, const SrtRuntime& ru
 		const auto&          indirect = *source->indirect_descriptor;
 		if (!indirect.sources.empty()) {
 			// Path proofs: direct candidate V#s (the reads a path proof leaves).
-			const auto first_range = ranges.size();
 			for (const auto candidate_source: indirect.sources) {
 				DescriptorValue candidate;
 				uint64_t    address = 0, size = 0;
@@ -1065,18 +1051,6 @@ bool MaterializeIndirectRanges(const ResourcePlan& program, const SrtRuntime& ru
 				}
 				if (size != 0u)
 					ranges.push_back({.address = address, .size = size, .written = range.written});
-			}
-			if (TraceIndirectRangesEnabled() && t_ahead.log == nullptr) {
-				auto line = fmt::format("INDIRECT_RANGES hash=0x{:016x} source={} proven={} written={} ranges=",
-				                        program.shader_hash, range.source, indirect.sources.size(), range.written ? 1 : 0);
-				for (size_t index = first_range; index < ranges.size(); ++index) {
-					line += fmt::format("{}{:x}+{:x}", index == first_range ? "" : ",", ranges[index].address,
-					                    ranges[index].size);
-				}
-				static std::mutex            mutex;
-				static std::set<std::string> seen;
-				std::lock_guard              lock(mutex);
-				if (seen.size() < 256u && seen.insert(line).second) std::fprintf(stderr, "%s\n", line.c_str());
 			}
 			continue;
 		}
@@ -1155,7 +1129,6 @@ bool MaterializeIndirectRanges(const ResourcePlan& program, const SrtRuntime& ru
 			    program.shader_hash, range.source, key, count, why, candidate.dwords[0], candidate.dwords[1],
 			    candidate.dwords[2], candidate.dwords[3]));
 		};
-		const auto first_range = ranges.size();
 		for (uint32_t key = 0; key < count; ++key) {
 			// The GPU's record offset: 32-bit shader arithmetic, then the dword-aligned instruction offset.
 			const uint64_t offset = uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
@@ -1197,21 +1170,6 @@ bool MaterializeIndirectRanges(const ResourcePlan& program, const SrtRuntime& ru
 				return refuse(key, why, candidate);
 			}
 			if (size != 0u) ranges.push_back({.address = address, .size = size, .written = range.written});
-		}
-		if (TraceIndirectRangesEnabled() && t_ahead.log == nullptr) {
-			auto line = fmt::format("INDIRECT_RANGES hash=0x{:016x} source={} table=0x{:x}+0x{:x} stride={} field={} "
-			                        "records={}{} written={} ranges=",
-			                        program.shader_hash, range.source, table_base, table_size, indirect.table_stride,
-			                        uint64_t {indirect.table_offset} + indirect.table_immediate, count,
-			                        game_count ? " (game count)" : "", range.written ? 1 : 0);
-			for (size_t index = first_range; index < ranges.size(); ++index) {
-				line += fmt::format("{}{:x}+{:x}", index == first_range ? "" : ",", ranges[index].address,
-				                    ranges[index].size);
-			}
-			static std::mutex            mutex;
-			static std::set<std::string> seen;
-			std::lock_guard              lock(mutex);
-			if (seen.size() < 256u && seen.insert(line).second) std::fprintf(stderr, "%s\n", line.c_str());
 		}
 	}
 	// Overlapping and adjacent ranges are one: the renderer obtains and tests each once.
@@ -1589,7 +1547,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		                                          format == Prospero::BufferFormat::k16SInt ||
 		                                          format == Prospero::BufferFormat::k8SInt) &&
 		                              base.written && !base.read && !base.atomic;
-		// Packed 11_11_10 UNorm (format 30, KYTY_DIAG_RT_11_11_10_FLOAT=0) is bound through its R32_UINT backing: the
+		// Packed 11_11_10 UNorm (format 30, KYTY_FIX_RT_11_11_10_FLOAT=0) is bound through its R32_UINT backing: the
 		// image is typed by the backing's class and the shader decodes the fields (UnpackImageTexel, SamplePackedUnormLz).
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    image.conversion_format == Prospero::BufferFormat::k11_11_10UNorm ? Prospero::RemapTextureFormat(format) : format);
@@ -2737,7 +2695,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
-// KYTY_DIAG_SRT_TAPE_VERIFY=1: materializes with the tape into scratch copies, then with SrtWalker
+// KYTY_FIX_SRT_TAPE_VERIFY=1: materializes with the tape into scratch copies, then with SrtWalker
 // into the real outputs, and reports any difference (including the order of captured reads).
 static bool MaterializeResourcesVerified(const ResourcePlan& program, const SrtRuntime& runtime,
                                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
@@ -2867,7 +2825,7 @@ bool MaterializeResourcesAhead(const ResourcePlan& program, const SrtRuntime& ru
 	};
 	// Not reentrant; and only configurations whose reads and results the ahead path reproduces exactly.
 	if (t_ahead.log != nullptr || !SrtTapeEnabled() || SrtTapeVerifyEnabled() ||
-	    NullFormattedStickyEnabled() || TraceSrtReadsEnabled() ||
+	    NullFormattedStickyEnabled() ||
 	    (runtime.read_memory != nullptr && runtime.read_memory != &AheadReadMemory)) {
 		return finish(false, AheadRefusal::Flag);
 	}
@@ -2922,38 +2880,6 @@ static bool EntryUnchangedViaReaders(const ReadLog& log, const ReadLog::Entry& e
 	                std::memcmp(words.data(), log.bytes.data() + entry.first, entry.size) == 0));
 }
 
-// KYTY_TRACE_FAST_ADOPT_TIME=1 (diagnostic, default off): where ReadsUnchangedFast spends its time, GPU thread only.
-// Every 65536 calls one FAST_ADOPT_TIME line: time in the kernel's verifier (hook) and in the one-by-one reader path
-// (slow), the entries of the slow path by kind and bytes, and the verdicts.
-namespace {
-struct FastAdoptTime {
-	uint64_t calls = 0, hook_ns = 0, slow_ns = 0, slow_entries = 0, slow_strict = 0, slow_bytes = 0, changed = 0;
-};
-bool FastAdoptTimeEnabled() {
-	static const bool on = Common::EnvRead::FastAdoptTime();
-	return on;
-}
-FastAdoptTime g_fast_adopt_time;
-uint64_t NowNs() {
-	return static_cast<uint64_t>(
-	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-void FastAdoptTimeCall(bool unchanged) {
-	auto& t = g_fast_adopt_time;
-	t.calls++;
-	if (!unchanged) t.changed++;
-	if ((t.calls & 0xffffu) != 0) return;
-	std::fprintf(stderr,
-	             "FAST_ADOPT_TIME calls=%llu hook_ms=%.1f slow_ms=%.1f slow_entries=%llu slow_strict=%llu slow_bytes=%llu "
-	             "changed=%llu\n",
-	             static_cast<unsigned long long>(t.calls), static_cast<double>(t.hook_ns) / 1e6,
-	             static_cast<double>(t.slow_ns) / 1e6, static_cast<unsigned long long>(t.slow_entries),
-	             static_cast<unsigned long long>(t.slow_strict), static_cast<unsigned long long>(t.slow_bytes),
-	             static_cast<unsigned long long>(t.changed));
-	t = {};
-}
-} // namespace
-
 // The check with the kernel's fast verifier in front (see ResourceMaterialization.h). Every entry is verified
 // exactly once, in log order: runs the verifier proves are compared in place, the rest one by one through the
 // readers (which download GPU-dirty bytes and wait for pending readbacks as a real call does). The result is true
@@ -2972,20 +2898,13 @@ bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdopt
 	const OrdinaryReadSession session(true);
 	const size_t              count = log.entries.size();
 	size_t                    index = 0;
-	const bool                timed = FastAdoptTimeEnabled();
-	auto&                     time  = g_fast_adopt_time;
 	while (index < count) {
 		if (hook != nullptr) {
-			size_t         stop  = index;
-			const uint64_t start = timed ? NowNs() : 0;
-			const auto     found = hook(log, index, stop, counted);
-			if (timed) time.hook_ns += NowNs() - start;
+			size_t     stop  = index;
+			const auto found = hook(log, index, stop, counted);
 			switch (found) {
-				case FastVerifyResult::Unchanged:
-					if (timed) FastAdoptTimeCall(true);
-					return true;
+				case FastVerifyResult::Unchanged: return true;
 				case FastVerifyResult::Changed:
-					if (timed) FastAdoptTimeCall(false);
 					t_srt_changed_entry = stop;
 					return false;
 				case FastVerifyResult::NeedsReader: break;
@@ -2994,24 +2913,15 @@ bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdopt
 			index = stop >= index && stop < count ? stop : index;
 		}
 		++counted.entries_slow;
-		const uint64_t start = timed ? NowNs() : 0;
-		t_srt_read_class     = log.entries[index].cls; // KYTY_TRACE_SRT_CLASSES (0 when the trace is off)
-		const bool same      = EntryUnchangedViaReaders(log, log.entries[index], runtime);
-		t_srt_read_class     = 0u;
-		if (timed) {
-			time.slow_ns += NowNs() - start;
-			time.slow_entries++;
-			if (log.entries[index].kind == ReadLog::Kind::Strict) time.slow_strict++;
-			time.slow_bytes += log.entries[index].size;
-		}
+		t_srt_read_class = log.entries[index].cls; // KYTY_TRACE_SRT_CLASSES (0 when the trace is off)
+		const bool same  = EntryUnchangedViaReaders(log, log.entries[index], runtime);
+		t_srt_read_class = 0u;
 		if (!same) {
-			if (timed) FastAdoptTimeCall(false);
 			t_srt_changed_entry = index;
 			return false;
 		}
 		++index;
 	}
-	if (timed) FastAdoptTimeCall(true);
 	return true;
 }
 

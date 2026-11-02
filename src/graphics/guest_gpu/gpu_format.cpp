@@ -10,7 +10,7 @@
 
 namespace Libs::Graphics::Prospero {
 
-// KYTY_DIAG_RT_11_11_10_FLOAT=1: logged APPROXIMATION. Packed 11_11_10 UNORM (format 30) holds
+// KYTY_FIX_RT_11_11_10_FLOAT=1: logged APPROXIMATION. Packed 11_11_10 UNORM (format 30) holds
 // unsigned floats in practice; it takes the 11_11_10 FLOAT format info and host format
 // (B10G11R11_UFLOAT, as SharpEmu maps it). =0 keeps format 30 unknown.
 bool Diagnostic111110UnormAsFloat() {
@@ -20,9 +20,9 @@ bool Diagnostic111110UnormAsFloat() {
 		// 10_11_11_FLOAT, 43 11_11_10_FLOAT; 30-35 and 37-42 are not listed) and Mesa maps R11G11B10_FLOAT to the same
 		// COLOR_10_11_11 / IMG 10_11_11, but no document says what format 30 itself returns; to confirm: a captured
 		// render target with values > 1.0 (refinterp). =0 turns it off.
-		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_RT_11_11_10_FLOAT");
+		const char* value = Common::ShaderEnv::Read("KYTY_FIX_RT_11_11_10_FLOAT");
 		const bool on = value != nullptr && value[0] == '1' && value[1] == '\0';
-		if (on) std::fprintf(stderr, "DIAG_RT_11_11_10_FLOAT APPROXIMATION enabled: 11_11_10 UNORM as UFLOAT\n");
+		if (on) std::fprintf(stderr, "FIX_RT_11_11_10_FLOAT APPROXIMATION enabled: 11_11_10 UNORM as UFLOAT\n");
 		return on;
 	}();
 	return enabled;
@@ -266,7 +266,7 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
 		// Upstream 1905b28b3 / b4406b046 sample format 30 as packed UNorm bits (R32Uint + shader decode); with
-		// KYTY_DIAG_RT_11_11_10_FLOAT (default on, M48) it is an unsigned-float texture, not remapped.
+		// KYTY_FIX_RT_11_11_10_FLOAT (default on, M48) it is an unsigned-float texture, not remapped.
 		case BufferFormat::k11_11_10UNorm:
 			return Diagnostic111110UnormAsFloat() ? format : BufferFormat::k32UInt;
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;

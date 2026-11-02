@@ -40,13 +40,13 @@
 // watchdog_trips: only with KYTY_DIAG_RT_TRIPS (diagnostic, changes SPIR-V): invocations that reached a loop cap (a
 //   KYTY_SHADER_LOOP_LIMIT_HASHES cap or the global KYTY_SHADER_LOOP_LIMIT) summed over the fault passes that read the
 //   diagnostic tail (faultManager.cpp ReportDiagTail; which shader: WATCHDOG_TRIP lines). passes=0: RT_TRIPS off.
-// depth_encoding: KYTY_DIAG_DEPTH_ENCODING_LENIENT (descriptors.cpp DepthEncodingFieldsVerdict): sampled depth T#s the
+// depth_encoding: KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT (descriptors.cpp DepthEncodingFieldsVerdict): sampled depth T#s the
 //   strict encoding check refused, by what differs: only fields the texture unit does not use for that T# (RDNA2 ISA
 //   table 45), CORNER_SAMPLES = 1 (texel placement, not emulated), anything else.
-// fmt30: KYTY_DIAG_RT_11_11_10_FLOAT: render targets programmed COLOR_10_11_11 + UNORM (guest format 30) taken as packed
+// fmt30: KYTY_FIX_RT_11_11_10_FLOAT: render targets programmed COLOR_10_11_11 + UNORM (guest format 30) taken as packed
 //   unsigned floats; T#s of format 36 (10_11_11_FLOAT) over the memory of such a target (the game itself reads what the
 //   target holds as floats); T#s of format 30.
-// clamp_layer / clamp_mip: KYTY_DIAG_TEXTURE_CLAMP_LAST_LEVEL: 1D/2D views whose BASE_ARRAY names a layer the image does
+// clamp_layer / clamp_mip: KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL: 1D/2D views whose BASE_ARRAY names a layer the image does
 //   not have, and of those the images with more than one layer (only there "the last layer" differs from the only one);
 //   views whose LAST_LEVEL exceeds MAX_MIP, and of those the ones whose BASE_LEVEL is past MAX_MIP too.
 // tess_ring: (Tessellation.cpp, per translated program): ring addresses evaluated; of
@@ -81,13 +81,13 @@
 // A5 step E0 (DCC colour metadata), same line, last:
 //        dcc_fast=<tex_clears>/<known_expands>/<partial_fill>/<fills> meta_unaligned=<n> dcc_levels=<n>
 //        dcc_check=<checks>/<skips>/<fallback>/<cpu_reads>
-// dcc_fast: KYTY_DIAG_DCC_FAST_CLEAR (textureCache.cpp): sampled surfaces cleared before a use by a registered key fill
-//   (ApplyDccFastClear), known keys expanded for a render-target or storage use without a check (KYTY_DIAG_DCC_KNOWN_KEYS),
+// dcc_fast: KYTY_WORKAROUND_DCC_FAST_CLEAR (textureCache.cpp): sampled surfaces cleared before a use by a registered key fill
+//   (ApplyDccFastClear), known keys expanded for a render-target or storage use without a check (KYTY_FIX_DCC_KNOWN_KEYS),
 //   decisions where a registered fill covered only part of the metadata, key fills registered (RegisterDccFill).
 // meta_unaligned: colour metadata not made of whole 4 KiB slices (MaterializeColorClear; read slice by slice as they are,
 //   as the hardware places them).
 // dcc_levels: DCC or CMASK views with more than one level, whose keys are never looked at (MaterializeColorClear).
-// dcc_check: KYTY_DIAG_DCC_GPU_CLEAR_CHECK: key checks recorded on the GPU, checks skipped (slices already checked since
+// dcc_check: KYTY_FIX_DCC_GPU_CLEAR_CHECK: key checks recorded on the GPU, checks skipped (slices already checked since
 //   their last write, or no key clears the view), checks that fell back to the CPU read, CPU reads of GPU-written keys
 //   (each one waits for the GPU).
 namespace Common::WorkaroundHits {
@@ -201,7 +201,7 @@ inline void NoteShader(Hit hit, Tally tally, uint64_t shader_hash) {
 	t.other.fetch_add(1, std::memory_order_relaxed);
 }
 
-// KYTY_DIAG_RT_11_11_10_FLOAT (fmt30): guest addresses of render targets programmed as format 30 (the first 64), so a
+// KYTY_FIX_RT_11_11_10_FLOAT (fmt30): guest addresses of render targets programmed as format 30 (the first 64), so a
 // later T# over the same memory can be matched (Fmt30ReadAsFloat).
 inline std::atomic<uint64_t>* Fmt30Targets() {
 	static std::atomic<uint64_t> targets[64] {};

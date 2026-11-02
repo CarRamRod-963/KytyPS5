@@ -10,7 +10,6 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDrawPlan.h"
-#include "graphics/host_gpu/renderer/sceneAudit.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
@@ -43,50 +42,12 @@ static const char* RenderColorTypeName(const RenderColorInfo& color) {
 	return color.image_id ? "RenderTexture" : "NoColorOutput";
 }
 
-void TraceDrawDrop(const char* reason, const CommandBuffer& buffer, const std::string* state) {
+void TraceDrawDrop(const char* reason, [[maybe_unused]] const CommandBuffer& buffer) {
 	// KYTY_TRACE_CLEAN_DRAWS: a metadata / copy / resolve operation ends a series of clean draws.
 	if (std::strncmp(reason, "metadata", 8) == 0) {
 		CleanDraws::g_meta_ops.fetch_add(1, std::memory_order_relaxed);
 		CleanDraws::NoteBreak(CleanDraws::BreakMetaOp);
 	}
-	// KYTY_TRACE_AUDIT_FRAME: the dropped draw is a record of the scene audit.
-	if (SceneAudit::Enabled()) {
-		SceneAudit::RecordSkipped("draw", reason);
-		if (state != nullptr) SceneAudit::NoteSkipState(*state);
-	}
-	static const std::vector<std::string> filters = [] {
-		std::vector<std::string> list;
-		const char*              value = std::getenv("KYTY_TRACE_DRAW_DROPS");
-		if (value == nullptr) return list;
-		std::string text(value);
-		size_t      start = 0;
-		while (start <= text.size()) {
-			const auto end  = text.find('|', start);
-			auto       item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
-			if (!item.empty()) list.push_back(item);
-			if (end == std::string::npos) break;
-			start = end + 1;
-		}
-		return list;
-	}();
-	if (filters.empty()) return;
-	const auto path = DebugMarkerPath();
-	if (std::none_of(filters.begin(), filters.end(),
-	                 [&](const std::string& f) { return path.find(f) != std::string::npos; })) {
-		return;
-	}
-	static std::mutex            mutex;
-	static std::set<std::string> seen;
-	{
-		std::scoped_lock lock(mutex);
-		if (seen.size() >= 64u ||
-		    !seen.insert(std::string(reason) + "|" + path + "|" + (state != nullptr ? *state : std::string())).second) {
-			return;
-		}
-	}
-	std::fprintf(stderr, "DRAW_DROP reason=%s marker=[%s] prim=%u frame=%u%s%s\n", reason, path.c_str(),
-	             static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()), DebugPresentCount().load(),
-	             state != nullptr ? " state=" : "", state != nullptr ? state->c_str() : "");
 }
 
 void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,

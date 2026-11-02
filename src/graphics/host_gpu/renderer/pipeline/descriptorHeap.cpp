@@ -41,7 +41,7 @@ constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
-    // KYTY_PERF_UNIFORM_CONST_BUFFERS: flattened SRT and shader-data uniform views.
+    // Uniform const buffers (ShaderIR.h): flattened SRT and shader-data uniform views.
     vk::DescriptorPoolSize {vk::DescriptorType::eUniformBuffer, 2048},
 };
 

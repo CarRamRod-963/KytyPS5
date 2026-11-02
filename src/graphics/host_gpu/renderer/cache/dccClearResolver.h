@@ -13,7 +13,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandScheduler;
 
-// KYTY_DIAG_DCC_GPU_CLEAR_CHECK (port of BryanKAdams 8db16e32 + c41cebee).
+// KYTY_FIX_DCC_GPU_CLEAR_CHECK (port of BryanKAdams 8db16e32 + c41cebee).
 // Decides on the GPU whether GPU-written DCC metadata slices hold a fast clear. The check writes
 // one predicate per (slice, clear code); callers wrap each candidate clear in conditional
 // rendering, so the CPU never waits for the metadata bytes.

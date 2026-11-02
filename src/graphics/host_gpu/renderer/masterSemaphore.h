@@ -33,8 +33,6 @@ public:
 	void Refresh();
 	void RefreshNow();
 	void Wait(uint64_t tick);
-	// KYTY_TRACE_PERF_SAMPLE_IDLE: the semaphore's value now, from any thread (no stats, the known tick stays).
-	[[nodiscard]] uint64_t QueryTickRaw() const;
 
 	// KYTY_TRACE_PERF (PERF semaphore): semaphore queries (calls/ns) by caller: 0 Refresh, 1 Wait before blocking, 2 Wait
 	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats.

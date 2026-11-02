@@ -80,7 +80,7 @@ public:
 	void                        DebugDescribeRegion(const char* tag, uint64_t address, uint64_t size) const;
 	// Diagnostic: the cached images starting exactly at address.
 	[[nodiscard]] std::vector<Image*> DebugImagesAt(uint64_t address);
-	// KYTY_DIAG_STENCIL_STORAGE_SHADOW: a GPU-only R8_UINT image standing in for a stencil plane.
+	// KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW: a GPU-only R8_UINT image standing in for a stencil plane.
 	[[nodiscard]] ImageId GetStencilShadowImage(uint32_t width, uint32_t height);
 	// descriptors.cpp NullCompareBinding: the null image of a depth-compare binding, a 1x1 D16_UNORM image holding
 	// 0.0 or (one) 1.0, created once each. Takes m_lock.
@@ -161,8 +161,6 @@ public:
 	// for a table's unchanged slots, under one lock.
 	void TouchTableImages(std::span<const ImageId> ids);
 	[[nodiscard]] bool        ImageReplayable(ImageId id) const;
-	// KYTY_TRACE_TABLE_CENSUS: the stage-image-set proof for one image, dry (0 proven, else a reason).
-	[[nodiscard]] uint32_t TableProofDry(ImageId id);
 	// The table sets (pipeline\descriptors.cpp): FindImage / FindTexture work of a stage image set, all or none.
 	[[nodiscard]] bool TableReplayStage(std::span<const ImageId> ids);
 	[[nodiscard]] bool TableTexturesReady(std::span<const ImageId> ids);
@@ -209,7 +207,7 @@ public:
 	// KYTY_FIX_HTILE_SLICE_CLEAR=2: a dispatch read inside metadata (not at its first byte), so it is no clear.
 	void NoteMetaReadGuard(uint64_t address, uint64_t hash);
 
-	// KYTY_DIAG_DCC_FAST_CLEAR=1: a compute fill wrote the uniform key byte over [address, address +
+	// KYTY_WORKAROUND_DCC_FAST_CLEAR=1: a compute fill wrote the uniform key byte over [address, address +
 	// size). A DCC clear key there means every color surface whose metadata starts at address reads
 	// as the clear color (the texture unit ignores its data memory) until it is rendered into or its
 	// keys are written again; other keys end such a clear.
@@ -218,7 +216,7 @@ public:
 	// Before a sampling (or rendering/storage) use of the image: sampled images with a registered
 	// clear key are cleared to its color; rendered or storage images end the registered clear.
 	void ApplyDccFastClear(CommandBuffer& command, ImageId id, const ImageDesc& desc);
-	// KYTY_DIAG_DCC_KNOWN_KEYS=1 (with KYTY_DIAG_DCC_FAST_CLEAR): metadata whose keys a registered
+	// KYTY_FIX_DCC_KNOWN_KEYS=1 (with KYTY_WORKAROUND_DCC_FAST_CLEAR): metadata whose keys a registered
 	// fill wrote is not downloaded (each download drained the GPU) for any use of the surface.
 	[[nodiscard]] static bool DccKnownKeysEnabled();
 	// KYTY_FIX_DCC_KEY_0X10=1 (default off): DCC key 0x10 means "the block reads as its first element". The AGC
@@ -439,7 +437,7 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
-	// KYTY_DIAG_DCC_GPU_CLEAR_CHECK (port of BryanKAdams 8db16e32 + c41cebee): GPU-written DCC keys are checked
+	// KYTY_FIX_DCC_GPU_CLEAR_CHECK (port of BryanKAdams 8db16e32 + c41cebee): GPU-written DCC keys are checked
 	// on the GPU and the clears run under conditional rendering, instead of a CPU readback (a full drain).
 	[[nodiscard]] static uint32_t DccGpuClearCheckLevel();
 	// all (KYTY_PERF_DCC_GPU_ALL): every binding type, CMASK as well as DCC metadata (the caller), more than
@@ -549,7 +547,7 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	std::array<ImageId, 2>                            m_null_depth_images {}; // GetNullDepthImage: 0.0, 1.0
 	std::unordered_map<uint64_t, ImageId>             m_stencil_shadow_images;
-	// KYTY_DIAG_PRESERVE_STENCIL: stencil of a depth image replaced by a color view (storage write
+	// KYTY_WORKAROUND_PRESERVE_STENCIL: stencil of a depth image replaced by a color view (storage write
 	// to the depth plane), restored when the depth image is recreated.
 	std::unique_ptr<Buffer> m_saved_stencil;
 	// KYTY_FIX_SHARED_IMAGE_MEMORY: private merge buffer.
@@ -561,7 +559,7 @@ private:
 	void SaveStencil(Image& depth);
 	// One saved stencil aspect per (depth image address, guest stencil plane address).
 	std::unordered_map<uint64_t, std::unique_ptr<Buffer>> m_stencil_planes;
-	// KYTY_DIAG_STENCIL_PLANE_SYNC: the depth address each guest stencil plane address was last bound with (an
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC: the depth address each guest stencil plane address was last bound with (an
 	// address, not an image: depth images get replaced), and per saved plane (same key as m_stencil_planes) the
 	// content serial taken when it was saved.
 	std::unordered_map<uint64_t, uint64_t> m_stencil_plane_depth;
@@ -573,14 +571,14 @@ private:
 	// layout is not one the saved copy describes (one layer, the depth image's extent); the caller then writes as before.
 	bool UploadStencilPlaneToSaved(Image& depth, const Image& plane, Buffer& source, uint64_t source_offset);
 	bool FillStencilPlaneSaved(CommandBuffer& command, Image& depth, const Image& plane, uint8_t value);
-	// KYTY_DIAG_STENCIL_PLANE_SYNC: a plain 1-byte image at the plane address, of the depth image's extent, written
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC: a plain 1-byte image at the plane address, of the depth image's extent, written
 	// after the plane was saved.
 	[[nodiscard]] ImageId NewerStencilPlaneImage(uint64_t plane_address, uint64_t saved_serial, vk::Extent3D extent);
 
 public:
 	// Makes a depth image's stencil aspect hold the given guest stencil plane (saved/restored on GPU).
 	void EnsureStencilPlane(ImageId depth_id, uint64_t plane_address);
-	// KYTY_DIAG_STENCIL_PLANE_SYNC=1 (default off): PS5 keeps each stencil plane in its own memory, the host keeps one
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC (default 2, Common::EnvDefaults; =0 off): PS5 keeps each stencil plane in its own memory, the host keeps one
 	// stencil aspect per depth image. A 1-byte image at a guest stencil plane address that a shader reads gets that
 	// plane's current contents: the owning depth image's stencil aspect when it holds the plane, else the copy saved
 	// at its last plane swap (kept as is when the image itself was written after that save). Returns true when the
@@ -588,7 +586,7 @@ public:
 	[[nodiscard]] static bool StencilPlaneSyncEnabled();
 	[[nodiscard]] static int  StencilPlaneSyncLevel();
 	bool SyncStencilPlaneReader(uint64_t plane_address, ImageId reader_id);
-	// KYTY_DIAG_STENCIL_ALIAS_COPY: the stencil association record at this exact address (its
+	// KYTY_WORKAROUND_STENCIL_ALIAS_COPY: the stencil association record at this exact address (its
 	// depth image holds the stencil), the last one found; empty when there is none.
 	[[nodiscard]] ImageId FindStencilAssociationAt(uint64_t address) {
 		ImageId best {};
@@ -611,9 +609,9 @@ private:
 	std::vector<std::unique_ptr<Buffer>>              m_cpu_read_buffers;
 	std::vector<std::unique_ptr<Buffer>>              m_cpu_read_buffers_busy;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// KYTY_DIAG_DCC_FAST_CLEAR: metadata start address -> (filled size, clear key).
+	// KYTY_WORKAROUND_DCC_FAST_CLEAR: metadata start address -> (filled size, clear key).
 	std::map<uint64_t, std::pair<uint64_t, uint8_t>> m_dcc_fills;
-	// KYTY_DIAG_DCC_KNOWN_KEYS: GPU writes reported by the buffer cache, applied to m_dcc_fills
+	// KYTY_FIX_DCC_KNOWN_KEYS: GPU writes reported by the buffer cache, applied to m_dcc_fills
 	// under m_lock (the observer may run while m_lock is held).
 	std::mutex                                        m_dcc_pending_mutex;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_dcc_pending;
@@ -636,7 +634,7 @@ private:
 	// stored), decoded for desc's view; false (logged as DCC_KEY_0X10 skip) when no registered store explains it.
 	[[nodiscard]] bool DecodeDccKey10(const ImageDesc& desc, vk::ClearColorValue& clear, const char* path);
 	void               EraseDccPixelFill(uint64_t address); // caller holds m_lock
-	// KYTY_DIAG_DCC_GPU_CLEAR_CHECK: slices checked on the GPU since their last write.
+	// KYTY_FIX_DCC_GPU_CLEAR_CHECK: slices checked on the GPU since their last write.
 	struct DccChecked {
 		uint64_t size      = 0;
 		uint32_t code_mask = 0;

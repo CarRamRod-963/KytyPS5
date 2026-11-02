@@ -176,7 +176,7 @@ public:
 		return m_rendering;
 	}
 
-	// KYTY_DIAG_DRAW_STATE_FILTER: the graphics pipeline and dynamic state draws last recorded into
+	// KYTY_FIX_DRAW_STATE_FILTER: the graphics pipeline and dynamic state draws last recorded into
 	// this command buffer, so that a draw skips the commands that would set the same values again.
 	// Vulkan (Pipelines, "Dynamic State"): dynamic state "persists for the lifetime of the command
 	// buffer, or until modified by another dynamic state setting command or made invalid by binding
@@ -397,8 +397,6 @@ private:
 	                                                 const ShaderTextureResource&               descriptor,
 	                                                 TextureCache::ImageDesc& desc, bool shader_conversion,
 	                                                 vk::Format pixel_format, vk::Format view_format);
-	// KYTY_TRACE_CMD_SIGNATURE (cmdSignature.h): folds what CommitBindings binds, by identity.
-	void FoldCommitSignature(vk::PipelineBindPoint bind_point, std::span<PreparedBindings* const> stages);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	// PrepareGraphicsBindings' parts in their order - FindBuffers and PrepareBda, RebindImages and the render targets,
@@ -409,9 +407,7 @@ private:
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	// metadata_expand (KYTY_FIX_NO_OUTPUT_DRAWS): the bound depth surface is resolved also without depth or stencil
-	// tests, for an HTILE expand/resummarize draw whose pending fast clear the attachment then applies.
-	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target, bool metadata_expand = false);
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
@@ -502,7 +498,7 @@ private:
 	uint32_t                          m_bindless_layout_memo_next = 0;
 	// A running hash of this draw's image binds (BindImage / BindRenderTarget: id and order), reset by ResetBindings.
 	uint64_t                          m_bound_hash = 0;
-	// KYTY_PERF_UNIFORM_CONST_BUFFERS: words padded to whole uvec4 elements before an upload read as a uniform buffer.
+	// Uniform const buffers (ShaderIR.h): words padded to whole uvec4 elements before an upload read as a uniform buffer.
 	// The soft-resolve flag below: set and reset around a soft resolve; read by its own image slots and table-set keys.
 	static inline thread_local std::vector<uint32_t> m_uniform_words;
 	static inline thread_local bool                  m_soft_texture_resolve = false;
@@ -523,7 +519,7 @@ private:
 	uint64_t                              m_table_frame         = 0;
 	uint64_t                              m_table_release_frame = 0;
 	PreparedBindings                     m_compute_bindings;
-	// KYTY_DIAG_STENCIL_STORAGE_SHADOW: storage writes to a stencil plane go to an R8_UINT shadow
+	// KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW: storage writes to a stencil plane go to an R8_UINT shadow
 	// that is filled from the stencil before the dispatch and copied back after it.
 	struct StencilShadow {
 		ImageId shadow;

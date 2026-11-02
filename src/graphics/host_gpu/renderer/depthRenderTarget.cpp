@@ -19,7 +19,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/stageFTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -288,9 +287,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r, bool metadata_expand) {
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
-	const StageF::Zone stagef_target(StageF::Sub::Target); // KYTY_TRACE_STAGEF
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
@@ -302,7 +300,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
-	if (!depth_active && !stencil_active && !metadata_expand) {
+	if (!depth_active && !stencil_active) {
 		return;
 	}
 	const bool attachment_unbound =

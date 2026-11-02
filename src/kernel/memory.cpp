@@ -12,7 +12,6 @@
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/texWinTrace.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -110,12 +109,14 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 
 // M109 crash report: the last guest unmaps, so an invalid-address exit can tell a range the game unmapped moments ago
 // (GPU work recorded after the game freed its memory) from one that was never mapped.
+// The caller of a GPU-side unmap: a real unmap, or a map (or reserve) that unmaps what it replaces.
+enum class UnmapCaller : uint32_t { MapReplace, MapOther, Unmap, Reserve, Other };
 struct RecentUnmap {
 	uint64_t vaddr   = 0;
 	uint64_t size    = 0;
 	uint64_t time_us = 0;
 	uint32_t frame   = 0;
-	uint32_t caller  = 0; // Graphics::TexWin::UnmapCaller: a real unmap, or a map that unmaps what it replaces
+	uint32_t caller  = 0; // UnmapCaller
 };
 static std::mutex                    g_recent_unmaps_mutex;
 static std::array<RecentUnmap, 8192> g_recent_unmaps;
@@ -126,7 +127,7 @@ static uint64_t SteadyMicroseconds() {
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-static void NoteRecentUnmap(uint64_t vaddr, uint64_t size, Graphics::TexWin::UnmapCaller caller) {
+static void NoteRecentUnmap(uint64_t vaddr, uint64_t size, UnmapCaller caller) {
 	std::scoped_lock lock(g_recent_unmaps_mutex);
 	g_recent_unmaps[g_recent_unmaps_count++ % g_recent_unmaps.size()] = {
 	    vaddr, size, SteadyMicroseconds(), Graphics::DebugPresentCount().load(), static_cast<uint32_t>(caller)};
@@ -143,7 +144,7 @@ static void ReportRecentUnmaps(uint64_t vaddr, uint64_t size) {
 		found++;
 		std::fprintf(stderr, "INVALID_ADDRESS_RECENT_UNMAP range=0x%016llx+0x%llx by=%s %.1f ms ago at frame %u (now %u)\n",
 		             static_cast<unsigned long long>(unmap.vaddr), static_cast<unsigned long long>(unmap.size),
-		             std::string(magic_enum::enum_name(static_cast<Graphics::TexWin::UnmapCaller>(unmap.caller))).c_str(),
+		             std::string(magic_enum::enum_name(static_cast<UnmapCaller>(unmap.caller))).c_str(),
 		             static_cast<double>(now - unmap.time_us) / 1000.0, unmap.frame, Graphics::DebugPresentCount().load());
 	}
 	if (found == 0)
@@ -165,7 +166,7 @@ ClampContextScope::~ClampContextScope() {
 	t_clamp_context = m_previous;
 }
 
-static void UnmapGpuRangeOf(uint64_t vaddr, uint64_t size, Graphics::TexWin::UnmapCaller caller) {
+static void UnmapGpuRange(uint64_t vaddr, uint64_t size, UnmapCaller caller) {
 	NoteRecentUnmap(vaddr, size, caller); // M109 crash report
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
@@ -177,13 +178,7 @@ static void UnmapGpuRangeOf(uint64_t vaddr, uint64_t size, Graphics::TexWin::Unm
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
-	UnmapGpuRangeOf(vaddr, size, Graphics::TexWin::UnmapCaller::Other);
-}
-
-// KYTY_TRACE_TEXWIN (TW3): the same, with its caller named for the TEXWIN batchmap line (and the M109 history).
-static void UnmapGpuRange(uint64_t vaddr, uint64_t size, Graphics::TexWin::UnmapCaller caller) {
-	const Graphics::TexWin::UnmapCallerScope texwin_caller(caller);
-	UnmapGpuRangeOf(vaddr, size, caller);
+	UnmapGpuRange(vaddr, size, UnmapCaller::Other);
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -1297,7 +1292,7 @@ static_assert(Graphics::TRACKER_PAGE_SIZE == 4096u, "OrdinaryReadBufferBacking c
 
 static bool SrtPageCacheVerify() {
 	static const bool on = [] {
-		const char* value = std::getenv("KYTY_DIAG_SRT_TAPE_VERIFY");
+		const char* value = std::getenv("KYTY_FIX_SRT_TAPE_VERIFY");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
 	return on;
@@ -1305,7 +1300,7 @@ static bool SrtPageCacheVerify() {
 
 // Brackets one MaterializeResources call: the page cache lives inside it. Within one call on
 // the GPU thread a page found clean stays clean: only the GPU thread marks pages GPU-modified or queues eager readbacks,
-// and it does neither inside the call. KYTY_DIAG_SRT_TAPE_VERIFY=1 re-checks every hit.
+// and it does neither inside the call. KYTY_FIX_SRT_TAPE_VERIFY=1 re-checks every hit.
 static void SrtReadSession(bool begin) {
 	auto& cache = t_ordinary_read_pages;
 	if (!begin) {
@@ -1314,7 +1309,7 @@ static void SrtReadSession(bool begin) {
 	}
 	++cache.depth;
 	std::fill(std::begin(cache.pages), std::end(cache.pages), ~0ull);
-	cache.active = g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() && !SrtReadTraceEnabled();
+	cache.active = g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread();
 }
 
 // TryReadBufferBacking reached from OrdinaryReadBufferBacking (counted there).
@@ -1333,7 +1328,7 @@ static bool OrdinaryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size)
 	if (classes) SrtClassesNoteRead(vaddr, size); // KYTY_TRACE_SRT_CLASSES
 	if (cache.active && one_page && cache.pages[page % OrdinaryReadPageCache::kSlots] == page) {
 		if (SrtPageCacheVerify()) {
-			// KYTY_DIAG_SRT_TAPE_VERIFY=1: every hit is re-checked against the tracker.
+			// KYTY_FIX_SRT_TAPE_VERIFY=1: every hit is re-checked against the tracker.
 			static std::atomic_uint hits {0};
 			static std::atomic_uint stale {0};
 			const auto              count = hits.fetch_add(1) + 1u;
@@ -1348,8 +1343,7 @@ static bool OrdinaryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size)
 		}
 		return false;
 	}
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && Graphics::GuestGpu::IsGpuThread() &&
-	    !SrtReadTraceEnabled()) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && Graphics::GuestGpu::IsGpuThread()) {
 		auto&          buffers    = GetGpuResources().GetBufferCache();
 		const uint64_t wait_start = classes ? SrtClassesNowNs() : 0;
 		const bool     overlay    = buffers.WaitPendingReadbacks(vaddr, size);
@@ -1385,7 +1379,6 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (SrtReadTraceEnabled()) TraceSrtRead(buffers, vaddr, size);
 		// KYTY_TRACE_SRT_CLASSES: reads, and the waits below, by class and region.
 		namespace Ir         = Graphics::ShaderRecompiler::IR;
 		const bool classes   = Ir::SrtClassTrace();
@@ -1479,12 +1472,11 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 		stop = count;
 		return Result::Unchanged;
 	}
-	// Off the GPU thread or while tracing reads nothing can be proven here. Without an active session page cache a
+	// Off the GPU thread nothing can be proven here. Without an active session page cache a
 	// per-call cache is used: every page is still asked the
 	// ordinary hook's questions (pending readback waited for, GPU-modified) once, and no eager readback is issued
 	// during this call.
-	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
-	    SrtReadTraceEnabled()) {
+	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
 		return Result::NeedsReader;
 	}
 	uint64_t  local_pages[OrdinaryReadPageCache::kSlots] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
@@ -3188,7 +3180,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len, Graphics::TexWin::UnmapCaller::MapOther);
+			UnmapGpuRange(in_addr, len, UnmapCaller::MapOther);
 			reserved_target = true;
 			out_addr        = in_addr;
 		}
@@ -3200,7 +3192,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len, Graphics::TexWin::UnmapCaller::MapOther);
+			UnmapGpuRange(out_addr, len, UnmapCaller::MapOther);
 		}
 	}
 
@@ -3454,9 +3446,9 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 	return OK;
 }
 
-// caller: KYTY_TRACE_TEXWIN / M109 unmap tag only.
+// caller: M109 unmap tag only.
 static int UnmapMemoryRange(const VirtualRanges::Range& range, uint64_t vaddr, size_t len,
-                            Graphics::TexWin::UnmapCaller caller = Graphics::TexWin::UnmapCaller::Other) {
+                            UnmapCaller caller = UnmapCaller::Other) {
 	UnmapGpuRange(vaddr, len, caller);
 	const int result = UnmapMemoryOwner(range, vaddr, len);
 	if (result != OK && IsCommittedRangeType(range.type)) MapGpuRange(vaddr, len);
@@ -3478,7 +3470,7 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	}
 	// Per range (upstream 259a40abf): a range whose owner refuses the unmap gets its GPU mapping back.
 	for (const auto& range: ranges) {
-		const int result = UnmapMemoryRange(range, range.start, range.size, Graphics::TexWin::UnmapCaller::Unmap);
+		const int result = UnmapMemoryRange(range, range.start, range.size, UnmapCaller::Unmap);
 		if (result != OK) return result;
 	}
 	return OK;
@@ -3509,7 +3501,7 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 		if (!g_virtual_ranges->Query(vaddr, 1, &range) || range.start >= end) break;
 		vaddr = std::max(vaddr, range.start);
 		const auto chunk = std::min(end, range.start + range.size) - vaddr;
-		const int result = UnmapMemoryRange(range, vaddr, chunk, Graphics::TexWin::UnmapCaller::Unmap);
+		const int result = UnmapMemoryRange(range, vaddr, chunk, UnmapCaller::Unmap);
 		if (result != OK) return result;
 		vaddr += chunk;
 	}
@@ -3964,7 +3956,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			if (covered != len) {
 				return KERNEL_ERROR_EBUSY;
 			}
-			UnmapGpuRange(in_addr, len, Graphics::TexWin::UnmapCaller::MapReplace);
+			UnmapGpuRange(in_addr, len, UnmapCaller::MapReplace);
 			for (size_t index = 0; index < replaced_mappings.size(); ++index) {
 				const auto& old = replaced_mappings[index];
 				GpuAccessMode old_gpu_mode = GpuAccessMode::NoAccess;
@@ -3988,7 +3980,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 				    return range.type == VirtualRangeType::Reserved;
 			    })) {
-				UnmapGpuRange(in_addr, len, Graphics::TexWin::UnmapCaller::MapOther);
+				UnmapGpuRange(in_addr, len, UnmapCaller::MapOther);
 				reserved_target = true;
 			}
 			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
@@ -4010,7 +4002,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len, Graphics::TexWin::UnmapCaller::MapOther);
+			UnmapGpuRange(in_addr, len, UnmapCaller::MapOther);
 			reserved_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr       = in_addr;
@@ -4020,7 +4012,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		if (!reserved_target) {
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
-				UnmapGpuRange(out_addr, len, Graphics::TexWin::UnmapCaller::MapOther);
+				UnmapGpuRange(out_addr, len, UnmapCaller::MapOther);
 				shared_backing = map_shared_fixed(out_addr);
 				if (!shared_backing) {
 					out_addr = 0;
@@ -4295,19 +4287,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		return ok;
 	};
 
-	// KYTY_TRACE_TEXWIN (TW3): a fixed map over space without committed memory (the game's texture page maps), a fixed
-	// map over committed memory, or a fixed reserve (tagged by its caller).
-	auto texwin_caller = Graphics::TexWin::UnmapCaller::Other;
-	if (Graphics::TexWin::Enabled()) {
-		const bool committed = std::any_of(chunks.begin(), chunks.end(), [](const ReplacedChunk& chunk) {
-			return IsCommittedRangeType(chunk.range.type);
-		});
-		texwin_caller = Graphics::TexWin::CurrentUnmapCaller() == Graphics::TexWin::UnmapCaller::Reserve
-		                    ? Graphics::TexWin::UnmapCaller::Reserve
-		                : committed ? Graphics::TexWin::UnmapCaller::MapReplace
-		                            : Graphics::TexWin::UnmapCaller::MapFree;
-	}
-	UnmapGpuRange(start, size, texwin_caller);
+	UnmapGpuRange(start, size);
 	g_virtual_ranges->Remove(start, size);
 
 	for (auto& chunk: chunks) {
@@ -4440,8 +4420,6 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
-		// KYTY_TRACE_TEXWIN (TW3): the GPU-side unmap inside is a reserve's.
-		const Graphics::TexWin::UnmapCallerScope texwin_caller(Graphics::TexWin::UnmapCaller::Reserve);
 		if (ReplaceFixedRangeWithReserved(in_addr, len)) {
 			out_addr            = in_addr;
 			range_already_added = true;
@@ -4450,7 +4428,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len, Graphics::TexWin::UnmapCaller::Reserve);
+			UnmapGpuRange(out_addr, len, UnmapCaller::Reserve);
 		}
 	}
 
@@ -4904,9 +4882,6 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 	}
 
 	int processed = 0;
-	// KYTY_TRACE_TEXWIN (TW3): calls and entries by operation and range.
-	const bool texwin = Graphics::TexWin::Enabled();
-	if (texwin) Graphics::TexWin::NoteBatchCall();
 
 	for (int i = 0; i < num_entries; i++, processed++) {
 		auto* entry = &entries[i];
@@ -4920,9 +4895,6 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		if (entry->length == 0 || entry->operation < MAP_OP_MAP_DIRECT ||
 		    entry->operation > MAP_OP_TYPE_PROTECT) {
 			break;
-		}
-		if (texwin) {
-			Graphics::TexWin::NoteBatchEntry(entry->operation, reinterpret_cast<uint64_t>(entry->start), entry->length);
 		}
 
 		int result = OK;

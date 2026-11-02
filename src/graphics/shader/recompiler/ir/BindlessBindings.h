@@ -45,7 +45,7 @@ inline constexpr uint32_t BindlessCensusWords = 5;
 	return on;
 }
 // KYTY_DIAG_WATERFALL_RECORD0_CENSUS=1 (workaround W11's counter; diagnostic, default off, changes translated shader
-// code): every waterfall address that KYTY_DIAG_WATERFALL_POINTER_RECORD0 replaces with record 0's (ResourceTracking.cpp
+// code): every waterfall address that KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0 replaces with record 0's (ResourceTracking.cpp
 // UniformizeWaterfallPointers, first form) adds its wave's active lanes to the fault buffer's diag words
 // WaterfallRecord0CensusWord + {0: lanes executed, 1: lanes whose ReadFirstLane address differs from record 0's}
 // (IR WaterfallRecord0Census); faultManager.cpp prints the totals (PERF waterfall_record0_census).
