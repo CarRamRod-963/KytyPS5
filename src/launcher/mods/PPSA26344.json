@@ -68,13 +68,27 @@
    "key": "render1080",
    "name": "Render 1080p (dynamic-resolution index locked at 15 = 1920x1080, also in cutscenes)",
    "title": "Render at 1080p",
-   "gain": "not measured on the route (mostly lightens the graphics card, e.g. in cutscenes)",
-   "description": "The game renders at 1920x1080, also in cutscenes (less load on the graphics card).",
+   "gain": "+21% fps in cutscenes, no gain on the route",
+   "description": "The game renders at 1920x1080, also in cutscenes, where it would go up to 3584x2016.",
    "memory": [
     {
      "offset": "0x00e5e33c",
      "off": "8b8b48783200",
      "on": "b90f00000090"
+    }
+   ]
+  },
+  {
+   "key": "lod04",
+   "name": "LOD scale 0.4 in ladder row 0 (the same detail distance as level 8, kept when the game changes its ladder level)",
+   "title": "Shorter detail distance (LOD 0.4)",
+   "gain": "+16% fps, +29% while walking",
+   "description": "Objects switch to simpler models closer to the camera. Unlike the ladder levels, it stays on for the whole session.",
+   "memory": [
+    {
+     "offset": "0x0209bfc0",
+     "off": "000000000000803f000000000000000000000000010000000000803f000000000000000000000000",
+     "on": "00000000cdcccc3e000000000000000000000000010000000000803f000000000000000000000000"
     }
    ]
   },

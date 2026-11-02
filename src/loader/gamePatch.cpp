@@ -236,8 +236,14 @@ bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 			        !IsInsideProgram(program, write.target_address, write.on.size())) != external) {
 				continue;
 			}
-			std::memcpy(reinterpret_cast<void*>(write.target_address), write.on.data(),
-			            write.on.size());
+			// Only the bytes the mod changes: several mods may name one table row for their own fields.
+			const bool whole  = IsZero(write.off);
+			auto*      target = reinterpret_cast<uint8_t*>(write.target_address);
+			for (size_t index = 0; index < write.on.size(); index++) {
+				if (whole || write.on[index] != write.off[index]) {
+					target[index] = write.on[index];
+				}
+			}
 			if (!Common::VirtualMemory::FlushInstructionCache(write.target_address,
 			                                                  write.on.size())) {
 				return Fail(error, "could not finalize cheat write");
