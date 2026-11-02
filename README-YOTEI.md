@@ -45,9 +45,14 @@ code is copied.
    (about +16%, +29% while walking) at the cost of simpler distant objects.
 5. **Performance panel:** F2 shows or hides it in game, Shift+F2 shows its details (frame time, CPU waiting on the GPU,
    draw calls, shader compiles, memory). The launcher's Overlay option shows it from the start.
+6. **If the game crashes:** every run writes a log to `_Logs` next to the emulator (the newest 10 are kept). Launcher,
+   Advanced page, **Export bug report** packs the newest logs, the settings and the system info into one zip, with your
+   user and computer names replaced; attach it to a GitHub issue.
 
-What to expect: on the test PC (Ryzen 7 9800X3D, RTX 5070 Ti) the game runs at roughly 13-17 fps in the open world
-with the default settings, more with the mods above. The emulator's GPU work runs on four threads, each on its own
+The package has the same steps with pictures in `KytyPS5-Yotei-Player-Guide.pdf`.
+
+What to expect: on the test PC (Ryzen 7 9800X3D, RTX 5070 Ti) the game runs at roughly 13-17 fps in towns and 21-25
+fps in the open world with the default settings, more with the mods above. The emulator's GPU work runs on four threads, each on its own
 physical CPU core, chosen automatically for the processor (`KYTY_GPU_THREAD_CPUS=off` turns that off).
 
 ## Building (Windows)

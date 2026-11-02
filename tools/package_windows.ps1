@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Packs a Windows release of the KytyPS5 Yotei fork into one zip: the launcher with its Qt runtime, the emulator, the
-    emulator's assets, the shader hints, the licences and the readme.
+    emulator's assets, the shader hints, the licences, the readme and the player guide.
 
 .DESCRIPTION
     The readme is README-YOTEI.md under its own name: the documents linking to it and those it links to keep their
@@ -12,12 +12,13 @@
 
 .EXAMPLE
     pwsh tools/package_windows.ps1 -Emulator build\kyty_emulator.exe -LauncherDir build_launcher\launcher `
-        -Hints hints\PPSA26344_01.512.000.kyhints -Version v0.1 -Out dist
+        -Hints hints\PPSA26344_01.512.000.kyhints -Guide KytyPS5-Yotei-Player-Guide.pdf -Version v0.1 -Out dist
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Emulator,    # kyty_emulator.exe of the release build
     [Parameter(Mandatory = $true)][string]$LauncherDir, # the launcher build folder (launcher.exe, Qt DLLs and plugins)
     [string]$Hints = '',                                # a shader hints file (.kyhints), shipped in hints\
+    [string]$Guide = '',                                # the player guide (PDF), shipped next to the readme
     [string]$Version = 'v0.1',
     [string]$Out = 'dist'
 )
@@ -55,6 +56,7 @@ if ($Hints -ne '') {
 Copy-Item (Join-Path $repo 'LICENSE') $stage
 Copy-Item -Recurse (Join-Path $repo 'LICENSES') (Join-Path $stage 'LICENSES')
 Copy-Item (Join-Path $repo 'README-YOTEI.md') $stage
+if ($Guide -ne '') { Copy-Item $Guide (Join-Path $stage 'KytyPS5-Yotei-Player-Guide.pdf') }
 Copy-Item (Join-Path $repo 'CONTRIBUTING.md') $stage
 New-Item -ItemType Directory -Force (Join-Path $stage 'docs\launcher') | Out-Null
 foreach ($doc in 'PERFORMANCE.md', 'FIXES.md', 'FRAME.md', 'ARCHITECTURE.md', 'TESTING.md', 'CODES.md', 'launcher\DESIGN-SPEC.md') {
