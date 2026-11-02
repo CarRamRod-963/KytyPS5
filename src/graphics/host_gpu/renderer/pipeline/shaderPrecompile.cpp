@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 
+#include "common/archive.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/envDefaults.h"
@@ -8,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/shaderEnv.h"
 #include "common/startupTrace.h"
+#include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -22,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <fstream>
 #include <functional>
 #include <fmt/format.h>
 #include <limits>
@@ -1232,15 +1235,33 @@ HintCode ReadHintCode(Reader& r) {
 // footer). False when the file cannot be read.
 template <typename Fn>
 bool ForEachFooter(const std::filesystem::path& path, size_t max_bytes, Fn&& fn) {
-	std::FILE* f = std::fopen(path.string().c_str(), "rb");
-	if (f == nullptr) return false;
+	// A member of a .zar game (Common::IsArchivePath) is read through the archive; a host file by its wide path (a
+	// narrow fopen lost every path with characters outside the code page).
+	std::unique_ptr<Common::ArchiveFile> member;
+	std::ifstream                        host;
+	if (Common::IsArchivePath(path)) {
+		member = Common::OpenArchiveFile(path);
+		if (member == nullptr) return false;
+	} else {
+		host.open(path, std::ios::binary);
+		if (!host) return false;
+	}
+	const auto fread_chunk = [&](char* data, size_t size) -> size_t {
+		if (member != nullptr) {
+			uint32_t got = 0;
+			member->Read(data, static_cast<uint32_t>(size), &got);
+			return got;
+		}
+		host.read(data, static_cast<std::streamsize>(size));
+		return static_cast<size_t>(host.gcount());
+	};
 	constexpr size_t     chunk = size_t {64} << 20u;
 	std::vector<char>    buffer;
 	size_t               kept  = 0; // bytes of the previous chunk kept in front (the overlap)
 	std::vector<char>    read_buffer(chunk);
 	const std::boyer_moore_horspool_searcher searcher(std::begin(HintFooterText), std::end(HintFooterText));
 	for (;;) {
-		const size_t got = std::fread(read_buffer.data(), 1, chunk, f);
+		const size_t got = fread_chunk(read_buffer.data(), chunk);
 		if (got == 0) break;
 		buffer.resize(kept + got);
 		std::memcpy(buffer.data() + kept, read_buffer.data(), got);
@@ -1265,7 +1286,6 @@ bool ForEachFooter(const std::filesystem::path& path, size_t max_bytes, Fn&& fn)
 		std::memmove(buffer.data(), buffer.data() + buffer.size() - kept, kept);
 		buffer.resize(kept);
 	}
-	std::fclose(f);
 	return true;
 }
 
@@ -1469,19 +1489,46 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 	std::error_code ec;
 	// eboot.bin first, then the shader packs (.xpps), then every other file of the folder (links followed: a game folder
 	// can link its parts); done once every block is found.
+	// A game run from a .zar archive: its members are listed and read through the archive (the handle keeps the archive's
+	// index and block cache for the whole scan).
+	const bool archive        = Common::IsArchivePath(game_dir);
+	const auto archive_handle = archive ? Common::OpenArchive(game_dir) : nullptr;
 	std::vector<std::filesystem::path> paths {game_dir / "eboot.bin"};
 	std::vector<std::filesystem::path> others;
-	for (auto it = std::filesystem::recursive_directory_iterator(
-	         game_dir, std::filesystem::directory_options::follow_directory_symlink, ec);
-	     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-		if (!it->is_regular_file(ec) || it->path().filename() == "eboot.bin") continue;
-		(it->path().extension() == ".xpps" ? paths : others).push_back(it->path());
+	if (archive) {
+		std::vector<std::filesystem::path> dirs {game_dir};
+		while (!dirs.empty()) {
+			const auto dir = std::move(dirs.back());
+			dirs.pop_back();
+			for (const auto& entry: Common::GetArchiveDirEntries(dir)) {
+				const auto member = dir / Common::PathFromUtf8(entry.name);
+				if (!entry.is_file) {
+					dirs.push_back(member);
+				} else if (member.filename() != "eboot.bin") {
+					(member.extension() == ".xpps" ? paths : others).push_back(member);
+				}
+			}
+		}
+	} else {
+		for (auto it = std::filesystem::recursive_directory_iterator(
+		         game_dir, std::filesystem::directory_options::follow_directory_symlink, ec);
+		     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+			if (!it->is_regular_file(ec) || it->path().filename() == "eboot.bin") continue;
+			(it->path().extension() == ".xpps" ? paths : others).push_back(it->path());
+		}
 	}
 	paths.insert(paths.end(), others.begin(), others.end());
 	for (const auto& path: paths) {
 		if (found.size() == distinct_blocks.size()) break;
-		const auto size = std::filesystem::file_size(path, ec);
-		if (ec) continue;
+		uint64_t size = 0;
+		if (archive) {
+			const auto info = Common::GetArchiveInfo(path);
+			if (!info || !info->is_file) continue;
+			size = info->size;
+		} else {
+			size = std::filesystem::file_size(path, ec);
+			if (ec) continue;
+		}
 		files++;
 		read += size;
 		ForEachFooter(path, max_bytes, [&](std::span<const char> before, uint64_t footer) {
