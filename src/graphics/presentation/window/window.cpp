@@ -14,7 +14,6 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -458,11 +457,6 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
-	// KYTY_OVERLAY: F2 hide/show, Shift+F2 compact. Checked before the upstream performance panel's F2 so our
-	// overlay keeps the key while it is enabled; with KYTY_OVERLAY off F2 toggles the upstream panel.
-	if (ProcessPerfOverlayKey(*event)) {
-		return;
-	}
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {

@@ -9,7 +9,6 @@
 #include "common/logging/log.h"
 #include "common/lookupMemo.h"
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"

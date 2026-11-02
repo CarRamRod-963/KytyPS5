@@ -106,9 +106,8 @@ a large compute pipeline. A run with a cold cache measures compilation, not the 
 
 - Run `kyty_emulator.exe --game "<your game folder>" --precompile-only` (or the launcher's "Precompile shaders")
   after building, or play one warm-up run first. Shader journals are kept per game in `_PipelineCache/`.
-- Check that background compiles are finished before the measured window: `KYTY_OVERLAY=2` prints the overlay page to
-  the log (`PERF overlay … Precompile: done …`), and `--precompile-only` prints `PRECOMPILE_PROGRESS` / `PRECOMPILE_DONE`
-  lines.
+- Check that background compiles are finished before the measured window: `--precompile-only` prints
+  `PRECOMPILE_PROGRESS` / `PRECOMPILE_DONE` lines.
 - Keep one pipeline cache per build you compare. A run of another build rewrites the warm list and the driver cache,
   and the next run of the first build is cold again.
 - Changes that alter SPIR-V cannot be measured live in one module; they get a shader variant bit so both programs exist

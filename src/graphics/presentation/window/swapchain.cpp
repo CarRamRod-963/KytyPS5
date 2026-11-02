@@ -18,7 +18,6 @@
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 #include "graphics/presentation/openxrHeadset.h"
-#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -352,9 +351,6 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
-		if (Common::OverlayStats::Enabled()) {
-			Common::OverlayStats::Add(Common::OverlayStats::Counter::SwapchainRebuild); // KYTY_OVERLAY
-		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
@@ -522,8 +518,6 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
-	PerfOverlayNoteSwapchain(m_extent.width, m_extent.height, create_info.presentMode,
-	                         static_cast<uint32_t>(m_images.size()), m_hdr_active); // KYTY_OVERLAY
 
 	m_image_views.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
@@ -1267,9 +1261,6 @@ void Presenter::Present(std::span<const Layer> layers) {
 			m_impl->frames.Release(previous.frame);
 		}
 		previous = layer;
-		if (layer.bus == 0 && layer.frame != nullptr && PerfOverlayEnabled()) { // KYTY_OVERLAY: a new frame
-			PerfOverlayNoteFrame(layer.frame->image.extent.width, layer.frame->image.extent.height);
-		}
 	}
 	m_impl->Present();
 }
@@ -1320,11 +1311,9 @@ void Presenter::Impl::Present() {
 			const auto lock_got = std::chrono::steady_clock::now();
 			KYTY_PROFILER_BLOCK("Present::RecordSubmit");
 			auto&             command = present_scheduler.BeginCommand();
-			// KYTY_OVERLAY: the performance overlay is drawn on every frame shown but, unlike the dialogs, asks for no
-			// repeated presents of the last frame (NeedsSystemOverlayRefresh): it changes the present cadence of nothing.
-			// The upstream performance panel (F2 while KYTY_OVERLAY is off) is drawn by the same pass.
+			// The performance panel (F2) is drawn by the same pass.
 			const bool draw_system_overlay =
-			    (overlay_visual.active || PerfOverlayVisible() || PerformanceOverlayEnabled()) &&
+			    (overlay_visual.active || PerformanceOverlayEnabled()) &&
 			    swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);

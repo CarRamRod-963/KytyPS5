@@ -8,7 +8,6 @@
 #include "common/emulatorConfig.h"
 #include "common/envRead.h"
 #include "common/logging/log.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -559,13 +558,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
-		if (Common::OverlayStats::Enabled()) {
-			Common::OverlayStats::Add(Common::OverlayStats::Counter::FlipQueueFull); // KYTY_OVERLAY
-		}
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-	}
-	if (Common::OverlayStats::Enabled()) {
-		Common::OverlayStats::Add(Common::OverlayStats::Counter::FlipRequest); // KYTY_OVERLAY
 	}
 	return OK;
 }
@@ -940,11 +933,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-		// KYTY_OVERLAY: this vblank period ended after the next one was due (the loop does not sleep before it).
+		// This vblank period ended after the next one was due (the loop does not sleep before it).
 		if (total_wait < 0) {
-			if (Common::OverlayStats::Enabled()) {
-				Common::OverlayStats::Add(Common::OverlayStats::Counter::LateVblank);
-			}
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
 		}
 	}

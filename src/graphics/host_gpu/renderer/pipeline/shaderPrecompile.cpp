@@ -90,7 +90,7 @@ constexpr size_t   GraphicsHeaderBytes = sizeof(GraphicsJournalMagic) + sizeof(u
 
 thread_local bool  g_background_thread = false;
 ShaderPrecompiler* g_quick_exit_target = nullptr; // the live precompiler, for the at_quick_exit handler
-// KYTY_OVERLAY: GetPrecompileProgress's values (written by Start, the workers and the last worker).
+// GetPrecompileProgress's values (written by Start, the workers and the last worker).
 struct ProgressAtomics {
 	std::atomic<bool>     started {false};
 	std::atomic<bool>     done {false};

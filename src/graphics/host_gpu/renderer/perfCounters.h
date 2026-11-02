@@ -200,7 +200,7 @@ inline Common::StartupTrace::Counter PerfStartupCounter(PerfKind kind) {
 class PerfScope {
 public:
 	// KYTY_LIVE_AB: the GPU thread's fence waits also count for the running live A/B phase (fence_wait_ms).
-	// KYTY_TRACE_STARTUP / KYTY_OVERLAY: fence waits count only on the GPU thread (the priority-operation thread waits
+	// KYTY_TRACE_STARTUP: fence waits count only on the GPU thread (the priority-operation thread waits
 	// for the host GPU all the time; its wait is nobody's stall).
 	explicit PerfScope(PerfKind kind)
 	    : m_kind(kind), m_on(PerfEnabled()),

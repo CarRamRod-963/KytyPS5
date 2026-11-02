@@ -144,17 +144,6 @@ struct GraphicContext {
 	// KYTY_TRACE_MEM_CENSUS: VkDeviceMemory blocks and VMA allocations in the device-local heaps, and VMA block
 	// bytes in the other (host) heaps.
 	void GetMemoryCounts(uint64_t& device_blocks, uint64_t& device_allocations, uint64_t& host_block_bytes) const;
-	// KYTY_OVERLAY: every memory heap's driver-reported usage and budget of this process and VMA's allocations and
-	// blocks in it (vmaGetHeapBudgets). Returns the number of heaps written (at most `max`).
-	struct HeapBudget {
-		uint64_t usage        = 0;
-		uint64_t budget       = 0;
-		uint64_t size         = 0; // the heap's size
-		uint64_t allocations  = 0;
-		uint64_t blocks       = 0;
-		bool     device_local = false;
-	};
-	uint32_t GetHeapBudgets(HeapBudget* out, uint32_t max) const;
 	// Bytes of one VMA allocation (0 for none).
 	[[nodiscard]] uint64_t GetAllocationSize(VmaAllocation allocation) const;
 	// KYTY_VRAM_BUDGET: target = min(KYTY_VRAM_BUDGET_MB cap, driver budget - 1 GiB) for the device-local heaps, read

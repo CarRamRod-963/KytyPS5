@@ -5,7 +5,6 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
@@ -299,27 +298,15 @@ private:
 
 	// Busy-waits for a while: the recording thread appends a few commands per draw, so the gap to the
 	// next batch is shorter than a wake-up.
-	// KYTY_OVERLAY: the spin's time goes to OverlayStats::RecordSpin (the overlay shows the thread's work, not its spin).
 	[[nodiscard]] bool SpinForWork(uint64_t position) {
-		const auto start    = Clock::now();
-		const auto deadline = start + SpinTime;
-		const auto note     = [&] {
-			if (Common::OverlayStats::Enabled()) {
-				Common::OverlayStats::Add(Common::OverlayStats::Counter::RecordSpin, 1,
-				                          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-				                                                    Clock::now() - start)
-				                                                    .count()));
-			}
-		};
+		const auto deadline = Clock::now() + SpinTime;
 		for (uint32_t i = 0;; ++i) {
 			_mm_pause();
 			if (m_write.load(std::memory_order_relaxed) != position) {
-				note();
 				return true;
 			}
 			if ((i & 127u) == 127u) {
 				if (m_stop.load(std::memory_order_relaxed) || Clock::now() >= deadline) {
-					note();
 					return m_stop.load(std::memory_order_relaxed);
 				}
 			}

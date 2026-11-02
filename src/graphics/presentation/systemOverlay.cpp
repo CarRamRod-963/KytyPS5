@@ -11,7 +11,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
-#include "graphics/presentation/perfOverlay.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
@@ -688,7 +687,6 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 }
 
 void ShutdownSystemOverlayInput() {
-	StopPerfOverlay(); // KYTY_OVERLAY: its sampler reads guest memory and process counters
 	g_splash_active.store(false, std::memory_order_release);
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
@@ -2026,11 +2024,9 @@ struct SystemOverlay::Impl {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		PerfOverlayTick(graphics);                      // KYTY_OVERLAY=1/2: sampler and GPU heaps
-		const bool perf_overlay = PerfOverlayVisible(); // KYTY_OVERLAY
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) && !g_loading_active.load(std::memory_order_acquire) &&
-		    !ShaderBadgeVisible() && !perf_overlay &&
+		    !ShaderBadgeVisible() &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
 			return false;
 		}
@@ -2064,9 +2060,6 @@ struct SystemOverlay::Impl {
 		if (!DrawLoadingScreen(frame_extent, now)) {
 			DrawSplash(frame_extent);
 			DrawShaderBadge(frame_extent);
-		}
-		if (perf_overlay) {
-			DrawPerfOverlay(graphics, frame_extent); // below the dialogs and toasts drawn after it
 		}
 		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
 		GetOverlaySnapshot(&snapshot);

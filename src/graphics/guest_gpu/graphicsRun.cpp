@@ -10,7 +10,6 @@
 #include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/startupTrace.h"
 #include "common/stringUtils.h"
@@ -2532,12 +2531,6 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-// KYTY_OVERLAY (in-game performance overlay): one host draw and its instances (0 is drawn as one).
-static void NoteOverlayDraw(uint32_t instance_count) {
-	Common::OverlayStats::Add(Common::OverlayStats::Counter::Draw);
-	Common::OverlayStats::Add(Common::OverlayStats::Counter::Instance, std::max(instance_count, 1u));
-}
-
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	auto operation           = MakeOperation(GpuOperationKind::DrawIndex);
@@ -2552,7 +2545,6 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	if (UpstreamIndirectRecordsMode() == 2u && args.offset_source != DrawOffsetSource::IndirectArgs) {
 		CheckStaleIndirectSgprs(operation, 0, "draw_index");
 	}
-	if (Common::OverlayStats::Enabled()) NoteOverlayDraw(args.instance_count); // KYTY_OVERLAY
 	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
 }
 
@@ -2727,9 +2719,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
-	// KYTY_OVERLAY: the packet; the draws the CPU expansion records count as draws (DrawIndex/DrawIndexAuto), those of
-	// the GPU path are decided on the GPU and not counted.
-	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::IndirectDraw);
 
 	auto operation          = MakeOperation(GpuOperationKind::DrawIndirect);
 	operation.draw_indirect = {.args_base         = m_draw_indirect_args_base_addr,
@@ -2947,7 +2936,6 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 		}
 	}
 
-	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::Dispatch);
 	m_renderer.GetRenderExecutor().DispatchDirect(operation.submit_id, CurrentBuffer(), thread_group_x,
 	                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
 }
@@ -2969,7 +2957,6 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 		ExecuteDispatchDirect(operation, args->x, args->y, args->z, dispatch.mode);
 		return;
 	}
-	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::Dispatch);
 	m_renderer.GetRenderExecutor().DispatchIndirect(operation.submit_id, CurrentBuffer(), dispatch.args_addr, dispatch.mode,
 	                                                IsAsyncComputeQueue());
 }
@@ -2987,7 +2974,6 @@ void CommandProcessor::ExecuteDrawAuto(const GpuOperation& operation, DrawAutoAr
 	if (UpstreamIndirectRecordsMode() == 2u && args.offset_source != DrawOffsetSource::IndirectArgs) {
 		CheckStaleIndirectSgprs(operation, 0, "draw_auto");
 	}
-	if (Common::OverlayStats::Enabled()) NoteOverlayDraw(args.instance_count); // KYTY_OVERLAY
 	m_renderer.GetRenderExecutor().DrawAuto(operation.submit_id, CurrentBuffer(), args);
 }
 

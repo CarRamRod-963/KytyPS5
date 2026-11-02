@@ -5296,38 +5296,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	return OK;
 }
 
-bool TryGetGuestMemoryStats(GuestMemoryStats* out) {
-	EXIT_IF(out == nullptr);
-	// The overlay's sampler never makes a guest thread wait longer than one walk of the block lists, and never waits
-	// itself: a busy lock keeps the previous sample.
-	std::unique_lock<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex, std::try_to_lock);
-	if (!memory_operation_lock.owns_lock() || g_physical_memory == nullptr || g_flexible_memory == nullptr ||
-	    g_pooled_memory == nullptr || g_virtual_ranges == nullptr) {
-		return false;
-	}
-	GuestMemoryStats stats {};
-	stats.direct_total = PhysicalMemory::Size();
-	{
-		Common::LockGuard lock(g_physical_memory->GetMutex());
-		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
-			(block.kind == PhysicalMemory::AllocationKind::Pooled ? stats.pool_expanded : stats.direct_allocated) +=
-			    block.size;
-		}
-		for (const auto& mapping: g_physical_memory->GetMappings()) {
-			stats.direct_mapped += mapping.map_size;
-		}
-	}
-	stats.pool_committed   = g_memory_pool_committed.load(std::memory_order_relaxed);
-	stats.flexible_total   = FlexibleMemory::Size();
-	stats.flexible_used    = stats.flexible_total - std::min(stats.flexible_total, g_flexible_memory->Available());
-	stats.page_table_total = PAGE_TABLE_POOL_ENTRIES;
-	stats.page_table_cpu   = g_virtual_ranges->CountPageTableEntries(false);
-	stats.page_table_gpu   = g_virtual_ranges->CountPageTableEntries(true);
-	*out                   = stats;
-	return true;
-}
-
-// The upstream performance panel (F2 while KYTY_OVERLAY is off).
+// The performance panel (F2).
 DebugStats GetDebugStats() {
 	DebugStats stats;
 	stats.direct_total       = PhysicalMemory::Size();

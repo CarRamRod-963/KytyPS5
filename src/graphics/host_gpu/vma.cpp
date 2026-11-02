@@ -337,25 +337,6 @@ void GraphicContext::GetMemoryCounts(uint64_t& device_blocks, uint64_t& device_a
 	}
 }
 
-uint32_t GraphicContext::GetHeapBudgets(HeapBudget* out, uint32_t max) const {
-	if (allocator == nullptr || physical_device == nullptr || out == nullptr) {
-		return 0;
-	}
-	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
-	vmaGetHeapBudgets(allocator, budgets);
-	const auto&    properties = GetPhysicalDeviceMemoryProperties();
-	const uint32_t count      = std::min(properties.memoryHeapCount, max);
-	for (uint32_t i = 0; i < count; i++) {
-		out[i].usage        = budgets[i].usage;
-		out[i].budget       = budgets[i].budget;
-		out[i].size         = properties.memoryHeaps[i].size;
-		out[i].allocations  = budgets[i].statistics.allocationCount;
-		out[i].blocks       = budgets[i].statistics.blockCount;
-		out[i].device_local = static_cast<bool>(properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
-	}
-	return count;
-}
-
 void GraphicContext::GetVramBudgetState(uint64_t& target, uint64_t& effective) const {
 	uint64_t usage = 0, budget = 0, blocks = 0, allocated = 0;
 	GetDeviceLocalMemoryStats(usage, budget, blocks, allocated);

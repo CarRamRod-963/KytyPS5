@@ -7,7 +7,6 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <type_traits>
@@ -70,7 +69,6 @@ vk::Result QueueSubmitLocked(GraphicContext& graphics, vk::CommandBuffer buffer,
 	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-	if (Common::OverlayStats::Enabled()) Common::OverlayStats::Add(Common::OverlayStats::Counter::QueueSubmit);
 	QueueLockGuard lock(graphics.queue_mutex, "commandScheduler.cpp:152");
 	return graphics.queue.submit(1, &submit_info, nullptr);
 }

@@ -89,7 +89,7 @@ lg 10 (cards, status icons).
 Padding 32 top and bottom. Brand block: padding 0 24 32, gap 4: "KytyPS5" (Brand/Wordmark, text/on-dark) and
 "YŌTEI FORK" (Label/Eyebrow, text/on-dark-muted). Nav items, then a spacer, then the footer (padding 0 24, gap 4,
 Label/Caption): "by Erlou" (on-dark), the fork version "v0.1" (`FORK_VERSION`, on-dark-muted), "F2 overlay ·
-Shift+F2 compact" (on-dark-muted). Nav items: Play, Display, Graphics, Shaders, Advanced.
+Shift+F2 details" (on-dark-muted). Nav items: Play, Display, Graphics, Shaders, Advanced.
 
 **NavItem** — 248 × 46, padding left 24, dot 6 × 6, gap 12, Label/Nav.
 
@@ -190,8 +190,8 @@ folder of games; it is added to the game folders, its first game is selected and
 Banner page. They edit the selected game's own settings when it has them (eyebrow "SETTINGS · PPSA26344 ONLY"), else
 the global ones ("SETTINGS · ALL GAMES"); every change is saved at once and used at the next start.
 - Display: Resolution (select 240), Full screen (toggle), Present mode (select 240: Fifo, Mailbox, Immediate; a
-  launcher option the Figma frame does not show), Overlay (select 240: Off / On = `KYTY_OVERLAY=1`; F2 hides it,
-  Shift+F2 makes it compact).
+  launcher option the Figma frame does not show), Overlay (select 240: Off / On = `--perf-overlay`, the performance
+  panel from the start; F2 hides or shows it, Shift+F2 its details).
 - Graphics: Tessellation (toggle; off passes `--no-tessellation`), Graphics card (select 400: Auto (<card>) and every
   Vulkan device with its VRAM, in the emulator's `--gpu` order).
 - Not shown until the emulator has them: Aspect ratio (Display), Ray tracing pool (Graphics), overlay starting compact.

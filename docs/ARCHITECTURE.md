@@ -241,7 +241,7 @@ Short list; [TESTING.md](TESTING.md) explains how they are used.
 | Workaround counters | `common/workaroundHits.h` | how often each approximation changed a draw or dispatch (`PERF workaround_hits`) |
 | Reference capture | `host_gpu/renderer/refCapture.*`, `tools/refinterp` | one dispatch captured and re-run on the CPU from the AMD ISA |
 | Twin dispatch | `renderCompute.cpp` (`KYTY_DIAG_TWIN_DISPATCH`) | the same dispatch run with two shader variants, outputs compared on the GPU |
-| Performance overlay | `presentation/perfOverlay.*` (`KYTY_OVERLAY=1`) | fps, frame-time graph, thread load, precompile progress in game |
+| Performance panel | `presentation/performanceOverlay.*` (F2, `--perf-overlay`) | fps, frame-time graph, CPU waiting on GPU, draw calls, compiles, transfers, memory in game |
 
 ## 8. Presentation
 

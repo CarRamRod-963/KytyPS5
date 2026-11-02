@@ -122,8 +122,8 @@ public:
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = true;
-	// KYTY_OVERLAY=1 for the game: the performance overlay (F2 hides it, Shift+F2 makes it compact). Off: left out
-	// of the game's environment.
+	// --perf-overlay for the game: the performance panel shown from the start (F2 hides or shows it, Shift+F2 its
+	// details).
 	bool                   overlay_enabled             = false;
 	bool                   trophy_enabled              = true;
 	int                    vblank_frequency            = 60;

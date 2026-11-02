@@ -2,7 +2,6 @@
 #define KYTY_COMMON_STARTUPTRACE_H_
 
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 
 #include <atomic>
 #include <chrono>
@@ -44,10 +43,6 @@
 //            zero = backing ranges cleared
 //   io       ReadFile operations of the whole process n/MiB (OS counters: includes the pipeline cache, driver, logs)
 //   pf       page faults (all kinds: commit, guard, tracker write-protect)   priv  private bytes MiB
-//
-// KYTY_OVERLAY=1 (in-game performance overlay, user play) switches the counters on as well, without the reporter: the
-// overlay reads them (they only grow then) and shows the difference per second. The few one-off STARTUP_PCACHE lines
-// gated by Enabled() appear then too.
 namespace Common::StartupTrace {
 
 enum class Counter : uint32_t {
@@ -95,9 +90,6 @@ struct Slot {
 	std::atomic<uint64_t> count {0};
 	std::atomic<uint64_t> nanos {0};
 	std::atomic<uint64_t> bytes {0};
-	// The longest single Add since the in-game overlay last took it (KYTY_OVERLAY: "peak" of shader/pipeline
-	// compiles); the reporter does not use it.
-	std::atomic<uint64_t> max_nanos {0};
 };
 
 // Constant-initialized: no guard, no registration for destruction.
@@ -106,18 +98,13 @@ inline constinit Slot g_slots[static_cast<uint32_t>(Counter::Count)] {};
 // Starts the reporter thread (once). Called by Enabled() when the switch is on.
 void StartReporter(uint32_t seconds);
 
-// True while the reporter runs (KYTY_TRACE_STARTUP): it takes the counters every second (exchange to 0), so the
-// in-game overlay, which only reads them, cannot use them then.
-inline constinit std::atomic<bool> g_reporter_running {false};
-
-// The counters are collected for KYTY_TRACE_STARTUP (with the reporter) and for KYTY_OVERLAY=1/2 (the in-game
-// performance overlay reads them; no reporter, no STARTUP lines).
+// The counters are collected for KYTY_TRACE_STARTUP (with the reporter).
 inline bool Enabled() {
 	static constinit Common::OnceValue<bool> enabled_once;
 	return enabled_once.Get([] {
 		const char* value   = std::getenv("KYTY_TRACE_STARTUP");
 		const long  seconds = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
-		if (seconds <= 0) return OverlayStats::Enabled();
+		if (seconds <= 0) return false;
 		StartReporter(seconds == 1 ? 180u : static_cast<uint32_t>(seconds));
 		return true;
 	});
@@ -128,9 +115,6 @@ inline void Add(Counter counter, uint64_t nanos, uint64_t bytes = 0) noexcept {
 	slot.count.fetch_add(1, std::memory_order_relaxed);
 	if (nanos != 0) {
 		slot.nanos.fetch_add(nanos, std::memory_order_relaxed);
-		for (auto max = slot.max_nanos.load(std::memory_order_relaxed);
-		     nanos > max && !slot.max_nanos.compare_exchange_weak(max, nanos, std::memory_order_relaxed);) {
-		}
 	}
 	if (bytes != 0) slot.bytes.fetch_add(bytes, std::memory_order_relaxed);
 }

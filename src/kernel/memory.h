@@ -181,21 +181,6 @@ private:
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
-// KYTY_OVERLAY (in-game performance overlay, another host thread): the guest memory the kernel hands out, in bytes
-// (page table: entries). False when the memory lock is busy or the memory is not initialized (nothing is waited for).
-struct GuestMemoryStats {
-	uint64_t direct_total     = 0; // direct memory size (sceKernelGetDirectMemorySize)
-	uint64_t direct_allocated = 0; // allocated direct memory (sceKernelAllocate*DirectMemory, automatic mappings)
-	uint64_t direct_mapped    = 0; // direct memory mapped into the address space
-	uint64_t pool_expanded    = 0; // direct memory given to the memory pool (sceKernelMemoryPoolExpand)
-	uint64_t pool_committed   = 0; // pool memory committed (sceKernelMemoryPoolCommit)
-	uint64_t flexible_total   = 0; // configured flexible memory
-	uint64_t flexible_used    = 0;
-	uint64_t page_table_total = 0; // entries per pool (sceKernelGetPageTableStats)
-	uint64_t page_table_cpu   = 0; // entries in use
-	uint64_t page_table_gpu   = 0;
-};
-[[nodiscard]] bool TryGetGuestMemoryStats(GuestMemoryStats* out);
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 // The one reader for the emulator's own ordinary reads of guest memory. Bytes of a page under the image read watch come from
 // the backing mapping (no fault, no wait): what a plain read gives without the watch. A page the buffer cache also watches is

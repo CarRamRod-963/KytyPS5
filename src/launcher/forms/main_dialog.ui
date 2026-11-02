@@ -220,7 +220,7 @@
         <item>
          <widget class="QLabel" name="footer_keys">
           <property name="text">
-           <string>F2 overlay · Shift+F2 compact</string>
+           <string>F2 overlay · Shift+F2 details</string>
           </property>
           <property name="textStyle" stdset="0">
            <string notr="true">Label/Caption</string>
@@ -635,7 +635,7 @@
 <item><widget class="QComboBox" name="display_overlay"><property name="minimumSize"><size><width>240</width><height>40</height></size></property>
 <property name="maximumSize"><size><width>240</width><height>40</height></size></property>
 <property name="select" stdset="0"><bool>true</bool></property><property name="textStyle" stdset="0"><string notr="true">Body/Default</string></property></widget></item>
-<item><widget class="QLabel" name="row_overlay_description"><property name="text"><string>F2 shows or hides the overlay, Shift+F2 switches it to the compact one.</string></property>
+<item><widget class="QLabel" name="row_overlay_description"><property name="text"><string>Shows the performance panel from the start. In the game F2 shows or hides it, Shift+F2 shows its details.</string></property>
 <property name="wordWrap"><bool>true</bool></property>
 <property name="textStyle" stdset="0"><string notr="true">Body/Description</string></property>
 <property name="tone" stdset="0"><string notr="true">secondary</string></property>

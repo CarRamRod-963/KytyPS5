@@ -302,7 +302,7 @@ LOD bias, the "perf" mip and Z fields) make textures sharper. Not verified.
 is the last marker of the frame. *(Which marker the HUD draws belong to is not verified.)*
 
 **In the emulator.** The presentation thread copies the flipped image to the window's swapchain, scaled to the window
-size. The optional performance overlay (`KYTY_OVERLAY=1`, F2 / Shift+F2) is drawn on top of the presented frame and
+size. The optional performance panel (F2 / Shift+F2, `--perf-overlay` at start) is drawn on top of the presented frame and
 never touches the game's image.
 
 ## Where the frame time goes, in short

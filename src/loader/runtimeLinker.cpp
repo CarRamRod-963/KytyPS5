@@ -7,7 +7,6 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
-#include "common/overlayStats.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -216,10 +215,6 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 		}
 	}
 	return 0;
-}
-
-uint32_t UnresolvedImportStubCalls() {
-	return g_unresolved_stub_call_log_count.load(std::memory_order_relaxed);
 }
 
 constexpr uint64_t SYSTEM_RESERVED  = 0x800000000u;
@@ -678,9 +673,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
-		}
-		if (Common::OverlayStats::Enabled()) {
-			Common::OverlayStats::Add(Common::OverlayStats::Counter::GpuMemoryFault); // KYTY_OVERLAY
 		}
 		// The faulting instruction runs again when this handler returns.
 		const Libs::Graphics::RetriedFaultScope retried_fault;

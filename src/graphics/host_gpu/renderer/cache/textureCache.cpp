@@ -13,7 +13,6 @@
 #include "common/envRead.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"
@@ -4754,9 +4753,6 @@ void TextureCache::RunGarbageCollector() {
 			}
 			m_gc_stats.freed++;
 			m_gc_stats.freed_bytes += m_graphics.GetAllocationSize(owner->backing.allocation);
-			if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-				Common::OverlayStats::Add(Common::OverlayStats::Counter::ImageEvict, 1, owner->AccountedSize());
-			}
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
@@ -4989,9 +4985,6 @@ void TextureCache::FreeCollectedImage(ImageId id) {
 	}
 	m_gc_stats.freed++;
 	m_gc_stats.freed_bytes += bytes;
-	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-		Common::OverlayStats::Add(Common::OverlayStats::Counter::ImageEvict, 1, image.AccountedSize());
-	}
 	NoteFreedBytes(bytes);
 	image.eviction_pending = false;
 	if (EvictReuseTrace() && !image.info.data.Empty()) {

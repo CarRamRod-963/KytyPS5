@@ -9,7 +9,6 @@
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
-#include "common/overlayStats.h"
 #include "common/startupTrace.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -762,9 +761,6 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tWrite %u bytes to: %s\n", bytes_written, Common::PathToString(file->real_name).c_str());
-	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1, bytes_written);
-	}
 
 	return bytes_written;
 }
@@ -997,9 +993,6 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
-	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1, bytes_written);
-	}
 
 	return bytes_written;
 }
@@ -1073,10 +1066,6 @@ static int64_t Writev(int d, const KernelIovec* iov, int iovcnt, std::optional<i
 
 	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRIu64 ", iovcnt = %d) to: %s\n", bytes_written,
 	     target, iovcnt, Common::PathToString(file->real_name).c_str());
-	if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-		Common::OverlayStats::Add(Common::OverlayStats::Counter::GuestFileWrite, 1,
-		                          static_cast<uint64_t>(bytes_written));
-	}
 	return bytes_written;
 }
 

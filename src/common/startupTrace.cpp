@@ -189,7 +189,6 @@ void Run(uint32_t seconds) {
 	const OsSample os_now = SampleOs();
 	const double   t      = age + std::chrono::duration<double>(now - start).count();
 	Print("STARTUP_TOTAL", t, t, total, Delta(os_now, os_start), os_now);
-	g_reporter_running.store(false, std::memory_order_relaxed); // KYTY_OVERLAY may read the counters from now on
 }
 
 } // namespace
@@ -243,7 +242,6 @@ void StartReporter(uint32_t seconds) {
 	             "file reads)\n",
 	             seconds);
 	std::fflush(stderr);
-	g_reporter_running.store(true, std::memory_order_relaxed);
 	std::thread(Run, seconds).detach();
 }
 

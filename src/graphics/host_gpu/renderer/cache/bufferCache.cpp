@@ -15,7 +15,6 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
-#include "common/overlayStats.h"
 #include "common/profiler.h"
 #include "common/startupTrace.h"
 #include "common/workaroundHits.h"
@@ -3889,9 +3888,6 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_gc_retired++;
 		m_gc_retired_bytes += buffer.Size();
-		if (Common::OverlayStats::Enabled()) { // KYTY_OVERLAY
-			Common::OverlayStats::Add(Common::OverlayStats::Counter::BufferEvict, 1, buffer.Size());
-		}
 		if (dirty) {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);

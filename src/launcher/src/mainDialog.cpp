@@ -166,7 +166,7 @@ public:
 	void PausePrecompile();
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
-	// The game's environment: KYTY_OVERLAY (Display), KYTY_SHADER_PRECOMPILE and its threads (Shaders).
+	// The game's environment: KYTY_SHADER_PRECOMPILE and its threads (Shaders).
 	[[nodiscard]] QProcessEnvironment GameEnvironment(const Configuration& info) const;
 	// A new run log in _Logs with a header (launcher, emulator, command line); keeps the newest LOG_KEEP logs.
 	[[nodiscard]] QString StartRunLog(const QString& command) const;
@@ -1301,6 +1301,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.hide_cursor_enabled) {
 		args << "--hide-cursor";
 	}
+	if (info.overlay_enabled) {
+		args << "--perf-overlay";
+	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	// (This fork's emulator: trophy toasts on by default, "--no-trophy-notifications" turns them off.)
 	if (!info.trophy_enabled) {
@@ -1548,11 +1551,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 
 QProcessEnvironment MainDialogPrivate::GameEnvironment(const Configuration& info) const {
 	auto env = QProcessEnvironment::systemEnvironment();
-	if (info.overlay_enabled) {
-		env.insert(QStringLiteral("KYTY_OVERLAY"), QStringLiteral("1"));
-	} else {
-		env.remove(QStringLiteral("KYTY_OVERLAY"));
-	}
 	if (!g_precompile_on_start) {
 		// Off: no background compiles and no shader journals (Common::EnvDefaults has it on).
 		env.insert(QStringLiteral("KYTY_SHADER_PRECOMPILE"), QStringLiteral("0"));

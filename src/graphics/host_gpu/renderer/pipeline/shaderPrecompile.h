@@ -223,7 +223,7 @@ private:
 	mutable uint64_t             m_verify_hits    = 0;
 };
 
-// KYTY_OVERLAY (in-game performance overlay) and --precompile-only (PipelineCache::RunPrecompileOnly): the background
+// --precompile-only (PipelineCache::RunPrecompileOnly): the background
 // precompile's progress, readable from any thread.
 struct PrecompileProgress {
 	bool     started  = false; // ShaderPrecompiler::Start ran
