@@ -8,16 +8,15 @@ relative to `src/`. For the game's side of the frame see [FRAME.md](FRAME.md); f
 ## 1. The big picture
 
 ```
- game threads (native x86-64)                 emulator threads
- ───────────────────────────                  ──────────────────────────────────────────────────────────
+ game threads (native x86-64)                 emulator threads (four GPU stages, each on its own physical core)
+ ───────────────────────────                  ──────────────────────────────────────────────────────────────
  game code ── HLE libraries (libs/, kernel/)
-              └ libAgcDriver: command buffers ──► GPU thread (guest_gpu/graphicsRun.cpp)
-                                                   ├ PM4 packets → registers   (guest_gpu/command_processor/)
-                                                   ├ draws / dispatches → Vulkan (host_gpu/renderer/)
-                                                   │    ├ scout thread (reads ahead, one per graphics queue)
-                                                   │    ├ preparation worker(s) (draw bindings)
-                                                   │    └ shader / pipeline compile workers
-                                                   └ command recording worker → vkQueueSubmit
+              └ libAgcDriver: command buffers ──► command processor thread: PM4 packets → registers, operations
+                                                   └► resolve thread: programs and resources of the next draws
+                                                       └► execution thread: bindings, Vulkan commands (in order)
+                                                           └► recording worker: driver calls, vkQueueSubmit
+                                                  priority-completion thread: results of finished GPU work
+                                                  pipeline / shader compile workers (background)
                                                   presentation thread (presentation/) → window swapchain
 ```
 
@@ -29,69 +28,52 @@ relative to `src/`. For the game's side of the frame see [FRAME.md](FRAME.md); f
 - The host side is Vulkan 1.3. Game shaders (AMD RDNA2 machine code) are translated to SPIR-V by the emulator's own
   recompiler (`graphics/shader/recompiler/`).
 
-## 2. The GPU thread
+## 2. The GPU pipeline threads
 
 `graphics/guest_gpu/graphicsRun.cpp` owns the guest GPU queues: the graphics queue and the async compute queues. The
-GPU thread runs one queue's command stream at a time in work slices. A stream that reaches a wait (for a memory value
-another queue or the CPU will write) is suspended and resumed later, so queues interleave as on the console, but all of
-them execute on one host thread and one host Vulkan queue.
+emulated GPU runs as a pipeline of four host threads (the design follows TheCruZ/KytyPS5-GTA). Each is pinned to a
+whole physical core of its own (`Common::ChooseGpuStageCpus`, `src/common/gpuStageCores.h`: the fastest cores of one
+last-level cache, not core 0; `KYTY_GPU_THREAD_CPUS` overrides), and the rest of the process is kept off those cores.
+Measured on 2026-11-02: taking the pinning away costs 18% at the gate.
 
-For each packet the command processor (`guest_gpu/command_processor/pm4Handlers.cpp`) either
+- **Command processor thread** (`GuestGpu::ThreadRun`). Runs one queue's command stream at a time in work slices. A
+  stream that reaches a wait (`WAIT_REG_MEM` for a value another queue, the GPU or the CPU will write) is suspended and
+  resumed later, so queues interleave as on the console. For each packet the command processor
+  (`guest_gpu/command_processor/`) either writes registers (`SET_CONTEXT_REG`, `SET_SH_REG`, `SET_UCONFIG_REG`, decoded
+  into typed state in `guest_gpu/hardwareContext.h`) or emits an **operation** (a draw, dispatch, label, memory write,
+  flip...) with a snapshot of the registers it needs, in stream order.
+- **Resolve thread** (`GuestGpu::ResolveThread`). Ahead of execution, finds or translates the shader programs of each
+  draw and dispatch and walks the descriptors and tables the game left in guest memory, logging every read
+  (`RenderExecutor::ResolveDrawAhead`, `ResolveDispatchAhead`).
+- **Execution thread** (`GuestGpu::ExecutionThread`, the renderer's owner). Executes the operations in order: checks
+  that the bytes the resolve thread read are still the same (else does that work again), resolves render targets,
+  pipelines, textures, samplers and buffers (`host_gpu/renderer/renderDraw.cpp`, `renderCompute.cpp`) and records the
+  Vulkan commands.
+- **Recording worker** (`host_gpu/renderer/commandRecorder.*`), below.
 
-- **writes registers**: `SET_CONTEXT_REG`, `SET_SH_REG`, `SET_UCONFIG_REG` are decoded into typed state
-  (`guest_gpu/hardwareContext.h`: render targets, viewports, blend, shader stage registers and user data), or
-- **does work**: draws (`DrawIndex`, `DrawAuto`, indirect draws), dispatches, waits (`WAIT_REG_MEM`), memory writes,
-  end-of-pipe events and labels, DMA and copies.
+The stages hand work over through single-producer queues and wait for each other by spinning briefly, then sleeping.
+A frame timeline (2026-11-02, the gate and the village) showed where the frame time goes: the execution thread works
+for about 80% of the frame and the host GPU is idle about half of it, waiting for the next command buffer; the game,
+the command processor and the resolve thread add about 1%. The execution thread's work per draw and its waits for
+GPU results (section 4.4) are what limit the frame rate today.
 
-Draws go to `RenderExecutor` (`host_gpu/renderer/renderDraw.cpp`), dispatches to `renderCompute.cpp`. For one draw the
-renderer must find or translate its shader programs, resolve its render targets, its pipeline, every texture, sampler
-and buffer it reads (by walking the descriptors and tables the game left in guest memory), then record Vulkan
-commands. At the gate scene that is several thousand draws per frame, and this CPU work, not the host GPU, limits the
-frame rate today. The rest of this section is about spreading it over more threads without changing results.
+`KYTY_PERF_TABLE_ASYNC` (default on): a draw whose graphics pipeline does not exist yet is skipped while background
+workers create it; later draws of the same key take it.
 
-### 2.1 Scout: reading ahead
-
-`guest_gpu/drawSpeculator.*`. One scout thread per graphics queue walks the
-command stream ahead of the GPU thread with a shadow copy of the shader registers. For draws and dispatches whose
-program already exists it reads their resources from guest memory in advance and logs every read. When the GPU thread
-reaches the draw it re-checks the log (the same bytes are still there, no pending GPU write or readback covers them)
-and only then adopts the result. A changed byte means the result is thrown away and the work is done again in order.
-
-### 2.2 Preparation workers and the run queue
-
-`host_gpu/renderer/prepWorker.*`, `renderDraw.cpp`.
-
-- **Run queue** (`KYTY_PERF_PREP_WORKER=3`, default). Consecutive draws separated only by register writes form a
-  *run*. Each draw is queued at its packet with a copy of the registers and translated later, in order, at the point
-  where something must follow it (another kind of packet, a submission, a wait, a guest memory read).
-- **Binder** (`KYTY_PERF_RUN_QUEUE_BINDER=3`, default). Inside a run the binding preparation of draw *i* (textures,
-  samplers, buffers, uploads) runs on a preparation worker while the GPU thread commits draw *i−1* and does the front
-  of draw *i+1* (programs, render targets, pipeline). Whatever the preparation may not share with that commit waits
-  for it first; anything that must happen in GPU order (recording a command, allocating from a GPU ring, a submission)
-  is taken over by the GPU thread. Mode `=4` adds a separate commit worker.
-- `KYTY_PERF_PREP_WORKERS=2` (off) adds a second preparation worker for pairs of draws; parts that change shared
-  caches are kept in draw order between the two workers ("turns"), with a race checker
-  (`KYTY_PERF_PREP_WORKERS_CHECK=1`).
-- `KYTY_PERF_TABLE_ASYNC` (default on): a draw whose graphics pipeline does not exist yet is skipped while background
-  workers create it; later draws of the same key take it. (The name is project D's, the table-draw path of 21.10,
-  archived and removed on 31.10.2026 together with `KYTY_PERF_SELF_SERVE` and `KYTY_PERF_TABLE_BUFFERS`.)
-
-Each mode has a verify mode and was made the default only after a measured gain (see [TESTING.md](TESTING.md)).
-
-### 2.3 Command recording and submission
+### 2.1 Command recording and submission
 
 `host_gpu/renderer/commandRecorder.*`, `commandScheduler.*`.
 
 - The `vkCmd*` calls of the render scheduler's command buffer are copied
   into a ring and a **recording worker** makes the driver calls in the same order, then ends and submits the buffer.
-  The GPU thread never waits for the driver at a command buffer boundary. Other queue users (presentation, overlay,
+  The GPU thread never waits for the driver at a command buffer boundary. Other queue users (presentation, the performance panel,
   readback helpers) first wait until every render submission enqueued so far is made.
 - The open command buffer is submitted (without waiting) after 128 draws or
   dispatches, so the host GPU starts while the CPU records the rest. At the gate that is ~90 command buffers per frame.
 - Every command buffer completes a tick on a timeline semaphore (`masterSemaphore.*`); deferred work (freeing
   resources, applying readbacks, writing guest labels) is attached to ticks and runs once the host GPU passed them.
 
-### 2.4 GPU clock
+### 2.2 GPU clock
 
 `host_gpu/renderer/virtualGpuClock.*` (`KYTY_FIX_VIRTUAL_GPU_CLOCK`, on). The GPU clock values the game asks for with
 end-of-pipe events count the host GPU's busy time on the renderer's command buffers (100 MHz, idle gaps not counted),
@@ -130,7 +112,7 @@ emulator, per game title:
 - a **warm list** (`.warm`): pipelines already in the driver cache for this build, which need no background job. Its
   entries hash the effective values of the settings that change translated shaders or pipelines
   (`Common::ShaderEnv::Names` in `src/common/shaderEnv.h`, the `ENV_FINGERPRINT` log line) and no other `KYTY_`
-  variable, so reports, the overlay or a dispatch skip list keep it. A setting read in the recompiler that is on
+  variable, so reports or a dispatch skip list keep it. A setting read in the recompiler that is on
   neither that list nor its list of output-only settings does not compile (`Common::ShaderEnv::Read`).
 
 At start, background workers (`KYTY_SHADER_PRECOMPILE_THREADS`, default 6, below normal priority) translate and
@@ -142,6 +124,12 @@ without starting the game (used by the launcher's "Precompile" button). A change
 many shaders, so the first start after an update recompiles them. A record made under other settings that this run
 cannot translate (another resource layout or image format) is skipped and counted (`SHADER_PRECOMPILE done: ... records
 rejected`), not compiled.
+
+**Shader hints** (`--export-hints <file>`, `--import-hints <file>` with `--precompile-only`): a hints file is the
+journals without the game's code. Each shader record keeps its inputs and, instead of its code, the size and a hash of
+the code block's footer; the import finds those blocks in the game folder and adds the records to this device's
+journals. Pipelines whose stage records are missing (recorded by older builds) are left out of the export. The release
+package ships one for the game in `hints/`, and the launcher imports it on the game's first start.
 
 ## 4. Memory
 
@@ -192,6 +180,11 @@ The game reads some GPU results on the CPU (hi-Z for culling, terrain images, sm
 - **Linear images** (`the linear readback`, on): the pages of GPU-written linear images, and of images the texture
   cache replaced by a copy in another format, stay closed from the write on. The first CPU read faults, waits for the
   copy and reopens them, so the CPU sees the bytes of every write it has a label for. Pages nobody reads cost nothing.
+- **Read window**: a fault read downloads every GPU-written range of its buffer within 4 MiB around it in one
+  synchronization, so neighbouring reads need no new wait. When the host mapping cannot serve that window at once
+  (over 1 MiB GPU-written, or written by unfinished work) but can serve the pages of the read itself, the read takes
+  only those pages and waits only for their writes (`BufferCache::ReadRange`; 2026-11-02, a 4-byte read at the start
+  of each frame had waited 6-9.5 ms for the whole queue).
 - `KYTY_PERF_WRITE_PUBLISH` (off, verify mode `=2`): finished GPU writes to pages the CPU also writes are published
   from the host mapping instead of downloaded on the next fault.
 

@@ -132,8 +132,7 @@ a large compute pipeline. A run with a cold cache measures compilation, not the 
   reaches it, and an exact version can be tested there by turning the approximation off.
 - The first lines of every log list the settings the run used: `ENV_DEFAULT KYTY_X=value source=env|code kind=…`.
   Check them when comparing two runs.
-- Errors to look for in every run: device lost, emulator exits that name a shader or resource, and
-  `PREP_WORKER_COMMIT_WAIT_STUCK` (a preparation worker stuck waiting).
+- Errors to look for in every run: device lost and emulator exits that name a shader or resource.
 
 ## 9. Exactness tools
 

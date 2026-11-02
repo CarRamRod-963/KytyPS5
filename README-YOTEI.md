@@ -3,7 +3,8 @@
 An experimental fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) (itself based on
 [Kyty](https://github.com/InoriRus/Kyty)) that targets **one game only: Ghost of Yōtei (PS5)**. Every change in this
 tree is made, measured and tested against that game. Other titles are not tested and may run worse than on upstream
-KytyPS5; use upstream for them. The upstream README ([README.md](README.md)) is kept unchanged.
+KytyPS5; use upstream for them. The upstream README ([KytyPS5](https://github.com/KytyPS5/KytyPS5#readme)) is kept
+unchanged in the source tree as `README.md`.
 
 This repository contains **no game files, no firmware, no system software and no material taken from the game's
 code**. You need your own legally obtained dump of the game. Where the emulator relies on how the game behaves (for
@@ -27,6 +28,27 @@ code is copied.
   that were measured (NVIDIA), other vendors take slower but exact fallbacks.
 - 32 GB of RAM recommended (the game needs about 20 GB of free commit) and several GB of free disk space for the shader
   and pipeline caches.
+
+## Playing (release package)
+
+1. Unpack the zip into an empty folder (not under `Program Files`; the emulator writes its caches and saves next to
+   itself).
+2. Start `launcher.exe`, choose the folder of your Ghost of Yōtei dump (game version **1.512** is the one tested) and
+   press **Play**.
+3. **First start:** the package ships shader hints for the game (`hints\`, a list of the shaders the game uses, without
+   any game code). On the first Play the launcher finds those shaders in your game files and compiles them before the
+   game starts; this takes a few minutes and runs only once. The game then starts by itself. Without it the first
+   hours stutter while shaders compile during play.
+4. **Graphics mode:** the game's own *Performance* mode is the one tested. In *Quality* mode the game changes its
+   internal resolution all the time, which makes the screen flicker in this build; turn on the **Render at 1080p** mod
+   (launcher, Mods page) for Quality mode. The **Shorter detail distance (LOD 0.4)** mod gives the largest speed-up
+   (about +16%, +29% while walking) at the cost of simpler distant objects.
+5. **Performance panel:** F2 shows or hides it in game, Shift+F2 shows its details (frame time, CPU waiting on the GPU,
+   draw calls, shader compiles, memory). The launcher's Overlay option shows it from the start.
+
+What to expect: on the test PC (Ryzen 7 9800X3D, RTX 5070 Ti) the game runs at roughly 13-17 fps in the open world
+with the default settings, more with the mods above. The emulator's GPU work runs on four threads, each on its own
+physical CPU core, chosen automatically for the processor (`KYTY_GPU_THREAD_CPUS=off` turns that off).
 
 ## Building (Windows)
 
@@ -73,13 +95,19 @@ directly:
 kyty_emulator.exe --game "D:\Games\<your Ghost of Yotei dump>" --screen-width 1280 --screen-height 720
 ```
 
-Run `kyty_emulator.exe --help` for the logging, validation and debugging options. Tessellation is on by default
+Run `kyty_emulator.exe --help` for the logging, validation and debugging options; `--perf-overlay` shows the
+performance panel from the start (F2 / Shift+F2 in game). Tessellation is on by default
 (`--no-tessellation` turns it off). The first start compiles shaders and pipelines in the background, so the first
 minutes stutter; later starts reuse the caches. `--precompile-only` (the launcher's "Precompile shaders") compiles the
-shaders recorded in earlier runs and exits without starting the game.
+shaders recorded in earlier runs and exits without starting the game. `--export-hints <file>` with `--precompile-only`
+writes the recorded shaders as a hints file (no game code), `--import-hints <file>` finds a hints file's shaders in the
+game folder and adds them before compiling.
 
 ## Documentation
 
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) – where the frame time goes, how a change is measured, and every larger
+  idea that was tried with its result (also the ones that did not work); read it before performance work;
+- [docs/FIXES.md](docs/FIXES.md) – what was broken, why, how it was fixed and what the fix costs (newest first);
 - [docs/FRAME.md](docs/FRAME.md) – a Ghost of Yōtei frame pass by pass (shadows, G-buffer, terrain, cloth, particles,
   probes and RTGI, fog, water, FSR3, post-processing) and how the emulator handles each pass;
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – the GPU thread, preparation workers, command recording, shader
@@ -106,7 +134,7 @@ the whole table. At start the emulator prints one `ENV_DEFAULT KYTY_X=value sour
 Which settings keep the shader cache warm: only the settings listed in `Common::ShaderEnv::Names`
 (`src/common/shaderEnv.h`) change the translated shaders or pipelines, and only their effective values (the
 environment, else the code default) decide whether the pipelines of earlier runs count as compiled. Changing any other
-`KYTY_` variable - reports (`KYTY_TRACE_*`), the overlay, live A/B, pad scripts, dispatch skip lists such as the "No
+`KYTY_` variable - reports (`KYTY_TRACE_*`), live A/B, pad scripts, dispatch skip lists such as the "No
 particles" mod (`KYTY_DIAG_SKIP_CS_HASHES`), precompiler threads, VRAM budget - keeps the cache; changing a listed one
 makes the next start compile in the background again. The start log has one `ENV_FINGERPRINT hash=...` line: two runs
 with the same hash share the cache.
@@ -122,7 +150,7 @@ until their replacement lands.
 | Area (work item) | Switches | What may differ from the PS5 |
 |---|---|---|
 | GPU-written memory (D6) | `DIAG_BDA_STORE_TRACK`, `DIAG_BDA_STORE_UNTRACKED`, `DIAG_BDA_PIN_FAULTED`, `DIAG_FAULT_WINDOW_KB`, `DIAG_SCALAR_READS_IGNORE_ADDRESS_WRITES` | pages the GPU writes through pointers are tracked late and kept generously; rare stale reads |
-| Image memory shared by several images (D4/D5) | `WORKAROUND_ALIAS_SYNC` | transient targets copied between aliases; some post-processing (screen-space GI filter) may be off |
+| Image memory shared by several images (D4/D5) | `WORKAROUND_ALIAS_SYNC` | transient targets copied between aliases; some post-processing (screen-space GI filter) may be off; in the game's Quality mode, where the internal resolution changes all the time, the screen can flicker and textures can vanish for a moment (use the "Render at 1080p" mod). The exact replacement exists (`KYTY_FIX_IMAGE_MEMORY_OWNER=1`: no flicker) but costs 10-15% fps, so it is not the default yet |
 | Stencil and depth metadata (D8) | `WORKAROUND_STENCIL_PLANE_SYNC`, `WORKAROUND_STENCIL_STORAGE_SHADOW`, `WORKAROUND_PRESERVE_STENCIL`, `WORKAROUND_STENCIL_ALIAS_COPY`, `WORKAROUND_HTILE_FULL_RANGE`, `FIX_HTILE_RMW_CLEAR` (code), `WORKAROUND_DEPTH_ENCODING_LENIENT` | stencil kept as copies, HTILE emulated as "full range"; occasional missing masks or shadow tiles |
 | Colour compression (A5) | `WORKAROUND_DCC_FAST_CLEAR`, `DIAG_DCC_KEEP_BUFFER_WRITES`, `DIAG_COLOR_META_UNALIGNED_SKIP` | simplified DCC clear handling |
 | One fill compute shader (A5) | `WORKAROUND_FILL_CS_HASHES` (code: shader `2bd3cd129405f9a9`) | the shader is recognised by its hash and its stores are taken as a DCC fast clear (it still runs); with the list set by hand, a listed shader's output is filled instead of computed |
@@ -149,6 +177,11 @@ most measurements). Reporting the time a PS5 would take is open.
   [LICENSES/AMD-GPU-MR-ISA-MIT.txt](LICENSES/AMD-GPU-MR-ISA-MIT.txt).
 - Code adapted from other KytyPS5 forks (chenxiao07/KytyPS5, TheCruZ/KytyPS5-GTA, both GPL-2.0) carries a "Based on ..." note with its origin
   in the file; ideas taken from other forks name their source in the comment.
+- The launcher uses Qt 6.7.2 under the LGPL-3.0, linked dynamically and unmodified:
+  [LICENSES/Qt-NOTICE.txt](LICENSES/Qt-NOTICE.txt), [LICENSES/LGPL-3.0-Qt.txt](LICENSES/LGPL-3.0-Qt.txt),
+  [LICENSES/GPL-3.0.txt](LICENSES/GPL-3.0.txt).
+- The launcher and the emulator's overlays use the Cormorant Garamond, Manrope and JetBrains Mono fonts under the SIL
+  Open Font License 1.1 (`LICENSES/OFL-1.1-*.txt`).
 - Third-party components in `3rdparty/` and the submodules remain under their own licenses, included with them.
 - Ghost of Yōtei, PlayStation and PS5 are trademarks of their respective owners. This project is not affiliated with
   or endorsed by Sony Interactive Entertainment or Sucker Punch Productions.

@@ -154,8 +154,9 @@ water writes `0x4C`, and lighting classifies tiles by `(stencil & 0x48) == 0x48`
 `Composite depth bias` follow.
 
 **In the emulator.** This pass is where the CPU cost per draw dominates: every draw's registers, shader programs,
-render targets, pipeline, textures and buffers are resolved before it is recorded. Most of that work runs on
-preparation workers in parallel with the GPU thread (see [ARCHITECTURE.md](ARCHITECTURE.md)). Colour compression and
+render targets, pipeline, textures and buffers are resolved before it is recorded. The programs and the tables they
+read are resolved ahead on the resolve thread, the bindings and the recording on the execution thread (see
+[ARCHITECTURE.md](ARCHITECTURE.md)). Colour compression and
 depth/stencil metadata are emulated with workarounds that are still on: `KYTY_WORKAROUND_DCC_FAST_CLEAR` and related A5
 entries (simplified DCC clears), and the D8 stencil group (`KYTY_WORKAROUND_STENCIL_PLANE_SYNC`,
 `KYTY_WORKAROUND_PRESERVE_STENCIL`, `KYTY_WORKAROUND_HTILE_FULL_RANGE`, …), which keep stencil as copies and treat HTILE as
