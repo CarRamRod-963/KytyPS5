@@ -7,7 +7,7 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameContent.h"
-#include "gameViews.h"
+#include "gameListTreeWidget.h"
 #include "inputMappingDialog.h"
 #include "launcherTheme.h"
 #include "mainDialog.h"
@@ -71,6 +71,15 @@ constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_LAST_GAME[]    = "last_game";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
+
+constexpr int GAME_NAME_COLUMN             = 0;
+constexpr int GAME_SERIAL_COLUMN           = 1;
+constexpr int GAME_VERSION_COLUMN          = 2;
+constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
+constexpr int GAME_SIZE_COLUMN             = 4;
+constexpr int GAME_PATH_COLUMN             = 5;
+constexpr int GAME_STATUS_COLUMN           = 6;
+constexpr int GAME_COMMENT_COLUMN          = 7;
 
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
@@ -197,6 +206,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_compatibility = new CompatibilityDatabase(
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
+	ConfigureGameList(m_ui);
 
 	// Play shows the games as tiles on the list's model and selection; the table only in --local mode, where the
 	// compatibility status and comment are edited.
@@ -220,9 +230,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->edit_button->setEnabled(false);
 
 	m_ui->cfgs_list->setContextMenuPolicy(Qt::CustomContextMenu);
-	m_ui->cfgs_list->setAllColumnsShowFocus(true);
-	m_ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
 	m_ui->cfgs_list->setIconSize(QSize(48, 48));
+	m_ui->cfgs_list->setRootIsDecorated(false);
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
@@ -234,8 +243,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
-	SetupGameGrid(m_ui->cfgs_list, m_ui->cfgs_grid);
-	m_ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
 
 	connect(m_ui->refresh_action, &QAction::triggered, this,
 	        &ConfigurationListWidget::ScanGameDirectory);
@@ -265,6 +272,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::filter_configurations);
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
+
+	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
 
 	ReadSettings();
 	if (m_compatibility->IsLocal()) {
@@ -344,13 +353,6 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
-	s->remove(CONF_ADDCONT);
-	s->beginGroup(CONF_ADDCONT);
-	for (auto it = m_addcont.constBegin(); it != m_addcont.constEnd(); ++it) {
-		s->setValue(it.key(), it.value());
-	}
-	s->endGroup();
-
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
@@ -393,13 +395,6 @@ void ConfigurationListWidget::ReadSettings() {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
 	m_last_game = s->value(CONF_LAST_GAME).toString();
-	s->endGroup();
-
-	m_addcont.clear();
-	s->beginGroup(CONF_ADDCONT);
-	for (const auto& title_id: s->childKeys()) {
-		m_addcont.insert(title_id, SettingsStringList(s->value(title_id)));
-	}
 	s->endGroup();
 
 	s->beginGroup(CONF_GLOBAL);

@@ -41,15 +41,11 @@ private:
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
-	bool                         m_geometry_restored      = false;
 
 protected:
 	void Init(const Configuration& info);
 	void InitGameDirectories();
 	void AddGameDirectoryItem(const QString& dir);
-	void MakeTabsScrollable();
-	void GrowToFitContents();
-	void ShowTab(QWidget* page);
 
 	void moveEvent(QMoveEvent* event) override;
 	void resizeEvent(QResizeEvent* event) override;

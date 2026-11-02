@@ -317,10 +317,9 @@
  </widget>
  <customwidgets>
   <customwidget>
-   <class>GameViews</class>
-   <extends>QStackedWidget</extends>
-   <header>gameViews.h</header>
-   <container>1</container>
+   <class>GameListTreeWidget</class>
+   <extends>QTreeWidget</extends>
+   <header>gameListTreeWidget.h</header>
   </customwidget>
   <customwidget>
    <class>GameTileView</class>

@@ -80,12 +80,19 @@
 class QWidget;
 
 #if defined(_WIN32)
-constexpr char  EMULATOR_EXE[] = "kyty_emulator.exe";
-constexpr char  CMD_EXE[]      = "cmd.exe";
-constexpr DWORD CMD_X_CHARS    = 175;
-constexpr DWORD CMD_Y_CHARS    = 1000;
+constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
 #else
 constexpr char EMULATOR_EXE[] = "kyty_emulator";
+#endif
+
+#if defined(_WIN32)
+constexpr char CMD_EXE[] = "cmd.exe";
+#elif defined(__linux__)
+constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
+#endif
+#if defined(_WIN32)
+constexpr DWORD CMD_X_CHARS = 175;
+constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
@@ -349,8 +356,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_ui->bug_report_button, &QPushButton::clicked, this, &MainDialogPrivate::ExportBugReport);
 	ConnectSettingsPages();
 
-	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
-	                            Qt::WindowCloseButtonHint);
+	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
@@ -1267,7 +1273,7 @@ static QString BoolArg(bool value) {
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
-	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
+	auto        r = EnumToText(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
 		return {};
@@ -1439,22 +1445,27 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 #endif
 
 #if defined(_WIN32)
-// cmd /K arguments that keep the console open (with close_on_clean_exit, only after an error).
-// A quote is written as "" rather than \" so cmd's quote count stays even and operators inside
-// arguments stay quoted.
-static QString CmdCommand(const QString& interpreter, const QStringList& args,
-                          bool close_on_clean_exit) {
-	static const QRegularExpression quote_or_end(QStringLiteral(R"((\\*)("|\z))"));
-	// The UCRT reads 2n backslashes before a quote as n.
-	auto quoted = QStringList {interpreter} + args;
-	quoted.replaceInStrings(quote_or_end, QStringLiteral(R"(\1\1\2\2)"));
-	return QStringLiteral("/K \"\"") + quoted.join(QStringLiteral("\" \"")) +
-	       (close_on_clean_exit ? "\" && exit\"" : "\"\"");
+// Quote one token for cmd.exe so paths with spaces survive /K parsing.
+static QString WinCmdQuote(QString value) {
+	value.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+	return QLatin1Char('"') + value + QLatin1Char('"');
+}
+
+static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList& args) {
+	QString command = WinCmdQuote(QDir::toNativeSeparators(interpreter));
+	for (const auto& arg: args) {
+		command += QLatin1Char(' ');
+		command += WinCmdQuote(arg);
+	}
+	return command;
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
+
+	QFileInfo f(interpreter);
+	auto      dir = f.absoluteDir();
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {
@@ -1508,7 +1519,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		process->setStandardErrorFile(log_file, QIODevice::Append);
 	}
 #endif
-	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	process->setWorkingDirectory(dir.path());
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
@@ -1646,20 +1657,8 @@ void MainDialogPrivate::Run() {
 	m_running_item->SetRunning(true);
 	m_lightbar.Stop();
 
-	auto* process = new QProcess(this);
-	connect(process, &QProcess::stateChanged, this,
-	        [this, process, item](QProcess::ProcessState state) {
-		        if (state == QProcess::NotRunning) {
-			        if (item != nullptr) {
-				        item->SetRunning(false);
-			        }
-			        m_running_games--;
-			        process->deleteLater();
-			        Update();
-		        }
-	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
 }

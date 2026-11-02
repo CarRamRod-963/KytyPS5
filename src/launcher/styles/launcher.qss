@@ -351,18 +351,18 @@ GameListTreeWidget#cfgs_list {
     outline: 0;
 }
 
-QTreeWidget#cfgs_list::item {
+GameListTreeWidget#cfgs_list::item {
     background: transparent;
     border-bottom: 1px solid palette(mid);
     padding: 4px;
 }
 
-QTreeWidget#cfgs_list::item:selected {
+GameListTreeWidget#cfgs_list::item:selected {
     background: palette(highlight);
     color: palette(highlighted-text);
 }
 
-QTreeWidget#cfgs_list QHeaderView::section {
+GameListTreeWidget#cfgs_list QHeaderView::section {
     background: palette(button);
     color: palette(button-text);
     border: 0;

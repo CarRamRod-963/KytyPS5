@@ -23,7 +23,10 @@ inline QStringList EnumToList() {
 	auto        me    = QMetaEnum::fromType<T>();
 	int         count = me.keyCount();
 	for (int i = 0; i < count; i++) {
-		ret << QString(me.key(i));
+		auto key = QString(me.key(i));
+		ret << (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit()
+		            ? key.remove('R').toLower()
+		            : key);
 	}
 	return ret;
 }
@@ -31,12 +34,16 @@ inline QStringList EnumToList() {
 template <class T>
 T TextToEnum(const QString& text) {
 	auto me = QMetaEnum::fromType<T>();
-	return static_cast<T>(me.keyToValue(text.toUtf8().constData()));
+	return static_cast<T>(me.keyToValue(
+	    ((text.size() > 1 && text.at(0).isDigit()) ? 'R' + text.toUpper() : text).toUtf8().data()));
 }
 
 template <class T>
 QString EnumToText(T value) {
-	return QString(QMetaEnum::fromType<T>().valueToKey(static_cast<int>(value)));
+	auto me  = QMetaEnum::fromType<T>();
+	auto key = QString(me.valueToKey(static_cast<int>(value)));
+	return (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit() ? key.remove('R').toLower()
+	                                                                     : key);
 }
 
 struct ControllerSettings {
@@ -70,10 +77,13 @@ public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
-	static constexpr int MIN_SCREEN_SIZE = 320;
-	static constexpr int MAX_SCREEN_SIZE = 16384;
-
-	static QString NormalizeResolution(const QString& text);
+	enum class Resolution {
+		R1280X720,
+		R1920X1080,
+		R2560X1440,
+		R3840X2160,
+	};
+	Q_ENUM(Resolution)
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
@@ -102,7 +112,7 @@ public:
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	QString                screen_resolution           = QStringLiteral("1280x720");
+	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
@@ -110,7 +120,6 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
-	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = true;
 	// KYTY_OVERLAY=1 for the game: the performance overlay (F2 hides it, Shift+F2 makes it compact). Off: left out
@@ -130,9 +139,7 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -149,7 +156,6 @@ public:
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
-		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
 		overlay_enabled             = other.overlay_enabled;
@@ -167,9 +173,7 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
-		pro_enabled                 = other.pro_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
-		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif

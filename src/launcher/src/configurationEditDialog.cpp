@@ -22,8 +22,6 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
-#include <QScreen>
-#include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -122,10 +120,10 @@ static QString GameDirectoryKey(const QString& dir) {
 }
 
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
-    : QDialog(parent, Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint),
-      m_ui(new Ui::ConfigurationEditDialog), m_info(info) {
+    : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
+      m_info(info) {
 	m_ui->setupUi(this);
-	MakeTabsScrollable();
+	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
 
@@ -169,11 +167,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	setSizeGripEnabled(true);
 
+	restoreGeometry(g_last_geometry);
+
 	Init(info);
-	m_geometry_restored = restoreGeometry(g_last_geometry);
-	if (!m_geometry_restored) {
-		GrowToFitContents();
-	}
 }
 
 QByteArray ConfigurationEditDialog::g_last_geometry;
@@ -240,7 +236,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		                    info.audio_input_device);
 	}
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
-	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
+	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
@@ -276,7 +272,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
-	m_ui->checkBox_stretch->setChecked(info.stretch_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
@@ -290,9 +285,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
-	m_ui->checkBox_pro->setChecked(info.pro_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
-	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -301,7 +294,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
-	// ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
+	ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -371,46 +364,8 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
-	if (!m_geometry_restored) {
-		GrowToFitContents();
-	}
-}
-
-void ConfigurationEditDialog::MakeTabsScrollable() {
-	auto* tabs = m_ui->settings_tabs;
-	for (int i = 0; i < tabs->count(); i++) {
-		auto* page   = tabs->widget(i);
-		auto  title  = tabs->tabText(i);
-		auto* scroll = new QScrollArea;
-		scroll->setWidgetResizable(true);
-		scroll->setFrameShape(QFrame::NoFrame);
-		tabs->removeTab(i);
-		scroll->setWidget(page);
-		tabs->insertTab(i, scroll, title);
-	}
-	tabs->setCurrentIndex(0);
-}
-
-void ConfigurationEditDialog::GrowToFitContents() {
 	layout()->activate();
-	auto* tabs = m_ui->settings_tabs;
-	QSize content;
-	for (int i = 0; i < tabs->count(); i++) {
-		content = content.expandedTo(
-		    static_cast<QScrollArea*>(tabs->widget(i))->widget()->minimumSizeHint());
-	}
-	const QSize chrome = size() - tabs->currentWidget()->size();
-	resize(size().expandedTo(content + chrome).boundedTo(screen()->availableGeometry().size()));
-}
-
-void ConfigurationEditDialog::ShowTab(QWidget* page) {
-	auto* tabs = m_ui->settings_tabs;
-	for (int i = 0; i < tabs->count(); i++) {
-		if (tabs->widget(i)->isAncestorOf(page)) {
-			tabs->setCurrentIndex(i);
-			return;
-		}
-	}
+	resize(size().expandedTo(minimumSizeHint()));
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -465,13 +420,12 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
 	}
 	info.screen_resolution =
-	    Configuration::NormalizeResolution(ui.comboBox_screen_resolution->currentText());
+	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
-	info.stretch_enabled           = ui.checkBox_stretch->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
@@ -480,14 +434,12 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
-	info.pro_enabled               = ui.checkBox_pro->isChecked();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
-	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
-	// info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
-	//     ui.comboBox_shader_optimization_type->currentText());
+	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
+	    ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
@@ -515,16 +467,6 @@ void ConfigurationEditDialog::save() {
 	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
-		return;
-	}
-	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
-	        .isEmpty()) {
-		ShowTab(m_ui->settings_tab);
-		m_ui->comboBox_screen_resolution->setFocus();
-		QMessageBox::critical(this, tr("Save failed"),
-		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")
-		                          .arg(Configuration::MIN_SCREEN_SIZE)
-		                          .arg(Configuration::MAX_SCREEN_SIZE));
 		return;
 	}
 
