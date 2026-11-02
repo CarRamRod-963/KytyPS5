@@ -329,7 +329,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	DispatchCensusTimer         census_timer(buffer.GetShaders().GetCs().cs_regs.data_addr, async_compute); // KYTY_TRACE_DISPATCH_CENSUS
 	GpuBurnAt(GpuBurnSite::Dispatch); // KYTY_DIAG_GPU_BURN_AT=dispatch (measurement only)
 	// KYTY_DIAG_GPU_BURN_AT=dispatch_async / dispatch_gfx (measurement only): the asynchronous compute queues' dispatches
-	// or the graphics queue's (notes\PROJEKT-KOLEJKI-COMPUTE.md, step 0c).
+	// or the graphics queue's (step 0c).
 	GpuBurnAt(async_compute ? GpuBurnSite::DispatchAsync : GpuBurnSite::DispatchGfx);
 	m_context.GetCommandScheduler().NoteGpuCommand();
 	KYTY_PROFILER_BLOCK("Dispatch(direct)");

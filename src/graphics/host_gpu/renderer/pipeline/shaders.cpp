@@ -42,7 +42,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-// PIPELINE_REPEAT (diagnostic, notes\PROJEKT-BIBLIOTEKA-POTOKOW-2026-10-25.md stage 1): a driver compile (50 ms or more)
+// PIPELINE_REPEAT (diagnostic): a driver compile (50 ms or more)
 // of a VS+PS pair (shader hashes) already compiled in this session, with the inputs that differ from its closest earlier
 // variant - which pipeline state makes the same shaders compile again (dynamic state or a pipeline library, stage 2).
 struct PipelineVariant {

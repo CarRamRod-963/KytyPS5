@@ -1,7 +1,7 @@
 # Project codes in the comments
 
 Comments in `src` often name a change by a short code. The codes come from this fork's working lists, which are not part
-of the repository (the same goes for the `notes\...` files some comments point to). This page says what each code still
+of the repository. This page says what each code still
 found in `src` stands for, so a comment can be read without those lists.
 
 How to read them:

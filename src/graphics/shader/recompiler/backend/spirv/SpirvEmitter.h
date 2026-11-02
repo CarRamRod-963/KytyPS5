@@ -61,7 +61,7 @@ void SetSpirvStoreOutlineOverride(std::optional<bool> enabled);
 
 // A formatted load through a GPU-selected descriptor takes its own case for the 7 formats the game reads that way and
 // one table-driven read for every other format (spirvEmitterMemory.cpp, LoadIndirectFormattedVector and
-// LoadIndirectFormattedTable; notes\PROJEKT-ODCHUDZANIE-ODCZYT-FORMATOWANY-2026-10-25.md, notes\TESTY-GOSPODA-2026-10-27.md).
+// LoadIndirectFormattedTable).
 // The compute test (--indirect-formatted-table-only) sets the reference to emit the 78-case format switch and checks
 // that both give the same values (the guard of AGENTS 2); the emulator never sets it.
 bool SpirvFormattedSwitchReference();

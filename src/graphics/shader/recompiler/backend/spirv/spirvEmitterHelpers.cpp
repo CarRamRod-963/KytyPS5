@@ -148,7 +148,7 @@ bool WavePairRequested(uint64_t shader_hash) {
 
 // The pair rule: besides the list above, every wave64 compute shader whose workgroup is one guest wave (64
 // threads: the exchanges take the workgroup barrier) and whose guest code has 2048 words or more is paired - one guest
-// lane per invocation halves the SPIR-V the driver compiles. Meter (the 48 compute records of Rafal's 29.10 play): 37.8 ->
+// lane per invocation halves the SPIR-V the driver compiles. Meter (the 48 compute records of a 29.10 play): 37.8 ->
 // 28.2 s of driver time, the two giants 5.8 / 5.4 -> 2.7 / 2.7 s; live A/B open world +0.39 % +- 0.19 (all sizes: -2.46 %,
 // the 1024..2048-word ones cost the card time; 1024: -1.69 %), gate +0.56 % +- 0.24 (1024). LDS writes are synced across
 // the halves (EmitPairLdsWriteSync), without which the blur CS 099c56ee made black particles.

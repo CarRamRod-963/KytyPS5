@@ -159,7 +159,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
-// ---- KYTY_PERF_DIRECT_RANGES (A1 stage 2, notes\A1-WSPOLNA-PAMIEC.md) ---------------------------------------------
+// ---- KYTY_PERF_DIRECT_RANGES (A1 stage 2) ---------------------------------------------
 namespace {
 
 uint32_t HostPointerTypeBits(GraphicContext& graphics, uint64_t cpu_address) {

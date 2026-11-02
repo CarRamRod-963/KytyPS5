@@ -420,7 +420,7 @@ private:
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool                      primitive_restart_enable,
 	                         const DrawIndirectSource* indirect = nullptr);
-	// S1 (notes\PROJEKT-ROWNOLEGLE-FAZY-RYSOWANIA.md): the part of a draw after its "cannot touch guest memory" point,
+	// S1: the part of a draw after its "cannot touch guest memory" point,
 	// from what ExecutePreparedDraw prepared (the plan).
 	void CommitPreparedDraw(DrawPlan& plan);
 	// The steps the draw entries share. DrawEntryStart: DrawIndex and DrawAuto.

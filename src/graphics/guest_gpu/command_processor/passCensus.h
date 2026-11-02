@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-// Parallel-translation project, step S0 (notes\PROJEKT-ROWNOLEGLE-TLUMACZENIE-2026-10-29.md section 4; diagnostic only,
+// Parallel-translation project, step S0 (diagnostic only,
 // default off, removed with the project's decision):
 // KYTY_TRACE_PASS_CENSUS=1: the GPU thread's time between PM4 events is attributed to the game's marker pass of the
 // command processor that runs (its marker stack, two levels: "outer>inner"), less the time it blocked on the card

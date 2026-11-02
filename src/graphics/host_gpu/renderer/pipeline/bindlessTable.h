@@ -38,7 +38,7 @@ class SamplerCache;
 // (a page index of the slots' ranges), which are marked named until a replay check or a refresh of theirs runs. A slot
 // dropped counts against its owners (no TableSlotsAlive walk), and a table lists its images again only when one of its
 // own slots changed.
-// The list path of tables over 1 MiB (bindless C9 variant A p. 1-3, notesANALIZA-FABLE-C9-2026-10-29.md §4; the only
+// The list path of tables over 1 MiB (bindless C9 variant A, points 1-3; the only
 // path; its check found refresh/release/touch misses 0 at the gate and in the
 // open world): a large table's refresh visits only the slots on its list - those the journal named (NameSlot), those a
 // refresh left without a replay (NoteFastSlot) - and its gpu_slots, instead of all 39,211 (~1.55 ms per frame). The

@@ -195,7 +195,7 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 	// KYTY_FIX_HTILE_SLICE_CLEAR (default off; =1 on; =2 on + check against the old decisions): HTILE clears of single
 	// array layers. The game clears one layer's HTILE inside a layered depth target (far shadow-page cache 0x509e720000,
-	// 256 layers, notes\M122-PLAMA-CIENIA-ANALIZA.md); the old lookup took only writes at the metadata's first byte and
+	// 256 layers); the old lookup took only writes at the metadata's first byte and
 	// kept the cleared state of layers 0..63. 0: off, 1: on, 2: on + check.
 	[[nodiscard]] static uint32_t HtileSliceClearMode();
 	// The address is registered metadata, or (KYTY_FIX_HTILE_SLICE_CLEAR) lies inside a registered HTILE's layers.

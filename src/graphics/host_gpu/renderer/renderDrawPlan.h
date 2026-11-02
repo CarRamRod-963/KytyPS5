@@ -119,7 +119,7 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
-// S1 (notes\PROJEKT-ROWNOLEGLE-FAZY-RYSOWANIA.md): what the preparation of a draw (ExecutePreparedDraw up to its
+// S1: what the preparation of a draw (ExecutePreparedDraw up to its
 // "cannot touch guest memory" point) hands to its commit (CommitPreparedDraw). Step 1 only moves the locals here; the
 // preparation still runs right before the commit, on the same thread.
 struct DrawPlan {

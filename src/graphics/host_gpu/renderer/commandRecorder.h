@@ -4,7 +4,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 // The driver cost of recording the render scheduler's Vulkan commands (the vkCmd* calls) moves off the GPU thread (stage 1
-// of notes/PLAN-WIELOWATKOWOSC.md: the GPU thread ~8 ms per frame less).
+// of the multithreading plan: the GPU thread ~8 ms per frame less).
 //
 // - Install() replaces the vkCmd* members of the default Vulkan-Hpp dispatcher.
 // - Route(buffer) is called once the render scheduler has begun a command buffer. From then until
@@ -55,7 +55,7 @@ void SyncQueue();
 // only). Made visible to the worker at once.
 void EnqueueCall(void (*call)(const void* blob), const void* blob, size_t bytes);
 
-// The record packets (step 1 of option O1, notes\PROJEKT-PRZEBUDOWA-RDZENIA.md): room for `bytes` of data of
+// The record packets (step 1 of option O1): room for `bytes` of data of
 // one call the worker makes on `buffer` after everything appended before it (the recording thread only). Null when
 // commands of `buffer` go straight to the driver (no worker, or another buffer): the caller then makes the call itself.
 // Otherwise the caller fills the bytes and calls CommitCall; `call` gets them and makes its Vulkan calls through the

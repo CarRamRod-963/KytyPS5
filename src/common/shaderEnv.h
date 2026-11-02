@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdlib>
 
-// The KYTY_* settings and the shader caches (notes\ANALIZA-FABLE-ODCISK-SRODOWISKA-2026-10-29.md, steps K1 and K2).
+// The KYTY_* settings and the shader caches (steps K1 and K2).
 //
 // Names: every setting that, for the same journal record (the same inputs), changes what is made from it - the SPIR-V,
 // the program's resource layout, the state or the flags of the pipeline. The warm list's environment fingerprint

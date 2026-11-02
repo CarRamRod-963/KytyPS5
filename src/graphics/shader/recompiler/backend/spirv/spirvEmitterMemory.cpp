@@ -390,10 +390,10 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 // project step 1): ok = exec && in bounds; the element at Select(ok, index, 0) is read and Select(ok, value, 0) is the
 // result. An active in-bounds lane reads the same element; every other lane gets the same 0. The read of element 0 is
 // defined (robustBufferAccess, which the emitter relies on already) and has no side effect; its value is discarded.
-// Measured 27-28.10 (MAPA-WYDAJNOSCI): driver compile time of the 2.000 journals -24% on the same shaders; card time per
+// Measured 27-28.10: driver compile time of the 2.000 journals -24% on the same shaders; card time per
 // frame at the gate, the inn and the meadow 1.1-3.0 ms lower, fps unchanged or higher. (Until 28.10 the cloth shader only,
 // after a card-time loss on c6b0a54e on 17.10 that the 28.10 runs no longer show: 0.81 -> 0.82 ms.)
-// Compute stages (EmitterState::guardless, the only way, step K2 of notes\ANALIZA-FABLE-K2-ZAPISY-2026-10-30.md):
+// Compute stages (EmitterState::guardless, the only way, step K2):
 // a buffer access through a descriptor without a branch. robustBufferAccess2 (required, vulkanWindow.cpp) makes the card
 // return 0 for a read and drop a write outside the descriptor's range, so an inactive lane or an out-of-range index goes
 // past the end of the range (RobustPastEnd): the same result as the guards.
@@ -1074,7 +1074,7 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 
 // KYTY_PERF_BDA_ENTRY_SHARE: LoadBdaDword for a scalar load through a GPU-built V#, reusing the page-table entry of
 // this invocation half's previous such load when the address is in the same 16 KiB page. The cloth shader fc6f8c56
-// reads 27 dwords of one collider record per loop iteration through 7 S_BUFFER_LOADs (notes\PROJEKT-TKANINY-2026-10-16.md):
+// reads 27 dwords of one collider record per loop iteration through 7 S_BUFFER_LOADs:
 // 27 calls of get_bda_pointer (page-table load, range checks, fault branch) for the same page. Exact: the pointer of
 // a page is entry_base + (address & page mask) with the entry the host wrote before the submission (it does not change
 // during a dispatch); a reused base came from a real lookup of that page by the same invocation that found it present,

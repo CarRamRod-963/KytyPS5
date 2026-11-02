@@ -13,8 +13,8 @@ struct PreparedBindings;
 struct ShaderComputeInputInfo;
 } // namespace Libs::Graphics
 
-// KYTY_DIAG_TWIN_DISPATCH=<hex shader hash>[:<n>[:<hex variant bits>]] (diagnostic, default off; measurement only;
-// notes\PERF-OGON-KARTY-2026-10-22.md 7.4): an exact check, on the GPU, of a change of a compute shader's whole module.
+// KYTY_DIAG_TWIN_DISPATCH=<hex shader hash>[:<n>[:<hex variant bits>]] (diagnostic, default off; measurement only):
+// an exact check, on the GPU, of a change of a compute shader's whole module.
 // At most one dispatch (direct or indirect) of the shader per n presented frames (default 8) runs twice: first "B", the
 // same dispatch with its program looked up with the variant bits toggled in ShaderComputeInputInfo::compute_variant
 // (default 2 = ComputeVariantPairOff: the two-lanes module against the paired one; 4 =

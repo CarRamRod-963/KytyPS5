@@ -1398,7 +1398,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
-// ---- KYTY_PERF_DIRECT_RANGES (A1 stage 2, notes\A1-WSPOLNA-PAMIEC.md) ---------------------------------------------
+// ---- KYTY_PERF_DIRECT_RANGES (A1 stage 2) ---------------------------------------------
 // Default on (=0 off; live A/B is not a fair test of it: each switch to off re-uploads and re-protects
 // the whole range). 3+2 alternating runs from the start (20261014-2038..2049): 6.34 fps on against 6.28 off (+1%),
 // GPU-thread protection time halved, game-thread lock waits ~10x shorter, images correct; Vulkan validation: no new
@@ -1557,7 +1557,7 @@ bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
 }
 
 
-// A CPU write fault into a GPU-modified page of the data ring (YOTEI-ENGINE.md 4.4: two
+// A CPU write fault into a GPU-modified page of the data ring (two
 // halves, each reused every second frame; the game overwrites what it allocates there and never reads an older
 // frame's data) drops the page's GPU bytes written before the previous frame began instead of downloading them (and
 // waiting for their writer). Newer GPU bytes are downloaded as before. Returns true when no GPU byte is left in the page.

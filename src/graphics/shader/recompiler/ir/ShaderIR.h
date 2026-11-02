@@ -160,7 +160,7 @@ struct MemoryInfo {
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
-// Record-keyed V#s (notes\PROJEKT-D6-KROK-B.md). B1: formatted stores through a GPU-selected V# that a bounded loop reads
+// Record-keyed V#s. B1: formatted stores through a GPU-selected V# that a bounded loop reads
 // from a record table are record-keyed like raw stores (their guest ranges are listed per materialization and obtained for
 // writing) and written through BDA in the runtime format. B2: a record-keyed V# whose key no bounded loop limits lists every
 // record of its table (a read past the table's bytes reads a zero, i.e. empty, V#). Candidates are the records at whole
@@ -526,7 +526,7 @@ struct PushData {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
 	}
 
-	// Stage slots (notes\PROJEKT-STALY-POCZATEK-DANYCH-VS-2026-10-25.md): a push cursor may carry where a
+	// Stage slots: a push cursor may carry where a
 	// stage's data goes besides the next free dword. FromEnd (the pixel stage): its data ends at `end` (bits 8-15), the
 	// first `front` dwords (bits 0-7) are the draw's; Limited (the vertex stages after it): from `front`, up to `limit`
 	// (bits 8-15, the pixel data's start). So each stage's start depends on its own data and the draw's dwords only, not
@@ -754,8 +754,8 @@ inline bool ReadConstUniform(size_t srt_reads) {
 // live share one permutation; the emitter then returns what the null V# gives (zero in every channel) when the run-time
 // stride is 0. Without it every null/live combination of a shader's formatted buffers is its own SPIR-V (072a51c6:
 // ~820k words, 86-96 s per cold compile).
-// The null share journal (notes\SESJA-ZACIECIA.md): a session whose first call of a program has a null formatted buffer
-// would compile a null/live combination of its own (Rafał's two runs: 072a51c6 had 4 recorded permutations
+// The null share journal: a session whose first call of a program has a null formatted buffer
+// would compile a null/live combination of its own (two runs: 072a51c6 had 4 recorded permutations
 // differing only in b15/b16 null or live, 66-67 s per cold compile). At a program's first use its last
 // live values are taken from the precompile journal's records of the same program (file order, the later record wins,
 // as the later call wins in a session), so a null buffer gets the permutation an earlier session compiled. The share
@@ -776,7 +776,7 @@ bool WavePairRulePaired(uint64_t shader_hash);
 // (shader hash low, high) (PERF clamp_nan verify).
 inline constexpr uint32_t ClampNanDiagWord  = 24;
 inline constexpr uint32_t ClampNanDiagSlots = 2;
-// F1 (grouped IndirectBuffer reads, notes\ANALIZA-CLOTH-2026-10-25.md; the only path since 26.10, measured at the Atsu
+// F1 (grouped IndirectBuffer reads; the only path since 26.10, measured at the Atsu
 // house: cloth CS 29.4 -> 14.6 ms GPU per frame, 12.1 -> 14.3 fps; the test switch's check mode compared 10.7e9 dwords with
 // the per-dword path, 0 differ): a raw BUFFER_LOAD_DWORDX2..X4 through a GPU-selected V# (ResourceKind::IndirectBuffer)
 // is one call per wave half of indirect_raw_x<N>: the V# is decoded once, every dword keeps its own bounds test, and

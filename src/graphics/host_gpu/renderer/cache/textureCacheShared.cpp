@@ -48,7 +48,7 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 // One guest memory under several images: KYTY_FIX_IMAGE_MEMORY_OWNER, KYTY_FIX_SHARED_IMAGE_MEMORY (+_DIRECT), both off by
-// default and the proper implementations KYTY_WORKAROUND_ALIAS_SYNC waits for (notes\LISTA-ZMIAN-Z-DEKOMPILACJI.md, D4). Nothing
+// default and the proper implementations KYTY_WORKAROUND_ALIAS_SYNC waits for (D4). Nothing
 // here runs while their gates (textureCacheShared.h, asked in textureCache.cpp) are off.
 namespace Libs::Graphics {
 

@@ -1593,7 +1593,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	if (mip >= destination.backing.mip_levels && mip < destination.info.resources.levels) {
 		// A guest level past the destination's 1x1 level has no host subresource (ImageInfo::HostLevels); those levels
-		// are 1x1 as well, and the host's last level stands for them: the copy goes there (28.10, Rafał's decision; the
+		// are 1x1 as well, and the host's last level stands for them: the copy goes there (28.10; the
 		// stop added that day ended Snake's house in RT mode).
 		mip = destination.backing.mip_levels - 1u;
 	}
@@ -2618,7 +2618,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-// Default level 3 (=0 off; plan step 1 / A5, notes\PLAN-CZEKANIE.md): the remaining metadata
+// Default level 3 (=0 off; plan step 1 / A5): the remaining metadata
 // downloads (~64 per 5 s, ~9.5 ms a frame of GPU-thread drains: the HDR target whose keys a whole-range write of the
 // Forward Pre Water pass leaves unknown, and the two video-out surfaces after the Toolkit's retile) went to 0; 3 runs
 // 20261014-2251..2257: images correct (kimono, landmarks), 6.27-6.55 fps.
@@ -4585,8 +4585,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 // Ghost of Yotei: the HTILE of the UI pass's depth target lies at the start of the contact-shadow mask
 // (0x5062b40000, 0xa0000 bytes of HTILE in 0x870000 bytes of R8 mask). The game clears the mask every frame with a
 // 0x870000-byte compute fill; taken as an HTILE clear, it was dropped, so the mask kept every earlier frame's shadows
-// (dark trails and hard-edged black patches on clothes, the gate and the huts; F:\Claude\ghidra_q1\
-// YOTEI-CONTACT-SHADOWS.md).
+// (dark trails and hard-edged black patches on clothes, the gate and the huts).
 bool TextureCache::ClearMetaWrite(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	if (HtileSliceClearMode() != 0u) return ClearMetaSlices(address, size, true, 0);

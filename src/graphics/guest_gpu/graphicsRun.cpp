@@ -491,7 +491,7 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 	}
 }
 
-// labels at completion (default on, =0 off, live A/B; A1 stage 1, notes\A1-WSPOLNA-PAMIEC.md).
+// labels at completion (default on, =0 off, live A/B; A1 stage 1).
 // Live A/B 20261014-182251 (82 cycles): fps -0.01% (se 0.21%), same GPU-thread busy and fence time; on-from-start run
 // 20261014-182029: loads and plays, kimono correct; labels reach the guest ~4 ms (max ~15 ms) after recording. An end-of-pipe label
 // (RELEASE_MEM / EVENT_WRITE_EOP data) reaches guest memory when the host GPU has finished the work recorded before it,

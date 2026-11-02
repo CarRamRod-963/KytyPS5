@@ -316,7 +316,7 @@ void DefineDescriptors(EmitterState& state) {
 				// ("buffers_coherent"); every other access
 				// goes through the plain aliases and may hit L1. Before, one GLC read made the whole shader Coherent:
 				// the grass vertex shader 58e7b882 (one GLC read of 107 per vertex) got 4% L1 hits against 87% for the
-				// rest of the frame (Nsight GPU Trace, notes\PROJEKT-TRAWA-2026-10-16.md). Exact: with no
+				// rest of the frame (Nsight GPU Trace). Exact: with no
 				// buffer writes in the shader, no invocation of the command produces data a plain read could see early
 				// or late; earlier commands are made visible by the emulator's barriers; the guest's own non-GLC loads
 				// go through its non-coherent GL0/GL1 caches as well. The GLC accesses stay Coherent + Volatile.

@@ -952,7 +952,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	                                     ? storage_view_format
 	                                 : r8_srgb_read ? vk::Format::eR8Srgb
 	                                                : pixel_format;
-	// Guard (notes\PROJEKT-ODCZYT-SRGB-R8-2026-10-26.md): a read of an sRGB T# whose view does not decode and whose
+	// Guard: a read of an sRGB T# whose view does not decode and whose
 	// shader does not decode either (an 8_SRGB T# on a device without sampled R8_SRGB). Expected never; the first
 	// distinct textures are logged.
 	if (!storage && format == Prospero::BufferFormat::k8Srgb && view_format != vk::Format::eR8Srgb) {
@@ -3165,7 +3165,7 @@ void RenderExecutor::RefreshTableSlots(BindlessTable::Table& table, uint64_t fra
 	const bool full     = table.refreshed_frame != frame;
 	// The journal names its slots first.
 	bindless.DrainSlotJournal();
-	// The list path (bindless C9 variant A p. 1-3, notes\ANALIZA-FABLE-C9-2026-10-29.md §4; bindlessTable.h): a table over
+	// The list path (bindless C9 variant A, points 1-3; bindlessTable.h): a table over
 	// 1 MiB lists the slots that may need more than the trusted skip (journal-named, refreshed without a replay) and visits
 	// only those and its gpu_slots - the rest would only be skipped and LRU-touched, now answered by the owners' last full
 	// refresh (table.used_frame). After a translation (refreshed_frame 0) every slot once, then the list is built.
@@ -4710,7 +4710,7 @@ void ReportBindlessLayoutWalk() {
 // an identical list under the same epochs is not walked again: every image in it is still registered as it was and in the
 // layout the walk left it in.
 
-// The commit packet (step 1 of option O1, notes\PROJEKT-PRZEBUDOWA-RDZENIA.md): CommitBindings
+// The commit packet (step 1 of option O1): CommitBindings
 // writes the push constants and the descriptor contents (the buffer and image infos, back to back in the order of a
 // descriptor update template of the pipeline) straight into the record ring as one packet, and the record worker makes
 // the calls the commit made before: push constants, then push descriptors (now with the template) or, for a pipeline

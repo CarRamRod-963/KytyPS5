@@ -161,7 +161,7 @@ bool Packet(const void* cp, bool dispatch) {
 	auto& state = t_processors[cp];
 	if (t_active != cp) Switch(cp, state.key);
 	const bool skip = state.free && CeilingOn();
-	// KYTY_DIAG_CEILING_FREE_BURN_NS=<ns> (the ceiling with the remainder, notes\PRZEGLAD-FABLE-ROWNOLEGLE-2026-10-29.md):
+	// KYTY_DIAG_CEILING_FREE_BURN_NS=<ns> (the ceiling with the remainder):
 	// a left-out packet still costs the GPU thread that much (busy wait) - the in-order work a parallel translation
 	// keeps per draw.
 	static const uint64_t burn_ns = [] {

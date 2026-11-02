@@ -204,7 +204,7 @@ public:
 		++m_rk_incomplete;
 		m_rk_incomplete_frame = m_rk_frame + 1u; // + 1: 0 means "none yet"
 	}
-	// D6 step C0 (notes\D6-KROK-C-PROJEKT.md, Stage C0), KYTY_D6_C0 (read once, logged):
+	// D6 step C0 (Stage C0), KYTY_D6_C0 (read once, logged):
 	//   0 - the path without C0: every store report marks its pages GPU-modified;
 	//   1 (default) - C0. The written record-keyed ranges own their bytes exactly (ObtainBdaRange
 	//       makes them GPU-modified when the call is recorded); a store page the fault buffer reports for the work of a
@@ -286,7 +286,7 @@ public:
 	// The BDA fallback (M06): a mapped direct-memory page without a buffer gets a BDA table entry into the imported
 	// direct-memory backing (bit 0 set = fallback), so a shader reads and writes the guest's real bytes instead of zeros /
 	// a dropped store; the shader still reports the page (BDA_FAULT), and the fault pass gives it a device-local buffer as
-	// before. See notes\M06-PROJEKT.md.
+	// before.
 	// KYTY_PERF_BDA_ENTRY_SHARE (0 off, 1 on, 2 verify; spirvEmitterMemory.cpp LoadBdaDwordShared): a scalar load through
 	// a GPU-built V# reuses the page-table entry of the invocation's previous such load when the page is the same.
 	// Verify counts checks / mismatches in fault-buffer diag words FAULT_DIAG_ENTRY_SHARE (+0, +1).
@@ -311,7 +311,7 @@ public:
 	// true: written to guest memory and to the GPU copy at this point of the command stream, the page left GPU-owned;
 	// false: the caller writes it as before (the write faults and synchronizes the page).
 	[[nodiscard]] bool TryCpWriteThrough(uint64_t address, const void* data, uint64_t size);
-	// KYTY_PERF_DIRECT_RANGES (A1 stage 2, notes\A1-WSPOLNA-PAMIEC.md), GPU thread. A direct range's guest memory is the
+	// KYTY_PERF_DIRECT_RANGES (A1 stage 2), GPU thread. A direct range's guest memory is the
 	// memory of one cache buffer: the host GPU reads and writes the guest's bytes in place, no page of it is tracked.
 	//   - InDirectRange: [vaddr, vaddr + size) overlaps an active direct range;
 	//   - WaitDirectGpuWrites: before the GPU thread reads guest memory itself (indirect arguments, waits, predicates,

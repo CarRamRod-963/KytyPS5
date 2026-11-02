@@ -69,7 +69,7 @@ std::vector<ResourceBlock> ResourceControlFlowOf(const Program& program, const s
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 // The ordinary read hook reads guest memory for SRT walks without faulting on GPU-modified pages (byte-precise
 // GPU-dirty check); it returns false to fall back to a direct read.
-// Table slots (notes\PROJEKT-STALE-TABELE-TEKSTUR-2026-10-26.md): a GPU-selected
+// Table slots: a GPU-selected
 // descriptor table takes a power of two of candidates (padding copies, never selected), of flattened-SRT room and of
 // search steps, so a table that gains candidates keeps its permutation until it crosses the next power of two.
 // The only layout since 26.10 (6cc64dee at the user's new area: 3 -> 1 permutations in 300 s); the unit test sets
