@@ -22,6 +22,7 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QSet>
+#include <utility>
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
@@ -110,6 +111,9 @@ constexpr int  BUG_REPORT_LOGS = 3; // newest run logs in a bug report
 constexpr char PRECOMPILE_LOG_FILE[] = "_precompile_log.txt";
 // The emulator's pipeline cache folder (relative to its working directory, the emulator's folder).
 constexpr char PIPELINE_CACHE_DIR[] = "_PipelineCache";
+// The shader hints folder next to the emulator: the package's hints (<title id>_<version>.kyhints) and the default of the
+// hints file dialogs.
+constexpr char HINTS_DIR[] = "hints";
 // Saves a picture of every page into this folder and quits, without looking for the emulator (design check against
 // the Figma frames, docs/launcher/DESIGN-SPEC.md).
 constexpr char SCREENSHOT_DIR_ENV[] = "KYTY_LAUNCHER_SCREENSHOT_DIR";
@@ -212,6 +216,10 @@ private:
 	void ExportBugReport();
 	[[nodiscard]] QList<BugReport::File> BugReportFiles() const;
 	[[nodiscard]] QString PipelineCacheDir() const;
+	[[nodiscard]] QString HintsDir() const;
+	// The hints file shipped for the game (hints/<title>_*.kyhints, the newest name) when the pipeline cache has no
+	// shader journal of it yet: its first start. Empty otherwise.
+	[[nodiscard]] QString FirstStartHints(const QString& title) const;
 	[[nodiscard]] QString LogDir() const;
 	[[nodiscard]] Check   CacheCheck(const ConfigurationItem* item) const;
 	// What is wrong with the emulator; nothing while it is found (or not looked for yet).
@@ -260,6 +268,8 @@ private:
 	QString                   m_mods_title;
 	QByteArray                m_mods_plan_data;
 	QString                m_hints_file;       // the hints file of the running import or export
+	bool                   m_play_after_precompile = false; // Play on a first start: the game starts once the shaders are ready
+	QSet<QString>          m_first_start_hints; // titles whose shipped hints this session imported (or tried to)
 
 	QPointer<ConfigurationItem> m_running_item;
 };
@@ -621,6 +631,28 @@ QString MainDialogPrivate::PipelineCacheDir() const {
 		return {};
 	}
 	return QFileInfo(m_interpreter).absoluteDir().filePath(PIPELINE_CACHE_DIR);
+}
+
+QString MainDialogPrivate::HintsDir() const {
+	if (m_interpreter.isEmpty()) {
+		return QApplication::applicationDirPath() + QLatin1Char('/') + QString::fromLatin1(HINTS_DIR);
+	}
+	return QFileInfo(m_interpreter).absoluteDir().filePath(HINTS_DIR);
+}
+
+QString MainDialogPrivate::FirstStartHints(const QString& title) const {
+	if (title.isEmpty() || m_interpreter.isEmpty() || m_first_start_hints.contains(title)) {
+		return {};
+	}
+	const QDir hints(HintsDir());
+	const auto files = hints.entryList({title + QStringLiteral("_*.kyhints")}, QDir::Files, QDir::Name);
+	if (files.isEmpty()) {
+		return {};
+	}
+	if (!QDir(PipelineCacheDir()).entryList({title + QStringLiteral("*.journal")}, QDir::Files).isEmpty()) {
+		return {};
+	}
+	return hints.filePath(files.last());
 }
 
 QString MainDialogPrivate::LogDir() const {
@@ -1652,6 +1684,18 @@ void MainDialogPrivate::Run() {
 		return;
 	}
 
+	// The first start of a game whose hints the package ships: its shaders are prepared from them first (the game and
+	// a precompile use the same cache files), then the game starts by itself.
+	if (const auto hints = FirstStartHints(m_running_item->GetInfo().title_id); !hints.isEmpty()) {
+		m_first_start_hints.insert(m_running_item->GetInfo().title_id);
+		m_running_item          = nullptr;
+		m_play_after_precompile = true;
+		ShowPage(PAGE_SHADERS);
+		m_hints_file = hints;
+		Precompile({QStringLiteral("--import-hints"), QDir::toNativeSeparators(hints)});
+		return;
+	}
+
 	m_running_item->SetRunning(true);
 	m_lightbar.Stop();
 
@@ -1716,7 +1760,8 @@ void MainDialogPrivate::ImportHints() {
 	if (m_precompile.state() != QProcess::NotRunning || m_ui->widget->GetSelectedItem() == nullptr) {
 		return;
 	}
-	const auto file = QFileDialog::getOpenFileName(m_main_dialog, tr("Import shader hints"), QString(),
+	const auto file = QFileDialog::getOpenFileName(m_main_dialog, tr("Import shader hints"),
+	                                               QDir(HintsDir()).exists() ? HintsDir() : QDir::homePath(),
 	                                               tr("Shader hints (*.kyhints);;All files (*)"));
 	if (file.isEmpty()) {
 		return;
@@ -1730,8 +1775,9 @@ void MainDialogPrivate::ExportHints() {
 	if (m_precompile.state() != QProcess::NotRunning || item == nullptr) {
 		return;
 	}
-	const auto& info      = item->GetInfo();
-	const auto  suggested = QDir::home().filePath(
+	const auto& info = item->GetInfo();
+	QDir().mkpath(HintsDir());
+	const auto suggested = QDir(HintsDir()).filePath(
         QStringLiteral("%1_%2.kyhints").arg(info.title_id.isEmpty() ? QStringLiteral("game") : info.title_id,
                                              info.gameVersion.isEmpty() ? QStringLiteral("shaders") : info.gameVersion));
 	const auto file = QFileDialog::getSaveFileName(m_main_dialog, tr("Export shader hints"), suggested,
@@ -1754,6 +1800,13 @@ void MainDialogPrivate::Precompile(const QStringList& extra) {
 
 	auto* item = m_ui->widget->GetSelectedItem();
 	if (item == nullptr) {
+		return;
+	}
+	// "Precompile shaders" on a first start: the shipped hints are imported with it.
+	if (const auto hints = FirstStartHints(item->GetInfo().title_id); extra.isEmpty() && !hints.isEmpty()) {
+		m_first_start_hints.insert(item->GetInfo().title_id);
+		m_hints_file = hints;
+		Precompile({QStringLiteral("--import-hints"), QDir::toNativeSeparators(hints)});
 		return;
 	}
 	auto info = m_ui->widget->CreateConfiguration(*item);
@@ -1790,7 +1843,10 @@ void MainDialogPrivate::Precompile(const QStringList& extra) {
 	m_ui->precompile_eta->setVisible(false);
 	m_ui->precompile_status->setVisible(true);
 	m_ui->precompile_status->setText(
-	    extra.contains(QStringLiteral("--import-hints"))
+	    m_play_after_precompile
+	        ? tr("First start: preparing this game's shaders from the included hints (a few minutes). The game starts "
+	             "when they are ready.")
+	    : extra.contains(QStringLiteral("--import-hints"))
 	        ? tr("Importing hints: looking for their shaders in the game files (can take a few minutes)...")
 	    : extra.contains(QStringLiteral("--export-hints")) ? tr("Exporting hints...")
 	                                                       : tr("Starting: loading the pipeline cache and the shader journals..."));
@@ -1951,6 +2007,10 @@ void MainDialogPrivate::PrecompileFinished(int exit_code, QProcess::ExitStatus e
 	m_ui->precompile_status->setVisible(true);
 	m_ui->widget->WriteSettings();
 	Update();
+	// Play on a first start: the game now, once its shaders are ready (not after a pause or a failure).
+	if (std::exchange(m_play_after_precompile, false) && status == QLatin1String("complete")) {
+		Run();
+	}
 }
 
 void MainDialogPrivate::Update() {

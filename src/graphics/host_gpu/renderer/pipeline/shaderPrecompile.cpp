@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -1334,11 +1335,30 @@ bool PrecompileHintsExport(const std::filesystem::path& journal, const std::file
 		PrecompileStageRecord record;
 		if (Deserialize(payload, record) && hint(record, HintComputeMagic)) compute_hints++;
 	}
+	// The stages first, then only the pipelines whose stages all went into the file: a pipeline recorded under a stage
+	// key no stage record has (an older build's) is dropped by every load (PrecompileJournal: "pipelines without a stage
+	// record"), so it is left out (28.10: 1,704 of 7,301 recorded pipelines were such).
+	std::unordered_set<uint64_t> stage_keys;
 	for (const auto& payload: graphics) {
-		if (payload[0] == StageRecordMagic) {
-			PrecompileStageRecord record;
-			if (DeserializeStage(payload, record) && hint(record, HintStageMagic)) stage_hints++;
-		} else if (PrecompileGraphicsRecord record; DeserializePipeline(payload, record)) {
+		if (payload[0] != StageRecordMagic) continue;
+		PrecompileStageRecord record;
+		if (!DeserializeStage(payload, record)) continue;
+		const auto key = record.Key();
+		if (hint(record, HintStageMagic)) {
+			stage_hints++;
+			stage_keys.insert(key);
+		}
+	}
+	size_t dead = 0;
+	for (const auto& payload: graphics) {
+		if (payload[0] == StageRecordMagic) continue;
+		if (PrecompileGraphicsRecord record; DeserializePipeline(payload, record)) {
+			bool resolved = true;
+			ForEachStage(record, [&](uint64_t stage) { resolved = resolved && stage_keys.contains(stage); });
+			if (!resolved) {
+				dead++;
+				continue;
+			}
 			WritePayload(f, payload);
 			pipelines++;
 		}
@@ -1351,8 +1371,8 @@ bool PrecompileHintsExport(const std::filesystem::path& journal, const std::file
 		summary = "reason=cannot_write";
 		return false;
 	}
-	summary = fmt::format("compute={} stages={} pipelines={} no_footer={} title={} version={}", compute_hints,
-	                      stage_hints, pipelines, no_footer, title.empty() ? "-" : title,
+	summary = fmt::format("compute={} stages={} pipelines={} dead_pipelines={} no_footer={} title={} version={}",
+	                      compute_hints, stage_hints, pipelines, dead, no_footer, title.empty() ? "-" : title,
 	                      version.empty() ? "-" : version);
 	return true;
 }
