@@ -6,6 +6,9 @@ tree is made, measured and tested against that game. Other titles are not tested
 KytyPS5; use upstream for them. The upstream README ([KytyPS5](https://github.com/KytyPS5/KytyPS5#readme)) is kept
 unchanged in the source tree as `README.md`.
 
+Downloads and bug reports: [github.com/Erlou93/KytyPS5-Yotei](https://github.com/Erlou93/KytyPS5-Yotei)
+([Releases](https://github.com/Erlou93/KytyPS5-Yotei/releases), [Issues](https://github.com/Erlou93/KytyPS5-Yotei/issues)).
+
 This repository contains **no game files, no firmware, no system software and no material taken from the game's
 code**. You need your own legally obtained dump of the game. Where the emulator relies on how the game behaves (for
 example the layout of a table the game fills in memory), that knowledge is described in comments as behaviour; no game
@@ -47,7 +50,8 @@ code is copied.
    draw calls, shader compiles, memory). The launcher's Overlay option shows it from the start.
 6. **If the game crashes:** every run writes a log to `_Logs` next to the emulator (the newest 10 are kept). Launcher,
    Advanced page, **Export bug report** packs the newest logs, the settings and the system info into one zip, with your
-   user and computer names replaced; attach it to a GitHub issue.
+   user and computer names replaced; attach it to an issue at
+   [github.com/Erlou93/KytyPS5-Yotei/issues](https://github.com/Erlou93/KytyPS5-Yotei/issues).
 
 The package has the same steps with pictures in `KytyPS5-Yotei-Player-Guide.pdf`.
 

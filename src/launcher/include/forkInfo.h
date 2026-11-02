@@ -5,11 +5,9 @@
 
 constexpr char FORK_VERSION[] = "v0.1";
 
-// The fork's GitHub repository, for example "https://github.com/<owner>/<repo>" (no trailing slash). Empty until the
-// repository is public (publication plan, AGENTS rule 6): while it is empty the bug report only saves the zip, and the
-// About "Source code" button stays hidden. After publication put the address here; the bug report then opens
-// <address>/issues/new.
-constexpr char FORK_REPOSITORY_URL[] = "";
+// The fork's GitHub repository (no trailing slash): the About "Source code" button opens it and the bug report opens
+// <address>/issues/new after saving the zip. Empty: the button is hidden and the bug report only saves the zip.
+constexpr char FORK_REPOSITORY_URL[] = "https://github.com/Erlou93/KytyPS5-Yotei";
 
 // The GitHub API address of the fork's latest release, "https://api.github.com/repos/<owner>/<repo>/releases/latest".
 // Empty: the update check is off (the upstream KytyPS5 feeds announce upstream releases, not the fork's). Fill it in
