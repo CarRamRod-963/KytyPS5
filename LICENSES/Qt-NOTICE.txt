@@ -1,0 +1,8 @@
+The launcher (launcher.exe) uses Qt 6.7.2, Copyright (C) The Qt Company Ltd. and other contributors, under the
+GNU Lesser General Public License version 3 (LGPL-3.0-Qt.txt, which refers to GPL-3.0.txt).
+
+Qt is linked dynamically: the Qt libraries are the Qt6*.dll files and the plugin folders (generic, iconengines,
+imageformats, networkinformation, platforms, styles, tls) next to launcher.exe, unmodified, and can be replaced with
+other builds of the same Qt version.
+
+The Qt source code is available from https://download.qt.io/archive/qt/6.7/6.7.2/single/ and https://code.qt.io/.
