@@ -31,8 +31,8 @@ code is copied.
 
 ## Playing (release package)
 
-1. Unpack the zip into an empty folder (not under `Program Files`; the emulator writes its caches and saves next to
-   itself).
+1. Unpack the zip into an empty folder (not under `Program Files`; the emulator writes its caches, saves and logs next
+   to itself, the launcher its settings, `Kyty.ini`; nothing is written anywhere else).
 2. Start `launcher.exe`, choose the folder of your Ghost of Yōtei dump (game version **1.512** is the one tested) and
    press **Play**.
 3. **First start:** the package ships shader hints for the game (`hints\`, a list of the shaders the game uses, without

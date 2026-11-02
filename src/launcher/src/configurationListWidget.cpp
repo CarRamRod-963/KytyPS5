@@ -62,8 +62,10 @@
 #include "ui_configuration_list_widget.h"
 
 constexpr char CONF_FILE_NAME[]    = "Kyty.ini";
-constexpr char CONF_ORG_NAME[]     = "Kyty";
-constexpr char CONF_APP_NAME[]     = "Kyty";
+#ifdef __linux__
+constexpr char CONF_ORG_NAME[] = "Kyty";
+constexpr char CONF_APP_NAME[] = "Kyty";
+#endif
 constexpr char CONF_SECTION_NAME[] = "GameConfigurations";
 constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
@@ -328,20 +330,23 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
 }
 
-void ConfigurationListWidget::WriteSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
+// The settings file: a Kyty.ini in the working folder when there is one (a test list of games, the picture mode), else
+// on Windows Kyty.ini next to launcher.exe, so the release package keeps everything in the folder it was unpacked to
+// (created on the first write); on Linux the user's settings folder.
+static std::unique_ptr<QSettings> OpenSettings() {
+	if (QFile::exists(QDir(".").absoluteFilePath(CONF_FILE_NAME))) {
+		return std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
 	}
+#ifdef __linux__
+	return std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME, CONF_APP_NAME);
+#else
+	return std::make_unique<QSettings>(QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(CONF_FILE_NAME),
+	                                   QSettings::IniFormat);
+#endif
+}
+
+void ConfigurationListWidget::WriteSettings() {
+	auto s = OpenSettings();
 
 	MainDialog::WriteSettings(*s);
 	ConfigurationEditDialog::WriteSettings(*s);
@@ -370,19 +375,7 @@ void ConfigurationListWidget::WriteSettings() {
 }
 
 void ConfigurationListWidget::ReadSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
-	}
+	auto s = OpenSettings();
 
 	m_settings_file = s->fileName();
 

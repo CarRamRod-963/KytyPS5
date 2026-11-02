@@ -219,7 +219,7 @@ Last row of a section has no divider; the next section title has 24 px above it.
 
 Sections "Folders" (Game folder with "Change...", Log folder with "Open" — one log per game run in `_Logs` next to the
 emulator: a header with the command line, then the emulator's stderr; the newest 10 are kept — Emulator, Settings
-file), "Support" (Bug report: "Export bug report"), "Updates" (shown only where the update check is supported — off in
+file: on Windows `Kyty.ini` next to `launcher.exe`), "Support" (Bug report: "Export bug report"), "Updates" (shown only where the update check is supported — off in
 the fork until it has its own release feed, `forkInfo.h`), "About": Version ("KytyPS5 · Yōtei fork · v0.1",
 description "by Erlou · emulator build <build>"), Licence ("GPL-2.0 (source code on GitHub)" and a "Source code"
 button once `FORK_REPOSITORY_URL` is set), Credits.
@@ -262,7 +262,8 @@ launcher-play-hover.png when there are two or more games — the second tile und
 launcher-graphics.png, launcher-shaders.png, launcher-shaders-precompiling.png, launcher-advanced.png,
 launcher-first-start.png) and quit. It looks for the emulator file as usual (so the Checks show it found or missing)
 but never starts it; the Play picture waits for the selected game's picture. As always, a `Kyty.ini` in the working
-folder is used instead of the user's settings, which is how a test list of games is shown. The precompiling picture
+folder is used instead of the user's settings (on Windows `Kyty.ini` next to `launcher.exe`), which is how a test list
+of games is shown. The precompiling picture
 runs sample `PRECOMPILE_*` lines through the same parser as the emulator's output. It also writes a sample run log
 with this PC's real paths into `bug-report-sample/`, shows the bug report dialog on it (launcher-bug-report.png) and
 saves `bug-report-sample.zip`; when `<folder>/test-cache/_PipelineCache` exists (a copy made for the test), it shows
