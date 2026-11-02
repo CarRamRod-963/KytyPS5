@@ -2,10 +2,12 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
+#include "common/gpuStageCores.h"
 
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace Common {
 
@@ -48,6 +50,9 @@ public:
 	// `min_other_cores` other physical cores remain. Returns what was done.
 	// Based on TheCruZ/KytyPS5-GTA dd7a6e008 (threads.h), GPL-2.0.
 	static std::string ReserveCores(std::span<const int> logical_cpus, size_t min_other_cores);
+	// The logical processors of group 0 with their physical core, efficiency class and last-level cache (empty where
+	// unknown).
+	static std::vector<LogicalCpu> SystemLogicalCpus();
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.

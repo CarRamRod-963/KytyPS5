@@ -499,4 +499,48 @@ std::string Thread::ReserveCores(std::span<const int> logical_cpus, size_t min_o
 #endif
 }
 
+std::vector<LogicalCpu> Thread::SystemLogicalCpus() {
+	std::vector<LogicalCpu> cpus;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 ||
+	    !::GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length, &length,
+	                                  ::GetCurrentProcess(), 0)) {
+		return cpus;
+	}
+	for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64) {
+			cpus.push_back({info->CpuSet.LogicalProcessorIndex, info->CpuSet.CoreIndex, info->CpuSet.EfficiencyClass,
+			                info->CpuSet.LastLevelCacheIndex, 0});
+		}
+		offset += info->Size;
+	}
+	// The size of the last-level cache each logical processor shares (level 3, else level 2).
+	DWORD bytes = 0;
+	(void)::GetLogicalProcessorInformationEx(RelationCache, nullptr, &bytes);
+	std::vector<uint8_t> caches(bytes);
+	if (bytes != 0 && ::GetLogicalProcessorInformationEx(
+	                      RelationCache, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(caches.data()), &bytes)) {
+		std::vector<std::pair<uint32_t, uint64_t>> best(cpus.size()); // (level, size)
+		for (DWORD offset = 0; offset < bytes;) {
+			const auto* info  = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(caches.data() + offset);
+			const auto& cache = info->Cache;
+			if (cache.Level >= 2 && cache.GroupMask.Group == 0) {
+				for (size_t i = 0; i < cpus.size(); i++) {
+					if (((cache.GroupMask.Mask >> cpus[i].logical) & 1u) != 0u) {
+						best[i] = std::max(best[i], std::pair {uint32_t {cache.Level}, uint64_t {cache.CacheSize}});
+					}
+				}
+			}
+			offset += info->Size;
+		}
+		for (size_t i = 0; i < cpus.size(); i++) cpus[i].llc_bytes = best[i].second;
+	}
+#endif
+	return cpus;
+}
+
 } // namespace Common

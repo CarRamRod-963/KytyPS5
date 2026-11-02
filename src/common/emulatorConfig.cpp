@@ -268,13 +268,14 @@ const std::filesystem::path& GetGameDir() {
 	return g_config->game_dir;
 }
 
-// Based on TheCruZ/KytyPS5-GTA 12ec19890 and dd7a6e008 (emulatorConfig.cpp), GPL-2.0. The list and the priority rule are
-// ours: physical cores 1, 3, 4 and 2 of a 9800X3D (one CCD, SMT siblings adjacent), away from the interrupt-heavy core 0;
-// only the threads that own the stream get the higher priority (the recording and resolve threads spin).
+// Based on TheCruZ/KytyPS5-GTA 12ec19890 and dd7a6e008 (emulatorConfig.cpp), GPL-2.0. The choice of cores and the
+// priority rule are ours: four whole physical cores of the processor (Common::ChooseGpuStageCpus; on a 9800X3D physical
+// cores 1, 3, 4 and 2), away from the interrupt-heavy core 0; only the threads that own the stream get the higher
+// priority (the recording and resolve threads spin). KYTY_GPU_THREAD_CPUS=<e>,<r>,<v>,<c> or off: the user's choice.
 void ConfigureGpuStageThread(GpuStageThread stage) {
 	static const std::array<int, 4> cpus = [] {
-		std::array<int, 4> result {2, 6, 8, 4};
-		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		std::array<int, 4> result = Common::ChooseGpuStageCpus(Common::Thread::SystemLogicalCpus());
+		const char*        value  = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
