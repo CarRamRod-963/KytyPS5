@@ -34,10 +34,13 @@ code is copied.
 
 ## Playing (release package)
 
+Requirements: Windows 10/11 64-bit, a Vulkan GPU with a current driver, and **32 GB of RAM** (the game takes 22-28 GB
+of system memory in play; with 16 GB Windows runs out of memory and pages to disk).
+
 1. Unpack the zip into an empty folder (not under `Program Files`; the emulator writes its caches, saves and logs next
    to itself, the launcher its settings, `Kyty.ini`; nothing is written anywhere else).
-2. Start `launcher.exe`, choose the folder of your Ghost of Yōtei dump (game version **1.512** is the one tested) and
-   press **Play**.
+2. Start `launcher.exe` (not `kyty_emulator.exe`: only the launcher prepares the shaders), choose your Ghost of Yōtei
+   dump (game version **1.512** is the one tested): its folder or its `.zar` archive, and press **Play**.
 3. **First start:** the package ships shader hints for the game (`hints\`, a list of the shaders the game uses, without
    any game code). On the first Play the launcher finds those shaders in your game files and compiles them before the
    game starts; this takes a few minutes and runs only once. The game then starts by itself. Without it the first
