@@ -81,6 +81,14 @@ namespace Common::EnvRead {
 	return value != nullptr && value[0] == '1';
 }
 
+// The periodic counter lines (PERF <name>, PERF_RESOLVE_STAGES, BINDLESS_STATS, BAR_READS, RECORD_THREAD...) only with
+// KYTY_TRACE_PERF=1; without it the run log keeps the start-up lines and the first lines of each event, not a line
+// every few seconds (the release log grew ~3 KB/s in play). Read once.
+[[nodiscard]] inline bool PerfLines() {
+	static const bool on = Perf();
+	return on;
+}
+
 [[nodiscard]] inline bool ProxyCounts() {
 	return std::getenv("KYTY_TRACE_PROXY_COUNTS") != nullptr;
 }

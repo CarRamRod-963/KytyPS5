@@ -1,6 +1,8 @@
 #ifndef KYTY_COMMON_LOOKUPMEMO_H_
 #define KYTY_COMMON_LOOKUPMEMO_H_
 
+#include "common/envRead.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -15,7 +17,7 @@
 //  - ImageStart: "no registered image starts at this address" (TextureCache::FindImageFromRange): per 64 KiB granule
 //    (hashed) a count of the registered images whose first byte lies there, changed with the registration under the
 //    texture cache's lock; a count of 0 means none starts there, so the search would find no match.
-// Their hits: the PERF lookup_memo line (~5 s).
+// Their hits: the PERF lookup_memo line (~5 s, KYTY_TRACE_PERF).
 namespace Common::LookupMemo {
 
 enum class Kind : uint32_t { Shader, Permutation, Format, ImageStart, Count };
@@ -41,6 +43,7 @@ inline void Report() {
 		return;
 	}
 	if (now - start < 5'000'000'000 || !c.window_start_ns.compare_exchange_strong(start, now)) return;
+	if (!EnvRead::PerfLines()) return;
 	uint64_t hits[4] {};
 	for (uint32_t k = 0; k < 4; k++) hits[k] = c.hits[k].exchange(0, std::memory_order_relaxed);
 	const auto u = [](uint64_t a) { return static_cast<unsigned long long>(a); };

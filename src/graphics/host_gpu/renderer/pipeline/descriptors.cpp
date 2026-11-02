@@ -789,7 +789,7 @@ void TextureDescCacheCount(bool hit, bool cleared) {
 	static std::atomic<int64_t>  last_log {0};
 	const auto lookups = (hit ? hits : misses).fetch_add(1, std::memory_order_relaxed) + 1;
 	if (cleared) clears.fetch_add(1, std::memory_order_relaxed);
-	if ((lookups & 4095u) != 0) return;
+	if ((lookups & 4095u) != 0 || !Common::EnvRead::PerfLines()) return;
 	const auto now =
 	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	auto last = last_log.load(std::memory_order_relaxed);
@@ -2289,7 +2289,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 		std::string incompatible;
 		for (const auto& [key, count]: g_bindless_incompatible)
 			incompatible += fmt::format(" t{}f{}:{}", key.first, key.second, count);
-		std::fprintf(stderr,
+		if (Common::EnvRead::PerfLines()) std::fprintf(stderr,
 		             "BINDLESS_STATS frame=%llu heaps=%zu settled=%llu resolved=%llu read_fail=%llu "
 		             "incompatible=%llu bad_address=%llu swizzle=%llu soft_null=%llu no_view=%llu no_slot=%llu cached=%llu stale=%llu remapped=%llu requests=%llu requests_settled=%llu deferred=%llu prefilled=%llu released=%llu slots=%zu "
 		             "unregistered=%llu unregistered_keys=%llu heap_fail=%llu heap_evict=%llu%s\n",
@@ -3750,7 +3750,7 @@ static size_t TableSetFindHashed(const ShaderRecompiler::IR::CompiledShaderInfo&
 static void TableSetsReport() {
 	static uint32_t              calls_shared = 0; // the clock is read on every 256th call (once per stage preparation before)
 	uint32_t&                    calls        = calls_shared;
-	if ((++calls & 255u) != 0u) return;
+	if ((++calls & 255u) != 0u || !Common::EnvRead::PerfLines()) return;
 	static auto window = std::chrono::steady_clock::now();
 	const auto  now    = std::chrono::steady_clock::now();
 	if (now - window < std::chrono::seconds(5)) return;

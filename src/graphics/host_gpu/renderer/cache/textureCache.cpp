@@ -970,7 +970,7 @@ bool TextureCache::SwapStencilPlane(Image& depth, uint64_t plane_address) {
 	                          &copy);
 	command.pipelineBarrier2(dependency);
 	static uint32_t logged = 0;
-	if (++logged % 100u == 1u) {
+	if (std::has_single_bit(++logged)) { // #1, 2, 4, 8...: that it happens and how often, not a line per 100
 		std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL plane swap #%u depth=0x%llx 0x%llx -> 0x%llx\n", logged,
 		             static_cast<unsigned long long>(depth.info.data.address),
 		             static_cast<unsigned long long>(previous), static_cast<unsigned long long>(plane_address));
@@ -1259,7 +1259,7 @@ void TextureCache::SaveStencil(Image& depth) {
 		std::fprintf(stderr, "CAPTURE_STENCIL_SAVE cs_index=%u\n", DebugCaptureIndex().load());
 	}
 	static uint32_t saves = 0;
-	if (++saves % 50u == 1u) {
+	if (std::has_single_bit(++saves)) { // #1, 2, 4, 8...
 		std::fprintf(stderr, "WORKAROUND_PRESERVE_STENCIL save #%u 0x%llx %ux%u\n", saves,
 		             static_cast<unsigned long long>(depth.info.data.address), extent.width, extent.height);
 	}

@@ -1181,6 +1181,8 @@ DirectStats g_direct_stats;
 // Reads that took pending command-processor writes from the overlay.
 std::atomic<uint64_t> g_direct_overlay_reads {0};
 void ReportDirectStats(size_t pending) {
+	// Without the lines cp_writes is not reset either, so PERF_DIRECT_CP_WRITE logs its first 32 writes of the run.
+	if (!Common::EnvRead::PerfLines()) return;
 	static int64_t window_start = 0;
 	const int64_t  now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	if (window_start == 0) window_start = now;
@@ -1593,7 +1595,7 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 	static int64_t window_start = 0;
 	const int64_t  now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	if (window_start == 0) window_start = now;
-	if (now - window_start >= 5000) {
+	if (now - window_start >= 5000 && Common::EnvRead::PerfLines()) {
 		window_start = now;
 		std::fprintf(stderr, "PERF ring_dead faults=%llu freed=%llu partial=%llu dropped_KiB=%llu\n",
 		             static_cast<unsigned long long>(g_ring_dead.faults.exchange(0)),
@@ -2396,7 +2398,7 @@ static void NoteCleanRange() {
 	static std::atomic<uint64_t> skipped {0};
 	static std::atomic<int64_t>  last_log {0};
 	const auto ranges = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
-	if ((ranges & 4095u) != 0) return;
+	if ((ranges & 4095u) != 0 || !Common::EnvRead::PerfLines()) return;
 	const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
 	                     .count();
 	auto last = last_log.load(std::memory_order_relaxed);
@@ -2481,7 +2483,7 @@ void ObtainMemoStore(uint64_t vaddr, uint64_t size, const ObtainMemoEntry& fresh
 
 void ObtainMemoReport() {
 	auto& s = ObtainMemoStatsRef();
-	if (((s.hits + s.misses) & 0x3ffffu) != 0) return;
+	if (((s.hits + s.misses) & 0x3ffffu) != 0 || !Common::EnvRead::PerfLines()) return;
 	std::fprintf(stderr, "PERF obtain_memo hits=%llu misses=%llu stores=%llu\n", static_cast<unsigned long long>(s.hits),
 	             static_cast<unsigned long long>(s.misses), static_cast<unsigned long long>(s.stores));
 }
@@ -2562,7 +2564,7 @@ WriteMemoEntry* WriteMemoFind(uint64_t vaddr, uint64_t size, uint32_t& reason) {
 
 void WriteMemoReport() {
 	auto& s = g_write_memo_stats;
-	if (((s.hits + s.misses) & 0x3ffffu) != 0) return;
+	if (((s.hits + s.misses) & 0x3ffffu) != 0 || !Common::EnvRead::PerfLines()) return;
 	std::fprintf(stderr,
 	             "PERF write_memo hits=%llu (later tick %llu) misses=%llu stores=%llu "
 	             "miss(range/-/registry/cpu/gpu/buffer)=%llu/%llu/%llu/%llu/%llu/%llu\n",
@@ -3127,7 +3129,7 @@ struct ObtainExactStats {
 ObtainExactStats g_obtain_exact;
 
 void ReportObtainExact(uint64_t count) {
-	if ((count & 0xfffffu) != 0) return;
+	if ((count & 0xfffffu) != 0 || !Common::EnvRead::PerfLines()) return;
 	std::fprintf(stderr, "PERF obtain_exact granule_checks=%llu granule_skips=%llu\n",
 	             static_cast<unsigned long long>(g_obtain_exact.granule_checks.load(std::memory_order_relaxed)),
 	             static_cast<unsigned long long>(g_obtain_exact.granule_skips.load(std::memory_order_relaxed)));
@@ -3585,7 +3587,7 @@ int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	const auto                     outcome = [&](size_t index) {
         outcomes[index]++;
         DownloadWaitTrace::g_last_bar_reason = static_cast<int>(index);
-        if ((++calls & 0xfffu) == 0) {
+        if ((++calls & 0xfffu) == 0 && Common::EnvRead::PerfLines()) {
             std::fprintf(stderr,
                          "BAR_READS calls=%llu mapped=%llu no_tick=%llu open=%llu pending=%llu large=%llu outside=%llu "
                          "empty=%llu\n",
@@ -3786,7 +3788,7 @@ void BufferCache::RunGarbageCollector() {
 		++m_rk_frame;
 		m_rk_listed_pages[m_rk_frame % m_rk_listed_pages.size()].clear();
 	}
-	if (D6C0Mode() != 0u && m_rk_frame % 64u == 0u) {
+	if (D6C0Mode() != 0u && m_rk_frame % 64u == 0u && Common::EnvRead::PerfLines()) {
 		std::fprintf(stderr,
 		             "PERF d6_c0 frame=%llu listed_skipped=%llu unlisted_pages=%llu conflicts=%llu incomplete_calls=%llu "
 		             "would_mark=%llu " // D6 step K2

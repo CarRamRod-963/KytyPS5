@@ -1384,7 +1384,8 @@ static void NoteAsyncDraw(bool skipped) {
 	(skipped ? skipped_draws : writing_draws).fetch_add(1, std::memory_order_relaxed);
 	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
 	auto       last = last_line.load(std::memory_order_relaxed);
-	if (now - last >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count() &&
+	if (Common::EnvRead::PerfLines() &&
+	    now - last >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(5)).count() &&
 	    last_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
 		std::fprintf(stderr, "PERF async_draw_pipelines skipped=%llu writing_draws_waited=%llu\n",
 		             static_cast<unsigned long long>(skipped_draws.load(std::memory_order_relaxed)),
@@ -1529,7 +1530,7 @@ bool SameBytes(const T& a, const T& b) {
 }
 
 void Report(TargetMemo& m) {
-	if ((m.draws & 0xffffu) != 0) return;
+	if ((m.draws & 0xffffu) != 0 || !Common::EnvRead::PerfLines()) return;
 	std::fprintf(stderr, "PERF clean_draw_skip draws=%llu equal=%llu hits=%llu stored=%llu\n",
 	             static_cast<unsigned long long>(m.draws), static_cast<unsigned long long>(m.equal),
 	             static_cast<unsigned long long>(m.hits), static_cast<unsigned long long>(m.stored));

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/envRead.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
@@ -498,7 +499,7 @@ std::atomic<VkCommandBuffer> g_routed {nullptr};
 
 void Recorder::Report(bool is_final) {
 	const auto now = Clock::now();
-	if (!is_final && now - m_last_report < ReportEvery) {
+	if (!is_final && (now - m_last_report < ReportEvery || !Common::EnvRead::PerfLines())) {
 		return;
 	}
 	const double seconds = std::chrono::duration<double>(now - m_last_report).count();

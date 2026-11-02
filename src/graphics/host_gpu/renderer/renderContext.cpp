@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -132,7 +133,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	} else {
 		// Read faults that reach the synchronizing path (counted).
 		static std::atomic_uint read_faults {0};
-		if (((read_faults.fetch_add(1) + 1) & 0xfffu) == 0) {
+		if (((read_faults.fetch_add(1) + 1) & 0xfffu) == 0 && Common::EnvRead::PerfLines()) {
 			std::fprintf(stderr, "FAULT_SYNC reads=%u last=0x%llx\n", read_faults.load(),
 			             static_cast<unsigned long long>(fault_vaddr));
 		}
@@ -310,7 +311,7 @@ void RenderContext::PrepareBda() {
 			t_long_prep_parts[29] += stats.bytes;
 		}
 		const auto now = std::chrono::steady_clock::now();
-		if (now - m_bda_log_time >= std::chrono::seconds(10)) {
+		if (now - m_bda_log_time >= std::chrono::seconds(10) && Common::EnvRead::PerfLines()) {
 			m_bda_log_time = now;
 			std::fprintf(stderr, "BDA_REGION_STATS passes=%llu regions=%llu buffers_visited=%llu\n",
 			             static_cast<unsigned long long>(m_bda_counters.passes),
@@ -331,7 +332,7 @@ void RenderContext::ReportBdaSyncEpoch() {
 	auto& counters = m_bda_epoch_counters;
 	counters.calls++;
 	const auto now = std::chrono::steady_clock::now();
-	if (now - m_bda_epoch_log_time < std::chrono::seconds(10)) {
+	if (now - m_bda_epoch_log_time < std::chrono::seconds(10) || !Common::EnvRead::PerfLines()) {
 		return;
 	}
 	m_bda_epoch_log_time = now;

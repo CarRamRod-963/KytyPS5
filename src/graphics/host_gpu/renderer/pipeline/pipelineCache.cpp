@@ -1924,7 +1924,7 @@ static void ReportResolveStats(uint32_t count) {
 	static uint64_t stages = 0;
 	const uint64_t  before = stages;
 	stages += count + 1u;
-	if ((before >> 16u) == (stages >> 16u)) return;
+	if ((before >> 16u) == (stages >> 16u) || !Common::EnvRead::PerfLines()) return;
 	using Ir          = ShaderRecompiler::IR::AheadRefusal;
 	auto&       s     = g_resolve_stats;
 	const auto  total = [](const std::atomic<uint64_t>& a) -> unsigned long long { return a.load(std::memory_order_relaxed); };

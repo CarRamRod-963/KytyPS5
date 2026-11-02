@@ -519,6 +519,7 @@ int64_t LabelNowNs() {
 
 
 void ReportLabelStats() {
+	if (!Common::EnvRead::PerfLines()) return;
 	static int64_t window_start = 0;
 	const auto     now          = LabelNowNs();
 	if (window_start == 0) window_start = now;
