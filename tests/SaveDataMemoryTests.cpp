@@ -703,7 +703,9 @@ void TestSearchSortKeys() {
 
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
+	// _spawnl joins its arguments into one command line without quotes: a path with spaces needs them.
+	const auto quoted = "\"" + executable.string() + "\"";
+	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), quoted.c_str(), mode,
 	              static_cast<char*>(nullptr)) == 0);
 #else
 	const pid_t pid = fork();

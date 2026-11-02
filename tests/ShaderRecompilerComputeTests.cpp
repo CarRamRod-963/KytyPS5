@@ -424,6 +424,7 @@ struct TextureCacheTestAccess {
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
     metadata.clear_mask = 0;
+    metadata.SetAllSlices(false); // A new registration reads as cleared in the per-slice state.
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -1404,6 +1405,8 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // Host device capabilities the SPIR-V is emitted for; nullptr is the default profile.
+  const ShaderRecompiler::Spirv::Profile *profile = nullptr;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1727,6 +1730,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
+  if (test.profile != nullptr) {
+    options.profile = test.profile;
+  }
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -1792,7 +1798,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, 0u,
-                                                        ShaderRecompiler::Spirv::DefaultProfile, true);
+                                                        *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -18211,6 +18217,14 @@ public:
               std::swap(channels[0], channels[2]);
               std::memcpy(dst->data() + dst_offset, channels.data(),
                           sizeof(channels));
+            } else if (info.GetColorTransform() == ColorTransform::Rotate2_10_10_10) {
+              uint32_t packed = 0;
+              std::memcpy(&packed, src.data() + src_offset, sizeof(packed));
+              // The guest format stores the two-bit channel low; the host format stores it high.
+              const uint32_t alpha = to_tiled ? packed >> 30u : packed & 3u;
+              const uint32_t color = to_tiled ? packed & 0x3fffffffu : packed >> 2u;
+              packed = to_tiled ? (color << 2u) | alpha : color | (alpha << 30u);
+              std::memcpy(dst->data() + dst_offset, &packed, sizeof(packed));
             } else {
               std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
                           block.bytes_per_element);
@@ -18219,7 +18233,7 @@ public:
         }
       }
     };
-    const auto block_image = [](const TileBlockLayout &block, u32 width,
+    const auto block_image =[](const TileBlockLayout &block, u32 width,
                                 u32 height, u32 depth, u32 pitch,
                                 uint64_t guest_size) {
       ImageInfo info{};
@@ -18604,6 +18618,8 @@ public:
         convert_reference(false, &cpu, tiled, layout);
         gpu_detile(tiled, &gpu, total.size, total.size, layout);
         compare("format bytes", cpu, gpu);
+        if (layout.GetColorTransform() == ColorTransform::Rotate2_10_10_10)
+          check_round_trip("low-alpha packed format", total.size, layout);
         ++format_cases;
       }
     }
@@ -19298,8 +19314,10 @@ private:
     available_provoking_vertex.pNext = &available_feedback_dynamic;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_provoking_vertex;
+    vk::PhysicalDeviceShaderClockFeaturesKHR available_clock{};
+    available_clock.pNext = &available_min_lod;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
-    available_robustness2.pNext = &available_min_lod;
+    available_robustness2.pNext = &available_clock;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
@@ -19310,6 +19328,8 @@ private:
                 available_robustness2.robustBufferAccess2 == true &&
                 available_robustness2.nullDescriptor == true,
             "robustBufferAccess2 or null descriptors are not supported");
+    Require("VulkanHarness", "dispatch", available_clock.shaderDeviceClock == true,
+            "shader device clock is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -19421,10 +19441,13 @@ private:
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
+    vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
+    shader_clock.shaderDeviceClock = true;
+    shader_clock.pNext = &min_lod;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.robustBufferAccess2 = true;
     robustness2.nullDescriptor = true;
-    robustness2.pNext = &min_lod;
+    robustness2.pNext = &shader_clock;
     device_info.pNext = &robustness2;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.robustBufferAccess = true;
@@ -19447,6 +19470,7 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+        VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -23768,13 +23792,43 @@ TestCase Vop3CvtPkI16I32Captured() {
   TestCase test;
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
+  // Each half saturates: 98305 -> 0x7fff, -98306 -> 0x8000.
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
-  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
   test.ir_counts = {{" = BitFieldInsert ", 1}};
   test.required_spirv = {"OpBitFieldInsert"};
+  return test;
+}
+
+// V_CVT_PK_U16_U32 / V_CVT_PK_I16_I32 saturate each half: Min(src.u, 0xffff) and
+// Clamp(src.s, -0x8000, 0x7fff).
+TestCase Vop3CvtPk16Saturates() {
+  using O = ShaderOpcode;
+
+  TestCase test;
+  test.name = "Vop3CvtPk16Saturates";
+  test.initial = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                  0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                  0u,          0u,          0u,          0u};
+  test.expected = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                   0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                   0xffff1234u, 0xffffffffu, 0x80007fffu, 0x80007fffu};
+  auto &code = test.code;
+  for (u32 i = 0; i < 8u; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, i, 30);
+  }
+  AppendVop3(&code, 0x36a, 10, Vgpr(0), Vgpr(1)); // in range
+  AppendVop3(&code, 0x36a, 11, Vgpr(2), Vgpr(3)); // both clamp to 0xffff
+  AppendVop3(&code, 0x36b, 12, Vgpr(4), Vgpr(5)); // in range
+  AppendVop3(&code, 0x36b, 13, Vgpr(6), Vgpr(7)); // clamp to 0x7fff / 0x8000
+  for (u32 i = 0; i < 4u; i++) AppendStoreVgpr(&code, 10u + i, 8u + i);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PK_U16_U32,
+                  O::V_CVT_PK_I16_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -24727,7 +24781,7 @@ TestCase VectorLaneAndPackedOps() {
           {},
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
-           0x40000000u, 0xef015678u},
+           0x40000000u, 0xffffffffu},
           {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32,
            O::V_WRITELANE_B32, O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32,
            O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
@@ -25267,16 +25321,16 @@ TestCase VectorSpecialF16Ops() {
 TestCase VectorFractF16CapturedAndEdges() {
   using O = ShaderOpcode;
 
-  // RDNA2 section 12.8: x - floor(x), rounded to half precision.
+  // x - floor(x) rounded to half precision, clamped to 0x3bff below one.
   // Load at runtime to exercise the emitted operation, including half subnormals.
   const std::array<u32, 18> inputs{
       0x3d00u, 0xbd00u, 0x0000u, 0x8000u, 0x0001u, 0x8001u,
       0x03ffu, 0x83ffu, 0x7bffu, 0xfbffu, 0x3800u, 0xb800u,
       0x8c00u, 0x8c01u, 0x7c00u, 0xfc00u, 0x7e55u, 0x7d01u};
   const std::array<u32, 18> fractions{
-      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3c00u,
-      0x03ffu, 0x3c00u, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
-      0x3c00u, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
+      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3bffu,
+      0x03ffu, 0x3bffu, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
+      0x3bffu, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
   TestCase test;
   test.name = "VectorFractF16CapturedAndEdges";
   for (u32 bits : inputs) {
@@ -25304,6 +25358,37 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " RoundEven "};
   test.forbidden_spirv = {"OpCapability Float16", "PackHalf2x16"};
+  return test;
+}
+
+// V_FRACT_F32 clamps to 0x3f7fffff where x - floor(x) rounds to 1.0, before output modifiers.
+TestCase VectorFractF32Edges() {
+  using O = ShaderOpcode;
+
+  constexpr std::array<std::array<u32, 3>, 4> cases{{
+      {0xb3800000u, 0, 0x3f7fffffu},   // -2^-24: exact
+      {0xb3000000u, 0, 0x3f7fffffu},   // -2^-25: the tie rounds to 1.0
+      {0xb3000000u, 1, 0x3fffffffu},   // omod *2 applies after the clamp
+      {0x7fc00001u, 0, 0x7fc00000u}}}; // Quiet NaN class
+  TestCase test;
+  test.name = "VectorFractF32Edges";
+  for (const auto &[source, omod, expected] : cases) test.initial.push_back(source);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 7, 30);
+    AppendVop3(&code, 0x1a0, 9, Vgpr(7), 0, 0, 0, 0, false, cases[i][1]);
+    if (i + 1u == cases.size()) {
+      code.push_back(EncodeVop2(0x1b, 9, 255u, 9));
+      code.push_back(0x7fc00000u);
+    }
+    AppendStoreVgpr(&code, 9, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(cases[i][2]);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F32,
+                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -27103,7 +27188,7 @@ TestCase VectorFractF64CapturedAndEdges() {
       {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
       {0, 0}, {0x8000000000000000ull, 0},
       {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
-      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      {1, 1}, {0x8000000000000001ull, 0x3fefffffffffffffull}, // Clamped below one.
       {0x000fffffffffffffull, 0x000fffffffffffffull},
       {0x7fefffffffffffffull, 0},
       {0x7ff0000000000000ull, 0x7ff8000000000000ull},
@@ -29590,29 +29675,60 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads) {
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+// Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
+// min(delta, 64). The profile period picks the host clock shift.
+std::vector<TestCase> ScalarMemRealtimeCases() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeCases", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
               decoded.src0.kind == D::OperandKind::Unknown &&
               decoded.src1.kind == D::OperandKind::Unknown,
           "captured clock instruction must write s12:s13 without memory operands");
-  AppendStoreSgprPair(&code, 12, 0);
-  code.insert(code.end(), {0xf4940300u, 0xfa000000u});
-  AppendStoreSgprPair(&code, 12, 2);
+  code.insert(code.end(),
+              {EncodeSop1(0x03, 17, InlineU32(0)),          // s_mov_b32 s17, 0
+               0xf4940380u, 0xfa000000u,                    // loop: s_memrealtime s[14:15]
+               EncodeSop2(0x01, 16, 14, 12),                // s_sub_u32 s16, s14, s12
+               EncodeSop2(0x00, 17, 17, InlineU32(1)),      // s_add_u32 s17, s17, 1
+               EncodeSopc(0x09, 16, InlineU32(64)),         // s_cmp_ge_u32 s16, 64
+               EncodeSopp(0x05, 3),                         // s_cbranch_scc1 done
+               EncodeSopc(0x0a, 17, 255), 1u << 20,         // s_cmp_lt_u32 s17, 1 << 20
+               EncodeSopp(0x05, static_cast<u32>(-9)),      // s_cbranch_scc1 loop
+               EncodeSop2(0x07, 16, 16, InlineU32(64))});   // done: s_min_u32 s16, s16, 64
+  AppendStoreSgpr(&code, 16, 0);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+
+  static const struct {
+    const char *name;
+    ShaderRecompiler::Spirv::Profile profile;
+    std::vector<std::string> required, forbidden;
+  } variants[] = {
+      {"ScalarMemRealtimeShiftsNanosecondClock",
+       {.device_clock_period_ps = 1000},
+       {"OpShiftRightLogical %ulong", "%uint_3\n"},
+       {}},
+      {"ScalarMemRealtimeKeeps100MHzClock",
+       {.device_clock_period_ps = 10000},
+       {"OpReadClockKHR %ulong %uint_1"},
+       {"OpShiftRightLogical %ulong"}}};
+  std::vector<TestCase> tests;
+  for (const auto &variant : variants) {
+    TestCase test{variant.name, code, {}, {64},
+                  {O::S_MEMREALTIME, O::S_MOV_B32, O::S_SUB_U32, O::S_ADD_U32, O::S_CMP_GE_U32,
+                   O::S_CBRANCH_SCC1, O::S_CMP_LT_U32, O::S_MIN_U32, O::V_MOV_B32,
+                   O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+    test.profile = &variant.profile;
+    test.required_spirv = variant.required;
+    test.forbidden_spirv = variant.forbidden;
+    tests.push_back(std::move(test));
+  }
+  return tests;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -39178,6 +39294,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3CvtPk16Saturates);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Min3U16CapturedAndSelectors);
@@ -39217,6 +39334,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
+  AddCase(VectorFractF32Edges);
   AddCase(VectorFractF16Modifiers);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
   AddCase(VectorSinF16SdwaAndEdges);
@@ -39329,7 +39447,9 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 4); });
   AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 4); });
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  for (auto &test : ScalarMemRealtimeCases()) {
+    cases.push_back(std::move(test));
+  }
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -45231,7 +45351,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    for (const auto &test : ScalarMemRealtimeCases()) {
+      RunCase(&vulkan, test);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {

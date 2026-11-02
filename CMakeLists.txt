@@ -456,6 +456,7 @@ target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
 )
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
@@ -477,6 +478,7 @@ target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
+target_link_libraries(lru_cache_tests common)
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
 
@@ -548,7 +550,10 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
-add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
+add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
+)
 target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
 
@@ -563,6 +568,7 @@ target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
 )
 target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
 target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
@@ -587,30 +593,44 @@ target_include_directories(host_input_tests PRIVATE ${inc_headers})
 
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
 )
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
 
-add_executable(png_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PngEncTests.cpp")
+add_executable(png_enc_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PngEncTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
+)
 target_link_libraries(png_enc_tests common fmt::fmt)
 target_include_directories(png_enc_tests PRIVATE ${inc_headers})
 
-add_executable(jpeg_dec_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegDecTests.cpp")
+add_executable(jpeg_dec_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/JpegDecTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
+)
 target_link_libraries(jpeg_dec_tests common fmt::fmt)
 target_include_directories(jpeg_dec_tests PRIVATE ${inc_headers})
 
-add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.cpp")
+add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/JpegEncTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
+)
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
 
 
-add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
+add_executable(ces_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CesTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
+)
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
 
 add_executable(save_data_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/dialog.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
 )
 target_link_libraries(save_data_dialog_tests common fmt::fmt)
 target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
@@ -622,6 +642,7 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/hleCount.cpp" # (libs.h HLE_COUNT)
 )
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
 target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
