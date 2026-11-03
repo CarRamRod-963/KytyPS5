@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -274,12 +275,17 @@ struct GraphicsPipelineInputs {
 		if (tess_eval_shader_module != nullptr) {
 			device.destroyShaderModule(tess_eval_shader_module, nullptr);
 		}
+		if (task_shader_module != nullptr) {
+			device.destroyShaderModule(task_shader_module, nullptr);
+		}
 	}
 	KYTY_CLASS_NO_COPY(GraphicsPipelineInputs);
 
 	vk::Device                                        device;
 	vk::ShaderModule                                  tess_control_shader_module = nullptr;
 	vk::ShaderModule                                  tess_eval_shader_module    = nullptr;
+	// Indirect mesh draw: reads the records and launches the groups (gpu_mesh_indirect.task).
+	vk::ShaderModule                                  task_shader_module = nullptr;
 	vk::PipelineShaderStageCreateInfo                 shader_stages[4] {};
 	vk::VertexInputAttributeDescription               input_attr[ShaderVertexInputInfo::RES_MAX] {};
 	vk::VertexInputBindingDescription                 input_desc[ShaderVertexInputInfo::RES_MAX] {};
@@ -551,6 +557,9 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 
 	EXIT_NOT_IMPLEMENTED(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
+	if (mesh && vs_input_info.indirect_draw) {
+		inputs->task_shader_module = CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device);
+	}
 
 	auto&    shader_stages      = inputs->shader_stages;
 	uint32_t shader_stage_count = 0;
@@ -558,6 +567,11 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
 		                                       .module = vertex_info[i].stage.handle->module,
+		                                       .pName  = "main"};
+	}
+	if (inputs->task_shader_module) {
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
+		                                       .module = inputs->task_shader_module,
 		                                       .pName  = "main"};
 	}
 	if (rect_list) {
@@ -724,7 +738,10 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
-	bool                 bindless        = false;
+	if (inputs->task_shader_module) {
+		graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+	}
+	bool bindless = false;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
@@ -739,6 +756,7 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 		bindless |= UsesBindlessImages(*ps_input_info->stage.program);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	pipeline.push_stages = graphics_stages;
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
@@ -874,6 +892,7 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	                  vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = input_info.stage.program->info.uses_image_heap;
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	pipeline.push_stages = vk::ShaderStageFlagBits::eCompute;
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 

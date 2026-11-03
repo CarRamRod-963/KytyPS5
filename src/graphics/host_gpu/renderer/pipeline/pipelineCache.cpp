@@ -2433,6 +2433,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 			return;
 		}
+		// A task shader launches each record's groups and passes its draw parameters in a
+		// payload beside the LDS, the allocation pair and the Layer array; without room for
+		// it, the CPU reads the records.
+		if (state.indirect_draw &&
+		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+		        limits.maxMeshPayloadAndSharedMemorySize) {
+			vertex_info[0].indirect_offsets = state.indirect_offsets;
+			vertex_info[0].indirect_draw    = true;
+		}
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
