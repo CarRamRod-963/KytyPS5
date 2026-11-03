@@ -152,11 +152,12 @@ public:
 			UpdateProtection<true, true>();
 		}
 	}
-	// SetStaleReadable for each page of `page_size` bytes, with one protection update.
+	// SetStaleReadable for each page (a guest address) of `page_size` bytes, with one protection
+	// update.
 	void SetStaleReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable) {
 		const StateChange change(*this);
 		for (const auto page: pages) {
-			const auto [start, end] = GetPageRange(page, page_size);
+			const auto [start, end] = GetPageRange(page - m_cpu_addr, page_size);
 			if (!readable) {
 				m_stale_readable.UnsetRange(start, end);
 			} else if (m_gpu_dirty.FirstRangeFrom(start).first < end) {
@@ -203,8 +204,8 @@ public:
 	// takes the CPU-modified pages of several ranges of this region under one hold of `lock`, then
 	// write-protects them all with ProtectCpuClean before it releases the lock and copies them.
 	template <typename Func>
-	void TakeCpuModifiedRanges(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void TakeCpuModifiedRanges(uint64_t offset, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(offset, size);
 		if (m_cpu_dirty.FirstRangeFrom(start).first >= end) {
 			return;
 		}
