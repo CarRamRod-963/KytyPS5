@@ -562,8 +562,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
-	const bool commands =
-	    submission.type == SubmissionType::Graphics || submission.type == SubmissionType::Compute;
+	const bool commands = submission.type == SubmissionType::Commands;
 	if (commands) {
 		// The submissions this processor runs next continue its register state; a flip or a
 		// suspend point ends what the scan may assume.
@@ -571,8 +570,7 @@ bool GuestGpu::Process(Submission& submission) {
 		{
 			Common::LockGuard lock(m_queue_mutex);
 			for (const auto& queued: m_queues[submission.queue_id]) {
-				if (queued.type != SubmissionType::Graphics &&
-				    queued.type != SubmissionType::Compute) {
+				if (queued.type != SubmissionType::Commands) {
 					break;
 				}
 				m_lookahead_queue.push_back(queued.commands);
@@ -1276,7 +1274,7 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 			return -1;
 		}
 		if (location >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
-		    location <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
+		    location < Pm4::SPI_SHADER_USER_DATA_GS_0 + 32u) {
 			return static_cast<int32_t>(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
 		}
 		return std::nullopt;
@@ -1312,11 +1310,11 @@ bool CommandProcessor::DrawIndirectOnGpu(uint32_t data_offset, uint32_t max_coun
 	    .stale_slots          = stale_slots,
 	};
 	auto& executor = m_renderer.GetRenderExecutor();
-	auto  result   = executor.DrawIndirect(m_submit_id, CurrentBuffer(), args);
+	auto  result   = executor.DrawIndirect(CurrentBuffer(), args);
 	if (result == DrawIndirectResult::SettleRegisters) {
 		SettleIndirectDrawState(true, false);
 		args.stale_slots = 0;
-		result           = executor.DrawIndirect(m_submit_id, CurrentBuffer(), args);
+		result           = executor.DrawIndirect(CurrentBuffer(), args);
 	}
 	if (result == DrawIndirectResult::ReadArguments) {
 		return false;

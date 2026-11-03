@@ -508,7 +508,7 @@ struct RenderExecutorTestAccess {
   static DrawIndirectResult DrawIndirect(RenderExecutor &executor,
                                          CommandBuffer &command,
                                          const IndirectDrawSource &args) {
-    return executor.DrawIndirect(0, command, args);
+    return executor.DrawIndirect(command, args);
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -2672,7 +2672,7 @@ public:
 
     // Scalar resource reads are captured before the draw, so a stage that writes through
     // computed addresses commits alongside them.
-    vertex_module.info.has_address_writes = true;
+    vertex_program.has_address_writes = true;
     pixel_snapshot.specialization_reads = {{0x1000u, 4u}};
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
@@ -12219,7 +12219,7 @@ public:
       // More submissions than the removal age, all in one frame.
       const auto submissions = [&] {
         for (int i = 0; i < 40; i++) {
-          scheduler.FlushAndWait();
+          scheduler.Finish();
         }
       };
       const auto a = texture_cache.FindImage(a_desc);
@@ -12238,7 +12238,7 @@ public:
       // deletes it.
       for (int frame = 0; frame < 40; frame++) {
         texture_cache.RunGarbageCollector();
-        scheduler.FlushAndWait();
+        scheduler.Finish();
       }
       const auto c = texture_cache.FindImage(c_desc);
       Require(name, "stale displaced image deleted",
@@ -14847,8 +14847,7 @@ public:
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &executor = context.GetRenderExecutor();
-    ShaderModule module;
-    auto &program = module.info;
+    ShaderRecompiler::IR::CompiledShaderInfo program;
     program.stage = ShaderType::Compute;
     program.info.buffers.push_back({.packed_stride = 1, .written = true});
     program.info.buffers[0].descriptor_index = 0;
@@ -14856,7 +14855,7 @@ public:
     program.bindings.descriptor_mask = 1;
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
     snapshot.buffers.emplace_back().dword_count = 4;
-    ShaderStageRuntime runtime{&module, &snapshot};
+    ShaderStageRuntime runtime{&program, &snapshot};
     PreparedBindings bindings;
     executor.PrepareBindings(runtime, bindings);
     std::array<PreparedBindings *, 1> stages{&bindings};
@@ -25109,8 +25108,7 @@ public:
               (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
           for (u32 i = 0; i < 4; ++i)
             shaders.SetCsUserSgpr(i, out.fields[i]);
-          executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u,
-                                  false);
+          executor.DispatchDirect(scheduler.Current(), 1, 1, 1, 0x41u, false);
           Require(gpu_name, "arguments written on the GPU",
                   buffers.HasGpuDirtyBytes(args_address,
                                            words.size() * sizeof(u32)),
@@ -25405,14 +25403,13 @@ public:
         return code;
       }();
       static auto fetch_offsets = [] {
-        std::array<uint16_t,
-                   static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+        std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1>
             offsets{};
-        offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+        offsets.fill(ILLEGAL_DIRECT_OFFSET);
+        offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] =
+            0;
         offsets[static_cast<size_t>(
-            AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-        offsets[static_cast<size_t>(
-            AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+            DirectResourceType::PtrVertexAttribDescTable)] = 2;
         return offsets;
       }();
       static ShaderUserData fetch_user_data{};
