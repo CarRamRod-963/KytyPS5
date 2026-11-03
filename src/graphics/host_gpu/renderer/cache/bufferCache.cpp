@@ -437,15 +437,16 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		TouchHotPages(result.base, result.size);
 		DrainPublished();
 		auto& buffer = m_slot_buffers[FindBuffer(result.base, result.size)];
-		if (request.kind != GuestReadback::Kind::Around &&
-		    IsRegionGpuModified(result.base, result.size)) {
+		if (IsRegionGpuModified(result.base, result.size)) {
 			// GPU-modified ranges come as many small scattered islands, so a readback widens to
-			// a window of its buffer.
+			// a window of its buffer (a fault read: the window around the faulting byte).
+			const auto wanted_end = request.kind == GuestReadback::Kind::Around
+			                            ? request.vaddr + 1u
+			                            : request.vaddr + request.size;
 			const auto start = std::max(Common::AlignDown(request.vaddr, DownloadWindowSize),
 			                            buffer.CpuAddress());
-			const auto end =
-			    std::min(std::max(start + DownloadWindowSize, request.vaddr + request.size),
-			             buffer.CpuAddress() + buffer.Size());
+			const auto end        = std::min(std::max(start + DownloadWindowSize, wanted_end),
+			                                 buffer.CpuAddress() + buffer.Size());
 			result.base = start;
 			result.size = end - start;
 		}
