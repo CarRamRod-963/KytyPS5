@@ -114,7 +114,6 @@ void MemoryTracker::SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool r
 
 void MemoryTracker::SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size,
                                            bool readable) {
-	CheckNotInUploadCallback();
 	for (size_t first = 0; first < pages.size();) {
 		ValidateRange(pages[first], page_size);
 		const auto index = pages[first] / TRACKER_REGION_SIZE;

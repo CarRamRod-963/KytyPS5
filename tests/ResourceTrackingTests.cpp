@@ -4230,10 +4230,12 @@ void TestPointerTableIndexedMaterialKeys() {
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  // The root and two candidates of one class are padded to a power of two.
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
-            snapshot.images.size() == 4u,
-        "pointer-table selector did not read exactly the zero and material-key descriptors");
+  // The root and two candidates of one class are padded to a power of two,
+  // beside the storage image.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.descriptors == 3u && snapshot.images.size() == 5u,
+        "pointer-table selector did not read exactly the zero and material-key "
+        "descriptors");
   Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 20u, 52u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");

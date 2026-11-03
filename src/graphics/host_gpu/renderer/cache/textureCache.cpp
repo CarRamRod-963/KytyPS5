@@ -1719,15 +1719,14 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		// The descriptor names its association, which need not be the depth image's current
 		// stencil plane (a layered target last bound with another layer range).
 		stencil_id = {};
-		for (const auto candidate:
-		     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
-			const auto* stencil = m_slot_images.try_get(candidate);
-			if (stencil != nullptr && stencil->depth_id == id &&
-			    stencil->info.data == desc.info.data) {
-				stencil_id = candidate;
-				break;
-			}
-		}
+		ForEachImageInRegion(
+		    desc.info.data.address, desc.info.data.size, [&](ImageId candidate, Image& stencil) {
+			    if (stencil.depth_id == id && stencil.info.data == desc.info.data) {
+				    stencil_id = candidate;
+				    return true;
+			    }
+			    return false;
+		    });
 		if (!stencil_id) {
 			EXIT("TextureCache: depth storage binding without a stencil association: "
 			     "addr=0x%016" PRIx64 " size=0x%" PRIx64 " plane=0x%016" PRIx64 "+0x%" PRIx64 "\n",
@@ -2274,7 +2273,7 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	for (const auto id: FindImagesInRegion(address, size)) {
 		auto&      image = m_slot_images[id];
 		const bool covered =
 		    address <= image.info.data.address && address + size >= image.info.data.End();
