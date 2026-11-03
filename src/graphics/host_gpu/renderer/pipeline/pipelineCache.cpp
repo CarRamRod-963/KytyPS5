@@ -1585,7 +1585,7 @@ void PipelineCache::InitializeDriverCache() {
 	PipelineCacheLog("Pipeline manifest: {} graphics pipelines, {} stages in {}{}{}",
 	                 pipelines.pipelines, pipelines.stages,
 	                 Common::PathToString(m_pipeline_manifest->Path()),
-	                 pipelines.imported ? " (imported from the v5 file)" : "",
+	                 pipelines.imported ? " (imported from the v6 file)" : "",
 	                 pipelines.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
 	                                                   pipelines.dropped_bytes)
 	                                     : std::string {});

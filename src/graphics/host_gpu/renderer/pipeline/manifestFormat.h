@@ -103,10 +103,13 @@ constexpr uint32_t MaxPayloadSize = 64u << 20u;
 struct SpecializationFields {
 	bool mapping_header = true;
 	bool image_heap     = true;
+	// Image srgb_decode and skip_degamma (upstream's sRGB decode, e914ec6db).
+	bool srgb = true;
 };
 
 void PutSpecialization(Writer&                                             w,
-                       const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                       SpecializationFields                                fields = {});
 bool GetSpecialization(Reader& r, ShaderRecompiler::IR::ResourceSpecialization& specialization,
                        SpecializationFields fields = {});
 
