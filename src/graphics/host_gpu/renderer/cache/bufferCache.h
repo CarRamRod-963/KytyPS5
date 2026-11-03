@@ -302,6 +302,11 @@ public:
 	// D6 step K4: the page had a fallback entry until a buffer replaced it at most `frames` frames ago (a miss the fault
 	// pass reports later was then served by the entry, not read as 0).
 	[[nodiscard]] bool WasFallbackPage(uint64_t address, uint32_t frames) const;
+	// KYTY_DIAG_BDA_FALLBACK (map §3m step 1, diagnostic, removed with the fallback's replacement): 1 = census of the backing
+	// granules that shader first-reads (fault pass) and direct downloads use; 2 = census and no imports (the fallback's
+	// memory cost: no table entries, downloads take the ring). 0 = off.
+	[[nodiscard]] static int FallbackDiagMode();
+	static void NoteFallbackUse(uint64_t backing_offset, uint64_t bytes, bool download); // any thread
 
 	// KYTY_TRACE_PERF: the PERF fault_wait_on_caller line (the caller wait's counters).
 	void ReportCallerWaitPerf();

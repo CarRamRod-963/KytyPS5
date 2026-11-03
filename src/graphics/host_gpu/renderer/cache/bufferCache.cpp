@@ -194,6 +194,81 @@ bool BufferCache::FallbackEntry(uint64_t page, vk::DeviceAddress* entry) {
 	return true;
 }
 
+int BufferCache::FallbackDiagMode() {
+	static const int mode = [] {
+		const char* value = Common::EnvOrDefault("KYTY_DIAG_BDA_FALLBACK");
+		const int   m     = value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+		if (m != 0) std::fprintf(stderr, "DIAG_BDA_FALLBACK enabled mode=%d (%s)\n", m, m == 2 ? "no imports" : "census");
+		return m;
+	}();
+	return mode;
+}
+
+namespace {
+// The census: per 2 MiB backing granule, the first-read pages and download KiB; printed every ~10 s when it changed.
+struct FallbackCensus {
+	struct Granule {
+		uint64_t reads       = 0;
+		uint64_t download_kb = 0;
+		uint32_t first_frame = 0;
+	};
+	std::mutex                                   mutex;
+	std::unordered_map<uint64_t, Granule>        granules;
+	uint64_t                                     reads = 0, download_kb = 0, changes = 0, printed_changes = 0;
+	std::chrono::steady_clock::time_point        print_time {};
+};
+FallbackCensus g_fallback_census;
+constexpr uint64_t FallbackCensusGranule = uint64_t {2} << 20u;
+} // namespace
+
+void BufferCache::NoteFallbackUse(uint64_t backing_offset, uint64_t bytes, bool download) {
+	auto&            c = g_fallback_census;
+	std::scoped_lock lock(c.mutex);
+	const uint64_t   last = (backing_offset + std::max<uint64_t>(bytes, 1) - 1) / FallbackCensusGranule;
+	for (uint64_t g = backing_offset / FallbackCensusGranule; g <= last; ++g) {
+		auto [it, added] = c.granules.try_emplace(g);
+		if (added) it->second.first_frame = DebugPresentCount().load();
+		if (download) {
+			it->second.download_kb += (bytes + 1023) / 1024 / (last - backing_offset / FallbackCensusGranule + 1);
+		} else {
+			it->second.reads++;
+		}
+	}
+	if (download) {
+		c.download_kb += (bytes + 1023) / 1024;
+	} else {
+		c.reads++;
+	}
+	c.changes++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - c.print_time < std::chrono::seconds(10) || c.changes == c.printed_changes) return;
+	c.print_time      = now;
+	c.printed_changes = c.changes;
+	// Granules (2 MiB) and chunks (256 MiB) touched by reads, by downloads, by either; granules first touched in the last
+	// 600 frames (does the set settle?).
+	std::unordered_map<uint64_t, int> chunks;
+	uint64_t                          read_g = 0, dl_g = 0, recent = 0;
+	const uint32_t                    frame  = DebugPresentCount().load();
+	for (const auto& [g, v]: c.granules) {
+		if (v.reads != 0) read_g++;
+		if (v.download_kb != 0) dl_g++;
+		if (frame - v.first_frame < 600u) recent++;
+		chunks[g * FallbackCensusGranule / FallbackChunkBytes] |= (v.reads != 0 ? 1 : 0) | (v.download_kb != 0 ? 2 : 0);
+	}
+	uint64_t read_c = 0, dl_c = 0;
+	for (const auto& [chunk, kinds]: chunks) {
+		if ((kinds & 1) != 0) read_c++;
+		if ((kinds & 2) != 0) dl_c++;
+	}
+	std::fprintf(stderr,
+	             "DIAG_BDA_FALLBACK census frame=%u read_pages=%llu read_granules=%llu read_chunks=%llu download_MiB=%llu "
+	             "download_granules=%llu download_chunks=%llu granules=%zu chunks=%zu new_granules_600f=%llu\n",
+	             frame, static_cast<unsigned long long>(c.reads), static_cast<unsigned long long>(read_g),
+	             static_cast<unsigned long long>(read_c), static_cast<unsigned long long>(c.download_kb >> 10u),
+	             static_cast<unsigned long long>(dl_g), static_cast<unsigned long long>(dl_c), c.granules.size(),
+	             chunks.size(), static_cast<unsigned long long>(recent));
+}
+
 // The imported backing chunk `chunk` (FallbackChunkBytes each), imported on first use; null when the driver refuses it
 // (remembered and counted: the chunk's pages then miss as without the fallback). The direct downloads into the backing
 // take their imports from here too while the fallback is on (one import of each host range).
@@ -201,6 +276,7 @@ Buffer* BufferCache::FallbackChunk(size_t chunk) {
 	const uint64_t base  = LibKernel::Memory::GuestBackingBase();
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
 	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes >= total) return nullptr;
+	if (FallbackDiagMode() == 2) return nullptr; // KYTY_DIAG_BDA_FALLBACK=2: no imports
 	if (m_fallback_chunks.size() <= chunk) {
 		m_fallback_chunks.resize(chunk + 1);
 		m_fallback_chunk_failed.resize(chunk + 1, 0);
@@ -525,6 +601,7 @@ bool BufferCache::PlanDownloadToBacking(uint64_t buffer_address, const std::vect
 			return false;
 		}
 		plan.items.push_back({vaddr, backing, copy.size});
+		if (FallbackDiagMode() != 0) NoteFallbackUse(backing, copy.size, true); // KYTY_DIAG_BDA_FALLBACK
 		// D6 step K4: the BDA fallback's import table (256 MiB chunks, which import every GPU-mapped chunk anyway) serves the
 		// copies too, so no host range is imported twice.
 		const uint64_t granule = FallbackChunkBytes;
