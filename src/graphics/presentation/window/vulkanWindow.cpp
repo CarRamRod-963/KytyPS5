@@ -465,8 +465,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.memory_priority_enabled = memory_priority.memoryPriority == VK_TRUE;
 	graphics.pageable_memory_enabled =
 	    graphics.memory_priority_enabled && pageable_memory.pageableDeviceLocalMemory == VK_TRUE;
-	LOGF("Vulkan memory priority: %s, pageable device-local memory: %s
-",
+	LOGF("Vulkan memory priority: %s, pageable device-local memory: %s\n",
 	     graphics.memory_priority_enabled ? "true" : "false",
 	     graphics.pageable_memory_enabled ? "true" : "false");
 	if (!barycentric_supported) {
@@ -701,15 +700,6 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR>();
 		create.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
 	}
-	if (graphics.memory_priority_enabled) {
-		memory_priority.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext     = &memory_priority;
-	}
-	if (graphics.pageable_memory_enabled) {
-		pageable_memory.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext     = &pageable_memory;
-	}
-
 	if (!graphics.memory_priority_enabled) {
 		create.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
 	}

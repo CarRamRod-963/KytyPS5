@@ -71,7 +71,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	EXIT_IF(rt_slot >= m_color_target_lookups.size());
 	auto&          lookup = m_color_target_lookups[rt_slot];
 	auto&          source = m_color_target_sources[rt_slot];
-	const uint64_t inputs = render_target_slice_offset | uint64_t {exact_format} << 32u;
+	const uint64_t inputs = uint64_t {exact_format} << 32u;
 	// The description is a function of the slot's registers and these inputs alone, and the
 	// lookup still holds the one they decoded to last time.
 	if (source.Matches(rt, inputs, lookup) && !graphics_debug_dump_enabled()) {

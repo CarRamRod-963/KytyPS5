@@ -252,9 +252,6 @@ private:
 			}
 #endif
 			const auto offset = cached->backing_offset + vaddr - cached->vaddr;
-			if (!RangeOk(offset, size)) {
-				return false;
-			}
 			access(0, m_backing_base + offset, size);
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (m_sequence.load(std::memory_order_relaxed) == sequence) {
