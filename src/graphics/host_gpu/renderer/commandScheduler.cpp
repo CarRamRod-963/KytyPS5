@@ -357,6 +357,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_context.GetBufferCache().RecordAsyncDownloads();
 	m_command.EndRendering();
 	m_command.OrderDispatches();
+	if (m_command.HasCommands()) {
+		// Host-readable buffers are read in place once the submission completed
+		// (BufferCache::ReadBackInPlace): make its writes visible to the host.
+		vk::MemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.BarrierHandle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                          vk::PipelineStageFlagBits::eHost, {}, 1, &to_host,
+		                                          0, nullptr, 0, nullptr);
+	}
 	m_timestamps.End(m_command.m_buffer, CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
