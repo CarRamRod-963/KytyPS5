@@ -200,9 +200,13 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 // The SPIR-V features of the host device every module of this run is emitted for.
 ShaderRecompiler::Spirv::Profile HostShaderProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
-	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	// signed-zero results; GLSL.std.450 alone does not order -0 below +0. NVIDIA GPUs (vendor
+	// 0x10de) order the signed zeros and return the other operand of a single NaN as well, but
+	// give a canonical NaN for two NaN operands.
+	const auto vendor = graphics.physical_device_properties.vendorID;
 	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .native_float_min_max   = vendor == 0x1002u,
+	        .ordered_float_min_max  = vendor == 0x10deu,
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
