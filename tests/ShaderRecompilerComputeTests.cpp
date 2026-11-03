@@ -15950,6 +15950,75 @@ public:
               tick_after == tick_before + 1,
               "concurrent readbacks did not share one submission (" +
                   std::to_string(tick_after - tick_before) + ")");
+
+      // A guest read of a finished GPU write of a host-readable buffer is
+      // served from the mapping after waiting for that write's submission
+      // only: work submitted behind it (to another buffer) and the open command
+      // buffer are left alone. A write still in the open command buffer is
+      // read back as before.
+      constexpr uint64_t finished = base + 0xc0000;
+      constexpr uint64_t pending = base + 0xe0000;
+      const auto value_at = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "in-place backing read",
+                LibKernel::Memory::TryReadBacking(address + bytes - 4, &value,
+                                                  sizeof(value)),
+                "the backing could not be read");
+        return value;
+      };
+      bool host_readable = false;
+      gpu.SendCommandSync([&] {
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        auto [buffer, offset] = cache.ObtainBuffer(finished, 0x10000, true);
+        buffer->Fill(offset, 0x10000, 0x81818181u);
+        host_readable = buffer->IsHostReadable();
+        scheduler.Flush();
+      });
+      uint64_t queued_tick = 0;
+      gpu.SendCommandSync([&] {
+        // Later work, submitted and open, that the read must not wait for.
+        CommandProcessor processor(context, 0);
+        processor.BufferInit();
+        auto [buffer, offset] = cache.ObtainBuffer(pending, bytes, true);
+        buffer->Fill(offset, bytes, 0x82828282u);
+        scheduler.Flush();
+        auto [again, again_offset] = cache.ObtainBuffer(pending, bytes, true);
+        again->Fill(again_offset, bytes, 0x83838383u);
+        queued_tick = scheduler.CurrentTick();
+      });
+      const auto before_in_place = Common::GpuTiming::Sync().Snapshot();
+      std::thread in_place_reader([&] { cache.ReadMemory(finished, bytes); });
+      in_place_reader.join();
+      const auto in_place =
+          Common::GpuTiming::Sync().Snapshot().Since(before_in_place).in_place;
+      uint64_t tick_in_place = 0;
+      bool finished_clean = false;
+      gpu.SendCommandSync([&] {
+        tick_in_place = scheduler.CurrentTick();
+        // The readback takes the download window around the read, which holds the
+        // whole finished write.
+        finished_clean = !cache.HasGpuDirtyBytes(finished, 0x10000);
+      });
+      if (host_readable) {
+        Require(name, "in-place readback",
+                in_place == 1 && tick_in_place == queued_tick &&
+                    value_at(finished) == 0x81818181u && finished_clean,
+                "a finished write of a host-readable buffer was not read from "
+                "its mapping (" +
+                    std::to_string(in_place) + " in place, ticks " +
+                    std::to_string(queued_tick) + " -> " +
+                    std::to_string(tick_in_place) + ")");
+      } else {
+        std::printf("[gpu]     %-32s no host-readable device memory, in-place "
+                    "readback not checked\n",
+                    name);
+      }
+      std::thread open_reader([&] { cache.ReadMemory(pending, bytes); });
+      open_reader.join();
+      Require(name, "open write read back", value_at(pending) == 0x83838383u,
+              "a write in the open command buffer was read from the mapping "
+              "before it ran");
       gpu.SendCommandSync([&] {
         CommandProcessor processor(context, 0);
         processor.BufferInit();

@@ -131,6 +131,9 @@ public:
 	[[nodiscard]] bool ConsumeWatchedWritePending() noexcept {
 		return std::exchange(m_watched_write_pending, false);
 	}
+	// GPU thread, between commands (every write marked so far is recorded): the buffers written
+	// since the last boundary take the current tick as the tick of their latest write.
+	void               NoteCommandBoundary();
 	void               ProcessFaultBuffer();
 	// A fault report of a resident page whose buffer is watched (BdaWatchBit): records the
 	// access for the next collection and returns true; false when the page needs a buffer.
@@ -196,6 +199,17 @@ private:
 	DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                     std::vector<Common::UniqueFunction<void>>* batch = nullptr);
 	void ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Reads the GPU-dirty bytes of [vaddr, size) of a host-readable buffer straight from its
+	// mapping into guest memory, after waiting only for the submission that holds the buffer's
+	// latest GPU write (not for the work queued behind it). Returns false, doing nothing, when
+	// the buffer is not host-readable, the write may still be recorded into an open command
+	// buffer, or the dirty bytes exceed MaxInPlaceReadback.
+	[[nodiscard]] bool        ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	static constexpr uint64_t MaxInPlaceReadback = uint64_t {512} << 10u;
+	std::vector<uint8_t>      m_in_place_scratch;
+	// A GPU write of the buffer is being prepared; NoteCommandBoundary assigns it its tick.
+	void                  NoteOpenWrite(Buffer& buffer, BufferId id);
+	std::vector<BufferId> m_open_writes;
 
 	// A synchronous readback a guest thread waits for. Requests that arrive together (guest
 	// threads faulting at once) share one submission and one wait on the GPU thread.

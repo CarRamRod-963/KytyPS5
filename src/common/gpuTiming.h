@@ -113,6 +113,8 @@ struct SyncCounts {
 	// were left for a later submission because the downloads of one submission are capped.
 	uint64_t async_pages    = 0;
 	uint64_t async_deferred = 0;
+	// Readbacks read straight from a host-readable buffer's mapping.
+	uint64_t in_place = 0;
 	// End-of-pipe labels written by the completion thread, and labels it handed to the GPU
 	// thread (watched pages, or behind such a label).
 	uint64_t labels_direct     = 0;
@@ -158,6 +160,7 @@ public:
 	void AddServedBySubmitted(SyncReason reason) noexcept {
 		m_served[Index(reason)].fetch_add(1, std::memory_order_relaxed);
 	}
+	void AddInPlaceReadback() noexcept { m_in_place.fetch_add(1, std::memory_order_relaxed); }
 	void AddJoinedReadback(SyncReason reason) noexcept {
 		m_joined[Index(reason)].fetch_add(1, std::memory_order_relaxed);
 	}
@@ -207,6 +210,7 @@ private:
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_served {};
 	std::array<std::atomic<uint64_t>, SYNC_REASON_COUNT> m_joined {};
 	std::atomic<uint64_t>                                m_async_pages {};
+	std::atomic<uint64_t>                                m_in_place {};
 	std::atomic<uint64_t>                                m_async_deferred {};
 	std::atomic<uint64_t>                                m_labels_direct {};
 	std::atomic<uint64_t>                                m_labels_gpu_thread {};
