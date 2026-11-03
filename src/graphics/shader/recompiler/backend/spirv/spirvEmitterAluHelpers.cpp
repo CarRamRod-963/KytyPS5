@@ -112,15 +112,52 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 	              numeric);
 }
 
+static uint32_t EmitHostMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+	                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+	return result;
+}
+
+// The ordered host min/max may flush FP32 denormals; that is the guest's result only when the
+// program runs with FP32 denormals flushed (MODE.FP_DENORM, compute float_mode bits 4-5).
+static bool UseOrderedMinMax(const EmitterState& state) {
+	return state.profile.ordered_float_min_max && state.program.stage == ShaderType::Compute &&
+	       state.input_info.compute != nullptr &&
+	       (state.input_info.compute->float_mode & 0x30u) == 0;
+}
+
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	if (state.profile.native_float_min_max || state.profile.relaxed_float) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
-		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
-		return result;
+		return EmitHostMinMaxF32(state, lhs, rhs, max_value);
+	}
+	if (UseOrderedMinMax(state)) {
+		// Only a NaN pair differs: the host returns a canonical NaN, the guest S0.
+		const auto result = EmitHostMinMaxF32(state, lhs, rhs, max_value);
+		return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), result),
+		              lhs, result);
 	}
 	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
+}
+
+// MED3 when the host min/max order signed zeros as the guest does. The MAX3 comparisons and the
+// final V_MAX only matter without a NaN source, so they use the host operation directly.
+static uint32_t EmitFPMedTri32Host(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto min3 = EmitMinMaxF32Value(state, c, EmitMinMaxF32Value(state, b, a, false), false);
+	const auto max3 = EmitHostMinMaxF32(state, EmitHostMinMaxF32(state, a, b, true), c, true);
+	const auto a_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, a);
+	const auto b_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, b);
+	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
+	const auto y =
+	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
+	const auto median = EmitHostMinMaxF32(state, x, y, true);
+	const auto is_nan = [&](uint32_t value) {
+		return Unary(state, spv::OpIsNan, TypeBool(state), value);
+	};
+	const auto any_nan =
+	    EmitLogicalOrBool(state, EmitLogicalOrBool(state, is_nan(a), is_nan(b)), is_nan(c));
+	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -130,6 +167,9 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 		const auto bc = EmitMinMaxF32Value(state, b, c, true);
 		const auto ac = EmitMinMaxF32Value(state, a, c, true);
 		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
+	}
+	if (state.profile.native_float_min_max || UseOrderedMinMax(state)) {
+		return EmitFPMedTri32Host(state, a, b, c);
 	}
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);

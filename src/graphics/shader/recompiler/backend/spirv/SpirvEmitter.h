@@ -13,6 +13,9 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// NMin/NMax order -0 below +0 and return the other operand of a single NaN; a NaN pair gives a
+	// canonical NaN instead of the guest's first source, and FP32 denormals may be flushed.
+	bool ordered_float_min_max = false;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
 	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.

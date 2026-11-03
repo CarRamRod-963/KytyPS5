@@ -2275,6 +2275,13 @@ public:
     m_physical_device.getProperties(&properties);
     return properties.vendorID == 0x1002u;
   }
+  // Host float min/max with a NaN-pair fixup is used on NVIDIA GPUs, as in
+  // Kyty.
+  [[nodiscard]] bool SupportsOrderedFloatMinMax() const {
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x10deu;
+  }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
@@ -36087,7 +36094,9 @@ TestCase VectorMinMaxF32EdgePairs() {
   return test;
 }
 
-TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
+// float_mode 0xf0 preserves FP32 denormals; with 0xc0 (flushed) the denormal
+// cases are left out.
+TestCase VectorMed3F32NanUsesMin3Path(u32 wave, uint8_t float_mode = 0xf0) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
   constexpr u32 cases[][4] = {
@@ -36118,26 +36127,34 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.name = "VectorMed3F32NanUsesMin3Path";
   test.has_compute_info = true;
   test.compute_info.wave_size = wave;
-  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.float_mode =
+      float_mode; // 0xf0: preserve FP32 input/output denormals.
   test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  const auto denormal = [](u32 v) {
+    return (v & 0x7f800000u) == 0 && (v & 0x007fffffu) != 0;
+  };
+  std::vector<const u32 *> used;
   for (const auto &values : cases)
+    if ((float_mode & 0x30u) != 0 || std::none_of(values, values + 4, denormal))
+      used.push_back(values);
+  for (const auto *values : used)
     test.initial.insert(test.initial.end(), values, values + 3);
   test.expected = test.initial;
   auto &code = test.code;
-  for (u32 index = 0; index < std::size(cases); ++index) {
+  for (u32 index = 0; index < used.size(); ++index) {
     for (u32 operand = 0; operand < 3; ++operand) {
       AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
       AppendBufferLoadDword(&code, operand, 30);
     }
     AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
     AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
-    test.expected.push_back(cases[index][3]);
+    test.expected.push_back(used[index][3]);
   }
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.ir_counts = {{"FPMedTri32", std::size(cases)}};
+  test.ir_counts = {{"FPMedTri32", used.size()}};
   // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
   test.max_spirv_words = wave == 32u ? 16150u : 33720u;
   return test;
@@ -53893,6 +53910,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32EdgePairs);
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
+  cases.push_back(VectorMed3F32NanUsesMin3Path(32, 0xc0));
+  cases.push_back(VectorMed3F32NanUsesMin3Path(64, 0xc0));
   cases.push_back(VectorMinMaxF32RuntimeEdges(32));
   cases.push_back(VectorMinMaxF32RuntimeEdges(64));
   cases.push_back(Vop3FloatConversions(32));
@@ -60937,20 +60956,33 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
-    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
-    // compile it.
+    // Host min/max must keep the emulated results on AMD GPUs (native) and on
+    // NVIDIA GPUs (ordered); other GPUs only compile those forms.
     static constexpr ShaderProfile native_profile{.maintenance8 = true,
                                                   .native_float_min_max = true};
+    static constexpr ShaderProfile ordered_profile{
+        .maintenance8 = true, .ordered_float_min_max = true};
     VulkanHarness vulkan;
-    const bool supported = vulkan.SupportsNativeFloatMinMax();
-    for (bool native : {false, true}) {
+    const ShaderProfile *profiles[] = {&Maintenance8Profile, &native_profile,
+                                       &ordered_profile};
+    const bool supported[] = {true, vulkan.SupportsNativeFloatMinMax(),
+                              vulkan.SupportsOrderedFloatMinMax()};
+    for (size_t mode = 0; mode < std::size(profiles); ++mode) {
       for (auto test :
-           {VectorMinMaxF32NanAndSignedZeroEdges(),
-            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
-        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+           {VectorMinMaxF32NanAndSignedZeroEdges(), VectorMinMaxF32EdgePairs(),
+            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64),
+            VectorMed3F32NanUsesMin3Path(32), VectorMed3F32NanUsesMin3Path(64),
+            VectorMed3F32NanUsesMin3Path(32, 0xc0),
+            VectorMed3F32NanUsesMin3Path(64, 0xc0)}) {
+        // The ordered host form may flush FP32 denormals, so programs that
+        // preserve them keep the emulated min/max.
+        const bool preserved = test.has_compute_info &&
+                               (test.compute_info.float_mode & 0x30u) != 0;
+        const bool host = mode == 1 || (mode == 2 && !preserved);
+        auto &spirv = host ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
-        test.profile = native ? &native_profile : &Maintenance8Profile;
-        test.compile_only = native && !supported;
+        test.profile = profiles[mode];
+        test.compile_only = !supported[mode];
         RunCase(&vulkan, test);
       }
     }
