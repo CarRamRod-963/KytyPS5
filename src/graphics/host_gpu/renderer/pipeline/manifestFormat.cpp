@@ -10,14 +10,15 @@ using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 // Serialized field by field; these trip when a stored struct changes so that the formats are
 // revisited (a new field must be stored, or the versions bumped).
 static_assert(sizeof(Specialization::Buffer) == 32);
-static_assert(sizeof(Specialization::Image) == 40);
+static_assert(sizeof(Specialization::Image) == 44);
 static_assert(sizeof(Specialization::Sampler) == 16);
 
 namespace {
 constexpr size_t EntryHeaderSize = sizeof(uint32_t) + sizeof(uint64_t);
 } // namespace
 
-void PutSpecialization(Writer& w, const Specialization& specialization) {
+void PutSpecialization(Writer& w, const Specialization& specialization,
+                       SpecializationFields fields) {
 	w.Put(static_cast<uint32_t>(specialization.buffers.size()));
 	for (const auto& buffer: specialization.buffers) {
 		w.Put(buffer.packed_stride);
@@ -47,6 +48,10 @@ void PutSpecialization(Writer& w, const Specialization& specialization) {
 		w.PutBool(image.bindless_byte_keys);
 		w.PutBool(image.indirect_mapping_header);
 		w.PutBool(image.heap);
+		if (fields.srgb) {
+			w.PutEnum(image.srgb_decode);
+			w.PutBool(image.skip_degamma);
+		}
 	}
 	w.Put(static_cast<uint32_t>(specialization.samplers.size()));
 	for (const auto& sampler: specialization.samplers) {
@@ -65,6 +70,11 @@ bool GetSpecialization(Reader& r, Specialization& specialization, Specialization
 	const auto get_heap = [&](bool& value) {
 		value = false;
 		return !fields.image_heap || r.GetBool(value);
+	};
+	const auto get_srgb = [&](ShaderRecompiler::IR::ResourceSpecialization::Image& image) {
+		image.srgb_decode  = Prospero::BufferFormat::kInvalid;
+		image.skip_degamma = false;
+		return !fields.srgb || (r.GetEnum(image.srgb_decode) && r.GetBool(image.skip_degamma));
 	};
 	uint32_t count = 0;
 	if (!r.Get(count) || count > MaxResources) {
@@ -91,7 +101,7 @@ bool GetSpecialization(Reader& r, Specialization& specialization, Specialization
 		    !r.Get(image.indirect_mapping_offset) || !r.Get(image.indirect_search_iterations) ||
 		    !r.GetBool(image.cube) || !r.GetBool(image.fmask) || !r.GetBool(image.bindless) ||
 		    !r.GetBool(image.bindless_byte_keys) || !get_header(image.indirect_mapping_header) ||
-		    !get_heap(image.heap)) {
+		    !get_heap(image.heap) || !get_srgb(image)) {
 			return false;
 		}
 	}

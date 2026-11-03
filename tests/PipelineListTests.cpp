@@ -239,17 +239,20 @@ void TestManifestDamage() {
   Check(manifest.Loaded().stages == 1, "the replaced file is appended to");
 }
 
-// A layout-1 file (<title>.v5.pipelines) is imported once into the current file: its stages keep
-// their fields, its pipelines name the stages by their new keys, and the old file stays.
+// A layout-2 file (<title>.v6.pipelines) is imported once into the current
+// file: its stages keep their fields, its pipelines name the stages by their
+// new keys, and the old file stays.
 void TestManifestImport() {
   namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
   using Libs::Graphics::ManifestFormat::Writer;
-  const auto previous = TempPath("import.v5.pipelines");
-  const auto path = TempPath("import.v6.pipelines");
+  const auto previous = TempPath("import.v6.pipelines");
+  const auto path = TempPath("import.v7.pipelines");
   auto vs = VertexStage(4, Code(4, 80));
   vs.vertex.has_dynamic_vertex_fetch = true;
   vs.vertex.indirect_draw = true;
   vs.vertex.indirect_offsets = {3, ShaderIndirectOffsets::None};
+  // Layout 3 stores the sRGB fields of each specialized image.
+  vs.specialization.images.emplace_back();
   const auto ps = PixelStage(5, Code(5, 30));
   const auto code_entry = [](const ShaderCode &code) {
     std::vector<uint8_t> out;
@@ -267,7 +270,7 @@ void TestManifestImport() {
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{2});
-    RecordFormat::PutStage(w, *stage, 1);
+    RecordFormat::PutStage(w, *stage, 2);
     old_keys.push_back(XXH3_64bits(body.data(), body.size()));
     w.Put(stage->spirv_hash);
     payloads.push_back(std::move(body));
@@ -279,14 +282,14 @@ void TestManifestImport() {
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{3});
-    RecordFormat::PutPipeline(w, pipeline, 1);
+    RecordFormat::PutPipeline(w, pipeline, 2);
     payloads.push_back(std::move(body));
   }
   Check(old_keys[0] != vs.Key(), "the layouts encode a stage differently");
   Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
             previous, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
             PipelineManifest::FormatVersion, payloads),
-        "the layout-1 file is written");
+        "the layout-2 file is written");
   const auto previous_size = std::filesystem::file_size(previous);
   const auto ps2 = [] {
     auto stage = PixelStage(6, Code(6, 20));
@@ -298,12 +301,12 @@ void TestManifestImport() {
     PipelineManifest manifest(path, previous);
     const auto loaded = manifest.Loaded();
     Check(loaded.imported && loaded.stages == 2 && loaded.pipelines == 1,
-          "the layout-1 records are imported");
+          "the layout-2 records are imported");
     const auto imported = manifest.FindStage(vs.Key());
     Check(imported != nullptr && imported->vertex.indirect_draw &&
               imported->vertex.indirect_offsets == vs.vertex.indirect_offsets &&
               imported->vertex.has_dynamic_vertex_fetch,
-          "a layout-1 stage keeps its indirect draw and fetch fields");
+          "a layout-2 stage keeps its indirect draw and fetch fields");
     const auto pipelines = manifest.Pipelines();
     Check(pipelines[0]->vertex_stages[0] == vs.Key() &&
               pipelines[0]->pixel_stage == ps.Key() &&
@@ -312,7 +315,7 @@ void TestManifestImport() {
     Check(manifest.AddStage(ps2), "the imported manifest is appended to");
   }
   Check(std::filesystem::file_size(previous) == previous_size,
-        "the layout-1 file is left as it is");
+        "the layout-2 file is left as it is");
   PipelineManifest manifest(path, previous);
   const auto loaded = manifest.Loaded();
   Check(!loaded.imported && !loaded.rewritten && loaded.stages == 3 && loaded.pipelines == 1,
