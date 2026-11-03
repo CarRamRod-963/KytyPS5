@@ -476,12 +476,6 @@ void FaultManager::ProcessFaultBuffer() {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			if (first_fault == 0) first_fault = address;
 			// The pass runs at least a frame after the accesses: a page a buffer replaced since was served by its entry.
-			if (BufferCache::FallbackDiagMode() != 0) { // KYTY_DIAG_BDA_FALLBACK: the first reads of backing pages
-				uint64_t offset = 0;
-				if (LibKernel::Memory::GuestBackingOffset(address & ~(BufferCache::CACHING_PAGESIZE - 1u),
-				                                          BufferCache::CACHING_PAGESIZE, &offset))
-					BufferCache::NoteFallbackUse(offset, BufferCache::CACHING_PAGESIZE, false);
-			}
 			if (m_buffer_cache.IsFallbackPage(address) || m_buffer_cache.WasFallbackPage(address, 8u)) {
 				fallback_served++;
 			} else {

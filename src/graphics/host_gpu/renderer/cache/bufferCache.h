@@ -307,11 +307,6 @@ public:
 	// The fault pass: `page` (backing memory) was read as 0 because its granule is not imported yet: import it, add it to
 	// the game's granule list and give the granule's pages around `page` their fallback entries.
 	void WantFallback(uint64_t page);
-	// KYTY_DIAG_BDA_FALLBACK (map §3m step 1, diagnostic, removed with the fallback's replacement): 1 = census of the backing
-	// granules that shader first-reads (fault pass) and direct downloads use; 2 = census and no imports (the fallback's
-	// memory cost: no table entries, downloads take the ring). 0 = off.
-	[[nodiscard]] static int FallbackDiagMode();
-	static void NoteFallbackUse(uint64_t backing_offset, uint64_t bytes, bool download); // any thread
 
 	// KYTY_TRACE_PERF: the PERF fault_wait_on_caller line (the caller wait's counters).
 	void ReportCallerWaitPerf();
