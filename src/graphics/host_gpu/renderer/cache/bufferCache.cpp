@@ -17,6 +17,7 @@
 #include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/startupTrace.h"
+#include "common/stringUtils.h"
 #include "common/workaroundHits.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -30,6 +31,7 @@
 #include "graphics/host_gpu/renderer/stageFLookup.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <optional>
@@ -40,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cinttypes>
+#include <cctype>
 #include <cstring>
 #include <memory>
 #include <array>
@@ -158,7 +161,12 @@ void BufferCache::Unregister(BufferId id) {
 
 // ---- the BDA fallback (M06) ----------------------------------------------------------------------------------
 namespace {
-constexpr uint64_t FallbackChunkBytes = uint64_t {256} << 20u; // the import granule of the direct-memory backing
+// The import granule of the direct-memory backing. A granule is imported (pinned, counted as the card's shared memory)
+// only once the GPU uses it: a shader read the fault pass reports as 0, a direct download into it, or the game's
+// granule list from earlier sessions (map §3m, 3.11: one Snake cutscene used ~160 granules, ~330 MB, of the 12 GB the
+// whole backing in 256 MiB chunks pinned).
+constexpr uint64_t FallbackChunkBytes = uint64_t {2} << 20u;
+constexpr uint64_t FallbackMaxChunks  = 1536; // 3 GB pinned at most (and Vulkan's allocation count)
 } // namespace
 
 int BufferCache::BdaEntryShareMode() {
@@ -186,7 +194,7 @@ bool BufferCache::FallbackEntry(uint64_t page, vk::DeviceAddress* entry) {
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
 	if (LibKernel::Memory::GuestBackingBase() == 0 || offset >= total) return false;
 	const size_t chunk  = static_cast<size_t>(offset / FallbackChunkBytes);
-	Buffer*      import = FallbackChunk(chunk);
+	Buffer*      import = FallbackChunk(chunk, false);
 	if (import == nullptr) return false;
 	const uint64_t in_chunk = offset - static_cast<uint64_t>(chunk) * FallbackChunkBytes;
 	if (in_chunk + CACHING_PAGESIZE > import->Size()) return false;
@@ -269,25 +277,68 @@ void BufferCache::NoteFallbackUse(uint64_t backing_offset, uint64_t bytes, bool 
 	             chunks.size(), static_cast<unsigned long long>(recent));
 }
 
-// The imported backing chunk `chunk` (FallbackChunkBytes each), imported on first use; null when the driver refuses it
-// (remembered and counted: the chunk's pages then miss as without the fallback). The direct downloads into the backing
-// take their imports from here too while the fallback is on (one import of each host range).
-Buffer* BufferCache::FallbackChunk(size_t chunk) {
+// The game's granule list: _PipelineCache/<title id>_<version>.bda_granules, one granule index per line (the granules
+// earlier sessions used; imported when mapped, so their first reads are served too). Read once, on the GPU thread.
+void BufferCache::LoadFallbackList() {
+	m_fallback_list_loaded = true;
+	const uint64_t total   = LibKernel::Memory::GuestBackingSize();
+	const size_t   count   = static_cast<size_t>((total + FallbackChunkBytes - 1) / FallbackChunkBytes);
+	m_fallback_chunks.resize(count);
+	m_fallback_chunk_failed.resize(count, 0);
+	m_fallback_wanted.resize(count, 0);
+	std::string title, version;
+	if (!::Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty() ||
+	    !std::ranges::all_of(title, [](unsigned char c) { return std::isalnum(c) != 0; }))
+		return;
+	(void)::Loader::SystemContentParamSfoGetString("APP_VER", &version);
+	std::ranges::replace_if(version, [](unsigned char c) { return std::isalnum(c) == 0; }, '_');
+	m_fallback_list_path = std::filesystem::path("_PipelineCache") / (title + "_" + version + ".bda_granules");
+	if (std::FILE* f = std::fopen(Common::PathToString(m_fallback_list_path).c_str(), "r"); f != nullptr) {
+		unsigned long long g = 0;
+		while (std::fscanf(f, "%llu", &g) == 1) {
+			if (g < count && m_fallback_wanted[g] == 0) {
+				m_fallback_wanted[g] = 1;
+				m_fallback_stats.listed++;
+			}
+		}
+		std::fclose(f);
+	}
+	std::fprintf(stderr, "FIX_BDA_FALLBACK granule list %s: %llu granules of %zu\n",
+	             Common::PathToString(m_fallback_list_path).c_str(), static_cast<unsigned long long>(m_fallback_stats.listed),
+	             count);
+}
+
+// The imported backing granule `chunk` (FallbackChunkBytes each). Imported when `want` (the GPU uses it now: a fault,
+// a direct download) or the game's list names it, and then added to the list; null when it is neither, or the driver
+// refuses it (remembered and counted: the granule's pages then miss as without the fallback). The direct downloads into
+// the backing take their imports from here (one import of each host range).
+Buffer* BufferCache::FallbackChunk(size_t chunk, bool want) {
 	const uint64_t base  = LibKernel::Memory::GuestBackingBase();
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
 	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes >= total) return nullptr;
 	if (FallbackDiagMode() == 2) return nullptr; // KYTY_DIAG_BDA_FALLBACK=2: no imports
-	if (m_fallback_chunks.size() <= chunk) {
-		m_fallback_chunks.resize(chunk + 1);
-		m_fallback_chunk_failed.resize(chunk + 1, 0);
-	}
+	if (!m_fallback_list_loaded) LoadFallbackList();
 	if (!m_fallback_chunks[chunk]) {
-		if (m_fallback_chunk_failed[chunk] != 0) return nullptr;
+		if (m_fallback_chunk_failed[chunk] != 0 || (!want && m_fallback_wanted[chunk] == 0)) return nullptr;
+		if (m_fallback_stats.chunks >= FallbackMaxChunks) {
+			m_fallback_chunk_failed[chunk] = 1;
+			m_fallback_stats.failed++;
+			return nullptr;
+		}
+		if (m_fallback_wanted[chunk] == 0) {
+			m_fallback_wanted[chunk] = 1;
+			m_fallback_stats.learned++;
+			if (!m_fallback_list_path.empty()) {
+				std::error_code error;
+				std::filesystem::create_directories(m_fallback_list_path.parent_path(), error);
+				if (std::FILE* f = std::fopen(Common::PathToString(m_fallback_list_path).c_str(), "a"); f != nullptr) {
+					std::fprintf(f, "%zu\n", chunk);
+					std::fclose(f);
+				}
+			}
+		}
 		const uint64_t start = static_cast<uint64_t>(chunk) * FallbackChunkBytes;
 		const uint64_t bytes = std::min(FallbackChunkBytes, total - start) & ~uint64_t {0xfff};
-		std::fprintf(stderr, "FIX_BDA_FALLBACK importing chunk %zu at host 0x%llx bytes 0x%llx\n", chunk,
-		             static_cast<unsigned long long>(base + start), static_cast<unsigned long long>(bytes));
-		std::fflush(stderr);
 		if (bytes == 0 || !Buffer::CanImportGuestMemory(m_graphics, base + start, bytes)) {
 			m_fallback_chunk_failed[chunk] = 1;
 			m_fallback_stats.failed++;
@@ -310,10 +361,20 @@ Buffer* BufferCache::FallbackChunk(size_t chunk) {
 		m_fallback_chunks[chunk] = std::move(import);
 		m_fallback_stats.chunks++;
 		m_fallback_stats.imported_bytes += bytes;
-		std::fprintf(stderr, "FIX_BDA_FALLBACK chunk %zu imported (backing 0x%llx+0x%llx)\n", chunk,
-		             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes));
 	}
 	return m_fallback_chunks[chunk].get();
+}
+
+void BufferCache::WantFallback(uint64_t page) {
+	page            = page & ~(CACHING_PAGESIZE - 1);
+	uint64_t offset = 0;
+	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset)) return;
+	if (FallbackChunk(static_cast<size_t>(offset / FallbackChunkBytes), true) == nullptr) return;
+	// The guest range that maps the granule where `page` maps it (WriteFallbackRange checks each page's own granule;
+	// another view of the granule gets its entries when it is mapped again or faults itself).
+	const uint64_t in_granule = offset % FallbackChunkBytes;
+	if (page < in_granule) return;
+	WriteFallbackRange(page - in_granule, FallbackChunkBytes);
 }
 
 // Fallback entries for the pages of [vaddr, vaddr + size) that hold no buffer (one table write per run of pages).
@@ -371,11 +432,12 @@ void BufferCache::ApplyFallbackMaps() {
 			m_fallback_printed    = m_fallback_stats;
 			std::fprintf(stderr,
 			             "FIX_BDA_FALLBACK stats maps=%llu pages=%llu live=%zu replaced=%llu restored=%llu cleared=%llu chunks=%llu "
-			             "failed=%llu imported_MiB=%llu import_ms=%llu clear_fills=%llu clear_ms=%llu\n",
+			             "failed=%llu listed=%llu learned=%llu imported_MiB=%llu import_ms=%llu clear_fills=%llu clear_ms=%llu\n",
 			             static_cast<unsigned long long>(f.maps), static_cast<unsigned long long>(f.pages),
 			             m_fallback_pages.size(), static_cast<unsigned long long>(f.replaced),
 			             static_cast<unsigned long long>(f.restored), static_cast<unsigned long long>(f.cleared),
 			             static_cast<unsigned long long>(f.chunks), static_cast<unsigned long long>(f.failed),
+			             static_cast<unsigned long long>(f.listed), static_cast<unsigned long long>(f.learned),
 			             static_cast<unsigned long long>(f.imported_bytes >> 20u),
 			             static_cast<unsigned long long>(f.import_us / 1000u), static_cast<unsigned long long>(f.clear_fills),
 			             static_cast<unsigned long long>(f.clear_us / 1000u));
@@ -602,15 +664,15 @@ bool BufferCache::PlanDownloadToBacking(uint64_t buffer_address, const std::vect
 		}
 		plan.items.push_back({vaddr, backing, copy.size});
 		if (FallbackDiagMode() != 0) NoteFallbackUse(backing, copy.size, true); // KYTY_DIAG_BDA_FALLBACK
-		// D6 step K4: the BDA fallback's import table (256 MiB chunks, which import every GPU-mapped chunk anyway) serves the
-		// copies too, so no host range is imported twice.
+		// D6 step K4: the BDA fallback's import table serves the copies too, so no host range is imported twice; a granule
+		// a download needs is imported now (and so serves first reads afterwards).
 		const uint64_t granule = FallbackChunkBytes;
 		for (uint64_t done = 0; done < copy.size;) {
 			const uint64_t at         = backing + done;
 			const uint64_t chunk      = at / granule;
 			const uint64_t chunk_base = chunk * granule;
 			const uint64_t bytes      = std::min(copy.size - done, chunk_base + granule - at);
-			Buffer*        target     = FallbackChunk(static_cast<size_t>(chunk));
+			Buffer*        target     = FallbackChunk(static_cast<size_t>(chunk), true);
 			// A tail chunk is shorter (whole pages only).
 			if (target == nullptr || at + bytes > chunk_base + target->Size()) {
 				s.fallback_import.fetch_add(1, std::memory_order_relaxed);

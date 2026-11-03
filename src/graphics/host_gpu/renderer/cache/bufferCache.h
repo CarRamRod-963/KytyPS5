@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <optional>
@@ -286,7 +287,8 @@ public:
 	// The BDA fallback (M06): a mapped direct-memory page without a buffer gets a BDA table entry into the imported
 	// direct-memory backing (bit 0 set = fallback), so a shader reads and writes the guest's real bytes instead of zeros /
 	// a dropped store; the shader still reports the page (BDA_FAULT), and the fault pass gives it a device-local buffer as
-	// before.
+	// before. Only the 2 MiB granules of the backing the GPU used are imported (on the first read of one, which reads 0,
+	// or a direct download into it), and the game's granule list keeps them for the next session.
 	// KYTY_PERF_BDA_ENTRY_SHARE (0 off, 1 on, 2 verify; spirvEmitterMemory.cpp LoadBdaDwordShared): a scalar load through
 	// a GPU-built V# reuses the page-table entry of the invocation's previous such load when the page is the same.
 	// Verify counts checks / mismatches in fault-buffer diag words FAULT_DIAG_ENTRY_SHARE (+0, +1).
@@ -302,6 +304,9 @@ public:
 	// D6 step K4: the page had a fallback entry until a buffer replaced it at most `frames` frames ago (a miss the fault
 	// pass reports later was then served by the entry, not read as 0).
 	[[nodiscard]] bool WasFallbackPage(uint64_t address, uint32_t frames) const;
+	// The fault pass: `page` (backing memory) was read as 0 because its granule is not imported yet: import it, add it to
+	// the game's granule list and give the granule's pages around `page` their fallback entries.
+	void WantFallback(uint64_t page);
 	// KYTY_DIAG_BDA_FALLBACK (map §3m step 1, diagnostic, removed with the fallback's replacement): 1 = census of the backing
 	// granules that shader first-reads (fault pass) and direct downloads use; 2 = census and no imports (the fallback's
 	// memory cost: no table entries, downloads take the ring). 0 = off.
@@ -655,10 +660,15 @@ private:
 	Buffer                                            m_bda_pagetable_buffer;
 	// the BDA fallback (M06)
 	bool    FallbackEntry(uint64_t page, vk::DeviceAddress* entry);
-	Buffer* FallbackChunk(size_t chunk); // the imported backing chunk (null: refused); also the direct downloads'
+	// The imported backing granule (null: not imported, refused, or not wanted and `want` false); also the direct downloads'
+	Buffer* FallbackChunk(size_t chunk, bool want);
+	void    LoadFallbackList();
 	void    WriteFallbackRange(uint64_t vaddr, uint64_t size);
-	std::vector<std::unique_ptr<Buffer>>              m_fallback_chunks; // imported backing per 256 MiB, null: not yet
+	std::vector<std::unique_ptr<Buffer>>              m_fallback_chunks; // imported backing per granule, null: not yet
 	std::vector<uint8_t>                              m_fallback_chunk_failed;
+	std::vector<uint8_t>                              m_fallback_wanted; // granules the GPU used (now or in the list)
+	std::filesystem::path                             m_fallback_list_path; // the game's granule list (empty: none)
+	bool                                              m_fallback_list_loaded = false;
 	std::mutex                                        m_fallback_pending_mutex;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_fallback_pending;
 	std::unordered_set<uint64_t>                      m_fallback_pages; // 16 KiB guest pages with a fallback entry
@@ -666,6 +676,7 @@ private:
 	uint32_t m_fallback_replaced_pruned = ~0u; // present count of the last pruning of m_fallback_replaced
 	struct FallbackStats {
 		uint64_t maps = 0, pages = 0, replaced = 0, restored = 0, cleared = 0, chunks = 0, failed = 0, applies = 0;
+		uint64_t listed = 0, learned = 0; // granules named by the game's list at start; granules added to it now
 		uint64_t import_us = 0, imported_bytes = 0; // D6 step K4 (PERF bda_fallback)
 		// D6b: ClearFallback's Fill calls, its GPU-thread time.
 		uint64_t clear_fills = 0, clear_us = 0;

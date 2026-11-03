@@ -490,7 +490,9 @@ void FaultManager::ProcessFaultBuffer() {
 				uint64_t   generation = 0;
 				if (LibKernel::Memory::GuestBackingOffset(page, BufferCache::CACHING_PAGESIZE, &offset)) {
 					zero_backing++;
-					// Why the fallback did not serve it (the BDA fallback on: must not happen): the first 32.
+					// Its granule was not imported yet (the fallback imports granules the GPU used): from now on it is.
+					m_buffer_cache.WantFallback(page);
+					// The first 32 reads of a granule not imported yet.
 					static uint32_t logged = 0;
 					if (logged < 32u) {
 						++logged;
