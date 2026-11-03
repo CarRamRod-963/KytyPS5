@@ -1467,6 +1467,12 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 		summary = fmt::format("reason=other_game hints_title={} game_title={}", title, own_title);
 		return false;
 	}
+	// A hints file of another game version finds few of its shaders and reads the whole game looking for the rest (the
+	// 1.512 file on 2.002: ~185 GB, players thought it hung, 3.11): nothing is scanned.
+	if (!game_version.empty() && !own_version.empty() && game_version != own_version) {
+		summary = fmt::format("reason=other_version hints_version={} game_version={}", game_version, own_version);
+		return false;
+	}
 
 	// The code blocks wanted: footer hash -> (size, block hash).
 	std::unordered_multimap<uint64_t, std::pair<uint32_t, uint64_t>> wanted;

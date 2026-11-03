@@ -219,7 +219,7 @@ private:
 	[[nodiscard]] QString HintsDir() const;
 	// The hints file shipped for the game (hints/<title>_*.kyhints, the newest name) when the pipeline cache has no
 	// shader journal of it yet: its first start. Empty otherwise.
-	[[nodiscard]] QString FirstStartHints(const QString& title) const;
+	[[nodiscard]] QString FirstStartHints(const QString& title, const QString& version) const;
 	[[nodiscard]] QString LogDir() const;
 	[[nodiscard]] Check   CacheCheck(const ConfigurationItem* item) const;
 	// What is wrong with the emulator; nothing while it is found (or not looked for yet).
@@ -640,19 +640,21 @@ QString MainDialogPrivate::HintsDir() const {
 	return QFileInfo(m_interpreter).absoluteDir().filePath(HINTS_DIR);
 }
 
-QString MainDialogPrivate::FirstStartHints(const QString& title) const {
-	if (title.isEmpty() || m_interpreter.isEmpty() || m_first_start_hints.contains(title)) {
+QString MainDialogPrivate::FirstStartHints(const QString& title, const QString& version) const {
+	if (title.isEmpty() || version.isEmpty() || m_interpreter.isEmpty() || m_first_start_hints.contains(title)) {
 		return {};
 	}
+	// The hints of this game version only (hints\<title id>_<version>.kyhints): another version's shaders are mostly
+	// not in the game, and the scan would read the whole game looking for them.
 	const QDir hints(HintsDir());
-	const auto files = hints.entryList({title + QStringLiteral("_*.kyhints")}, QDir::Files, QDir::Name);
-	if (files.isEmpty()) {
+	const auto file = title + QLatin1Char('_') + version + QStringLiteral(".kyhints");
+	if (!hints.exists(file)) {
 		return {};
 	}
 	if (!QDir(PipelineCacheDir()).entryList({title + QStringLiteral("*.journal")}, QDir::Files).isEmpty()) {
 		return {};
 	}
-	return hints.filePath(files.last());
+	return hints.filePath(file);
 }
 
 QString MainDialogPrivate::LogDir() const {
@@ -1686,7 +1688,8 @@ void MainDialogPrivate::Run() {
 
 	// The first start of a game whose hints the package ships: its shaders are prepared from them first (the game and
 	// a precompile use the same cache files), then the game starts by itself.
-	if (const auto hints = FirstStartHints(m_running_item->GetInfo().title_id); !hints.isEmpty()) {
+	const auto& running = m_running_item->GetInfo();
+	if (const auto hints = FirstStartHints(running.title_id, running.gameVersion); !hints.isEmpty()) {
 		m_first_start_hints.insert(m_running_item->GetInfo().title_id);
 		m_running_item          = nullptr;
 		m_play_after_precompile = true;
@@ -1803,7 +1806,7 @@ void MainDialogPrivate::Precompile(const QStringList& extra) {
 		return;
 	}
 	// "Precompile shaders" on a first start: the shipped hints are imported with it.
-	if (const auto hints = FirstStartHints(item->GetInfo().title_id); extra.isEmpty() && !hints.isEmpty()) {
+	if (const auto hints = FirstStartHints(item->GetInfo().title_id, item->GetInfo().gameVersion); extra.isEmpty() && !hints.isEmpty()) {
 		m_first_start_hints.insert(item->GetInfo().title_id);
 		m_hints_file = hints;
 		Precompile({QStringLiteral("--import-hints"), QDir::toNativeSeparators(hints)});
@@ -1939,6 +1942,10 @@ static QString HintsText(const QMap<QString, QString>& hints) {
 		}
 		if (reason == QLatin1String("other_game")) {
 			return QObject::tr("Hints not used: they are for another game.");
+		}
+		if (reason == QLatin1String("other_version")) {
+			return QObject::tr("Hints not used: they are for game version %1, your game is %2.")
+			    .arg(hints.value(QStringLiteral("hints_version")), hints.value(QStringLiteral("game_version")));
 		}
 		return QObject::tr("Hints not used: this is not a shader hints file.");
 	}
