@@ -97,7 +97,7 @@ namespace PipelineRecordFormat {
 // Changes with the stored fields of any record. Layout 2: the vertex stage's indirect-draw
 // offsets as upstream's ShaderIndirectOffsets, the pixel stage's integer target masks, no cull
 // mode or front face (dynamic state). Layout 1 is still read (and written, for tests).
-constexpr uint32_t LayoutVersion = 2;
+constexpr uint32_t LayoutVersion = 3;
 void               PutStage(ManifestFormat::Writer& w, const GraphicsStageRecord& record,
                             uint32_t layout = LayoutVersion);
 // The record's code stays null; its code ids are read.
@@ -110,7 +110,7 @@ bool GetPipeline(ManifestFormat::Reader& r, GraphicsPipelineRecord& record,
 } // namespace PipelineRecordFormat
 
 // The graphics pipelines a title has needed and their stage programs, persisted next to its
-// driver pipeline cache (_PipelineCache/<title>.v6.pipelines), so that the pipelines can be
+// driver pipeline cache (_PipelineCache/<title>.v7.pipelines), so that the pipelines can be
 // built ahead of their first use (--precompile-pipelines, --precompile-only). Append-only like
 // ProgramManifest: checksummed entries, guest code once per shader, a torn or corrupt tail or
 // another format version rewrites the file with the readable entries. A pipeline is kept only
@@ -122,7 +122,7 @@ public:
 	static constexpr uint32_t FormatVersion = 1;
 
 	// An empty path keeps the manifest in memory only. Without a file at `path`, the records of
-	// `previous` (record layout 1, <title>.v5.pipelines) are read and written to `path`; that
+	// `previous` (record layout 2, <title>.v6.pipelines) are read and written to `path`; that
 	// file stays as it is for builds that read it.
 	explicit PipelineManifest(std::filesystem::path path = {}, std::filesystem::path previous = {});
 	~PipelineManifest();
