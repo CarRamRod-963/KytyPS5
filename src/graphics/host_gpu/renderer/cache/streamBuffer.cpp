@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <cstring>
+#include <immintrin.h>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -60,7 +61,7 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_readable)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -78,6 +79,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	const bool want_mapping        = host_readable && usage == MemoryUsage::DeviceLocal;
+	if (want_mapping) {
+		allocation_info.flags |=
+		    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		allocation_info.requiredFlags =
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	}
 
 	// Shaders reach device buffers through device addresses without a cache lookup that could
 	// mark them used, so they keep the highest residency priority. Host-side staging and
@@ -86,27 +94,38 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	const bool device_side = usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream;
 	const auto memory_class =
 	    device_side ? MemoryPriority::Class::Pinned : MemoryPriority::Class::Cache;
-	uint32_t memory_type = UINT32_MAX;
-	if (device_side && graphics.memory_priority_enabled &&
-	    vmaFindMemoryTypeIndexForBufferInfo(graphics.allocator, native_info, &allocation_info,
-	                                        &memory_type) != VK_SUCCESS) {
-		memory_type = UINT32_MAX;
-	}
-	auto pooled_info = allocation_info;
-	graphics.PreparePriorityAllocation(pooled_info, memory_class,
-	                                   device_side ? memory_type : UINT32_MAX);
-
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	auto              result =
-	    static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info, &pooled_info,
-	                                            &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess && pooled_info.pool != nullptr) {
-		// The pool could not grow; the default pools may still have room.
-		pooled_info.pool = nullptr;
-		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info,
-		                                                 &pooled_info, &native_buffer,
-		                                                 &m_allocation, &allocation_result));
+	auto              pooled_info   = allocation_info;
+	const auto        allocate      = [&] {
+		uint32_t memory_type = UINT32_MAX;
+		if (device_side && graphics.memory_priority_enabled &&
+		    vmaFindMemoryTypeIndexForBufferInfo(graphics.allocator, native_info, &allocation_info,
+		                                        &memory_type) != VK_SUCCESS) {
+			memory_type = UINT32_MAX;
+		}
+		pooled_info = allocation_info;
+		graphics.PreparePriorityAllocation(pooled_info, memory_class,
+		                                   device_side ? memory_type : UINT32_MAX);
+		auto result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info,
+		                                                      &pooled_info, &native_buffer,
+		                                                      &m_allocation, &allocation_result));
+		if (result != vk::Result::eSuccess && pooled_info.pool != nullptr) {
+			// The pool could not grow; the default pools may still have room.
+			pooled_info.pool = nullptr;
+			result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, native_info,
+			                                                 &pooled_info, &native_buffer,
+			                                                 &m_allocation, &allocation_result));
+		}
+		return result;
+	};
+	auto result = allocate();
+	if (result != vk::Result::eSuccess && want_mapping) {
+		// No mappable device-local memory, or no budget left in it: an ordinary device buffer.
+		allocation_info.flags &=
+		    ~(VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+		allocation_info.requiredFlags = 0;
+		result                        = allocate();
 	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
@@ -148,6 +167,30 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
+}
+
+void Buffer::ReadMapped(uint64_t offset, uint64_t size, void* destination) const {
+	EXIT_IF(!IsHostReadable() || offset > Size() || size > Size() - offset);
+	if (!IsCoherent() && size != 0) {
+		const auto result =
+		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
+		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+	}
+	const auto* source = m_mapped.data() + offset;
+	auto*       target = static_cast<uint8_t*>(destination);
+	// Streaming loads may be served from fill buffers that predate the GPU's write: the fence
+	// orders them after every earlier load and store, so they observe the completed write.
+	_mm_mfence();
+	const auto lead =
+	    std::min<uint64_t>(size, (16u - reinterpret_cast<uintptr_t>(source) % 16u) % 16u);
+	std::memcpy(target, source, static_cast<size_t>(lead));
+	uint64_t done = lead;
+	for (; done + 16 <= size; done += 16) {
+		const auto value =
+		    _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(source + done)));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(target + done), value);
+	}
+	std::memcpy(target + done, source + done, static_cast<size_t>(size - done));
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {

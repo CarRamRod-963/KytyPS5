@@ -506,6 +506,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		if (command) {
+			gpu->m_renderer.GetBufferCache().NoteCommandBoundary();
 			{
 				Common::DebugCounters::ScopedTimer busy(
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
@@ -920,6 +921,8 @@ void CommandProcessor::SuspendPm4(Common::GpuTiming::StallKind kind) {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
 	while (!execution.m_buffer_stack.empty()) {
+		// The previous packet recorded every GPU write it marked.
+		m_renderer.GetBufferCache().NoteCommandBoundary();
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}

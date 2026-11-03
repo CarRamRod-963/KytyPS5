@@ -39,8 +39,12 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// A host-readable device buffer is placed in device-local memory the host can map (resizable
+	// BAR) when the device has such memory and budget for it, and stays persistently mapped; it
+	// falls back to ordinary device-local memory otherwise (IsHostReadable() tells which).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       bool host_readable = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,6 +52,14 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// A device-local buffer the host can read in place (see the constructor).
+	[[nodiscard]] bool IsHostReadable() const noexcept {
+		return m_usage == MemoryUsage::DeviceLocal && !m_mapped.empty();
+	}
+	// Copies `size` bytes at `offset` of a host-readable buffer into `destination`. The caller
+	// waited for the GPU writes it reads. Device memory read through the mapping is uncached and
+	// write-combined: streaming loads read it ~30x faster than ordinary loads.
+	void ReadMapped(uint64_t offset, uint64_t size, void* destination) const;
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
@@ -76,6 +88,10 @@ public:
 	// The garbage-collector tick (plus one) since which shaders report their accesses to the
 	// buffer's pages (BufferCache::BdaWatchBit), or 0.
 	uint64_t bda_watch_tick = 0;
+	// The scheduler tick that holds the latest GPU write of the buffer, valid while no write is
+	// open (marked by a command still being prepared; BufferCache::NoteCommandBoundary).
+	uint64_t gpu_write_tick = 0;
+	bool     gpu_write_open = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
