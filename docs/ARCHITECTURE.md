@@ -127,9 +127,10 @@ rejected`), not compiled.
 
 **Shader hints** (`--export-hints <file>`, `--import-hints <file>` with `--precompile-only`): a hints file is the
 journals without the game's code. Each shader record keeps its inputs and, instead of its code, the size and a hash of
-the code block's footer; the import finds those blocks in the game folder (or inside its `.zar`) and adds the records
-to this device's journals. A file made for another game version is refused before the scan (another version's shaders
-are mostly not in the game, and the scan would read all of it). Pipelines whose stage records are missing (recorded by
+the code block's footer; the import finds those blocks in the game's `eboot.bin` and shader packs (`.xpps`, 22-25 GB of
+the ~200 GB game; in the folder or inside its `.zar`) and adds the records to this device's journals. A shader the game
+makes at run time is not in those files: it is counted as missing and compiled in play as without hints. A file made
+for another game version is refused before the scan (another version's shaders are mostly not in the game). Pipelines whose stage records are missing (recorded by
 older builds) are left out of the export. The release package ships one per game version in
 `hints/<title id>_<version>.kyhints`, and the launcher imports the one matching the game's version on its first start.
 

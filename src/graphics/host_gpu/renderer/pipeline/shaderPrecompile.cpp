@@ -1493,14 +1493,14 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 	size_t     files = 0;
 	uint64_t   read  = 0;
 	std::error_code ec;
-	// eboot.bin first, then the shader packs (.xpps), then every other file of the folder (links followed: a game folder
-	// can link its parts); done once every block is found.
+	// eboot.bin, then the shader packs (.xpps; links followed: a game folder can link its parts); done once every block is
+	// found. Only those files: every block found in 1.512 and 2.002 was in them (22-25 GB of shader packs), and a hint
+	// whose code the game makes at run time sent the scan through the other ~180 GB (30 min on 2.002, 3.11.2026).
 	// A game run from a .zar archive: its members are listed and read through the archive (the handle keeps the archive's
 	// index and block cache for the whole scan).
 	const bool archive        = Common::IsArchivePath(game_dir);
 	const auto archive_handle = archive ? Common::OpenArchive(game_dir) : nullptr;
 	std::vector<std::filesystem::path> paths {game_dir / "eboot.bin"};
-	std::vector<std::filesystem::path> others;
 	if (archive) {
 		std::vector<std::filesystem::path> dirs {game_dir};
 		while (!dirs.empty()) {
@@ -1510,8 +1510,8 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 				const auto member = dir / Common::PathFromUtf8(entry.name);
 				if (!entry.is_file) {
 					dirs.push_back(member);
-				} else if (member.filename() != "eboot.bin") {
-					(member.extension() == ".xpps" ? paths : others).push_back(member);
+				} else if (member.extension() == ".xpps") {
+					paths.push_back(member);
 				}
 			}
 		}
@@ -1519,11 +1519,9 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 		for (auto it = std::filesystem::recursive_directory_iterator(
 		         game_dir, std::filesystem::directory_options::follow_directory_symlink, ec);
 		     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-			if (!it->is_regular_file(ec) || it->path().filename() == "eboot.bin") continue;
-			(it->path().extension() == ".xpps" ? paths : others).push_back(it->path());
+			if (it->is_regular_file(ec) && it->path().extension() == ".xpps") paths.push_back(it->path());
 		}
 	}
-	paths.insert(paths.end(), others.begin(), others.end());
 	for (const auto& path: paths) {
 		if (found.size() == distinct_blocks.size()) break;
 		uint64_t size = 0;
