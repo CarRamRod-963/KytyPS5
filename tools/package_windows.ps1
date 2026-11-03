@@ -17,7 +17,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Emulator,    # kyty_emulator.exe of the release build
     [Parameter(Mandatory = $true)][string]$LauncherDir, # the launcher build folder (launcher.exe, Qt DLLs and plugins)
-    [string]$Hints = '',                                # a shader hints file (.kyhints), shipped in hints\
+    [string[]]$Hints = @(),                             # shader hints files (.kyhints, one per game version), in hints\
     [string]$Guide = '',                                # the player guide (PDF), shipped next to the readme
     [string]$Version = 'v0.1',
     [string]$Out = 'dist'
@@ -46,10 +46,10 @@ Copy-Item -Recurse (Join-Path $repo 'assets\fonts') (Join-Path $assets 'fonts')
 Copy-Item (Join-Path $repo 'assets\images\loading-valley.jpg') (Join-Path $assets 'images')
 Copy-Item (Join-Path $repo 'assets\sounds\trophy-unlock.wav') (Join-Path $assets 'sounds')
 
-# The shader hints: imported by the launcher on the game's first start (hints\<title id>_<version>.kyhints).
-if ($Hints -ne '') {
+# The shader hints: the launcher imports the one of the game's version on its first start (hints\<title id>_<version>.kyhints).
+if ($Hints.Count -ne 0) {
     New-Item -ItemType Directory -Force (Join-Path $stage 'hints') | Out-Null
-    Copy-Item $Hints (Join-Path $stage 'hints')
+    foreach ($file in $Hints) { Copy-Item $file (Join-Path $stage 'hints') }
 }
 
 # Licences, the readme and the documents it links to (the same relative paths as in the source tree).
