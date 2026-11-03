@@ -70,6 +70,7 @@
    "title": "Render at 1080p",
    "gain": "+21% fps in cutscenes, no gain on the route",
    "description": "The game renders at 1920x1080, also in cutscenes, where it would go up to 3584x2016.",
+   "default": true,
    "memory": [
     {
      "offset": "0x00e5e33c",

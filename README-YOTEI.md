@@ -47,8 +47,9 @@ of system memory in play; with 16 GB Windows runs out of memory and pages to dis
    game starts; this takes a few minutes and runs only once. The game then starts by itself. Without it the first
    hours stutter while shaders compile during play.
 4. **Graphics mode:** the game's own *Performance* mode is the one tested. In *Quality* mode the game changes its
-   internal resolution all the time, which makes the screen flicker in this build; turn on the **Render at 1080p** mod
-   (launcher, Mods page) for Quality mode. The **Shorter detail distance (LOD 0.4)** mod gives the largest speed-up
+   internal resolution all the time, which makes the screen flicker in this build; the **Render at 1080p** mod
+   (launcher, Mods page; on by default on 1.512 and 2.002 since v0.1.3, also in cutscenes) keeps it steady. The
+   **Shorter detail distance (LOD 0.4)** mod (1.512) gives the largest speed-up
    (about +16%, +29% while walking) at the cost of simpler distant objects.
 5. **Performance panel:** F2 shows or hides it in game, Shift+F2 shows its details (frame time, CPU waiting on the GPU,
    draw calls, shader compiles, memory). The launcher's Overlay option shows it from the start.
@@ -66,7 +67,7 @@ physical CPU core, chosen automatically for the processor (`KYTY_GPU_THREAD_CPUS
 Known slow spot: some in-engine cutscenes (for example the Snake cutscene) drop to about 6-7 fps for a minute, with
 a few seconds at 1-2 fps; the game returns to its usual frame rate after them. The game renders them at up to 4K,
 and in the first ~50 s after a save is loaded the emulator still translates the game's shaders in the background
-(again on every start). The **Render at 1080p** mod helps a little (about +10% in that cutscene).
+(again on every start). The **Render at 1080p** mod (on by default) helps a little (about +10% in that cutscene).
 
 ## Building (Windows)
 

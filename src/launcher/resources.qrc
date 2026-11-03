@@ -40,5 +40,6 @@
  </qresource>
  <qresource prefix="/mods">
   <file alias="PPSA26344.json">mods/PPSA26344.json</file>
+  <file alias="PPSA26344_02.002.000.json">mods/PPSA26344_02.002.000.json</file>
  </qresource>
 </RCC>

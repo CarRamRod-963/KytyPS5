@@ -1,0 +1,22 @@
+{
+ "id": "PPSA26344",
+ "version": "02.002.000",
+ "process": "eboot.bin",
+ "mods": [
+  {
+   "key": "render1080",
+   "name": "Render 1080p (dynamic-resolution index locked at 15 = 1920x1080, also in cutscenes)",
+   "title": "Render at 1080p",
+   "gain": "faster cutscenes",
+   "description": "The game renders at 1920x1080, also in cutscenes, where it would go up to 3584x2016.",
+   "default": true,
+   "memory": [
+    {
+     "offset": "0x00ee01ec",
+     "off": "8b8b10ee3200",
+     "on": "b90f00000090"
+    }
+   ]
+  }
+ ]
+}

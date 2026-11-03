@@ -500,6 +500,45 @@ static QWidget* ModsRow(const QString& label, QWidget* control, const QString& d
 	return row;
 }
 
+// The game's mods catalog: the one of its version (:/mods/<title id>_<version>.json) when there is one, else the title's
+// (:/mods/<title id>.json, whose "version" says which game version it fits). Empty when the game has none.
+static QJsonObject ModsCatalog(const QString& title_id, const QString& game_version) {
+	const auto title = title_id.trimmed().toUpper();
+	if (title.isEmpty()) return {};
+	QFile file(QStringLiteral(":/mods/%1_%2.json").arg(title, game_version));
+	if (game_version.isEmpty() || !file.open(QIODevice::ReadOnly)) {
+		file.setFileName(QStringLiteral(":/mods/%1.json").arg(title));
+		if (!file.open(QIODevice::ReadOnly)) return {};
+	}
+	return QJsonDocument::fromJson(file.readAll()).object();
+}
+
+// The mods that are on until the player turns them off ("default": true in the catalog) go into a new patch plan when
+// the game has none yet and its version is the catalog's (3.11.2026: "Render at 1080p" - cutscenes at up to 4K were the
+// slowest part of the game, and not every player reads the Mods page).
+static void WriteDefaultMods(const QString& title_id, const QString& game_version) {
+	const auto path = Cheats::PlanPath(title_id);
+	if (path.isEmpty() || QFileInfo::exists(path)) return;
+	const auto catalog = ModsCatalog(title_id, game_version);
+	if (game_version.isEmpty() || catalog.value(QStringLiteral("version")).toString() != game_version) return;
+	QJsonArray mods;
+	for (const auto& value: catalog.value(QStringLiteral("mods")).toArray()) {
+		const auto mod = value.toObject();
+		if (!mod.value(QStringLiteral("default")).toBool(false)) continue;
+		QJsonObject entry {{QStringLiteral("name"), mod.value(QStringLiteral("name"))}, {QStringLiteral("enabled"), true}};
+		if (mod.contains(QStringLiteral("memory"))) entry.insert(QStringLiteral("memory"), mod.value(QStringLiteral("memory")));
+		if (mod.contains(QStringLiteral("env"))) entry.insert(QStringLiteral("env"), mod.value(QStringLiteral("env")));
+		mods.append(entry);
+	}
+	if (mods.isEmpty()) return;
+	(void)Cheats::SaveDocument(path,
+	                           QJsonDocument(QJsonObject {{QStringLiteral("id"), title_id.trimmed().toUpper()},
+	                                                      {QStringLiteral("version"), game_version},
+	                                                      {QStringLiteral("process"), QStringLiteral("eboot.bin")},
+	                                                      {QStringLiteral("mods"), mods}}),
+	                           QByteArray());
+}
+
 void MainDialogPrivate::BuildModsPage() {
 	delete m_mods_rows;
 	m_mod_toggles.clear();
@@ -518,19 +557,18 @@ void MainDialogPrivate::BuildModsPage() {
 
 	const auto* item = m_ui->widget->GetSelectedItem();
 	m_mods_title     = item != nullptr ? item->GetInfo().title_id.trimmed().toUpper() : QString();
-	QFile catalog_file(QStringLiteral(":/mods/%1.json").arg(m_mods_title));
-	if (m_mods_title.isEmpty() || !catalog_file.open(QIODevice::ReadOnly)) {
-		m_mods_catalog = {};
+	m_mods_catalog = item != nullptr ? ModsCatalog(m_mods_title, item->GetInfo().gameVersion) : QJsonObject();
+	if (m_mods_catalog.isEmpty()) {
 		m_mods_status->setText(item == nullptr ? tr("Select a game on the Play page to see its mods.")
 		                                       : tr("No mods for this game yet."));
 		layout->addWidget(m_mods_status);
 		finish();
 		return;
 	}
-	m_mods_catalog          = QJsonDocument::fromJson(catalog_file.readAll()).object();
 	const auto version      = m_mods_catalog.value(QStringLiteral("version")).toString();
 	const auto game_version = item->GetInfo().gameVersion;
 	const bool fits         = game_version.isEmpty() || game_version == version;
+	WriteDefaultMods(m_mods_title, game_version);
 
 	// What the plan holds now (a mod is on when an enabled entry has its name).
 	m_mods_plan_data.clear();
@@ -1381,6 +1419,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
+	WriteDefaultMods(info.title_id, info.gameVersion);
 	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
