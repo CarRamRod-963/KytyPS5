@@ -47,6 +47,7 @@ Copy-Item (Join-Path $repo 'assets\images\loading-valley.jpg') (Join-Path $asset
 Copy-Item (Join-Path $repo 'assets\sounds\trophy-unlock.wav') (Join-Path $assets 'sounds')
 
 # The shader hints: the launcher imports the one of the game's version on its first start (hints\<title id>_<version>.kyhints).
+$Hints = @($Hints | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' }) # pwsh -File passes a list as one string
 if ($Hints.Count -ne 0) {
     New-Item -ItemType Directory -Force (Join-Path $stage 'hints') | Out-Null
     foreach ($file in $Hints) { Copy-Item $file (Join-Path $stage 'hints') }
