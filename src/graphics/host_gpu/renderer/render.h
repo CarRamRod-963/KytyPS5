@@ -292,7 +292,7 @@ private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
-	[[nodiscard]] DrawIndirectResult DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	[[nodiscard]] DrawIndirectResult DrawIndirect(CommandBuffer&            buffer,
 	                                              const IndirectDrawSource& args);
 	// Vertex shaders (code addresses) whose programs need indirect arguments on the host.
 	std::unordered_set<uint64_t> m_indirect_readback_shaders;

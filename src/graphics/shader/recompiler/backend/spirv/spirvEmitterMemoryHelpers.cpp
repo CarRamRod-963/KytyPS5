@@ -519,7 +519,7 @@ bool IsSignedFormatComponent(Format::ComponentType type) {
 	       type == Format::ComponentType::Sscaled;
 }
 
-static uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
+uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	const auto mantissa_bits = bits == 11u ? 6u : 5u;
 	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
 	const auto mantissa =
