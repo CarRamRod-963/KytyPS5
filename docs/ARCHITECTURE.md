@@ -161,7 +161,11 @@ Many Yōtei shaders read and write memory through 64-bit pointers instead of des
 table of host device addresses for 16 KiB guest pages (`BufferCache::BDA_PAGETABLE_SIZE`); translated shaders look up
 each pointer there (`get_bda_pointer`). A lookup of a page without a host buffer sets a bit in a **fault buffer**
 (`cache/faultManager.*`) that the GPU thread reads back to create the missing buffer for later draws (the missing
-access itself reads zero). Creating the buffer for a whole 2 MiB window around the page (`KYTY_DIAG_FAULT_WINDOW_KB`)
+access itself reads zero). The **BDA fallback** (M06) serves most of those accesses with the game's real bytes: a page
+of direct memory without a buffer gets an entry into the imported guest backing (bit 0 set). Only the 2 MiB granules
+of the backing the GPU used are imported (the first read of a granule not imported yet, which reads zero once, or a
+direct download into it), and `_PipelineCache/<title>_<version>.bda_granules` keeps them for the next session (a
+cutscene: ~190 granules, ~0.4 GB pinned, instead of the whole 12 GB backing). Creating the buffer for a whole 2 MiB window around the page (`KYTY_DIAG_FAULT_WINDOW_KB`)
 is still a listed workaround.
 
 Writes through pointers are the hardest case: the emulator must know which guest bytes the GPU now owns. The current
