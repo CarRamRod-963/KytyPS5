@@ -259,11 +259,13 @@ void PutPixelInput(Writer& w, const ShaderPixelInputInfo& info, uint32_t layout)
 		w.PutBool(value);
 	w.PutEnum(info.alpha_blend_source);
 	w.PutBool(info.ps_early_z);
-	w.PutBool(info.ps_execute_on_noop);
+	// Layouts 1 and 2 stored EXEC_ON_NOOP, which upstream no longer keeps (4626e7fb7).
+	if (layout < 3) w.PutBool(false);
 }
 
 bool GetPixelInput(Reader& r, ShaderPixelInputInfo& info, uint32_t layout) {
-	info = {};
+	info                 = {};
+	bool execute_on_noop = false;
 	if (!r.Get(info.input_num) || info.input_num > std::size(info.interpolator_settings)) {
 		return false;
 	}
@@ -304,7 +306,7 @@ bool GetPixelInput(Reader& r, ShaderPixelInputInfo& info, uint32_t layout) {
 	}
 	return r.GetEnum(info.alpha_blend_source,
 	                 static_cast<uint32_t>(ShaderAlphaBlendSource::SourceAlphaZero)) &&
-	       r.GetBool(info.ps_early_z) && r.GetBool(info.ps_execute_on_noop);
+	       r.GetBool(info.ps_early_z) && (layout >= 3 || r.GetBool(execute_on_noop));
 }
 
 void PutCodeId(Writer& w, const ShaderCodeId& id) {
@@ -427,7 +429,7 @@ void PipelineRecordFormat::PutStage(Writer& w, const GraphicsStageRecord& record
 	} else {
 		PutVertexInput(w, record.vertex, layout);
 	}
-	ManifestFormat::PutSpecialization(w, record.specialization);
+	ManifestFormat::PutSpecialization(w, record.specialization, {.srgb = layout >= 3});
 }
 
 bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record, uint32_t layout) {
@@ -444,7 +446,7 @@ bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record, uint
 	           record.vertex.logical_stage != record.stage) {
 		return false;
 	}
-	return ManifestFormat::GetSpecialization(r, record.specialization);
+	return ManifestFormat::GetSpecialization(r, record.specialization, {.srgb = layout >= 3});
 }
 
 void PipelineRecordFormat::PutPipeline(Writer& w, const GraphicsPipelineRecord& record,
@@ -578,12 +580,12 @@ bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record
 
 std::filesystem::path PipelineManifest::PathFor(const std::filesystem::path& directory,
                                                 const std::string&           title_id) {
-	return directory / (title_id + ".v6.pipelines");
+	return directory / (title_id + ".v7.pipelines");
 }
 
 std::filesystem::path PipelineManifest::PreviousPathFor(const std::filesystem::path& directory,
                                                         const std::string&           title_id) {
-	return directory / (title_id + ".v5.pipelines");
+	return directory / (title_id + ".v6.pipelines");
 }
 
 PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::path previous)
@@ -597,10 +599,10 @@ PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::
 	    });
 	std::error_code error;
 	if (read.size == 0 && !previous.empty() && std::filesystem::exists(previous, error)) {
-		// The previous file (record layout 1) is read once and left as it is for older builds.
+		// The previous file (record layout 2) is read once and left as it is for older builds.
 		(void)ManifestFormat::ReadEntryFile(
 		    previous, ManifestMagic, [this](std::span<const uint8_t> payload, uint32_t version) {
-			    return version == FormatVersion && Parse(payload, 1);
+			    return version == FormatVersion && Parse(payload, 2);
 		    });
 		m_legacy_stage_keys.clear();
 		m_loaded.imported = !m_stage_order.empty();

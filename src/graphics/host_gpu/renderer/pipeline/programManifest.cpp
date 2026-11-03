@@ -75,6 +75,7 @@ bool GetInput(Reader& r, ShaderComputeInputInfo& input) {
 // version 3 no resident image heap flags (there were no heaps).
 constexpr uint32_t FirstHeaderVersion = 3;
 constexpr uint32_t FirstHeapVersion   = 4;
+constexpr uint32_t FirstSrgbVersion   = 5;
 
 std::vector<uint8_t> FileHeader(uint32_t version = ProgramManifest::FormatVersion) {
 	std::vector<uint8_t> header(FileMagic.begin(), FileMagic.end());
@@ -165,12 +166,12 @@ std::vector<uint8_t> ProgramManifest::EncodeCode(uint64_t hash, std::span<const 
 std::filesystem::path ProgramManifest::PathFor(const std::filesystem::path& directory,
                                                const std::string&           title_id) {
 	// The format is part of the name: builds of another format share the directory.
-	return directory / (title_id + ".v4.programs");
+	return directory / (title_id + ".v5.programs");
 }
 
 std::filesystem::path ProgramManifest::PreviousPathFor(const std::filesystem::path& directory,
                                                        const std::string&           title_id) {
-	return directory / (title_id + ".v3.programs");
+	return directory / (title_id + ".v4.programs");
 }
 
 std::filesystem::path ProgramManifest::CreatedPathFor(const std::filesystem::path& directory,
@@ -213,7 +214,8 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload, uint32_t vers
 	    !r.Get(record->push_data_cursor) ||
 	    !ManifestFormat::GetSpecialization(r, record->specialization,
 	                                       {.mapping_header = version >= FirstHeaderVersion,
-	                                        .image_heap     = version >= FirstHeapVersion}) ||
+	                                        .image_heap     = version >= FirstHeapVersion,
+	                                        .srgb           = version >= FirstSrgbVersion}) ||
 	    !r.Get(record->spirv_hash) || !r.AtEnd()) {
 		return false;
 	}
