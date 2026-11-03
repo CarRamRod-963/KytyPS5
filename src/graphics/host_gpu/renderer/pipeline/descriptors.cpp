@@ -1418,7 +1418,7 @@ void RenderExecutor::ResetFullBindlessTable() {
 	LOGF("bindless translation table: %u of %u entries used%s; dropping its heaps\n",
 	     translation.UsedEntries(), translation.Capacity(),
 	     m_bindless_heap_refused ? " and a heap did not fit" : "");
-	m_context.GetCommandScheduler().FlushAndWait();
+	m_context.GetCommandScheduler().Finish();
 	table.Reset();
 	m_bindless_resources.clear();
 	m_bindless_heap_refused = false;

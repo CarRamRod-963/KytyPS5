@@ -1716,7 +1716,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		// stencil plane (a layered target last bound with another layer range).
 		stencil_id = {};
 		for (const auto candidate:
-		     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+		     FindImagesInRegion(desc.info.data.address, desc.info.data.size)) {
 			const auto* stencil = m_slot_images.try_get(candidate);
 			if (stencil != nullptr && stencil->depth_id == id &&
 			    stencil->info.data == desc.info.data) {
@@ -2241,7 +2241,7 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	for (const auto id: FindImagesInRegion(address, size)) {
 		auto&      image = m_slot_images[id];
 		const bool covered =
 		    address <= image.info.data.address && address + size >= image.info.data.End();

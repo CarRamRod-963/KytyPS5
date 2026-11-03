@@ -73,14 +73,12 @@ public:
 	template <typename Accept, typename Write>
 	void PublishGpuModified(uint64_t vaddr, uint64_t size, Accept&& accept, Write&& write) {
 		static_assert(std::is_nothrow_invocable_v<Write&, uint64_t, uint64_t>);
-		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			if (!accept()) {
 				return;
 			}
-			manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
-			    manager->GetCpuAddr() + offset, bytes, write);
+			manager->template ForEachModifiedRange<DirtySource::Gpu, true>(offset, bytes, write);
 		});
 	}
 
@@ -140,8 +138,6 @@ public:
 	                         UploadFunc&& upload_func) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
-		CheckNotInUploadCallback();
-		const auto*    previous_upload_owner = std::exchange(s_upload_owner, this);
 		RegionManager* held                  = nullptr;
 		bool           taken                 = false;
 		const auto     release               = [&] {
@@ -162,7 +158,7 @@ public:
 					              manager->lock.lock();
 					              held = manager;
 				              }
-				              manager->TakeCpuModifiedRanges(manager->GetCpuAddr() + offset, bytes,
+				              manager->TakeCpuModifiedRanges(offset, bytes,
 				                                             [&](uint64_t address, uint64_t size) {
 					                                             taken = true;
 					                                             range_func(index, address, size);
@@ -171,7 +167,6 @@ public:
 		}
 		release();
 		upload_func();
-		s_upload_owner = previous_upload_owner;
 	}
 
 private:

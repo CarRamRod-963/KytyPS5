@@ -884,9 +884,6 @@ static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
-	}
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	if (state.unavailable) {
 		return false;
@@ -1571,7 +1568,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	return emit.has_value();
 }
 
-DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+DrawIndirectResult RenderExecutor::DrawIndirect(CommandBuffer&            buffer,
                                                 const IndirectDrawSource& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1601,14 +1598,8 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 	bool                  primitive_restart = false;
 	if (args.indexed) {
 		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
-			case Prospero::IndexType::kIndex16:
-				index_source.type               = vk::IndexType::eUint16;
-				index_source.guest_element_size = 2;
-				break;
-			case Prospero::IndexType::kIndex32:
-				index_source.type               = vk::IndexType::eUint32;
-				index_source.guest_element_size = 4;
-				break;
+			case Prospero::IndexType::kIndex16: index_source.guest_element_size = 2; break;
+			case Prospero::IndexType::kIndex32: index_source.guest_element_size = 4; break;
 			default: return ReadArguments;
 		}
 		const auto restart = PrimitiveRestartFromState(buffer, index_source.guest_element_size);
@@ -1626,9 +1617,6 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 	}
 
 	m_context.GetCommandScheduler().PopPendingOperations();
-	buffer.SetDebugInfo(static_cast<uint32_t>(args.indexed ? CommandBufferDebugOp::DrawIndex
-	                                                       : CommandBufferDebugOp::DrawIndexAuto),
-	                    submit_id, 0, 0, 0, 0, args.args_address);
 	Common::LockGuard lock(m_context.GetMutex());
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return DrawIndirectResult::Done;
@@ -1646,12 +1634,10 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 	const auto slot = [](int32_t value) {
 		return value < 0 ? ShaderIndirectOffsets::None : static_cast<uint8_t>(value);
 	};
-	const DrawCallInfo draw {
-	    args.indexed ? CommandBufferDebugOp::DrawIndex : CommandBufferDebugOp::DrawIndexAuto, 0, 0,
-	    0};
+	const DrawCallInfo draw {args.indexed, 0, 0};
 	state.indirect_offsets = {slot(args.vertex_offset_slot), slot(args.instance_offset_slot)};
 	state.indirect_draw    = true;
-	if (!PrepareDrawRenderState(buffer, draw, 0, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, state)) {
 		ResetBindings();
 		return DrawIndirectResult::Done;
 	}
@@ -1706,7 +1692,7 @@ DrawIndirectResult RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffe
 
 	DrawEmitInfo emit {};
 	emit.indirect_source = &args;
-	ExecutePreparedDraw(submit_id, buffer, draw, state, emit, index_source);
+	ExecutePreparedDraw(buffer, draw, state, emit, index_source);
 	ResetBindings();
 	return DrawIndirectResult::Done;
 }

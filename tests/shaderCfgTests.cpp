@@ -3825,6 +3825,14 @@ void TestCreatedComputeShaderInput() {
         "registers without RSRC2 must not give a compute input");
 }
 
+void SetImageTestType(std::array<uint32_t, 64> *data, uint32_t srsrc,
+                      Prospero::ImageType type) {
+  const auto type_dword = srsrc * 4u + 3u;
+  Check(data != nullptr && type_dword < data->size(),
+        "invalid image test descriptor source");
+  (*data)[type_dword] = static_cast<uint32_t>(type) << 28u;
+}
+
 void TestCodeOnlySpecializationMatchesPlainDescriptors() {
   const auto code_only_module =
       [](std::span<const uint32_t> shader,

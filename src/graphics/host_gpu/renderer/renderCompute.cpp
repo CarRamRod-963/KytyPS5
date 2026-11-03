@@ -337,7 +337,7 @@ static bool DispatchMayWriteMemory(const ShaderRecompiler::IR::CompiledShaderInf
                                    const PreparedBindings&                         bindings) {
 	const auto& info = program.info;
 	return bindings.shared_memory.buffer != nullptr || program.has_address_writes ||
-	       program.scratch_dwords != 0 || info.uses_dma || info.uses_gds || info.function_scratch ||
+	       info.uses_dma || info.uses_gds || info.function_scratch ||
 	       std::ranges::any_of(
 	           info.buffers,
 	           [](const auto& resource) { return resource.written || resource.atomic; }) ||
