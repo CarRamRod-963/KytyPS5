@@ -1,0 +1,51 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// Batched buffer uploads (UploadScatter): one workgroup copies one piece of up to 4 KiB from a
+// source buffer to a destination address. The pieces of a dispatch form a table in a ring at a
+// fixed address, at a 256-byte unit that the dispatch passes as its base workgroup Y: a header
+// (source buffer address low, high) and one uvec4 per piece (destination address low, high, byte
+// offset in the source, size in bytes). Addresses and sizes are dword multiples; a piece whose
+// addresses and size are 16-byte multiples copies 16 bytes per invocation. The shader takes no
+// descriptors and no push constants, so it disturbs no state bound for other dispatches.
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 0) const uint RingLow  = 0;
+layout(constant_id = 1) const uint RingHigh = 0;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Pieces {
+	uvec4 pieces[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vectors {
+	uvec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+	uint v[];
+};
+
+uvec2 AddOffset(uvec2 address, uint offset) {
+	uint carry;
+	const uint low = uaddCarry(address.x, offset, carry);
+	return uvec2(low, address.y + carry);
+}
+
+void main() {
+	Pieces       table       = Pieces(AddOffset(uvec2(RingLow, RingHigh), gl_WorkGroupID.y * 256u));
+	const uvec4  header      = table.pieces[0];
+	const uvec4  piece       = table.pieces[1u + gl_WorkGroupID.x];
+	const uvec2  destination = piece.xy;
+	const uvec2  source      = AddOffset(header.xy, piece.z);
+	const uint   size        = piece.w;
+	const uint   lane        = gl_LocalInvocationID.x;
+	if (((destination.x | source.x | size) & 15u) == 0u) {
+		if (lane < size / 16u) {
+			Vectors(destination).v[lane] = Vectors(source).v[lane];
+		}
+	} else {
+		for (uint i = lane; i < size / 4u; i += gl_WorkGroupSize.x) {
+			Words(destination).v[i] = Words(source).v[i];
+		}
+	}
+}
