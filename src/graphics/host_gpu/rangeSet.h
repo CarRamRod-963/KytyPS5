@@ -12,6 +12,14 @@ namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	// The range a ForEachInRange call with a cursor ended in, for the next call of a sweep.
+	class Cursor final {
+	private:
+		friend class RangeSet;
+		std::map<uint64_t, uint64_t>::const_iterator m_range;
+		bool                                         m_valid = false;
+	};
+
 	// Returns whether the set changed: a range already covered (a buffer written again) leaves
 	// the set as it is without erasing and re-inserting its covering range.
 	bool Add(uint64_t address, uint64_t size) {
@@ -90,6 +98,31 @@ public:
 			--it;
 		}
 		for (; it != m_ranges.end() && it->first < end; ++it) {
+			const auto begin = std::max(address, it->first);
+			const auto last  = std::min(end, it->second);
+			if (begin < last) {
+				func(begin, last);
+			}
+		}
+	}
+
+	// ForEachInRange that first checks the range the cursor's previous call ended in: a query
+	// inside that range needs no lookup (a sweep in address order: one lookup per range of the
+	// set it enters). The set must not change while the cursor is in use.
+	template <typename Func>
+	void ForEachInRange(uint64_t address, uint64_t size, Cursor& cursor, Func&& func) const {
+		const auto end = End(address, size);
+		if (cursor.m_valid && cursor.m_range->first <= address && cursor.m_range->second >= end) {
+			func(address, end);
+			return;
+		}
+		auto it = m_ranges.upper_bound(address);
+		if (it != m_ranges.begin()) {
+			--it;
+		}
+		for (; it != m_ranges.end() && it->first < end; ++it) {
+			cursor.m_range   = it;
+			cursor.m_valid   = true;
 			const auto begin = std::max(address, it->first);
 			const auto last  = std::min(end, it->second);
 			if (begin < last) {
