@@ -15,6 +15,7 @@
 namespace Libs::Graphics {
 
 class Presenter;
+class QueueSubmitter;
 class RenderContext;
 
 struct SurfaceCapabilities {
@@ -53,6 +54,7 @@ struct WindowContext {
 	SDL_Window*                    window        = nullptr;
 	vk::SurfaceKHR                 surface       = nullptr;
 	SurfaceCapabilities            surface_capabilities;
+	std::unique_ptr<QueueSubmitter> submitter;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
