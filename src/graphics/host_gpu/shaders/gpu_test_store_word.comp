@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// Stores one word at a device address: a stand-in for a guest dispatch whose pipeline and push
+// constants are bound before the commands that precede it are recorded.
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Word {
+	uint value;
+};
+
+layout(push_constant) uniform Push {
+	uvec2 address;
+	uint  value;
+}
+push;
+
+void main() {
+	Word(push.address).value = push.value;
+}
