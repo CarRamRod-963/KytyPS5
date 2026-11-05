@@ -171,6 +171,10 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// Calls func(id, begin, end) for the part of every buffer in [start, finish), in address
+	// order.
+	template <typename Func>
+	void ForEachBufferPart(uint64_t start, uint64_t finish, Func&& func);
 	void TouchBuffer(Buffer& buffer);
 	// Writes the page table entries of a registered buffer, with BdaWatchBit when `watched`.
 	void WriteBdaEntries(const Buffer& buffer, bool watched);

@@ -1392,6 +1392,30 @@ void BufferCache::TakeBdaSync(BdaSyncDue& due) {
 	m_bda_sync.Take(due);
 }
 
+template <typename Func>
+void BufferCache::ForEachBufferPart(uint64_t start, uint64_t finish, Func&& func) {
+	// Buffers start and end at page boundaries and never overlap (CreateBuffer joins overlaps),
+	// so the page table names the one buffer of a page: one lookup per buffer part, and a map
+	// lookup only to skip a gap between buffers.
+	for (auto address = start; address < finish;) {
+		const auto* owner = address < PageTable::kAddressSpaceSize
+		                        ? m_page_table.Find(address >> PageTable::kPageBits)
+		                        : nullptr;
+		if (owner != nullptr && *owner) {
+			const auto& buffer = m_slot_buffers[*owner];
+			const auto  last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
+			func(*owner, address, last);
+			address = last;
+			continue;
+		}
+		const auto next = m_buffers.lower_bound(address);
+		if (next == m_buffers.end() || next->first >= finish) {
+			break;
+		}
+		address = next->first;
+	}
+}
+
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	m_bda_in_use = true;
 	// Take before walking: writes queued during synchronization remain pending.
@@ -1401,21 +1425,14 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	auto& owners = m_bda_owners;
 	ranges.clear();
 	owners.clear();
+	// The due ranges come in address order, so a mapping usually holds several in a row.
+	RangeSet::Cursor mapping;
 	due.ForEach([&](uint64_t begin, uint64_t end) {
-		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
-			auto it = m_buffers.upper_bound(start);
-			if (it != m_buffers.begin()) {
-				--it;
-			}
-			for (; it != m_buffers.end() && it->first < finish; ++it) {
-				const auto& buffer = m_slot_buffers[it->second];
-				const auto  first  = std::max(buffer.CpuAddress(), start);
-				const auto  last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
-				if (first < last) {
-					ranges.push_back({first, last - first});
-					owners.push_back(it->second);
-				}
-			}
+		mapped.ForEachInRange(begin, end - begin, mapping, [&](uint64_t start, uint64_t finish) {
+			ForEachBufferPart(start, finish, [&](BufferId id, uint64_t first, uint64_t last) {
+				ranges.push_back({first, last - first});
+				owners.push_back(id);
+			});
 		});
 	});
 	due.Clear();

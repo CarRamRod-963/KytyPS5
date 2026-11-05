@@ -369,6 +369,40 @@ void TestRangeSetUnion() {
   }
 }
 
+// ForEachInRange with a cursor yields what it yields without one, whatever the
+// order of the queries.
+void TestRangeSetCursor() {
+  using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
+  TestRandom random{0x13579bdfu};
+  for (int round = 0; round < 2000; round++) {
+    RangeSet set;
+    const auto count = random() % 12u;
+    for (uint32_t i = 0; i < count; i++) {
+      set.Add(uint64_t{1 + random() % 64u} << 12u,
+              uint64_t{1 + random() % 6u} << 12u);
+    }
+    RangeSet::Cursor cursor;
+    const bool ascending = round % 2 == 0;
+    uint64_t address = 0x1000;
+    for (int query = 0; query < 16; query++) {
+      address = ascending ? address + (uint64_t{random() % 8u} << 12u)
+                          : uint64_t{1 + random() % 72u} << 12u;
+      const uint64_t size = uint64_t{1 + random() % 5u} << 12u;
+      Ranges_t plain;
+      set.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) {
+        plain.emplace_back(begin, end);
+      });
+      Ranges_t cursored;
+      set.ForEachInRange(address, size, cursor,
+                         [&](uint64_t begin, uint64_t end) {
+                           cursored.emplace_back(begin, end);
+                         });
+      Check(cursored == plain,
+            "a range-set query with a cursor differs from one without");
+    }
+  }
+}
+
 void TestBdaSyncQueue() {
   using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
   Libs::Graphics::BdaSyncQueue queue;
@@ -1709,6 +1743,7 @@ int main(int argc, char **argv) {
   TestGuestRange();
   TestRangeSet();
   TestRangeSetUnion();
+  TestRangeSetCursor();
   TestBdaSyncQueue();
   TestBdaSyncQueueModel();
   TestQueriesDoNotRequireMappedOwnership();
