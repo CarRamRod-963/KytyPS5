@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -502,6 +503,7 @@ void Swapchain::Destroy() {
 	}
 	auto& graphics = m_window.graphic_ctx;
 
+	graphics.DrainSubmissions();
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
@@ -909,6 +911,8 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
+	// The wait semaphore's signal must be on the queue before the present.
+	m_window.graphic_ctx.DrainSubmissions();
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
