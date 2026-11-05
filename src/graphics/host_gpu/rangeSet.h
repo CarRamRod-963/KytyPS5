@@ -98,8 +98,37 @@ public:
 		}
 	}
 
+	// The ranges of the union with `other` in address order, overlapping and adjacent ranges
+	// merged as Add merges them, without building the union.
+	template <typename Func>
+	void ForEachUnion(const RangeSet& other, Func&& func) const {
+		auto       a     = m_ranges.begin();
+		auto       b     = other.m_ranges.begin();
+		const auto a_end = m_ranges.end();
+		const auto b_end = other.m_ranges.end();
+		while (a != a_end || b != b_end) {
+			auto&    first = b == b_end || (a != a_end && a->first <= b->first) ? a : b;
+			uint64_t begin = first->first;
+			uint64_t end   = first->second;
+			++first;
+			for (;;) {
+				if (a != a_end && a->first <= end) {
+					end = std::max(end, a->second);
+					++a;
+				} else if (b != b_end && b->first <= end) {
+					end = std::max(end, b->second);
+					++b;
+				} else {
+					break;
+				}
+			}
+			func(begin, end);
+		}
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 	void               Clear() { m_ranges.clear(); }
+	void               Swap(RangeSet& other) noexcept { m_ranges.swap(other.m_ranges); }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {

@@ -321,41 +321,180 @@ std::vector<std::pair<uint64_t, uint64_t>> Ranges(const RangeSet &ranges) {
   return result;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>>
+Take(Libs::Graphics::BdaSyncQueue &queue) {
+  Libs::Graphics::BdaSyncDue due;
+  queue.Take(due);
+  std::vector<std::pair<uint64_t, uint64_t>> result;
+  due.ForEach(
+      [&](uint64_t begin, uint64_t end) { result.emplace_back(begin, end); });
+  return result;
+}
+
+// A small deterministic generator for the model tests.
+struct TestRandom {
+  uint32_t state;
+  uint32_t operator()() {
+    state = state * 1664525u + 1013904223u;
+    return state >> 8u;
+  }
+};
+
+// ForEachUnion yields what Add-ing both sets into one would hold.
+void TestRangeSetUnion() {
+  using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
+  TestRandom random{0x2468ace0u};
+  for (int round = 0; round < 2000; round++) {
+    RangeSet a;
+    RangeSet b;
+    RangeSet merged;
+    const auto count = random() % 12u;
+    for (uint32_t i = 0; i < count; i++) {
+      const uint64_t address = uint64_t{1 + random() % 64u} << 12u;
+      const uint64_t size = uint64_t{1 + random() % 6u} << 12u;
+      (random() % 2u == 0 ? a : b).Add(address, size);
+      merged.Add(address, size);
+    }
+    Ranges_t unite;
+    a.ForEachUnion(b, [&](uint64_t begin, uint64_t end) {
+      unite.emplace_back(begin, end);
+    });
+    Check(unite == Ranges(merged),
+          "a range-set union differs from the merged set");
+    Ranges_t reversed;
+    b.ForEachUnion(a, [&](uint64_t begin, uint64_t end) {
+      reversed.emplace_back(begin, end);
+    });
+    Check(reversed == unite, "a range-set union depends on the operand order");
+  }
+}
+
 void TestBdaSyncQueue() {
   using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
   Libs::Graphics::BdaSyncQueue queue;
   // Before the first synchronization everything is due.
   queue.Queue(0x1000, 0x1000, true);
   queue.Queue(0x8000, 0x1000, false);
-  Check(Ranges(queue.Take()) == Ranges_t{{0x1000, 0x2000}, {0x8000, 0x9000}},
+  Check(Take(queue) == Ranges_t{{0x1000, 0x2000}, {0x8000, 0x9000}},
         "the first BDA synchronization did not take every queued range");
-  Check(queue.Take().Empty(), "a BDA synchronization took a range twice");
+  Check(Take(queue).empty(), "a BDA synchronization took a range twice");
 
   // A guest store waits for the next ordering point; other writes are due at
   // once.
   queue.Queue(0x2000, 0x1000, true);
   queue.Queue(0x3000, 0x1000, false);
-  Check(Ranges(queue.Take()) == Ranges_t{{0x3000, 0x4000}},
+  Check(Take(queue) == Ranges_t{{0x3000, 0x4000}},
         "a guest store was synchronized before an ordering point");
   queue.Queue(0x2000, 0x2000, true);
-  Check(queue.Take().Empty(),
+  Check(Take(queue).empty(),
         "a guest store was synchronized before an ordering point");
   queue.NoteOrderingPoint();
   // A store queued after the point and before the synchronization rides along.
   queue.Queue(0x6000, 0x1000, true);
   queue.Queue(0x5000, 0x1000, false);
-  Check(Ranges(queue.Take()) == Ranges_t{{0x2000, 0x4000}, {0x5000, 0x7000}},
+  Check(Take(queue) == Ranges_t{{0x2000, 0x4000}, {0x5000, 0x7000}},
         "an ordering point did not release the queued guest stores");
   // One synchronization per point: later stores wait for the next one.
   queue.Queue(0x2000, 0x1000, true);
-  Check(queue.Take().Empty(),
+  Check(Take(queue).empty(),
         "an ordering point released stores queued after its synchronization");
   queue.NoteOrderingPoint();
   queue.NoteOrderingPoint();
-  Check(Ranges(queue.Take()) == Ranges_t{{0x2000, 0x3000}},
+  Check(Take(queue) == Ranges_t{{0x2000, 0x3000}},
         "an ordering point did not release a store queued before it");
-  Check(queue.Take().Empty(),
-        "repeated ordering points released a store twice");
+  Check(Take(queue).empty(), "repeated ordering points released a store twice");
+}
+
+// Take hands over the queued sets unmerged: a synchronization that walks
+// their union takes exactly what merging both into one set under the lock
+// took, and a due object reused (cleared) between Takes changes nothing.
+void TestBdaSyncQueueModel() {
+  using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
+  // The queue before Take exchanged its sets: it merged them on Take.
+  struct MergingQueue {
+    RangeSet next_access;
+    RangeSet at_ordering_point;
+    bool ordering_point = true;
+    Ranges_t Take() {
+      RangeSet taken;
+      next_access.ForEach(
+          [&](uint64_t begin, uint64_t end) { taken.Add(begin, end - begin); });
+      next_access.Clear();
+      if (std::exchange(ordering_point, false)) {
+        at_ordering_point.ForEach([&](uint64_t begin, uint64_t end) {
+          taken.Add(begin, end - begin);
+        });
+        at_ordering_point.Clear();
+      }
+      return Ranges(taken);
+    }
+  };
+  MergingQueue model;
+  Libs::Graphics::BdaSyncQueue queue;
+  Libs::Graphics::BdaSyncDue due;
+  TestRandom random{0x12345678u};
+  for (int i = 0; i < 20000; i++) {
+    const auto op = random() % 8u;
+    if (op < 4) {
+      const uint64_t address = uint64_t{1 + random() % 64u} << 12u;
+      const uint64_t size = uint64_t{1 + random() % 4u} << 12u;
+      const bool at_point = op != 0;
+      queue.Queue(address, size, at_point);
+      (at_point ? model.at_ordering_point : model.next_access)
+          .Add(address, size);
+    } else if (op == 4) {
+      queue.NoteOrderingPoint();
+      model.ordering_point = true;
+    } else {
+      queue.Take(due);
+      Ranges_t taken;
+      due.ForEach([&](uint64_t begin, uint64_t end) {
+        taken.emplace_back(begin, end);
+      });
+      due.Clear();
+      Check(taken == model.Take(),
+            "a BDA synchronization took other ranges than merging the queued "
+            "sets on Take");
+    }
+  }
+
+  // A thread queues under the owner's lock while the taking thread takes
+  // under it and walks outside it: no range is lost or taken twice.
+  Libs::Graphics::BdaSyncQueue shared;
+  std::mutex mutex;
+  std::atomic<bool> done{false};
+  uint64_t taken_bytes = 0;
+  RangeSet taken;
+  std::thread producer([&] {
+    for (uint64_t page = 1; page <= 4096; page++) {
+      std::lock_guard lock(mutex);
+      shared.Queue(page << 12u, 0x1000, (page & 1u) != 0);
+    }
+    done.store(true, std::memory_order_release);
+  });
+  const auto take = [&] {
+    {
+      std::lock_guard lock(mutex);
+      shared.Take(due);
+    }
+    due.ForEach([&](uint64_t begin, uint64_t end) {
+      taken_bytes += end - begin;
+      taken.Add(begin, end - begin);
+    });
+    due.Clear();
+  };
+  for (uint32_t round = 0; !done.load(std::memory_order_acquire); round++) {
+    if ((round & 3u) == 0) {
+      shared.NoteOrderingPoint();
+    }
+    take();
+  }
+  producer.join();
+  shared.NoteOrderingPoint();
+  take();
+  Check(Ranges(taken) == Ranges_t{{0x1000, uint64_t{4097} << 12u}} &&
+            taken_bytes == uint64_t{4096} << 12u,
+        "a range queued during exchanging Takes was lost or taken twice");
 }
 
 void TestGuestRange() {
@@ -1604,7 +1743,9 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetUnion();
   TestBdaSyncQueue();
+  TestBdaSyncQueueModel();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
