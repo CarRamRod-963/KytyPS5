@@ -43,6 +43,8 @@
 #include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -2336,6 +2338,15 @@ public:
     EnsureRuntimeContext();
     return Renderer();
   }
+  // The runtime context's schedulers submit through a QueueSubmitter thread, as
+  // in the emulator. KYTY_TEST_SUBMIT_THREAD=1 turns it on for every case.
+  void EnableSubmitThread() {
+    EnsureRuntimeContext();
+    if (m_submitter == nullptr) {
+      m_submitter = std::make_unique<QueueSubmitter>(m_runtime_context);
+      m_runtime_context.submitter = m_submitter.get();
+    }
+  }
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -3350,6 +3361,138 @@ public:
     m_runtime_context.device.destroySemaphore(gate, nullptr);
     Require(name, "shutdown native completion", !shutdown_overtook_native,
             "shutdown returned while the suspend point was still executing");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Command buffers handed to a QueueSubmitter reach the queue in push order,
+  // ticks of one timeline in increasing order, a host wait may target a tick
+  // still being submitted, and Drain returns only after the queue has every
+  // earlier buffer.
+  void CheckQueueSubmitter() {
+    constexpr const char *name = "QueueSubmitter";
+    auto &graphics = RuntimeContext();
+    constexpr u32 count = 48;
+    constexpr u32 lanes = 2;
+    auto target = CreateHostBuffer(name, sizeof(u32) * (4 + count),
+                                   vk::BufferUsageFlagBits::eTransferDst,
+                                   std::vector<u32>(4 + count, 0xffffffffu));
+    std::vector<vk::CommandBuffer> buffers;
+    std::mutex buffers_mutex;
+    const auto record = [&](u32 slot, u32 value, u32 own_slot) {
+      vk::CommandBufferAllocateInfo allocate{};
+      allocate.commandPool = m_command_pool;
+      allocate.level = vk::CommandBufferLevel::ePrimary;
+      allocate.commandBufferCount = 1;
+      vk::CommandBuffer command = nullptr;
+      {
+        std::lock_guard lock(buffers_mutex);
+        RequireVk(name, "allocate",
+                  m_device.allocateCommandBuffers(&allocate, &command),
+                  "vkAllocateCommandBuffers");
+        vk::CommandBufferBeginInfo begin{};
+        begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+        RequireVk(name, "begin", command.begin(&begin), "vkBeginCommandBuffer");
+        // Later submissions overwrite the shared slot only in submission order.
+        vk::MemoryBarrier ordered{};
+        ordered.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        ordered.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                                &ordered, 0, nullptr, 0, nullptr);
+        command.fillBuffer(target.buffer, sizeof(u32) * slot, sizeof(u32),
+                           value);
+        command.fillBuffer(target.buffer, sizeof(u32) * own_slot, sizeof(u32),
+                           value);
+        vk::MemoryBarrier to_host{};
+        to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eHost, {}, 1,
+                                &to_host, 0, nullptr, 0, nullptr);
+        RequireVk(name, "end", command.end(), "vkEndCommandBuffer");
+        buffers.push_back(command);
+      }
+      return command;
+    };
+
+    {
+      QueueSubmitter submitter(graphics);
+      // One pushing thread per timeline; each overwrites its lane's slot in
+      // push order.
+      std::array<std::unique_ptr<MasterSemaphore>, lanes> timelines;
+      std::array<uint64_t, lanes> last_tick{};
+      std::array<bool, lanes> increasing{};
+      for (auto &timeline : timelines) {
+        timeline = std::make_unique<MasterSemaphore>(graphics);
+      }
+      {
+        std::array<std::jthread, lanes> threads;
+        for (u32 lane = 0; lane < lanes; ++lane) {
+          threads[lane] = std::jthread([&, lane] {
+            uint64_t previous = 0;
+            bool ordered = true;
+            for (u32 index = lane; index < count; index += lanes) {
+              const auto command = record(lane, index, 4 + index);
+              const auto tick = submitter.Push(command, {}, *timelines[lane]);
+              ordered = ordered && tick == previous + 1;
+              previous = tick;
+              if (index % 8 == lane) {
+                // The tick may still be on its way to the queue.
+                timelines[lane]->Wait(tick);
+              }
+            }
+            last_tick[lane] = previous;
+            increasing[lane] = ordered;
+          });
+        }
+      }
+      for (u32 lane = 0; lane < lanes; ++lane) {
+        Require(name, "timeline order", increasing[lane],
+                "ticks of one timeline were not allocated in push order");
+        timelines[lane]->Wait(last_tick[lane]);
+      }
+      const auto words = ReadBuffer(name, target, 4 + count);
+      for (u32 lane = 0; lane < lanes; ++lane) {
+        Require(name, "push order", words[lane] == count - lanes + lane,
+                "a buffer pushed earlier reached the queue after a later one");
+      }
+      for (u32 index = 0; index < count; ++index) {
+        Require(name, "every buffer", words[4 + index] == index,
+                "a pushed buffer never executed");
+      }
+
+      // Drain returns only once the queue has every buffer pushed before it.
+      // The submission thread cannot reach the queue.
+      graphics.queue_mutex.Lock();
+      // The pushes queue up behind the first one and reach the queue in one
+      // vkQueueSubmit, in push order.
+      uint64_t blocked_tick = 0;
+      for (u32 value = 7; value < 16; ++value) {
+        blocked_tick = submitter.Push(record(2, value, 3), {}, *timelines[0]);
+      }
+      std::atomic<bool> drained{false};
+      std::jthread drainer([&] {
+        submitter.Drain();
+        drained.store(true, std::memory_order_release);
+      });
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const bool early = drained.load(std::memory_order_acquire);
+      const bool pending = submitter.Submitted() < submitter.Pushed();
+      graphics.queue_mutex.Unlock();
+      drainer.join();
+      Require(name, "pending submission", pending,
+              "a buffer reached the queue while the queue was locked");
+      Require(name, "drain", !early,
+              "Drain returned before the queue had every earlier buffer");
+      Require(name, "drained", submitter.Submitted() == submitter.Pushed(),
+              "Drain returned with buffers still waiting for the queue");
+      timelines[0]->Wait(blocked_tick);
+      Require(name, "batched push order", ReadBuffer(name, target, 4)[2] == 15,
+              "buffers submitted together reached the queue out of push order");
+    }
+    m_device.freeCommandBuffers(
+        m_command_pool, static_cast<u32>(buffers.size()), buffers.data());
+    DestroyBuffer(&target);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -17291,9 +17434,13 @@ public:
     Require(name, "watched page bookkeeping", cpu_modified,
             "a label written into a watched page left it clean");
 
-    // Labels are direct again once the GPU thread wrote the held ones.
+    // Labels are direct again once the GPU thread wrote the held ones. The GPU
+    // first finishes every earlier submission: a label behind work it still
+    // runs rides with later commands (below), and with a submission thread the
+    // last push may not even have reached the queue yet.
     const auto before_direct = Common::GpuTiming::Sync().Snapshot();
     gpu.SendCommandSync([&] {
+      context.GetCommandScheduler().Finish();
       processor->BufferInit();
       write_label(label, 0x4d4du, 0);
     });
@@ -28228,6 +28375,10 @@ private:
                   &allocator_info, &m_runtime_context.allocator)),
               "vmaCreateAllocator");
     m_renderer = std::make_unique<RenderContext>(m_runtime_context);
+    if (const char *submit_thread = std::getenv("KYTY_TEST_SUBMIT_THREAD");
+        submit_thread != nullptr && std::strcmp(submit_thread, "1") == 0) {
+      EnableSubmitThread();
+    }
   }
 
   void Init() {
@@ -28609,11 +28760,14 @@ private:
 
   void Destroy() {
     if (m_device != nullptr) {
+      m_runtime_context.DrainSubmissions();
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
+        m_runtime_context.submitter = nullptr;
+        m_submitter.reset();
         vmaDestroyAllocator(m_runtime_context.allocator);
         m_runtime_context.allocator = nullptr;
       }
@@ -28700,6 +28854,7 @@ private:
     submit.sType = vk::StructureType::eSubmitInfo;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
+    m_runtime_context.DrainSubmissions();
     RequireVk(shader_name, stage, m_queue.submit(1, &submit, fence),
               "vkQueueSubmit");
     RequireVk(shader_name, stage,
@@ -28917,6 +29072,7 @@ private:
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
+  std::unique_ptr<QueueSubmitter> m_submitter;
 };
 
 void CompareWords(const TestCase &test, const char *stage,
@@ -62675,6 +62831,15 @@ int main(int argc, char **argv) {
     vulkan.CheckSubmittedDownloadReadback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-thread-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckQueueSubmitter();
+    vulkan.EnableSubmitThread();
+    vulkan.CheckSubmittedDownloadReadback();
+    vulkan.CheckLabelDelivery();
+    vulkan.CheckGpuCommandLane();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--label-delivery-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLabelDelivery();
@@ -62988,6 +63153,7 @@ int main(int argc, char **argv) {
   vulkan.CheckScalarWalkGpuWrites();
   vulkan.CheckSubmittedDownloadReadback();
   vulkan.CheckLabelDelivery();
+  vulkan.CheckQueueSubmitter();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
