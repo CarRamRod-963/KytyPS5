@@ -114,7 +114,9 @@ void CommandBuffer::OrderIndirectReads() const {
 }
 
 void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
-                                 std::span<const vk::BufferCopy> regions) const {
+                                 std::span<const vk::BufferCopy> regions,
+                                 vk::DeviceAddress               source_address,
+                                 vk::DeviceAddress               destination_address) const {
 	EXIT_IF(IsInvalid());
 	if (regions.empty()) {
 		return;
@@ -132,23 +134,67 @@ void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 	}
 	const auto barrier = m_copies.BeforeCopy(m_copy_ranges);
 	if (barrier != CopyRunTracker::Barrier::None) {
+		// Copies of a run may be scatter dispatches.
+		constexpr auto Stages =
+		    vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader;
+		constexpr auto Writes =
+		    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderStorageWrite;
 		vk::MemoryBarrier2 memory {};
 		if (barrier == CopyRunTracker::Barrier::AllToTransfer) {
 			memory.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
 			memory.srcAccessMask =
 			    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 		} else {
-			memory.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-			memory.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			// The copies the barrier orders this one after.
+			RecordScatter();
+			memory.srcStageMask  = Stages;
+			memory.srcAccessMask = Writes;
 		}
-		memory.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		memory.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		memory.dstStageMask  = Stages;
+		memory.dstAccessMask = Writes | vk::AccessFlagBits2::eShaderStorageRead;
 		vk::DependencyInfo dependency {};
 		dependency.memoryBarrierCount = 1;
 		dependency.pMemoryBarriers    = &memory;
 		m_buffer.pipelineBarrier2(dependency);
 	}
-	m_buffer.copyBuffer(source, destination, static_cast<uint32_t>(regions.size()), regions.data());
+	// Only the copies of a batch can share a dispatch; the shader copies whole dwords.
+	const bool scatter = m_copy_batches != 0 && source_address != 0 && destination_address != 0;
+	if (scatter && source != m_scatter_source) {
+		RecordScatter();
+		m_scatter_source         = source;
+		m_scatter_source_address = source_address;
+	}
+	m_direct_regions.clear();
+	const auto pieces = m_scatter_pieces.size();
+	for (const auto& region: regions) {
+		constexpr auto Alignment = UploadScatter::Alignment;
+		const auto     body      = region.size / Alignment * Alignment;
+		if (!scatter || body == 0 || region.srcOffset % Alignment != 0 ||
+		    region.dstOffset % Alignment != 0 || region.srcOffset + body > UINT32_MAX) {
+			m_direct_regions.push_back(region);
+			continue;
+		}
+		UploadScatter::AddPieces(m_scatter_pieces, destination_address + region.dstOffset,
+		                         static_cast<uint32_t>(region.srcOffset),
+		                         static_cast<uint32_t>(body));
+		if (body != region.size) {
+			m_direct_regions.emplace_back(region.srcOffset + body, region.dstOffset + body,
+			                              region.size - body);
+		}
+	}
+	if (m_scatter_pieces.size() != pieces) {
+		if (!m_scatter_destinations.empty() &&
+		    m_scatter_destinations.back().buffer == destination) {
+			m_scatter_destinations.back().end = m_scatter_pieces.size();
+		} else {
+			m_scatter_destinations.push_back(
+			    {destination, destination_address, m_scatter_pieces.size()});
+		}
+	}
+	if (!m_direct_regions.empty()) {
+		m_buffer.copyBuffer(source, destination, static_cast<uint32_t>(m_direct_regions.size()),
+		                    m_direct_regions.data());
+	}
 	m_has_commands = true;
 	m_command_count++;
 	if (m_copy_batches == 0) {
@@ -156,15 +202,47 @@ void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 	}
 }
 
+void CommandBuffer::RecordScatter() const {
+	if (m_scatter_pieces.empty()) {
+		return;
+	}
+	if (!m_context.GetUploadScatter().Record(m_buffer, m_scatter_source_address,
+	                                         m_scatter_pieces)) {
+		// The ring is full: a copy command per destination buffer.
+		std::vector<vk::BufferCopy> copies;
+		size_t                      first = 0;
+		for (const auto& destination: m_scatter_destinations) {
+			copies.clear();
+			for (size_t i = first; i < destination.end; i++) {
+				const auto& piece   = m_scatter_pieces[i];
+				const auto  address = static_cast<uint64_t>(piece.destination_low) |
+				                      (static_cast<uint64_t>(piece.destination_high) << 32u);
+				copies.emplace_back(piece.source_offset, address - destination.address, piece.size);
+			}
+			m_buffer.copyBuffer(m_scatter_source, destination.buffer,
+			                    static_cast<uint32_t>(copies.size()), copies.data());
+			first = destination.end;
+		}
+	} else if (m_compute_pipeline) {
+		// The pipeline bound for a guest dispatch about to be recorded.
+		m_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, m_compute_pipeline);
+	}
+	m_scatter_pieces.clear();
+	m_scatter_destinations.clear();
+}
+
 void CommandBuffer::FinishCopies() const {
+	RecordScatter();
 	if (!m_copies.BeforeOther()) {
 		return;
 	}
 	// A copy ends the render pass instance, and starting one records this barrier first.
 	EXIT_IF(m_rendering);
 	vk::MemoryBarrier2 memory {};
-	memory.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-	memory.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	memory.srcStageMask =
+	    vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader;
+	memory.srcAccessMask =
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderStorageWrite;
 	memory.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	memory.dstAccessMask = LaterAccess2;
 	vk::DependencyInfo dependency {};
@@ -240,6 +318,7 @@ void CommandBuffer::Begin() {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	// The previous buffer recorded the barrier of its copies when it ended.
 	(void)m_copies.BeforeOther();
+	EXIT_IF(!m_scatter_pieces.empty());
 	m_has_commands         = false;
 	m_command_count        = 0;
 	m_compute_pipeline     = nullptr;
