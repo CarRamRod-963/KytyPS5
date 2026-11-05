@@ -1389,20 +1389,21 @@ void BufferCache::NoteBdaOrderingPoint() {
 	m_bda_sync.NoteOrderingPoint();
 }
 
-RangeSet BufferCache::TakeBdaSync() {
+void BufferCache::TakeBdaSync(BdaSyncDue& due) {
 	std::lock_guard lock(m_bda_sync_mutex);
-	return m_bda_sync.Take();
+	m_bda_sync.Take(due);
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	m_bda_in_use = true;
 	// Take before walking: writes queued during synchronization remain pending.
-	const auto pending = TakeBdaSync();
-	auto&      ranges  = m_bda_ranges;
-	auto&      owners  = m_bda_owners;
+	auto& due = m_bda_due;
+	TakeBdaSync(due);
+	auto& ranges = m_bda_ranges;
+	auto& owners = m_bda_owners;
 	ranges.clear();
 	owners.clear();
-	pending.ForEach([&](uint64_t begin, uint64_t end) {
+	due.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
 			auto it = m_buffers.upper_bound(start);
 			if (it != m_buffers.begin()) {
@@ -1419,6 +1420,7 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 		});
 	});
+	due.Clear();
 	if (ranges.empty()) {
 		return;
 	}
