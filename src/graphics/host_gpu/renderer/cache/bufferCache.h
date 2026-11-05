@@ -147,7 +147,7 @@ public:
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
 	// GPU thread: a submission starts or resumes, or the command processor waits for memory.
 	void                   NoteBdaOrderingPoint();
-	[[nodiscard]] RangeSet TakeBdaSync();
+	void                   TakeBdaSync(BdaSyncDue& due);
 	void               RunGarbageCollector();
 	// Called before every submission on the GPU thread: records downloads of the hot read-back
 	// pages the GPU wrote since the last submission, published into guest memory when the
@@ -264,8 +264,9 @@ private:
 	void                        AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size);
 	std::vector<uint64_t>       m_keep_readable;
 	std::vector<uint64_t>       m_make_unreadable;
-	// SynchronizeBda's scratch: the buffer parts to synchronize, their buffers, and the copies
-	// of their CPU-modified pages with the index of the part each belongs to.
+	// SynchronizeBda's scratch: the taken ranges, the buffer parts to synchronize, their buffers,
+	// and the copies of their CPU-modified pages with the index of the part each belongs to.
+	BdaSyncDue                  m_bda_due;
 	std::vector<GuestRange>     m_bda_ranges;
 	std::vector<BufferId>       m_bda_owners;
 	std::vector<vk::BufferCopy> m_bda_copies;
