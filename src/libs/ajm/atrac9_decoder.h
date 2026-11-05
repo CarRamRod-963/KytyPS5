@@ -141,6 +141,7 @@ public:
 		m_streams.clear();
 		m_is_initialized          = false;
 		m_num_frames              = 0;
+		m_lost_frames             = 0;
 		m_total_decoded_samples   = 0;
 		m_superframe_bytes_remain = 0;
 
@@ -210,16 +211,8 @@ public:
 				break;
 			}
 
-			int       bytes_used = 0;
-			const int ret        = DecodeFrame(input_bytes + input_offset, &bytes_used);
-			if (ret != 0) {
-				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
-				result.internal_result = ret;
-				break;
-			}
-			if (bytes_used <= 0 || static_cast<size_t>(bytes_used) > remaining_input ||
-			    static_cast<uint32_t>(bytes_used) > m_superframe_bytes_remain) {
-				result.result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+			int bytes_used = 0;
+			if (!NextFrame(input_bytes + input_offset, remaining_input, &bytes_used, &result)) {
 				break;
 			}
 
@@ -361,6 +354,7 @@ private:
 
 		m_is_initialized          = true;
 		m_num_frames              = 0;
+		m_lost_frames             = 0;
 		m_total_decoded_samples   = 0;
 		m_superframe_bytes_remain = static_cast<uint32_t>(m_codec_info.superframeSize);
 		SetFormat(static_cast<uint32_t>(m_codec_info.channels),
@@ -433,6 +427,50 @@ private:
 			else InterleaveStream<4>(channel);
 		}
 		return 0;
+	}
+
+	// Unpacks the next frame into m_pcm_buffer and sets the input bytes it takes. A frame LibAtrac9
+	// cannot unpack (an ERR_UNPACK_* status, or more bits than its superframe holds) is lost: it
+	// and the rest of its superframe play as silence and the superframe's bytes are skipped, as
+	// PS5 keeps decoding such a stream. False on an error that ends the job.
+	bool NextFrame(const uint8_t* input, size_t remaining_input, int* bytes_used,
+	               AjmDecodeResult* result) {
+		if (m_lost_frames == 0) {
+			const int ret = DecodeFrame(input, bytes_used);
+			if (ret == 0 && *bytes_used > 0 &&
+			    static_cast<uint32_t>(*bytes_used) <= m_superframe_bytes_remain) {
+				return true;
+			}
+			const bool unpack_error = (static_cast<uint32_t>(ret) & 0xff000000u) == 0x82000000u;
+			if (ret != 0 && !unpack_error) {
+				result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+				result->internal_result = ret;
+				return false;
+			}
+			if (ret == 0 && (*bytes_used <= 0 || static_cast<size_t>(*bytes_used) > remaining_input)) {
+				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+				return false;
+			}
+			m_lost_frames = static_cast<uint32_t>(m_codec_info.framesInSuperframe) - m_num_frames;
+			for (auto& stream: m_streams) {
+				stream.bytes_used = 0;
+			}
+		}
+		std::fill(m_pcm_buffer.begin(), m_pcm_buffer.end(), uint8_t {0});
+		*bytes_used = --m_lost_frames == 0 ? static_cast<int>(m_superframe_bytes_remain) : 0;
+		// LibAtrac9 counts the frames of a superframe and failed in the middle of one.
+		if (m_lost_frames == 0 && m_codec_info.framesInSuperframe > 1) {
+			RestartStreams();
+		}
+		return true;
+	}
+
+	void RestartStreams() {
+		AjmAt9Config config;
+		(void)AjmAt9InitDecoder(m_streams[0].handle.get(), m_config_data, config);
+		for (size_t i = 1; i < m_streams.size(); ++i) {
+			(void)Atrac9InitDecoder(m_streams[i].handle.get(), config.decoder_data.data());
+		}
 	}
 
 	uint64_t CopyDecodedFrame(uint8_t* output, size_t output_size, size_t* output_written,
@@ -529,16 +567,8 @@ private:
 				return;
 			}
 
-			int       bytes_used = 0;
-			const int ret        = DecodeFrame(input + *input_offset, &bytes_used);
-			if (ret != 0) {
-				result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
-				result->internal_result = ret;
-				return;
-			}
-			if (bytes_used <= 0 || static_cast<size_t>(bytes_used) > remaining_input ||
-			    static_cast<uint32_t>(bytes_used) > m_superframe_bytes_remain) {
-				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+			int bytes_used = 0;
+			if (!NextFrame(input + *input_offset, remaining_input, &bytes_used, result)) {
 				return;
 			}
 
@@ -635,6 +665,7 @@ private:
 	uint8_t              m_config_data[ATRAC9_CONFIG_DATA_SIZE] {};
 	uint32_t             m_superframe_bytes_remain = 0;
 	uint32_t             m_num_frames              = 0;
+	uint32_t             m_lost_frames             = 0; // Frames of the superframe still to skip.
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
 	std::vector<uint8_t> m_stream_pcm;
