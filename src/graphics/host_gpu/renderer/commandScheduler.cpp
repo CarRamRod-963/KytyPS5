@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
@@ -374,10 +375,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
-	vk::Result result;
-	uint64_t   tick;
+	vk::Result result    = vk::Result::eSuccess;
+	uint64_t   tick      = 0;
 	int64_t    submit_ns = 0;
-	{
+	if (graphics.submitter != nullptr) {
+		submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                std::chrono::steady_clock::now().time_since_epoch())
+		                .count();
+		tick      = graphics.submitter->Push(buffer, submit, m_master);
+	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
