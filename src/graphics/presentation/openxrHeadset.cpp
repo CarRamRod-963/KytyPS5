@@ -694,6 +694,7 @@ void OpenXrShutdown() {
 	if (g.graphics == nullptr) {
 		return;
 	}
+	g.graphics->DrainSubmissions();
 	{
 		Common::LockGuard queue_lock(g.graphics->queue_mutex);
 		(void)g.graphics->device.waitIdle();

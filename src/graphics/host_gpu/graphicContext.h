@@ -20,6 +20,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+class QueueSubmitter;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -69,6 +70,14 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Submits the command schedulers' buffers on a thread of its own; null: they submit
+	// directly. Not owned.
+	QueueSubmitter* submitter = nullptr;
+
+	// Returns once every buffer handed to the submitter has reached the queue. Call it before
+	// using the queue directly (present, wait for idle, external submissions), and never while
+	// holding queue_mutex.
+	void DrainSubmissions() const;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
