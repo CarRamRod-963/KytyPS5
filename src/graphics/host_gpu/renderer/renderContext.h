@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadScatter.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pendingLabels.h"
@@ -52,6 +53,7 @@ public:
 	ImageHeap&          GetImageHeap() { return m_image_heap; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
+	UploadScatter&      GetUploadScatter() { return m_upload_scatter; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
@@ -112,6 +114,7 @@ private:
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
+	UploadScatter             m_upload_scatter;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;

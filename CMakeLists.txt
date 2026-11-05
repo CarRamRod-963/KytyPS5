@@ -384,6 +384,7 @@ add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
+add_gpu_blit_shader(gpu_buffer_scatter gpu_buffer_scatter.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
@@ -836,6 +837,7 @@ function(add_gpu_test_shader shader_name shader_file)
 endfunction()
 add_gpu_test_shader(gpu_test_stencil_plane gpu_test_stencil_plane.comp)
 add_gpu_test_shader(gpu_test_stencil_bits gpu_test_stencil_bits.frag)
+add_gpu_test_shader(gpu_test_store_word gpu_test_store_word.comp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL

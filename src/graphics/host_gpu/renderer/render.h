@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/barrierTracker.h"
+#include "graphics/host_gpu/renderer/cache/uploadScatter.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -177,9 +178,12 @@ public:
 	// Records a copy of staged bytes into a buffer, ordered after every earlier command and
 	// before every later one. Inside a batch (BatchCopies), copies recorded back to back share
 	// their barriers (CopyRunTracker); outside one each copy gets its own pair. The source must
-	// be memory no recorded command writes, such as a staging buffer.
+	// be memory no recorded command writes, such as a staging buffer. With the device addresses
+	// of both buffers, the copies of a run from one source are recorded together as an
+	// UploadScatter dispatch when the run ends, instead of one copy command each.
 	void CopyToBuffer(vk::Buffer source, vk::Buffer destination,
-	                  std::span<const vk::BufferCopy> regions) const;
+	                  std::span<const vk::BufferCopy> regions, vk::DeviceAddress source_address = 0,
+	                  vk::DeviceAddress destination_address = 0) const;
 	// Batches the copies CopyToBuffer records until the guard is destroyed. The barrier after the
 	// copies is deferred to the next command recorded through Handle(), DispatchHandle(),
 	// BarrierHandle() and the like, or to the end of the batch: code inside a batch must not
@@ -225,6 +229,8 @@ private:
 	void RecordBarrier(BarrierTracker::Barrier barrier) const;
 	// Records the barrier from pending copies to all later commands.
 	void FinishCopies() const;
+	// Records the copies of the run waiting for a scatter dispatch.
+	void RecordScatter() const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -246,6 +252,20 @@ private:
 	mutable CopyRunTracker                     m_copies;
 	mutable std::vector<CopyRunTracker::Range> m_copy_ranges;
 	mutable uint32_t                           m_copy_batches = 0;
+	// Copies of the current run from m_scatter_source, recorded by RecordScatter(): their pieces,
+	// and the destination buffers in order with the end of their pieces (for copy commands when
+	// the pieces do not fit in the ring).
+	struct ScatterDestination {
+		vk::Buffer        buffer;
+		vk::DeviceAddress address = 0;
+		size_t            end     = 0;
+	};
+	mutable std::vector<UploadScatter::Piece> m_scatter_pieces;
+	mutable std::vector<ScatterDestination>   m_scatter_destinations;
+	mutable vk::Buffer                        m_scatter_source         = nullptr;
+	mutable vk::DeviceAddress                 m_scatter_source_address = 0;
+	// Regions of a CopyToBuffer call recorded as a copy command.
+	mutable std::vector<vk::BufferCopy> m_direct_regions;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

@@ -981,7 +981,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 void BufferCache::RecordUpload(Buffer& buffer, vk::Buffer source,
                                std::span<const vk::BufferCopy> copies) {
-	m_scheduler.Current().CopyToBuffer(source, buffer.Handle(), copies);
+	// The staging ring and game buffers have device addresses: batched uploads from the ring
+	// may be scattered by one dispatch.
+	if (source == m_staging_buffer.Handle()) {
+		m_scheduler.Current().CopyToBuffer(source, buffer.Handle(), copies,
+		                                   m_staging_buffer.BufferDeviceAddress(),
+		                                   buffer.BufferDeviceAddress());
+	} else {
+		m_scheduler.Current().CopyToBuffer(source, buffer.Handle(), copies);
+	}
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,

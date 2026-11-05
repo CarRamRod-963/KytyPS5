@@ -13,6 +13,7 @@
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "gpu_test_shaders/gpu_test_stencil_bits_spv.h"
 #include "gpu_test_shaders/gpu_test_stencil_plane_spv.h"
+#include "gpu_test_shaders/gpu_test_store_word_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -102,6 +103,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -6873,6 +6875,187 @@ public:
         LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
             LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
         "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Batched uploads with device addresses run as UploadScatter dispatches: the
+  // pieces of many ranges (dword bodies with byte tails, unaligned ranges left
+  // to copy commands, interleaved destinations, a later copy over an earlier
+  // one, more pieces than one dispatch table holds) must land as copy commands
+  // would put them, and a guest dispatch whose pipeline and push constants were
+  // bound before the run ended must still run with them.
+  void CheckScatteredUploads() {
+    constexpr const char *name = "ScatteredUploads";
+    EnsureRuntimeContext();
+    using GpuBuffer = ::Libs::Graphics::Buffer;
+    RenderContext context(m_runtime_context);
+    auto &graphics = context.GetGraphics();
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    constexpr uint64_t source_size = 1024 * 1024;
+    constexpr std::array<uint64_t, 3> destination_sizes{
+        256 * 1024, 64 * 1024 + 12, 600 * 1024};
+    constexpr auto flags =
+        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    GpuBuffer source(graphics, scheduler, MemoryUsage::Upload, 0, flags,
+                     source_size);
+    std::vector<uint8_t> source_bytes(source_size);
+    std::mt19937 random(0x5ca77e21u);
+    for (auto &byte : source_bytes) {
+      byte = static_cast<uint8_t>(random());
+    }
+    std::memcpy(source.Mapped().data(), source_bytes.data(), source_size);
+    source.Flush(0, source_size);
+    std::vector<std::unique_ptr<GpuBuffer>> destinations;
+    std::vector<std::vector<uint8_t>> expected;
+    for (const auto size : destination_sizes) {
+      destinations.push_back(std::make_unique<GpuBuffer>(
+          graphics, scheduler, MemoryUsage::DeviceLocal, 0, flags, size));
+      expected.emplace_back(size, uint8_t{0xa5});
+      scheduler.Current().Handle().fillBuffer(destinations.back()->Handle(), 0,
+                                              VK_WHOLE_SIZE, 0xa5a5a5a5u);
+    }
+    GpuBuffer marker(graphics, scheduler, MemoryUsage::DeviceLocal, 0, flags,
+                     16);
+    scheduler.Current().Handle().fillBuffer(marker.Handle(), 0, VK_WHOLE_SIZE,
+                                            0);
+    const auto copy = [&](size_t index,
+                          std::span<const vk::BufferCopy> regions) {
+      for (const auto &region : regions) {
+        std::memcpy(expected[index].data() + region.dstOffset,
+                    source_bytes.data() + region.srcOffset, region.size);
+      }
+      scheduler.Current().CopyToBuffer(
+          source.Handle(), destinations[index]->Handle(), regions,
+          source.BufferDeviceAddress(),
+          destinations[index]->BufferDeviceAddress());
+    };
+
+    // The guest stand-in: stores a pushed word at a pushed address.
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+    module_info.codeSize = sizeof(GPU_TEST_STORE_WORD_SPV);
+    module_info.pCode = GPU_TEST_STORE_WORD_SPV;
+    vk::ShaderModule store_module = nullptr;
+    RequireVk(name, "guest",
+              m_device.createShaderModule(&module_info, nullptr, &store_module),
+              "vkCreateShaderModule");
+    const vk::PushConstantRange store_push{vk::ShaderStageFlagBits::eCompute, 0,
+                                           3 * sizeof(uint32_t)};
+    vk::PipelineLayoutCreateInfo store_layout_info{};
+    store_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    store_layout_info.pushConstantRangeCount = 1;
+    store_layout_info.pPushConstantRanges = &store_push;
+    vk::PipelineLayout store_layout = nullptr;
+    RequireVk(name, "guest",
+              m_device.createPipelineLayout(&store_layout_info, nullptr,
+                                            &store_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo store_info{};
+    store_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+    store_info.stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    store_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    store_info.stage.module = store_module;
+    store_info.stage.pName = "main";
+    store_info.layout = store_layout;
+    vk::Pipeline store_pipeline = nullptr;
+    RequireVk(name, "guest",
+              m_device.createComputePipelines(nullptr, 1, &store_info, nullptr,
+                                              &store_pipeline),
+              "vkCreateComputePipelines");
+    constexpr uint32_t marker_value = 0x600dcafeu;
+    {
+      const auto batch = scheduler.Current().BatchCopies();
+      // Random disjoint ranges per destination, interleaved between the
+      // destinations, in calls of one to four regions.
+      std::array<uint64_t, 3> cursor{};
+      for (int call = 0; call < 96; call++) {
+        const auto index = static_cast<size_t>(random() % 2);
+        std::vector<vk::BufferCopy> regions;
+        const auto count = 1 + random() % 4;
+        for (uint32_t i = 0; i < count; i++) {
+          // Mostly dword-aligned starts with any size (byte tails), sometimes
+          // unaligned starts that only a copy command can do.
+          const bool unaligned = random() % 8 == 0;
+          const uint64_t size = 1 + random() % 9000;
+          auto offset = cursor[index] + random() % 64;
+          offset = unaligned ? offset | 1u : (offset + 3) / 4 * 4;
+          if (offset + size > destination_sizes[index]) {
+            break;
+          }
+          auto source_offset = random() % (source_size - size);
+          source_offset = unaligned ? source_offset : source_offset / 4 * 4;
+          regions.emplace_back(source_offset, offset, size);
+          cursor[index] = offset + size;
+        }
+        if (!regions.empty()) {
+          copy(index, regions);
+        }
+        if (call == 48) {
+          // A guest dispatch's state, bound while the run is open.
+          const auto address = marker.BufferDeviceAddress() + 4;
+          const std::array<uint32_t, 3> push{
+              static_cast<uint32_t>(address),
+              static_cast<uint32_t>(address >> 32u), marker_value};
+          scheduler.Current().BindComputePipeline(store_pipeline);
+          scheduler.Current().StateHandle().pushConstants(
+              store_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+              push.data());
+        }
+      }
+      Require(name, "deferred", scheduler.Current().HasPendingCopies(),
+              "batched uploads finished before the end of the batch");
+      // A later copy over bytes an earlier copy of the run wrote.
+      const vk::BufferCopy over{4096, 16, 8192};
+      copy(0, std::span{&over, 1});
+      // More pieces than one dispatch table: a dword to every other dword.
+      std::vector<vk::BufferCopy> words;
+      for (uint64_t i = 0; i < destination_sizes[2] / 8; i++) {
+        words.emplace_back((i * 12) % source_size, 8 * i, 4);
+      }
+      copy(2, words);
+    }
+    Require(name, "end of batch", !scheduler.Current().HasPendingCopies(),
+            "the end of a batch left uploads without their barrier");
+    scheduler.Current().DispatchHandle(true, false).dispatch(1, 1, 1);
+    std::vector<Buffer> readbacks;
+    for (size_t i = 0; i <= destinations.size(); i++) {
+      const auto &buffer = i < destinations.size() ? *destinations[i] : marker;
+      readbacks.push_back(CreateHostBuffer(
+          name, buffer.Size(), vk::BufferUsageFlagBits::eTransferDst, {}));
+      const vk::BufferCopy whole{0, 0, buffer.Size()};
+      scheduler.Current().Handle().copyBuffer(
+          buffer.Handle(), readbacks.back().buffer, 1, &whole);
+    }
+    vk::MemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    for (size_t i = 0; i < destinations.size(); i++) {
+      const auto words =
+          ReadBuffer(name, readbacks[i], destination_sizes[i] / 4);
+      Require(name, "GPU contents",
+              std::memcmp(words.data(), expected[i].data(),
+                          destination_sizes[i] / 4 * 4) == 0,
+              "a scattered upload differs from the copy it replaces");
+    }
+    Require(name, "guest state",
+            ReadBuffer(name, readbacks.back(), 4) ==
+                std::vector<u32>{0u, marker_value, 0u, 0u},
+            "a scatter dispatch replaced the pipeline or push constants of a "
+            "guest dispatch");
+    for (auto &readback : readbacks) {
+      DestroyBuffer(&readback);
+    }
+    m_device.destroyPipeline(store_pipeline, nullptr);
+    m_device.destroyPipelineLayout(store_layout, nullptr);
+    m_device.destroyShaderModule(store_module, nullptr);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -60701,6 +60884,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBatchedUploads();
+    vulkan.CheckScatteredUploads();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -60970,6 +61154,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBdaWatchedEviction();
   vulkan.CheckBatchedUploads();
+  vulkan.CheckScatteredUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBindlessSlotImageReuse();
