@@ -12513,6 +12513,120 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // At the memory pressure mark, an image another request overlaps used to be
+  // deleted with what the GPU wrote to it. On the console those bytes stay in
+  // memory: when the title binds the image again (Saros recreates a
+  // translucency lighting volume after a target over its tail retired it) it
+  // must not start from the stale guest bytes under it.
+  void CheckPressureRetiredContents() {
+    constexpr const char *name = "PressureRetiredContents";
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 16;
+    constexpr uint64_t image_size = uint64_t{width} * height * 4u;
+    constexpr uint32_t written = 0x11223344u;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "pressure-retired direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "pressure-retired fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      const auto describe = [&](uint64_t address) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, 4, 1);
+        desc.type = BindingType::Storage;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        return desc;
+      };
+
+      // The GPU fills a 64x16 R32_UINT storage image (256-byte rows).
+      auto old_desc = describe(base);
+      const auto old_id = cache.FindImage(old_desc);
+      (void)cache.FindTexture(old_id, old_desc);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = written;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), old_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      cache.MarkGpuWritten(old_id);
+
+      // More submissions than the removal age pass without the image being
+      // used, all in one frame.
+      const auto written_tick = scheduler.CurrentTick();
+      for (uint32_t submission = 0; submission < 40; submission++) {
+        scheduler.Finish();
+      }
+      Require(name, "submissions passed",
+              scheduler.CurrentTick() > written_tick + 33,
+              "the scheduler did not advance past the overlap removal window");
+
+      // At the pressure mark, an image over the old one's second half.
+      const auto previous_pressure =
+          TextureCacheTestAccess::SetPressureMark(cache, 0);
+      auto tail_desc = describe(base + image_size / 2);
+      const auto tail_id = cache.FindImage(tail_desc);
+      (void)cache.FindTexture(tail_id, tail_desc);
+      Require(name, "GPU-written image kept",
+              tail_id != old_id &&
+                  TextureCacheTestAccess::Contains(cache, old_id),
+              "pressure deleted an image holding GPU-written contents");
+
+      // A collection under pressure keeps its contents too (the image itself
+      // or the guest bytes it was downloaded to).
+      cache.RunGarbageCollector();
+
+      // The title binds the old image again.
+      const auto again_id = cache.FindImage(old_desc);
+      (void)cache.FindTexture(again_id, old_desc);
+      Require(name, "rebound image keeps GPU bytes",
+              ReadCachedTexel(name, context, again_id) ==
+                      std::vector<u32>{written} &&
+                  ReadCachedTexel(name, context, again_id,
+                                  {static_cast<int32_t>(width) - 1,
+                                   static_cast<int32_t>(height) - 1, 0}) ==
+                      std::vector<u32>{written},
+              "the rebound image started from stale guest bytes");
+      (void)TextureCacheTestAccess::SetPressureMark(cache, previous_pressure);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "pressure-retired fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "pressure-retired direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A shader writes a linear R32 float image (Ghost of Yotei's hi-Z pyramid), a
   // later pass samples the same memory as D32 depth, and the guest CPU reads
   // the bytes after the frame. The format swap replaces the cached image; the
@@ -62261,11 +62375,13 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
     vulkan.CheckTransientAliasReuse();
+    vulkan.CheckPressureRetiredContents();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--transient-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTransientAliasReuse();
+    vulkan.CheckPressureRetiredContents();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
