@@ -21588,6 +21588,17 @@ public:
                   !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
                   !uncompressed_depth.image_id,
               "a compression-disabled pass did not expand its pending HTile clear");
+      // Days Gone (PPSA28180): without a pending clear such a pass has nothing
+      // to expand (the host attachment is never compressed) and binds nothing.
+      registers.SetDepthRenderTarget(depth_only_target);
+      RenderDepthInfo expanded_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), expanded_depth);
+      Require(name, "compression-disabled pass without a pending clear",
+              !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
+                  !expanded_depth.image_id,
+              "a compression-disabled pass bound its depth target without a "
+              "pending HTile clear");
 
       // Captured DB_DEPTH_VIEW selects one layer of an 87-layer HTile target.
       auto high_slice_target = depth_only_target;
