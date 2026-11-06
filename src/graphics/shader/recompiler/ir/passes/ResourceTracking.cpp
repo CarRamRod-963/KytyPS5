@@ -304,7 +304,8 @@ private:
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
 		}
-		const auto cached = values.emplace(inst, UINT32_MAX).first;
+		// Recursive evaluation inserts more values; element references stay valid.
+		auto&      cached = values.emplace(inst, UINT32_MAX).first->second;
 		auto result = UINT32_MAX;
 		const auto arg = [&](uint32_t index) { return Evaluate(inst->Arg(index), current); };
 		switch (inst->GetOpcode()) {
@@ -352,10 +353,10 @@ private:
 		}
 		// Only unsupported values and cycles need free variables.
 		if (result == UINT32_MAX) {
-			if (cached->second == UINT32_MAX) cached->second = Unknown(value.GetType());
-			return cached->second;
+			if (cached == UINT32_MAX) cached = Unknown(value.GetType());
+			return cached;
 		}
-		cached->second = result;
+		cached = result;
 		return result;
 	}
 
@@ -368,11 +369,26 @@ private:
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
+	// One proof performs a few hundred thousand node lookups on large shaders.
+	struct KeyHash {
+		static size_t Mix(uint64_t seed, uint64_t value) {
+			return static_cast<size_t>((seed ^ value) * 0x9e3779b97f4a7c15ull + (seed >> 29u));
+		}
+		size_t operator()(const std::array<uint32_t, 3>& key) const {
+			return Mix(Mix(key[0], key[1]), key[2]);
+		}
+		size_t operator()(const std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>& key) const {
+			const auto [op, flags, left, right] = key;
+			return Mix(Mix(Mix(static_cast<uint64_t>(op), flags), left), right);
+		}
+	};
+
 	// Previous-iteration values, then current ones per incoming edge, kept across conditions.
-	std::array<std::map<const Inst*, uint32_t>, 3> m_values;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
-	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
-	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
+	std::array<std::unordered_map<const Inst*, uint32_t>, 3>       m_values;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, KeyHash> m_nodes_by_key;
+	std::unordered_map<std::array<uint32_t, 3>, uint32_t, KeyHash> m_choices;
+	std::unordered_map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t, KeyHash>
+	    m_predicates;
 };
 
 class Tracker {
