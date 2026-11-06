@@ -1647,6 +1647,23 @@ void TestEmptyScalarBufferSpecialization() {
           "a partly nonzero indirect descriptor was treated as unbound");
   }
   Check(empty != populated, "empty-to-populated scalar transition reused the folded specialization");
+  // Descriptor and SRT reads only plan resources: their memory info names no buffer of the
+  // specialization, so empty-buffer folding leaves them alone.
+  {
+    auto planning = make_fixture();
+    auto &block = *planning.program.blocks.front();
+    const auto index = static_cast<uint32_t>(planning.program.memory_info.size());
+    planning.program.memory_info.push_back(
+        {.kind = ResourceKind::ScalarBuffer, .resource = 0u, .planning_only = true});
+    const auto table = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+        {Value(0u), Value(0u), Value(0u), Value(0u)}));
+    auto &read = block.AppendNewInst(ValueOpcode::ReadConstBuffer, {table, Value(0u)});
+    read.SetFlags(MemoryFlags{.index = index});
+    auto &use = block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+    ApplyResourceSpecialization(planning.program, empty);
+    Check(use.Arg(0).Resolve().TryInstruction() == &read,
+          "empty scalar-table folding replaced a planning-only descriptor read");
+  }
   plan.info.buffers[0].scalar = false;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             !specialization.buffers[0].scalar_empty,
