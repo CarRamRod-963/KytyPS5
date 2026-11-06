@@ -3921,6 +3921,34 @@ public:
                 second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
             "a GDS release interrupt overtook an earlier interrupt");
 
+    // Interrupts of a context the guest has not read yet add to its count
+    // (fflags) instead of queuing an event each; another context still gets
+    // its own event.
+    for (uint32_t repeat = 0; repeat < 3u; ++repeat)
+      context.TriggerInterrupt(0x20, 0xb1u);
+    context.TriggerInterrupt(0x20, 0xb2u);
+    context.TriggerInterrupt(0x20, 0xb1u);
+    LibKernel::EventQueue::KernelEvent coalesced_event{};
+    LibKernel::EventQueue::KernelEvent other_context_event{};
+    int coalesced_count = 0;
+    int other_context_count = 0;
+    const auto coalesced_wait =
+        wait_for_interrupt(coalesced_event, coalesced_count);
+    const auto other_context_wait =
+        wait_for_interrupt(other_context_event, other_context_count);
+    interrupt_count = 0;
+    const auto coalesced_drained_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "unread interrupts coalesce per context",
+            coalesced_wait == 0 && coalesced_count == 1 &&
+                coalesced_event.data == 0xb1u && coalesced_event.fflags == 4u &&
+                other_context_wait == 0 && other_context_count == 1 &&
+                other_context_event.data == 0xb2u &&
+                other_context_event.fflags == 1u &&
+                coalesced_drained_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT,
+            "unread interrupts of one context queued separately or lost "
+            "their count");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
