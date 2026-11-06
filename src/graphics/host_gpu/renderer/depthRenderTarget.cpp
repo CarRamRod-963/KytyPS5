@@ -260,15 +260,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	const auto& sc          = hw.GetStencilControl();
 	const auto& sm          = hw.GetStencilMask();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const bool  depth_tested =
+	    dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
 	// With HTile, DEPTH_COMPRESS_DISABLE expands touched tiles even with depth/stencil tests off.
 	// PPSA32236 fast-clears HTile each frame, runs this pass, then samples the depth as raw memory.
 	// Unbound, the clear never lands: NaN depth makes one compute pass ~95 ms (60 -> 10 fps).
-	const bool depth_active = dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable ||
-	                          rc.copy_depth_to_color ||
-	                          (rc.depth_compress_disable && z.z_info.htile_acceleration);
-	const bool stencil_active =
-	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
-	if (!depth_active && !stencil_active) {
+	const bool expand_only = !depth_tested && !stencil_active && rc.depth_compress_disable &&
+	                         z.z_info.htile_acceleration;
+	if (!depth_tested && !stencil_active && !expand_only) {
 		return;
 	}
 	const bool attachment_unbound =
@@ -321,6 +322,17 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	} else {
 		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
+	// The host attachment is never compressed: such a pass only has a pending fast clear to
+	// expand. Days Gone (PPSA28180) runs several a frame without one, and binding their depth
+	// targets loses the device on NVIDIA ("3D WIDTH ZT Violation", then a TDR).
+	if (expand_only) {
+		const auto& metadata = r.desc.info.metadata;
+		if (metadata.kind != ImageMetadataKind::Htile ||
+		    !cache.IsMetaCleared(metadata.range.address, r.desc.view_info.base_layer)) {
+			r.image_id = {};
+			return;
+		}
 	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
