@@ -159,6 +159,9 @@ private:
 	void                      TouchImage(Image& image);
 	// Keeps an image an overlapping image displaced (Image::displaced).
 	void MarkDisplaced(ImageId id);
+	// Whether an image holds GPU-written contents guest memory does not have: such images
+	// are not deleted for memory pressure alone (the collector keeps or downloads them too).
+	[[nodiscard]] static bool HoldsGpuContents(const Image& image);
 	// Under memory pressure, frees displaced images oldest first until the pressure mark.
 	void                             ReleaseDisplaced(bool pressured);
 	void                      TrackImage(ImageId id);
