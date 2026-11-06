@@ -860,8 +860,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                            ? cached.tick_accessed_last
 	                            : std::max(cached.tick_accessed_last, cached.touched_tick);
 	const bool aged = m_gc_tick - std::min(m_gc_tick, last_frame) > NumFramesBeforeRemoval;
+	// Memory pressure alone does not delete an image the GPU wrote: on the console those bytes stay
+	// in memory, and the title may bind the image again after a surface over part of its memory
+	// (Saros' 64x64x64 translucency lighting volumes alias a 2304x1296 target bound over their
+	// tail; recreated from guest memory every frame, they lit dust particles with NaN). It stays
+	// displaced, as below the pressure mark, until it ages out; the collector keeps or downloads
+	// GPU-written images as before.
 	const bool safe_to_delete =
-	    (aged && unreferenced) || (displaceable && m_total_used_memory >= m_pressure_gc_memory);
+	    (aged && unreferenced) ||
+	    (displaceable && m_total_used_memory >= m_pressure_gc_memory && !HoldsGpuContents(cached));
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -978,6 +985,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	return {merged_id};
 }
 
+bool TextureCache::HoldsGpuContents(const Image& image) {
+	return image.IsGpuModified() && image.SafeToDownload();
+}
+
 void TextureCache::MarkDisplaced(ImageId id) {
 	auto& image     = m_slot_images[id];
 	image.displaced = true;
@@ -989,8 +1000,8 @@ void TextureCache::MarkDisplaced(ImageId id) {
 
 void TextureCache::ReleaseDisplaced(bool pressured) {
 	// Entries of images used again, deleted or replaced under a reused id are dropped. Under
-	// pressure the rest are freed oldest first: an overlapping image superseded their contents, so
-	// they are not downloaded (as when ResolveOverlap deletes one).
+	// pressure the rest are freed oldest first, except those holding GPU-written contents (see
+	// ResolveOverlap): an overlapping image superseded their contents, so they are not downloaded.
 	size_t kept = 0;
 	for (const auto& [id, serial]: m_displaced_images) {
 		auto* image = m_slot_images.try_get(id);
@@ -1002,7 +1013,7 @@ void TextureCache::ReleaseDisplaced(bool pressured) {
 			continue;
 		}
 		if (pressured && m_total_used_memory >= m_pressure_gc_memory && !image->depth_id &&
-		    image->heap_refs.load(std::memory_order_relaxed) == 0u) {
+		    !HoldsGpuContents(*image) && image->heap_refs.load(std::memory_order_relaxed) == 0u) {
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			continue;
