@@ -1392,9 +1392,15 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_p
 	m_bda_sync.Queue(begin, end - begin, at_ordering_point);
 }
 
-void BufferCache::NoteBdaOrderingPoint() {
-	// The flag belongs to the GPU thread, which also takes (only guest stores queue elsewhere).
-	m_bda_sync.NoteOrderingPoint();
+uint64_t BufferCache::BeginBdaStoreEpoch() {
+	std::lock_guard lock(m_bda_sync_mutex);
+	return m_bda_sync.BeginStoreEpoch();
+}
+
+void BufferCache::NoteBdaOrderingPoint(uint64_t epoch) {
+	// The ordered epoch belongs to the GPU thread, which also takes (only guest stores queue
+	// elsewhere).
+	m_bda_sync.NoteOrderingPoint(epoch);
 }
 
 void BufferCache::TakeBdaSync(BdaSyncDue& due) {
