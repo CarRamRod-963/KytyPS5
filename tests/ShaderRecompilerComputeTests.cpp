@@ -7301,6 +7301,61 @@ public:
     Require(name, "later epoch at the next submission",
             !cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
             "the next submission's ordering point did not release the store");
+    // A wait that passes on the value of the GPU's own label store, made after
+    // the waiting submission began its epoch, orders no guest store; a wait
+    // that passes on a value the guest stored orders every store.
+    {
+      auto &gpu = context.GetGpu();
+      alignas(8) uint32_t label = 0;
+      const auto label_address = reinterpret_cast<uint64_t>(&label);
+      for (const bool gpu_store : {true, false}) {
+        label = 0;
+        std::array<uint32_t, 7> wait{};
+        wait[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+        wait[1] = 0x10u | 3u;
+        wait[2] = static_cast<uint32_t>(label_address);
+        wait[3] = static_cast<uint32_t>(label_address >> 32u);
+        wait[4] = gpu_store ? 1u : 2u;
+        wait[5] = UINT32_MAX;
+        std::binary_semaphore entered{0};
+        std::binary_semaphore release{0};
+        gpu.SendCommand([&] {
+          entered.release();
+          release.acquire();
+        });
+        entered.acquire();
+        gpu.Submit(wait);
+        // The guest writes while the submission waits in the queue.
+        Require(name, "guest store before the wait",
+                context.HandleFault(PageFaultAccess::Write, guest_page),
+                "a guest write fault on mapped memory was not handled");
+        words[2 * TRACKER_PAGE_SIZE / sizeof(u32)] =
+            gpu_store ? 0x0badf00du : 0x600dcafeu;
+        if (gpu_store) {
+          context.DeliverLabel(&label, 1, sizeof(uint32_t), {}, 0);
+        } else {
+          label = 2;
+        }
+        release.release();
+        gpu.WaitForIdle();
+        gpu.SendCommandSync([&] { context.PrepareBda(); });
+        Require(
+            name,
+            gpu_store ? "wait on a GPU label store" : "wait on a guest store",
+            cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE) ==
+                gpu_store,
+            gpu_store
+                ? "a wait on the GPU's own label store released a guest store"
+                : "a wait on a guest-stored value did not release the stores "
+                  "before it");
+        if (gpu_store) {
+          gpu.SendCommandSync([&] {
+            context.NoteCommandOrderingPoint();
+            context.PrepareBda();
+          });
+        }
+      }
+    }
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
     context.PrepareBda();

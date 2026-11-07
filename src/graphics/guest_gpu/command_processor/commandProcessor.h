@@ -151,6 +151,9 @@ public:
 	void PlanLookahead(const Pm4Execution& execution, std::span<const uint32_t> commands);
 	// The command buffers of the submissions queued behind the running one on this processor's
 	// queue, in order, while it runs; they stay valid while queued. Empty between runs.
+	// The guest store epoch of the submission being processed (see BdaSyncQueue).
+	void SetStoreEpoch(uint64_t epoch) { m_store_epoch = epoch; }
+
 	void SetLookaheadQueue(std::span<const std::span<const uint32_t>> queued) {
 		m_lookahead_queued = queued;
 	}
@@ -227,6 +230,7 @@ private:
 	// The packet the last lookahead plan stopped at, if any.
 	const uint32_t* m_lookahead_stop   = nullptr;
 	bool            m_lookahead_active = false;
+	uint64_t        m_store_epoch      = 0;
 	// See SetLookaheadQueue; and the commands the scan may still plan in those submissions.
 	std::span<const std::span<const uint32_t>> m_lookahead_queued;
 	uint32_t                                   m_lookahead_budget = UINT32_MAX;

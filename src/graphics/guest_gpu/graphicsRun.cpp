@@ -247,7 +247,6 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
-	m_renderer.NoteCommandOrderingPoint();
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
@@ -268,12 +267,23 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		}
 		SettleLabelAccess(addr, sizeof(T));
 	}
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	const T observed = *addr;
+	// A wait on a value the GPU itself stored orders no guest store when the GPU stored it after
+	// this submission began (a pending label, as elided above, is stored later still): the GPU
+	// work that stored it ran after the stores its own submission ordered, and a guest store made
+	// after this submission, even of the same value, raced with that store on the console. Any
+	// other value may come from a guest store, which orders every store made before it.
+	const bool gpu_value =
+	    m_renderer.GetPendingLabels().StoredSince(reinterpret_cast<uint64_t>(addr), sizeof(T),
+	                                              static_cast<uint64_t>(observed), m_store_epoch);
+	if (!TestWaitRegMemValue(observed, ref, mask, func)) {
 		if (elide()) {
 			EmitGlobalBarrier();
 			return;
 		}
 		SuspendPm4(Common::GpuTiming::StallKind::WaitRegMem);
+	} else if (!gpu_value) {
+		m_renderer.NoteCommandOrderingPoint();
 	}
 }
 
@@ -565,6 +575,7 @@ bool GuestGpu::Process(Submission& submission) {
 	// A resumed submission orders nothing new: the wait it stopped at runs again and orders the
 	// stores it observes.
 	m_renderer.NoteCommandOrderingPoint(submission.store_epoch);
+	cp.SetStoreEpoch(submission.store_epoch);
 
 	cp.BufferInit();
 	bool complete = true;

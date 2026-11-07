@@ -134,9 +134,12 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
                                  Common::UniqueFunction<void>&& notify, uint64_t label_id) {
 	EXIT_IF(dst == nullptr || (size != sizeof(uint32_t) && size != sizeof(uint64_t)));
 	// The completion thread runs the publications of a submission's downloads before its
-	// labels, so whatever the label announces is already in guest memory.
+	// labels, so whatever the label announces is already in guest memory. The store epoch is read
+	// before the store: a wait of a submission of that epoch or earlier saw the store come later.
+	const auto epoch = m_buffer_cache.CurrentBdaStoreEpoch();
 	if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
 	    m_page_manager.TryWriteUnwatched(reinterpret_cast<uint64_t>(dst), &value, size)) {
+		m_pending_labels.NoteStoredValue(reinterpret_cast<uint64_t>(dst), size, value, epoch);
 		Common::GpuTiming::Sync().AddLabel(true);
 		if (label_id != 0) {
 			m_pending_labels.Stored(label_id);
@@ -151,6 +154,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
 	GetGpu().SendCommand([this, dst, value, size, label_id, notify = std::move(notify)]() mutable {
 		const auto vaddr = reinterpret_cast<uint64_t>(dst);
+		const auto epoch = m_buffer_cache.CurrentBdaStoreEpoch();
 		// A settled access may have stored the label, and later ones, already.
 		const auto store = [&] { return label_id == 0 || m_pending_labels.ShouldStore(label_id); };
 		// As upstream's RELEASE_MEM (2463e3aaf): a label beside GPU-written bytes goes to the
@@ -179,6 +183,9 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 					std::memcpy(dst, &value, sizeof(value));
 				}
 			}
+		}
+		if (store()) {
+			m_pending_labels.NoteStoredValue(vaddr, size, value, epoch);
 		}
 		if (label_id != 0) {
 			m_pending_labels.Stored(label_id);
@@ -263,6 +270,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
+		m_pending_labels.ForgetStored(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
