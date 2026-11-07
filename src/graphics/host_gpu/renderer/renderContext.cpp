@@ -279,8 +279,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::NoteCommandOrderingPoint() {
-	m_buffer_cache.NoteBdaOrderingPoint();
+uint64_t RenderContext::BeginGuestStoreEpoch() {
+	return m_buffer_cache.BeginBdaStoreEpoch();
+}
+
+void RenderContext::NoteCommandOrderingPoint(uint64_t epoch) {
+	m_buffer_cache.NoteBdaOrderingPoint(epoch);
 }
 
 void RenderContext::PrepareBda() {
