@@ -147,6 +147,10 @@ public:
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
 	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
 	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
+	// The newest epoch BeginBdaStoreEpoch returned (0 before the first). Safe from any thread.
+	[[nodiscard]] uint64_t CurrentBdaStoreEpoch() const noexcept {
+		return m_bda_store_epoch.load(std::memory_order_acquire);
+	}
 	// GPU thread: a submission starts or resumes, or the command processor waits for memory.
 	void                   NoteBdaOrderingPoint(uint64_t epoch = BdaSyncQueue::AllEpochs);
 	void                   TakeBdaSync(BdaSyncDue& due);
@@ -307,6 +311,7 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	BdaSyncQueue                                      m_bda_sync;
+	std::atomic<uint64_t>                             m_bda_store_epoch {0};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

@@ -145,12 +145,49 @@ void TestUnknownValue() {
 
 } // namespace
 
+void TestStoredValues() {
+  PendingLabels labels;
+  Check(!labels.StoredSince(0x1000, 4, 0, 0),
+        "a value nobody stored counted as the GPU's");
+  // The GPU stored 7 at 0x1000 in epoch 5.
+  labels.NoteStoredValue(0x1000, 4, 7, 5);
+  Check(labels.StoredSince(0x1000, 4, 7, 5) &&
+            labels.StoredSince(0x1000, 4, 7, 3),
+        "a GPU store made in or after the wait's epoch was not recognized");
+  Check(!labels.StoredSince(0x1000, 4, 7, 6),
+        "a GPU store made before the wait's submission counted as racing with "
+        "it");
+  Check(!labels.StoredSince(0x1000, 8, 7, 0),
+        "a wait of another width matched the store");
+  Check(!labels.StoredSince(0x1004, 4, 7, 0),
+        "a wait at another address matched the store");
+  // Another value: the bytes were written since, and stay unknown even if 7
+  // comes back.
+  Check(!labels.StoredSince(0x1000, 4, 9, 0),
+        "another value counted as the GPU's store");
+  Check(!labels.StoredSince(0x1000, 4, 7, 0),
+        "the record survived a different value being observed");
+  // A later GPU store replaces the record.
+  labels.NoteStoredValue(0x1000, 4, 7, 5);
+  labels.NoteStoredValue(0x1000, 4, 8, 6);
+  Check(labels.StoredSince(0x1000, 4, 8, 6),
+        "a later GPU store did not replace the earlier one");
+  Check(!labels.StoredSince(0x1000, 4, 7, 0),
+        "the earlier GPU store's value still matched");
+  // Unmapped memory forgets its stores.
+  labels.NoteStoredValue(0x2000, 8, 1, 2);
+  labels.ForgetStored(0x2000, 0x1000);
+  Check(!labels.StoredSince(0x2000, 8, 1, 0),
+        "an unmapped label kept its store");
+}
+
 int main() {
   TestElideAndStore();
   TestPartialAndNewest();
   TestStoreCompleted();
   TestPatchElided();
   TestUnknownValue();
+  TestStoredValues();
   std::printf("PendingLabelsTests: ok\n");
   return 0;
 }
