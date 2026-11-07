@@ -1394,7 +1394,9 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_p
 
 uint64_t BufferCache::BeginBdaStoreEpoch() {
 	std::lock_guard lock(m_bda_sync_mutex);
-	return m_bda_sync.BeginStoreEpoch();
+	const auto      epoch = m_bda_sync.BeginStoreEpoch();
+	m_bda_store_epoch.store(epoch, std::memory_order_release);
+	return epoch;
 }
 
 void BufferCache::NoteBdaOrderingPoint(uint64_t epoch) {
