@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -161,6 +162,40 @@ public:
 		return m_labels.size();
 	}
 
+	// A label the GPU stored to guest memory, in the guest store epoch current before the store
+	// (see BdaSyncQueue). Replaces the record of the same bytes.
+	void NoteStoredValue(uint64_t address, uint32_t size, uint64_t value, uint64_t epoch) {
+		std::lock_guard lock(m_mutex);
+		m_stored[address] = {value, epoch, size};
+	}
+
+	// Whether `size` bytes at `address`, read as `observed`, are the value of the GPU's last label
+	// store there, made in store epoch `epoch` or later. A wait of a submission of `epoch` that
+	// observes such a value orders no guest store: on the console it may pass on the GPU's store,
+	// which a guest store made before the submission (to reset the label, say) precedes. A value
+	// other than the stored one drops the record: the bytes were written since.
+	[[nodiscard]] bool StoredSince(uint64_t address, uint32_t size, uint64_t observed,
+	                               uint64_t epoch) {
+		std::lock_guard lock(m_mutex);
+		const auto      it = m_stored.find(address);
+		if (it == m_stored.end()) {
+			return false;
+		}
+		if (it->second.size != size || it->second.value != observed) {
+			m_stored.erase(it);
+			return false;
+		}
+		return it->second.epoch >= epoch;
+	}
+
+	// Forgets the label stores of unmapped memory.
+	void ForgetStored(uint64_t address, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		const auto      begin = m_stored.lower_bound(address > 7 ? address - 7 : 0);
+		const auto      end   = m_stored.lower_bound(address + size);
+		m_stored.erase(begin, end);
+	}
+
 private:
 	static bool Overlaps(const Label& label, uint64_t address, uint64_t size) noexcept {
 		return address < label.address + label.size && label.address < address + size;
@@ -186,10 +221,17 @@ private:
 		return nullptr;
 	}
 
-	mutable std::mutex    m_mutex;
-	std::vector<Label>    m_labels;
-	uint64_t              m_last_id = 0;
-	std::atomic<uint32_t> m_elided {0};
+	struct StoredValue {
+		uint64_t value = 0;
+		uint64_t epoch = 0;
+		uint32_t size  = 0;
+	};
+
+	mutable std::mutex              m_mutex;
+	std::vector<Label>              m_labels;
+	std::map<uint64_t, StoredValue> m_stored;
+	uint64_t                        m_last_id = 0;
+	std::atomic<uint32_t>           m_elided {0};
 };
 
 } // namespace Libs::Graphics
