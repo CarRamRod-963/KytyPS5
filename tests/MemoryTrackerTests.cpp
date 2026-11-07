@@ -531,6 +531,115 @@ void TestBdaSyncQueueModel() {
         "a range queued during exchanging Takes was lost or taken twice");
 }
 
+// Guest stores are kept by store epoch: an ordering point of a submission
+// releases only the stores queued before the submission began its epoch; a
+// point of every epoch (a wait) releases all of them.
+void TestBdaSyncQueueEpochs() {
+  using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
+  Libs::Graphics::BdaSyncQueue queue;
+  Check(Take(queue).empty(), "an empty BDA queue took a range");
+  queue.Queue(0x1000, 0x1000, true);
+  const uint64_t first = queue.BeginStoreEpoch();
+  // Written after the submission: the guest prepares the next one.
+  queue.Queue(0x3000, 0x1000, true);
+  const uint64_t second = queue.BeginStoreEpoch();
+  queue.Queue(0x5000, 0x1000, true);
+  queue.Queue(0x8000, 0x1000, false);
+  queue.NoteOrderingPoint(first);
+  Check(Take(queue) == Ranges_t{{0x1000, 0x2000}, {0x8000, 0x9000}},
+        "a submission's ordering point did not release exactly the stores "
+        "queued before it");
+  Check(Take(queue).empty(),
+        "stores of later epochs were taken without an ordering point");
+  // An older point releases nothing new; the next submission's point releases
+  // the stores before it.
+  queue.NoteOrderingPoint(first);
+  Check(Take(queue).empty(), "a repeated ordering point released later stores");
+  queue.NoteOrderingPoint(second);
+  Check(Take(queue) == Ranges_t{{0x3000, 0x4000}},
+        "the second submission's point did not release the store before it");
+  // A store of an epoch an earlier take already passed is still released by
+  // the next point that orders it.
+  queue.Queue(0x2000, 0x1000, true);
+  queue.NoteOrderingPoint();
+  queue.Queue(0x6000, 0x1000, true);
+  Check(Take(queue) == Ranges_t{{0x2000, 0x3000}, {0x5000, 0x7000}},
+        "an ordering point of every epoch did not release every store");
+  Check(Take(queue).empty(), "a store was taken twice");
+
+  // Model: every store carries its epoch; a take releases the next-access
+  // ranges and the stores of the epochs below the highest point since the
+  // previous take.
+  struct Model {
+    RangeSet next_access;
+    std::vector<std::pair<uint64_t, RangeSet>> stores;
+    uint64_t epoch = 0;
+    uint64_t ordered = UINT64_MAX;
+    Ranges_t Take() {
+      RangeSet taken;
+      next_access.ForEach(
+          [&](uint64_t begin, uint64_t end) { taken.Add(begin, end - begin); });
+      next_access.Clear();
+      for (auto it = stores.begin(); it != stores.end();) {
+        if (it->first < ordered) {
+          it->second.ForEach([&](uint64_t begin, uint64_t end) {
+            taken.Add(begin, end - begin);
+          });
+          it = stores.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      ordered = 0;
+      return Ranges(taken);
+    }
+  };
+  Model model;
+  Libs::Graphics::BdaSyncQueue checked;
+  Libs::Graphics::BdaSyncDue due;
+  std::vector<uint64_t> epochs{0};
+  TestRandom random{0x9e3779b9u};
+  for (int i = 0; i < 40000; i++) {
+    const auto op = random() % 16u;
+    if (op < 7) {
+      const uint64_t address = uint64_t{1 + random() % 64u} << 12u;
+      const uint64_t size = uint64_t{1 + random() % 4u} << 12u;
+      const bool at_point = op != 0;
+      checked.Queue(address, size, at_point);
+      if (!at_point) {
+        model.next_access.Add(address, size);
+      } else {
+        if (model.stores.empty() || model.stores.back().first != model.epoch) {
+          model.stores.emplace_back(model.epoch, RangeSet{});
+        }
+        model.stores.back().second.Add(address, size);
+      }
+    } else if (op < 9) {
+      const auto epoch = checked.BeginStoreEpoch();
+      model.epoch++;
+      Check(epoch == model.epoch, "store epochs are not consecutive");
+      epochs.push_back(epoch);
+    } else if (op < 11) {
+      // A submission's first command: any epoch handed out so far.
+      const auto epoch = epochs[random() % epochs.size()];
+      checked.NoteOrderingPoint(epoch);
+      model.ordered = std::max(model.ordered, epoch);
+    } else if (op == 11) {
+      checked.NoteOrderingPoint();
+      model.ordered = UINT64_MAX;
+    } else {
+      checked.Take(due);
+      Ranges_t taken;
+      due.ForEach([&](uint64_t begin, uint64_t end) {
+        taken.emplace_back(begin, end);
+      });
+      due.Clear();
+      Check(taken == model.Take(),
+            "a BDA synchronization took other ranges than the epoch model");
+    }
+  }
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -1781,6 +1890,7 @@ int main(int argc, char **argv) {
   TestRangeSetCursor();
   TestBdaSyncQueue();
   TestBdaSyncQueueModel();
+  TestBdaSyncQueueEpochs();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

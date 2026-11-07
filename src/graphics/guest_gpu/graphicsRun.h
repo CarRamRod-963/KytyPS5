@@ -66,6 +66,7 @@ private:
 		bool                      blocked         = false;
 		uint64_t                  blocked_writes  = 0; // m_memory_writes before it ran.
 		uint64_t                  flip_request_id = 0;
+		uint64_t                  store_epoch     = 0; // Orders the guest stores before Enqueue.
 	};
 
 	void              Enqueue(Submission submission);

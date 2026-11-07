@@ -145,8 +145,10 @@ public:
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);
+	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
+	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
 	// GPU thread: a submission starts or resumes, or the command processor waits for memory.
-	void                   NoteBdaOrderingPoint();
+	void                   NoteBdaOrderingPoint(uint64_t epoch = BdaSyncQueue::AllEpochs);
 	void                   TakeBdaSync(BdaSyncDue& due);
 	void               RunGarbageCollector();
 	// Called before every submission on the GPU thread: records downloads of the hot read-back

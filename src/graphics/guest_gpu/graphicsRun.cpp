@@ -407,6 +407,9 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 }
 
 void GuestGpu::Enqueue(Submission submission) {
+	// Guest stores made before the submission are ordered by its first command, later ones by a
+	// later submission or a wait.
+	submission.store_epoch = m_renderer.BeginGuestStoreEpoch();
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -559,7 +562,9 @@ void GuestGpu::NotifyMemoryWritten() {
 
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
-	m_renderer.NoteCommandOrderingPoint();
+	// A resumed submission orders nothing new: the wait it stopped at runs again and orders the
+	// stores it observes.
+	m_renderer.NoteCommandOrderingPoint(submission.store_epoch);
 
 	cp.BufferInit();
 	bool complete = true;
