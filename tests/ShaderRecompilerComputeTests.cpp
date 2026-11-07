@@ -7284,6 +7284,23 @@ public:
     Require(name, "guest store at ordering point",
             !cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
             "an ordering point did not release a guest store");
+    // A store made after a submission began its store epoch is not ordered by
+    // that submission's first command, only by a later submission (or a wait).
+    const auto submitted = context.BeginGuestStoreEpoch();
+    Require(name, "guest store after the submission",
+            context.HandleFault(PageFaultAccess::Write, guest_page),
+            "a guest write fault on mapped memory was not handled");
+    words[2 * TRACKER_PAGE_SIZE / sizeof(u32)] = 0x13579bdfu;
+    context.NoteCommandOrderingPoint(submitted);
+    context.PrepareBda();
+    Require(name, "later epoch deferred",
+            cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "a submission's ordering point released a store made after it");
+    context.NoteCommandOrderingPoint(context.BeginGuestStoreEpoch());
+    context.PrepareBda();
+    Require(name, "later epoch at the next submission",
+            !cache.IsRegionCpuModified(guest_page, TRACKER_PAGE_SIZE),
+            "the next submission's ordering point did not release the store");
     context.UnmapMemory(base + 2 * page, page);
     words[2 * page / sizeof(u32)] = 0xfedcba98u;
     context.PrepareBda();
