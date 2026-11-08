@@ -631,6 +631,46 @@ void TestResourceLookahead() {
   lookahead.Plan(&stream, &commands[3], plan_a, inputs);
   Check(lookahead.TakeStats().kept == 0u,
         "a job of an earlier run was kept after the kick");
+
+  // A program whose walks the owner could not take MissLimit times in a row is
+  // planned only every ProbeInterval-th time; a walk of it taken again plans it
+  // every time.
+  lookahead.BeginRun(&stream);
+  lookahead.Kick();
+  (void)lookahead.TakeStats();
+  for (uint32_t miss = 0; miss < LookaheadPlan::MissLimit; ++miss) {
+    planned({{&commands[0], plan_a.get()}});
+    first[2]++;
+    Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Moved,
+          "a walk whose guest bytes changed was adopted");
+  }
+  const auto missed = lookahead.TakeStats();
+  Check(missed.planned == LookaheadPlan::MissLimit && missed.skipped == 0u,
+        "a program was skipped before it missed MissLimit walks");
+  for (uint32_t skip = 1; skip < LookaheadPlan::ProbeInterval; ++skip) {
+    planned({{&commands[0], plan_a.get()}});
+    Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::NotPlanned,
+          "a program that keeps missing was planned");
+  }
+  // The other program of the command is still planned.
+  planned({{&commands[0], plan_b.get()}});
+  Check(adopt(&commands[0], plan_b.get(), inputs) == Outcome::Adopted,
+        "a program was skipped for another program's misses");
+  const auto skipped = lookahead.TakeStats();
+  Check(skipped.skipped == LookaheadPlan::ProbeInterval - 1u &&
+            skipped.planned == 1u,
+        "the skipped walks were not counted");
+  planned({{&commands[0], plan_a.get()}});
+  Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Adopted,
+        "the probe walk of a skipped program was not planned or adopted");
+  for (uint32_t round = 0; round < 2u; ++round) {
+    planned({{&commands[0], plan_a.get()}});
+    Check(adopt(&commands[0], plan_a.get(), inputs) == Outcome::Adopted,
+          "a program whose walk was taken again stayed skipped");
+  }
+  const auto resumed = lookahead.TakeStats();
+  Check(resumed.planned == 3u && resumed.skipped == 0u,
+        "a program whose walk was taken again was not planned every time");
 }
 
 // The owner's in-place check (LookaheadMemory::same) of a walk whose two reads

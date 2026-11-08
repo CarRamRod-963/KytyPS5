@@ -2680,12 +2680,14 @@ void PipelineCache::KickLookahead() {
 			return static_cast<unsigned long long>(stats.outcomes[static_cast<size_t>(outcome)]);
 		};
 		LOGF("Lookahead: %u helpers, %llu planned, adopted %llu, not planned %llu, changed %llu, "
-		     "late %llu, failed %llu, dirty %llu, moved %llu, heap %llu, kept %llu (10 s)\n",
+		     "late %llu, failed %llu, dirty %llu, moved %llu, heap %llu, kept %llu, skipped %llu "
+		     "(10 s)\n",
 		     programs.lookahead->HelperCount(), static_cast<unsigned long long>(stats.planned),
 		     count(Outcome::Adopted), count(Outcome::NotPlanned), count(Outcome::Changed),
 		     count(Outcome::Late), count(Outcome::Failed), count(Outcome::Dirty),
 		     count(Outcome::Moved), count(Outcome::Heap),
-		     static_cast<unsigned long long>(stats.kept));
+		     static_cast<unsigned long long>(stats.kept),
+		     static_cast<unsigned long long>(stats.skipped));
 	} else {
 		(void)programs.lookahead->TakeStats();
 	}
