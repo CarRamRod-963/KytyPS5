@@ -231,6 +231,10 @@ void ResourceLookahead::Plan(const void* stream_key, const void* command,
 			return;
 		}
 	}
+	if (!plan->ShouldPlan()) {
+		m_stats.skipped++;
+		return;
+	}
 	auto* job         = NewJob();
 	job->command      = command;
 	job->inputs       = inputs;
@@ -394,16 +398,20 @@ ResourceLookahead::TryAdopt(const void* stream_key, const void* command, const L
 		std::swap(stream.jobs[found], stream.jobs[stream.next]);
 		stream.next++;
 		Retire(job);
-		if (!(job->inputs == inputs)) return Outcome::Changed;
-		const auto state = job->state.load(std::memory_order_acquire);
-		if (state == State::Queued || state == State::Running) return Outcome::Late;
-		if (state != State::Done) return Outcome::Failed;
-		Outcome result = Outcome::Adopted;
-		if (!Unchanged(*job, result)) return result;
-		if (!job->heap_uses.empty() && !SameHeapViews(*job)) return Outcome::Heap;
-		std::swap(snapshot, job->snapshot);
-		std::swap(specialization, job->specialization);
-		return Outcome::Adopted;
+		const auto result = [&] {
+			if (!(job->inputs == inputs)) return Outcome::Changed;
+			const auto state = job->state.load(std::memory_order_acquire);
+			if (state == State::Queued || state == State::Running) return Outcome::Late;
+			if (state != State::Done) return Outcome::Failed;
+			Outcome checked = Outcome::Adopted;
+			if (!Unchanged(*job, checked)) return checked;
+			if (!job->heap_uses.empty() && !SameHeapViews(*job)) return Outcome::Heap;
+			std::swap(snapshot, job->snapshot);
+			std::swap(specialization, job->specialization);
+			return Outcome::Adopted;
+		}();
+		job->plan->NoteOutcome(result == Outcome::Adopted);
+		return result;
 	}();
 	m_stats.outcomes[static_cast<size_t>(outcome)]++;
 	return outcome;
