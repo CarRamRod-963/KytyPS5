@@ -47,9 +47,30 @@ public:
 	[[nodiscard]] const ShaderRecompiler::IR::ResourcePlan* Get() const { return m_job->Plan(); }
 	[[nodiscard]] uint32_t                                  Helper() const { return m_helper; }
 
+	// Owner thread: whether a new walk of this program is worth planning. A program whose last
+	// MissLimit walks the owner could not take (the helper was late, the walk failed, or the
+	// bytes it read changed) is walked by the owner anyway, so it is planned only every
+	// ProbeInterval-th time until a walk of it is taken again.
+	static constexpr uint32_t MissLimit     = 8;
+	static constexpr uint32_t ProbeInterval = 16;
+	[[nodiscard]] bool        ShouldPlan() {
+		return m_misses < MissLimit || ++m_skipped % ProbeInterval == 0;
+	}
+	// Owner thread: the owner took (true) or could not take (false) a walk of this program.
+	void NoteOutcome(bool adopted) {
+		if (adopted) {
+			m_misses  = 0;
+			m_skipped = 0;
+		} else if (m_misses < MissLimit) {
+			m_misses++;
+		}
+	}
+
 private:
 	std::shared_ptr<SrtWalkerCompileQueue::Job> m_job;
 	uint32_t                                    m_helper;
+	uint32_t                                    m_misses  = 0;
+	uint32_t                                    m_skipped = 0;
 };
 
 // Guest memory as the walks see it.
@@ -116,11 +137,14 @@ public:
 	                 ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
 	                 ShaderRecompiler::IR::ResourceSpecialization& specialization);
 
-	// Owner thread: outcomes, planned jobs (new walks) and jobs a new run kept since the last call.
+	// Owner thread: outcomes, planned jobs (new walks), jobs a new run kept and walks not planned
+	// for a program whose walks the owner keeps missing (LookaheadPlan::ShouldPlan) since the
+	// last call.
 	struct Stats {
 		std::array<uint64_t, static_cast<size_t>(Outcome::Count)> outcomes {};
 		uint64_t                                                  planned = 0;
 		uint64_t                                                  kept    = 0;
+		uint64_t                                                  skipped = 0;
 	};
 	Stats TakeStats();
 
