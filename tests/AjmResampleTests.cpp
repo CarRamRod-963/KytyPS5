@@ -7,6 +7,15 @@
 #include <opus.h>
 #include <opus_multistream.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 using namespace Libs::Audio::Ajm;
 
 namespace {
@@ -413,11 +422,77 @@ void UndecodableAt9FrameIsSilent() {
 	      "an unpackable ATRAC9 frame plays as silence");
 }
 
+// Input that ends right before an inaccessible page, as an exact-size heap buffer can.
+class GuardedInput {
+public:
+	explicit GuardedInput(size_t size) {
+#if defined(_WIN32)
+		m_base = static_cast<uint8_t*>(
+		    VirtualAlloc(nullptr, 2 * PageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+		DWORD old_protect = 0;
+		Check(m_base != nullptr &&
+		          VirtualProtect(m_base + PageSize, PageSize, PAGE_NOACCESS, &old_protect) != 0,
+		      "allocate a guarded input page");
+#else
+		void* base = mmap(nullptr, 2 * PageSize, PROT_READ | PROT_WRITE,
+		                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		Check(base != MAP_FAILED && mprotect(static_cast<uint8_t*>(base) + PageSize, PageSize,
+		                                     PROT_NONE) == 0,
+		      "allocate a guarded input page");
+		m_base = static_cast<uint8_t*>(base);
+#endif
+		Check(size <= PageSize, "guarded input fits a page");
+		m_data = m_base + PageSize - size;
+	}
+	~GuardedInput() {
+#if defined(_WIN32)
+		VirtualFree(m_base, 0, MEM_RELEASE);
+#else
+		munmap(m_base, 2 * PageSize);
+#endif
+	}
+	GuardedInput(const GuardedInput&)            = delete;
+	GuardedInput& operator=(const GuardedInput&) = delete;
+
+	[[nodiscard]] uint8_t* Data() const { return m_data; }
+
+private:
+	static constexpr size_t PageSize = 4096;
+	uint8_t*                m_base   = nullptr;
+	uint8_t*                m_data   = nullptr;
+};
+
+// LibAtrac9 takes no input size and reads past the bits a frame uses, far past them for a frame it
+// cannot unpack. A split decode job copies its input into an exact-size buffer; Saros' 320-byte
+// job once ended at an unmapped page and the decoder faulted reading its 321st byte. Frames of
+// noise in 48 kHz mono 64-byte superframes end at such a page here (the fourth read past it;
+// later ones reach a LibAtrac9 band-extension overrun of noise, unrelated to the input size).
+void At9FramesReadOnlyTheirInput() {
+	AjmAt9Decoder decoder(1, 48000, AjmSampleEncoding::S16, 0);
+	const AjmDecAt9InitializeParameters parameters {{0xfe, 0x70, 0x07, 0xe0}, 0};
+	Check(decoder.Initialize(&parameters, sizeof(parameters)).result == OK,
+	      "initialize mono ATRAC9");
+	GuardedInput         input(64);
+	std::vector<uint8_t> output(256 * sizeof(int16_t));
+	uint32_t             seed = 0x12345678u;
+	for (int frame = 0; frame < 8; frame++) {
+		for (size_t i = 0; i < 64; i++) {
+			seed           = seed * 1664525u + 1013904223u;
+			input.Data()[i] = static_cast<uint8_t>(seed >> 24u);
+		}
+		const auto result =
+		    decoder.Decode(input.Data(), 64, output.data(), output.size(), true, nullptr);
+		Check(result.frames <= 1 && result.input_consumed <= 64,
+		      "a noise ATRAC9 frame takes at most its superframe");
+	}
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 	Mp3ParseFrame();
 	UndecodableAt9FrameIsSilent();
+	At9FramesReadOnlyTheirInput();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);
