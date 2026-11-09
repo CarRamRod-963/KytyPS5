@@ -27324,6 +27324,55 @@ public:
           return out.str();
         };
         compare(family_label("detile bytes").c_str(), cpu, gpu);
+        if (family.family != TileBlockFamily::Depth64KB) {
+          // The same texels detiled straight into an image of that texel size.
+          constexpr vk::Format formats[] = {
+              vk::Format::eR8Unorm, vk::Format::eR16Sfloat,
+              vk::Format::eR8G8B8A8Unorm, vk::Format::eR16G16B16A16Sfloat,
+              vk::Format::eR32G32B32A32Sfloat};
+          auto image_info = info;
+          image_info.pixel_format = formats[std::countr_zero(bpe)];
+          image_info.samples = 1;
+          image_info.pitch = pitch;
+          image_info.data.address = 0x10000000;
+          Libs::Graphics::Image image(m_runtime_context, scheduler, image_info);
+          auto input =
+              CreateHostBuffer(name, align_dword(storage_size), AllFlags,
+                               to_dwords(tiled, align_dword(storage_size)));
+          const uint64_t linear_size = image_info.LinearSize();
+          auto output = CreateHostBuffer(
+              name, align_dword(linear_size), AllFlags,
+              std::vector<u32>(
+                  static_cast<size_t>(align_dword(linear_size) / 4u),
+                  0xabababab));
+          Require(name, family_label("detile into image").c_str(),
+                  tile_manager.DetileIntoImage(input.buffer, 0, image),
+                  "a plain color image was not detiled directly");
+          const auto copies = image_info.BufferCopies(0);
+          image.Download(copies, output.buffer, 0, linear_size);
+          host_barrier(output.buffer, align_dword(linear_size),
+                       vk::PipelineStageFlagBits::eTransfer,
+                       vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          const auto observed = read_bytes(output, linear_size);
+          const uint64_t row_bytes = uint64_t{pitch} * bpe;
+          const u32 slices =
+              image_info.IsVolume() ? depth : image_info.resources.layers;
+          bool equal = true;
+          for (u32 z = 0; z < slices && equal; z++) {
+            for (u32 y = 0; y < height && equal; y++) {
+              const uint64_t row = (uint64_t{z} * height + y) * row_bytes;
+              equal = std::equal(cpu.begin() + row,
+                                 cpu.begin() + row + uint64_t{width} * bpe,
+                                 observed.begin() + row);
+            }
+          }
+          Require(
+              name, family_label("image texels").c_str(), equal,
+              "texels detiled into the image differ from the linear detile");
+          DestroyBuffer(&output);
+          DestroyBuffer(&input);
+        }
 
         {
           std::vector<uint8_t> linear(storage_size);
