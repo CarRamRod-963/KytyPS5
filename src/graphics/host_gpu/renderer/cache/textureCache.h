@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -328,6 +329,11 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick                 = 0;
+	// Registered images and their accounted bytes, and the garbage collector's report state.
+	uint64_t                              m_image_count    = 0;
+	uint64_t                              m_image_bytes    = 0;
+	uint64_t                              m_gc_evicted     = 0;
+	std::chrono::steady_clock::time_point m_gc_last_report = {};
 	bool     m_readback_linear_images  = false;
 	bool     m_readback_tiled_images   = false;
 	bool     m_readback_storage_images = false;

@@ -283,6 +283,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_image_bytes += image.AccountedSize();
+	m_image_count++;
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -303,7 +305,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 		entries.erase(entry);
 	});
 	m_lru_cache.Free(image.lru_id);
-	m_total_used_memory -= image.AccountedSize();
+	const auto accounted = image.AccountedSize();
+	m_total_used_memory -= accounted;
+	m_image_bytes -= accounted;
+	m_image_count--;
 	image.registered = false;
 }
 
@@ -2255,6 +2260,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	size_t evicted = 0;
 	const auto collect = [&](bool allow_aggressive) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -2291,6 +2297,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			FreeImage(id);
+			evicted++;
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2305,6 +2312,20 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	m_gc_evicted += evicted;
+	if (m_total_used_memory >= m_pressure_gc_memory) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_gc_last_report >= std::chrono::seconds(30)) {
+			m_gc_last_report       = now;
+			constexpr uint64_t MiB = 1024ull * 1024;
+			LOGF("TextureCache: device memory %" PRIu64 " MiB (pressure %" PRIu64
+			     " MiB, critical %" PRIu64 " MiB), %" PRIu64 " images of %" PRIu64 " MiB, %" PRIu64
+			     " evicted since the last report\n",
+			     m_total_used_memory / MiB, m_pressure_gc_memory / MiB, m_critical_gc_memory / MiB,
+			     m_image_count, m_image_bytes / MiB, m_gc_evicted);
+			m_gc_evicted = 0;
+		}
 	}
 }
 
