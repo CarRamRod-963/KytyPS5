@@ -360,6 +360,8 @@ private:
 		SetFormat(static_cast<uint32_t>(m_codec_info.channels),
 		          static_cast<uint32_t>(m_codec_info.samplingRate), m_sample_encoding);
 		m_pcm_buffer.assign(FrameOutputBytes(), 0);
+		m_frame_input.assign(static_cast<size_t>(m_codec_info.superframeSize) + FrameReadSlack, 0);
+		m_frame_input_size = 0;
 		m_stream_pcm.resize(m_streams.size() > 1
 		                        ? m_codec_info.frameSamples * AjmBytesPerSample(m_sample_encoding)
 		                        : 0);
@@ -436,7 +438,7 @@ private:
 	bool NextFrame(const uint8_t* input, size_t remaining_input, int* bytes_used,
 	               AjmDecodeResult* result) {
 		if (m_lost_frames == 0) {
-			const int ret = DecodeFrame(input, bytes_used);
+			const int ret = DecodeFrame(CopyFrameInput(input), bytes_used);
 			if (ret == 0 && *bytes_used > 0 &&
 			    static_cast<uint32_t>(*bytes_used) <= m_superframe_bytes_remain) {
 				return true;
@@ -463,6 +465,21 @@ private:
 			RestartStreams();
 		}
 		return true;
+	}
+
+	// LibAtrac9 takes no input size. Its bit reader loads up to four bytes at a time, three past
+	// the last bit a frame uses, and a frame it cannot unpack reads as far as its header fields
+	// say. Frames are decoded from a copy of their superframe's remaining bytes followed by zeros,
+	// so neither reads past the job's input (an exact-size buffer can end at an unmapped page).
+	const uint8_t* CopyFrameInput(const uint8_t* input) {
+		const size_t size = m_superframe_bytes_remain;
+		EXIT_IF(size + FrameReadSlack > m_frame_input.size());
+		std::memcpy(m_frame_input.data(), input, size);
+		if (size < m_frame_input_size) {
+			std::memset(m_frame_input.data() + size, 0, m_frame_input_size - size);
+		}
+		m_frame_input_size = size;
+		return m_frame_input.data();
 	}
 
 	void RestartStreams() {
@@ -669,6 +686,11 @@ private:
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
 	std::vector<uint8_t> m_stream_pcm;
+	// Bytes one LibAtrac9 frame can read past its start: at most 8 channels of 256 coefficients of
+	// 16 + 28 bits (precision and fine precision), their scale factors and the headers, < 13 KiB.
+	static constexpr size_t FrameReadSlack = 16 * 1024;
+	std::vector<uint8_t>    m_frame_input;          // Superframe bytes left + FrameReadSlack zeros.
+	size_t                  m_frame_input_size = 0; // Bytes of m_frame_input not known to be zero.
 };
 
 } // namespace Libs::Audio::Ajm
