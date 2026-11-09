@@ -1490,7 +1490,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->program->info.uses_dma;
+		uses_dma |= stage->runtime->program->info.ReadsMemoryByAddress();
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
 	if (uses_dma) {
