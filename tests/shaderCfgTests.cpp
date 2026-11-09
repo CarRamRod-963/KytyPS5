@@ -8314,6 +8314,9 @@ void TestMeshExportStorage() {
           "mesh shader did not retain its user-data placement and buffer offset");
     Check(!result.program.info.uses_dma && result.program.info.uses_device_address,
           "mesh index fetch used the guest address domain");
+    // Its draws stay ordering points for the guest stores queued for BDA uploads.
+    Check(result.program.info.ReadsMemoryByAddress(),
+          "mesh index fetch by device address does not read memory by address");
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
     Check(reg != result.program.info.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
