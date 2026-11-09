@@ -443,7 +443,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	PreparedBindings* descriptor_stage = &bindings;
 	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
-	if (program.info.uses_dma) {
+	if (program.info.ReadsMemoryByAddress()) {
 		m_context.PrepareBda();
 	}
 	if (program.info.uses_image_heap) {
@@ -592,7 +592,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
-	if (program.info.uses_dma) {
+	if (program.info.ReadsMemoryByAddress()) {
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);

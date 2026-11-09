@@ -613,6 +613,11 @@ struct ShaderInfo {
 	bool                            float64                       = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
+
+	// Whether the shader reads guest memory by address: through the BDA page table or through a
+	// cached buffer's device address (mesh index fetches). Its draws and dispatches are ordering
+	// points that upload the guest stores queued for BDA buffers (BufferCache::SynchronizeBda).
+	[[nodiscard]] bool ReadsMemoryByAddress() const { return uses_dma || uses_device_address; }
 };
 
 struct DescriptorSource {
