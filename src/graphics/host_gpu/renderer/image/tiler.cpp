@@ -903,7 +903,8 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	    .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	// Binds a pipeline of its own, so the next guest dispatch binds its pipeline again.
+	auto command = m_scheduler.Current().PipelineHandle();
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);

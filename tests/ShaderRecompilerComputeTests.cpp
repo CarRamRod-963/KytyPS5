@@ -7706,6 +7706,104 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // TileManager::CheckColorClear leaves no pipeline of its own bound for a
+  // guest dispatch that still believes its pipeline is bound.
+  void CheckColorClearCheck() {
+    constexpr const char *name = "ColorClearCheck";
+    EnsureRuntimeContext();
+    using GpuBuffer = ::Libs::Graphics::Buffer;
+    RenderContext context(m_runtime_context);
+    auto &graphics = context.GetGraphics();
+    auto &scheduler = context.GetCommandScheduler();
+    auto &tiler = TextureCacheTestAccess::Tiler(context.GetTextureCache());
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    constexpr auto flags =
+        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    constexpr uint64_t slice_bytes = 4096;
+    GpuBuffer metadata(graphics, scheduler, MemoryUsage::Upload, 0, flags,
+                       slice_bytes);
+    std::memset(metadata.Mapped().data(), 0, slice_bytes);
+    metadata.Flush(0, slice_bytes);
+    GpuBuffer marker(graphics, scheduler, MemoryUsage::DeviceLocal, 0, flags,
+                     16);
+    scheduler.Current().Handle().fillBuffer(marker.Handle(), 0, VK_WHOLE_SIZE,
+                                            0);
+
+    // The guest stand-in: stores a pushed word at a pushed address.
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+    module_info.codeSize = sizeof(GPU_TEST_STORE_WORD_SPV);
+    module_info.pCode = GPU_TEST_STORE_WORD_SPV;
+    vk::ShaderModule store_module = nullptr;
+    RequireVk(name, "guest",
+              m_device.createShaderModule(&module_info, nullptr, &store_module),
+              "vkCreateShaderModule");
+    const vk::PushConstantRange store_push{vk::ShaderStageFlagBits::eCompute, 0,
+                                           3 * sizeof(uint32_t)};
+    vk::PipelineLayoutCreateInfo store_layout_info{};
+    store_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    store_layout_info.pushConstantRangeCount = 1;
+    store_layout_info.pPushConstantRanges = &store_push;
+    vk::PipelineLayout store_layout = nullptr;
+    RequireVk(name, "guest",
+              m_device.createPipelineLayout(&store_layout_info, nullptr,
+                                            &store_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo store_info{};
+    store_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+    store_info.stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    store_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    store_info.stage.module = store_module;
+    store_info.stage.pName = "main";
+    store_info.layout = store_layout;
+    vk::Pipeline store_pipeline = nullptr;
+    RequireVk(name, "guest",
+              m_device.createComputePipelines(nullptr, 1, &store_info, nullptr,
+                                              &store_pipeline),
+              "vkCreateComputePipelines");
+    const auto store = [&](uint32_t index, uint32_t value) {
+      const auto address = marker.BufferDeviceAddress() + 4 * index;
+      const std::array<uint32_t, 3> push{static_cast<uint32_t>(address),
+                                         static_cast<uint32_t>(address >> 32u),
+                                         value};
+      scheduler.Current().BindComputePipeline(store_pipeline);
+      scheduler.Current().StateHandle().pushConstants(
+          store_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+          push.data());
+      scheduler.Current().DispatchHandle(true, false).dispatch(1, 1, 1);
+    };
+
+    store(0, 0x600dcafeu);
+    (void)tiler.CheckColorClear({metadata.Handle(), 0, slice_bytes},
+                                slice_bytes, 1, 1u, false);
+    // The guest's pipeline is still believed bound: it must really be bound.
+    store(1, 0x5eedf00du);
+    auto readback = CreateHostBuffer(name, marker.Size(),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    const vk::BufferCopy whole{0, 0, marker.Size()};
+    scheduler.Current().Handle().copyBuffer(marker.Handle(), readback.buffer, 1,
+                                            &whole);
+    vk::MemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "guest state",
+            ReadBuffer(name, readback, 4) ==
+                std::vector<u32>{0x600dcafeu, 0x5eedf00du, 0u, 0u},
+            "a color-clear check replaced the pipeline of a guest dispatch");
+    DestroyBuffer(&readback);
+    m_device.destroyPipeline(store_pipeline, nullptr);
+    m_device.destroyPipelineLayout(store_layout, nullptr);
+    m_device.destroyShaderModule(store_module, nullptr);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -62190,6 +62288,11 @@ int main(int argc, char **argv) {
     CheckStorageTextureVolumeMipRegions();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--color-clear-check-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckColorClearCheck();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
@@ -62438,6 +62541,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckColorClearCheck();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -62861,6 +62965,7 @@ int main(int argc, char **argv) {
     vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckColorClearCheck();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
