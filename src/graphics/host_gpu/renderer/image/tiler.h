@@ -44,6 +44,10 @@ public:
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	// Detiles a color image's guest data straight into its single level, through an unsigned
+	// storage view of its texel size, and leaves it as Upload does. Returns false, recording
+	// nothing, for images the tiler cannot write directly (they detile into a buffer and copy).
+	[[nodiscard]] bool DetileIntoImage(vk::Buffer tiled, uint64_t tiled_offset, Image& image);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
@@ -71,6 +75,10 @@ private:
 	static constexpr uint32_t BytesPerElementCount = 5;
 	static constexpr uint32_t DirectionCount       = 2;
 	static constexpr uint32_t PipelineCount = FamilyCount * BytesPerElementCount * DirectionCount;
+	// 2D (layers) and 3D targets.
+	static constexpr uint32_t ImageTypeCount = 2;
+	static constexpr uint32_t ImagePipelineCount =
+	    FamilyCount * BytesPerElementCount * ImageTypeCount;
 	static constexpr uint32_t MaxMipLevels         = 16;
 
 	struct alignas(16) Mip {
@@ -126,8 +134,11 @@ private:
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	[[nodiscard]] vk::Pipeline GetImagePipeline(TileBlockFamily family, uint32_t bytes_per_element,
+	                                            bool volume);
 	[[nodiscard]] vk::Pipeline CreatePipeline(std::span<const uint32_t>     code,
-	                                          const vk::SpecializationInfo* specialization) const;
+	                                          const vk::SpecializationInfo* specialization,
+	                                          vk::PipelineLayout            layout = nullptr) const;
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
@@ -136,6 +147,9 @@ private:
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
+	vk::DescriptorSetLayout                      m_image_descriptor_layout = nullptr;
+	vk::PipelineLayout                           m_image_pipeline_layout   = nullptr;
+	std::array<vk::Pipeline, ImagePipelineCount> m_image_pipelines {};
 	vk::Pipeline                            m_d16_to_d24      = nullptr;
 	vk::Pipeline                            m_d16_to_d32      = nullptr;
 	vk::Pipeline                            m_d24_to_d16      = nullptr;

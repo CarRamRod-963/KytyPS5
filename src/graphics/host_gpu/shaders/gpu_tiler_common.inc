@@ -4,11 +4,21 @@
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
-layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
 layout(set = 0, binding = 0, std430) readonly buffer Input8 { uint8_t data[]; } input_buffer8;
-layout(set = 0, binding = 1, std430) buffer Output8 { uint8_t data[]; } output_buffer8;
 layout(set = 0, binding = 0, std430) readonly buffer Input16 { uint16_t data[]; } input_buffer16;
+#if defined(TILER_IMAGE_3D)
+// Detiles straight into a volume image through an unsigned view of its texel size.
+#define TILER_IMAGE
+layout(set = 0, binding = 1) uniform writeonly uimage3D output_image;
+#elif defined(TILER_IMAGE_2D)
+// Detiles straight into the layers of a 2D image through an unsigned view of its texel size.
+#define TILER_IMAGE
+layout(set = 0, binding = 1) uniform writeonly uimage2DArray output_image;
+#else
+layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+layout(set = 0, binding = 1, std430) buffer Output8 { uint8_t data[]; } output_buffer8;
 layout(set = 0, binding = 1, std430) buffer Output16 { uint16_t data[]; } output_buffer16;
+#endif
 
 struct Mip {
 	uint src_base;
@@ -33,6 +43,26 @@ layout(set = 0, binding = 2, std140) uniform TilingInfo {
 
 #include "gpu_tiler_color.inc"
 
+#ifdef TILER_IMAGE
+// The texel's bytes, as the copy from a linear buffer would place them: one unsigned component
+// per 32 bits (one for 8- and 16-bit texels).
+void store_element(uint src, uvec3 p) {
+	uvec4 value = uvec4(0u);
+	if (ELEMENT_BYTES == 1u) {
+		value.x = uint(input_buffer8.data[src]);
+	} else if (ELEMENT_BYTES == 2u) {
+		value.x = uint(input_buffer16.data[src >> 1]);
+	} else {
+		value.x = input_buffer.data[src >> 2];
+		if (ELEMENT_BYTES >= 8u) value.y = input_buffer.data[(src >> 2) + 1u];
+		if (ELEMENT_BYTES >= 16u) {
+			value.z = input_buffer.data[(src >> 2) + 2u];
+			value.w = input_buffer.data[(src >> 2) + 3u];
+		}
+	}
+	imageStore(output_image, ivec3(p), value);
+}
+#else
 void copy_element(uint src, uint dst) {
 	if ((ELEMENT_BYTES == 4u || ELEMENT_BYTES == 8u) && info.color_transform != 0u) {
 		uvec2 value = uvec2(input_buffer.data[src >> 2], 0u);
@@ -50,6 +80,7 @@ void copy_element(uint src, uint dst) {
 		output_buffer8.data[dst] = input_buffer8.data[src];
 	}
 }
+#endif
 
 void main() {
 	uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -79,6 +110,10 @@ void main() {
 	uint block_index = block.y * params.blocks_per_row + block.x;
 	uint tiled = block.z * params.tiled_slice_bytes + block_index * BLOCK_BYTES +
 	             block_offset(swizzle);
+#ifdef TILER_IMAGE
+	// One level at its origin: the texel lands at its coordinate (the layer or depth in z).
+	store_element(params.src_base + tiled, p);
+#else
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
 	if (TILE == 0) {
@@ -86,4 +121,5 @@ void main() {
 	} else {
 		copy_element(params.src_base + linear, params.dst_base + tiled);
 	}
+#endif
 }

@@ -16,10 +16,28 @@
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_dcc_constant_spv.h"
+
+#include "gpu_tiler_shaders/gpu_tiler_prt_3d_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_prt_3d_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_prt_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_prt_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_render_target_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_render_target_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard256_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard256_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard4_3d_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard4_3d_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard4_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard4_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard64_3d_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard64_3d_image3d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard64_image2d_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_standard64_image3d_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include <algorithm>
 #include <array>
@@ -65,12 +83,29 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	RequireVulkanSuccess(
 	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pipeline_layout),
 	    "create TileManager pipeline layout");
+
+	// Detiling into an image: the output binding is a storage image.
+	bindings[1].descriptorType = vk::DescriptorType::eStorageImage;
+	RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+	                                                                 &m_image_descriptor_layout),
+	                     "create TileManager image descriptor layout");
+	layout_info.pSetLayouts            = &m_image_descriptor_layout;
+	layout_info.pushConstantRangeCount = 0;
+	layout_info.pPushConstantRanges    = nullptr;
+	RequireVulkanSuccess(
+	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_image_pipeline_layout),
+	    "create TileManager image pipeline layout");
 }
 
 TileManager::~TileManager() {
 	for (auto pipeline: m_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
+	for (auto pipeline: m_image_pipelines) {
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
+	}
+	m_graphics.device.destroyPipelineLayout(m_image_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_image_descriptor_layout, nullptr);
 	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
 	                     m_color_clear, m_dcc_constant}) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
@@ -224,8 +259,38 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
+vk::Pipeline TileManager::GetImagePipeline(TileBlockFamily family, uint32_t bytes_per_element,
+                                           bool volume) {
+	const auto family_index = static_cast<uint32_t>(family);
+	const auto slot         = ((volume ? FamilyCount : 0u) + family_index) * BytesPerElementCount +
+	                          static_cast<uint32_t>(std::countr_zero(bytes_per_element));
+	EXIT_IF(family >= TileBlockFamily::Depth64KB || slot >= m_image_pipelines.size());
+	if (m_image_pipelines[slot] != nullptr) {
+		return m_image_pipelines[slot];
+	}
+	static_assert(static_cast<uint32_t>(TileBlockFamily::Depth64KB) == FamilyCount - 1);
+	static constexpr std::array<std::span<const uint32_t>, FamilyCount - 1> shaders_2d {
+	    GPU_TILER_STANDARD256_IMAGE2D_SPV,   GPU_TILER_STANDARD4_IMAGE2D_SPV,
+	    GPU_TILER_STANDARD4_3D_IMAGE2D_SPV,  GPU_TILER_STANDARD64_IMAGE2D_SPV,
+	    GPU_TILER_STANDARD64_3D_IMAGE2D_SPV, GPU_TILER_PRT_IMAGE2D_SPV,
+	    GPU_TILER_PRT_3D_IMAGE2D_SPV,        GPU_TILER_RENDER_TARGET_IMAGE2D_SPV};
+	static constexpr std::array<std::span<const uint32_t>, FamilyCount - 1> shaders_3d {
+	    GPU_TILER_STANDARD256_IMAGE3D_SPV,   GPU_TILER_STANDARD4_IMAGE3D_SPV,
+	    GPU_TILER_STANDARD4_3D_IMAGE3D_SPV,  GPU_TILER_STANDARD64_IMAGE3D_SPV,
+	    GPU_TILER_STANDARD64_3D_IMAGE3D_SPV, GPU_TILER_PRT_IMAGE3D_SPV,
+	    GPU_TILER_PRT_3D_IMAGE3D_SPV,        GPU_TILER_RENDER_TARGET_IMAGE3D_SPV};
+	const uint32_t                   values[] {bytes_per_element, 0u};
+	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
+	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
+	m_image_pipelines[slot] =
+	    CreatePipeline(volume ? shaders_3d[family_index] : shaders_2d[family_index],
+	                   &specialization, m_image_pipeline_layout);
+	return m_image_pipelines[slot];
+}
+
 vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
-                                         const vk::SpecializationInfo* specialization) const {
+                                         const vk::SpecializationInfo* specialization,
+                                         vk::PipelineLayout            layout) const {
 	const auto                        module = CompileSPV(code, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
@@ -234,7 +299,7 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 	stage.pSpecializationInfo = specialization;
 	vk::ComputePipelineCreateInfo create {};
 	create.stage          = stage;
-	create.layout         = m_pipeline_layout;
+	create.layout         = layout != nullptr ? layout : m_pipeline_layout;
 	vk::Pipeline pipeline = nullptr;
 	const auto   result =
 	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
@@ -339,6 +404,127 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
+}
+
+bool TileManager::DetileIntoImage(vk::Buffer tiled, uint64_t tiled_offset, Image& image) {
+	const auto& info  = image.info;
+	const auto& block = info.tiling.block;
+	// One level of plain texels without a color transform, in a storage-capable image that a
+	// view of the unsigned format of its texel size may alias.
+	if (!info.IsTiled() || info.IsBlock() || info.IsDepth() || info.samples != 1 ||
+	    info.resources.levels != 1 || info.GetColorTransform() != ColorTransform::None ||
+	    Prospero::IsFmaskTextureFormat(info.guest_format) ||
+	    block.family >= TileBlockFamily::Depth64KB || info.tiling.texel_width != 1 ||
+	    info.tiling.texel_height != 1 || image.depth_id || image.backing.samples != 1 ||
+	    !(image.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+		return false;
+	}
+	vk::Format view_format = vk::Format::eUndefined;
+	switch (block.bytes_per_element) {
+		case 1: view_format = vk::Format::eR8Uint; break;
+		case 2: view_format = vk::Format::eR16Uint; break;
+		case 4: view_format = vk::Format::eR32Uint; break;
+		case 8: view_format = vk::Format::eR32G32Uint; break;
+		case 16: view_format = vk::Format::eR32G32B32A32Uint; break;
+		default: return false;
+	}
+	const bool volume = image.backing.image_type == vk::ImageType::e3D;
+	if (volume != info.IsVolume() ||
+	    !ImageViewOps::FormatsCompatible(image.backing.format, view_format) ||
+	    !(m_graphics.GetFormatProperties(view_format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eStorageImage)) {
+		return false;
+	}
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t source_descriptor_offset = Common::AlignDown(tiled_offset, descriptor_alignment);
+	const uint64_t source_range =
+	    Common::AlignUp(tiled_offset - source_descriptor_offset + info.data.size, 4);
+	if (source_range > limits.maxStorageBufferRange) {
+		return false;
+	}
+	const auto tiling = Prepare(false, info.data.size, info.LinearSize(), info, 1, tiled_offset, 0);
+
+	ImageViewInfo view_info {};
+	view_info.format      = view_format;
+	view_info.type        = volume ? vk::ImageViewType::e3D : vk::ImageViewType::e2DArray;
+	view_info.layer_count = volume ? 1u : image.backing.layers;
+	view_info.usage       = vk::ImageUsageFlagBits::eStorage;
+	const auto view       = image.FindView(view_info);
+
+	m_scheduler.EndRendering();
+	auto                                    command = m_scheduler.Current().PipelineHandle();
+	std::array<vk::BufferMemoryBarrier2, 2> buffer_barriers {};
+	buffer_barriers[0].srcStageMask =
+	    vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+	buffer_barriers[0].srcAccessMask =
+	    vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eHostWrite;
+	buffer_barriers[0].dstStageMask        = vk::PipelineStageFlagBits2::eComputeShader;
+	buffer_barriers[0].dstAccessMask       = vk::AccessFlagBits2::eShaderStorageRead;
+	buffer_barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barriers[0].buffer              = tiled;
+	buffer_barriers[0].offset              = tiled_offset;
+	buffer_barriers[0].size                = info.data.size;
+	buffer_barriers[1]                     = buffer_barriers[0];
+	buffer_barriers[1].srcStageMask        = vk::PipelineStageFlagBits2::eHost;
+	buffer_barriers[1].srcAccessMask       = vk::AccessFlagBits2::eHostWrite;
+	buffer_barriers[1].dstAccessMask       = vk::AccessFlagBits2::eUniformRead;
+	buffer_barriers[1].buffer              = m_stream_buffer.Handle();
+	buffer_barriers[1].offset              = tiling.params_offset;
+	buffer_barriers[1].size                = tiling.params_size;
+	// Every texel of the level is written, as by a copy to the whole image.
+	const auto image_barriers =
+	    image.GetBarriers(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderStorageWrite,
+	                      vk::PipelineStageFlagBits2::eComputeShader, {});
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(buffer_barriers.size());
+	dependency.pBufferMemoryBarriers    = buffer_barriers.data();
+	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
+	dependency.pImageMemoryBarriers     = image_barriers.data();
+	command.pipelineBarrier2(dependency);
+
+	const vk::DescriptorBufferInfo source_info {tiled, source_descriptor_offset, source_range};
+	const vk::DescriptorImageInfo  target_info {nullptr, view, vk::ImageLayout::eGeneral};
+	const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(), tiling.params_offset,
+	                                            tiling.params_size};
+	std::array<vk::WriteDescriptorSet, 3> writes {};
+	for (uint32_t index = 0; index < writes.size(); index++) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+	}
+	writes[0].descriptorType = vk::DescriptorType::eStorageBuffer;
+	writes[0].pBufferInfo    = &source_info;
+	writes[1].descriptorType = vk::DescriptorType::eStorageImage;
+	writes[1].pImageInfo     = &target_info;
+	writes[2].descriptorType = vk::DescriptorType::eUniformBuffer;
+	writes[2].pBufferInfo    = &params_info;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_image_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
+	command.bindPipeline(vk::PipelineBindPoint::eCompute,
+	                     GetImagePipeline(block.family, block.bytes_per_element, volume));
+	const uint64_t groups   = (uint64_t {tiling.num_texels} + 63u) / 64u;
+	const uint32_t groups_y = static_cast<uint32_t>(
+	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
+	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
+	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+	command.dispatch(groups_x, groups_y, 1);
+
+	// Later writes of the source wait for the reads.
+	buffer_barriers[0].srcStageMask     = vk::PipelineStageFlagBits2::eComputeShader;
+	buffer_barriers[0].srcAccessMask    = vk::AccessFlagBits2::eShaderStorageRead;
+	buffer_barriers[0].dstStageMask     = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barriers[0].dstAccessMask    = vk::AccessFlagBits2::eMemoryWrite;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.imageMemoryBarrierCount  = 0;
+	dependency.pImageMemoryBarriers     = nullptr;
+	command.pipelineBarrier2(dependency);
+	image.Transit(vk::ImageLayout::eGeneral,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {},
+	              command);
+	return true;
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
