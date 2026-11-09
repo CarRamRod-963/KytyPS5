@@ -460,7 +460,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	PreparedBindings* descriptor_stage = &bindings;
 	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
-	if (program.info.uses_dma) {
+	if (program.info.ReadsMemoryByAddress()) {
 		m_context.PrepareBda();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
@@ -610,7 +610,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
-	if (program.info.uses_dma) {
+	if (program.info.ReadsMemoryByAddress()) {
 		m_context.PrepareBda();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
