@@ -9970,6 +9970,69 @@ public:
             "an exact-base buffer write copied older image texels over newer "
             "buffer bytes");
       }
+      {
+        // Transient resources share heap memory: a large target bound later
+        // spans a smaller GPU-written image further in. Which of their texels
+        // the memory holds is unknown (binding a target does not write all of
+        // it), so a partial buffer write at the large target's base must not
+        // copy its texels over the smaller image's bytes.
+        constexpr uint64_t aliased_offset = 0x1a10000;
+        constexpr uint64_t inner_offset = 16;
+        std::memset(memory + aliased_offset, 0, 32);
+        const auto aliased_address = base + aliased_offset;
+        auto outer_desc =
+            MakeLinearDesc(aliased_address, 32, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt,
+                           Prospero::ImageType::kColor2D, {8, 1, 1}, 1, 4, 1);
+        auto inner_desc = MakeLinearDesc(
+            aliased_address + inner_offset, 16, vk::Format::eR16G16B16A16Uint,
+            Prospero::BufferFormat::k16_16_16_16UInt,
+            Prospero::ImageType::kColor2D, {2, 1, 1}, 1, 8, 1);
+        const auto inner = texture_cache.FindImage(inner_desc);
+        const auto outer = texture_cache.FindImage(outer_desc);
+        Require(
+            name, "aliased images coexist",
+            inner && outer && inner != outer &&
+                texture_cache.GetImage(inner).registered &&
+                texture_cache.GetImage(outer).registered,
+            "an image inside another image's memory did not coexist with it");
+        constexpr uint32_t outer_value = 0x11223344u;
+        constexpr uint32_t inner_value = 0x5566u;
+        constexpr uint32_t aliased_write = 0x77777777u;
+        const auto paint = [&](ImageId id,
+                               const std::array<uint32_t, 4> &value) {
+          vk::ClearValue clear{};
+          clear.color.uint32 = value;
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        };
+        paint(inner, {inner_value, inner_value, inner_value, inner_value});
+        paint(outer, {outer_value, 0u, 0u, 0u});
+        // The first write also lands on the smaller image's first texel.
+        for (const auto &[offset, size] :
+             {std::pair{uint64_t{0}, uint64_t{20}},
+              std::pair{inner_offset, uint64_t{sizeof(uint32_t)}}}) {
+          const auto write_address = aliased_address + offset;
+          texture_cache.PrepareGpuBufferWrite(write_address, size);
+          auto writable = resources.GetBufferCache().ObtainBuffer(
+              write_address, size, true, false);
+          Require(name, "aliased image write buffer allocation",
+                  writable.first != nullptr,
+                  "failed to allocate the aliased image write buffer");
+          writable.first->Fill(writable.second, size, aliased_write);
+          texture_cache.InvalidateMemoryFromGPU(write_address, size);
+        }
+        (void)texture_cache.FindTexture(inner, inner_desc);
+        const auto texels =
+            ReadCachedTexel(name, context, inner, {}, {2, 1, 1});
+        Require(name, "aliased image bytes keep the other image's texels out",
+                texels.size() == 4 && texels[0] == aliased_write &&
+                    texels[1] != outer_value && texels[2] != outer_value &&
+                    texels[3] != outer_value,
+                "a partial buffer write at a target's base copied its texels "
+                "over a GPU-written image sharing its memory");
+      }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
