@@ -1677,7 +1677,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
 		const auto* owner = &image;
-		// A displaced image's contents are superseded by the image that displaced it.
+		// A displaced image's contents are superseded by the image that displaced it, and memory
+		// another image shares may hold that image's bytes instead.
 		if (image.displaced) {
 			return;
 		}
@@ -2286,12 +2287,28 @@ bool TextureCache::BufferWriteRefreshes(const Image& image, uint64_t address, ui
 	return image.info.data.address == address || inside;
 }
 
+bool TextureCache::MemorySharedWithOtherContents(ImageId id) {
+	const auto& image  = m_slot_images[id];
+	bool        shared = false;
+	// The walk only reads images, as ForEachImageInRegion requires.
+	ForEachImageInRegion(
+	    image.info.data.address, image.info.data.size, [&](ImageId other_id, const Image& other) {
+		    shared = other_id != id && (other.IsGpuModified() ||
+		                                other.native_write_sequence > image.native_write_sequence);
+		    return shared;
+	    });
+	return shared;
+}
+
 void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size)) {
+	// Collected first: publishing reads other images of the region.
+	Common::SmallVector<ImageId, 8> ids;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { ids.push_back(id); });
+	for (const auto id: ids) {
 		auto&      image = m_slot_images[id];
 		const bool covered =
 		    address <= image.info.data.address && address + size >= image.info.data.End();
@@ -2302,9 +2319,10 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 		// that does (conservative write ranges included) leaves the image behind its memory.
 		const bool current   = !image.buffer_written;
 		image.buffer_written = true;
-		// A displaced image's contents are superseded by the image that displaced it.
+		// A displaced image's contents are superseded by the image that displaced it, and memory
+		// another image shares may hold that image's bytes instead.
 		if (!current || image.depth_id || image.displaced || !image.SafeToDownload() ||
-		    !BufferWriteRefreshes(image, address, size)) {
+		    !BufferWriteRefreshes(image, address, size) || MemorySharedWithOtherContents(id)) {
 			continue;
 		}
 		// The write refreshes the whole image from guest memory, which does not hold what the

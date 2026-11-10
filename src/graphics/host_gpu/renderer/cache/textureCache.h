@@ -280,6 +280,11 @@ private:
 	// memory.
 	[[nodiscard]] static bool BufferWriteRefreshes(const Image& image, uint64_t address,
 	                                               uint64_t size);
+	// Whether another image over the image's memory holds GPU-written contents or was written
+	// natively after it. Aliased images (a title's transient resources placed in one heap) share
+	// their bytes, and which of them the memory holds is unknown: a render target binding is not
+	// a write of all its texels.
+	[[nodiscard]] bool MemorySharedWithOtherContents(ImageId id);
 
 	// FindImage; sole_owner, when given, tells whether the result is the only image overlapping
 	// the description's memory and matched it without an overlap resolution.
