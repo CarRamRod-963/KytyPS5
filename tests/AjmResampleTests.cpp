@@ -469,11 +469,39 @@ void At9FramesReadOnlyTheirInput() {
 	}
 }
 
+// LibAtrac9's band extension tables cover blocks of 13 to 20 coded quantization units. A frame
+// that enables band extension with other band counts indexed past them, and the noise spectrum
+// it then filled ran past the channel's 256 coefficients (Saros 01.005.002 died in
+// ApplyBandExtension). Such a frame fails to unpack instead.
+void At9BandExtensionNeedsItsBandRange() {
+	// 48 kHz mono: minimum band count 3, extension bands up to 18.
+	unsigned char config[4] = {0xfe, 0x70, 0x07, 0xe0};
+	// First block of a superframe, new band parameters, band count, band extension on,
+	// extension band: 4 bands (12 quantization units) extended to 5, and 11 bands (21 units)
+	// extended to 12.
+	for (const auto& [frame_bits, bands]: {std::pair {std::array<uint8_t, 2> {0x06, 0x40}, 4},
+	                                        std::pair {std::array<uint8_t, 2> {0x23, 0x20}, 11}}) {
+		void* handle = Atrac9GetHandle();
+		Check(handle != nullptr && Atrac9InitDecoder(handle, config) == 0,
+		      "initialize a mono ATRAC9 handle");
+		std::vector<uint8_t> frame(16 * 1024, 0);
+		std::copy(frame_bits.begin(), frame_bits.end(), frame.begin());
+		std::vector<int16_t> pcm(256, 0);
+		int                  used   = 0;
+		const int            status = Atrac9Decode(handle, frame.data(), pcm.data(), &used, 0);
+		Atrac9ReleaseHandle(handle);
+		Check(status == ERR_UNPACK_BAND_PARAMS_INVALID,
+		      bands == 4 ? "band extension of 12 quantization units is rejected"
+		                 : "band extension of 21 quantization units is rejected");
+	}
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 	UndecodableAt9FrameIsSilent();
 	At9FramesReadOnlyTheirInput();
+	At9BandExtensionNeedsItsBandRange();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);
