@@ -7351,6 +7351,101 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Below the memory trigger an old clean buffer is kept while no BDA access is
+  // in use, and watched, then retired, once BDA accesses keep it synchronized.
+  void CheckBdaAgeCollection() {
+    constexpr const char *name = "BdaAgeCollection";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * page, 0x3,
+                                                         0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    std::fill_n(static_cast<u32 *>(mapped), 2 * page / sizeof(u32),
+                0x0a9ec011u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 2 * page);
+    constexpr auto never = std::numeric_limits<uint64_t>::max();
+    const auto collect = [&](uint32_t times) {
+      for (uint32_t i = 0; i < times; i++) {
+        cache.RunGarbageCollector();
+      }
+    };
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+    const auto id = cache.FindBuffer(base, 2 * page);
+    Require(name, "resident", static_cast<bool>(id), "no buffer was created");
+    collect(200);
+    Require(name, "kept without BDA", cache.IsRegionRegistered(base, 2 * page),
+            "an old buffer was collected below the memory trigger without BDA "
+            "accesses");
+
+    const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
+    context.PrepareBda();
+    auto entries = CreateHostBuffer(name, sizeof(vk::DeviceAddress),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto read_entry = [&] {
+      auto command = scheduler.Current().Handle();
+      const vk::MemoryBarrier before{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                              &before, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy copy{BufferCache::PageIndex(base) *
+                                    sizeof(vk::DeviceAddress),
+                                0, entries.size};
+      command.copyBuffer(cache.GetBdaPageTableBuffer()->Handle(),
+                         entries.buffer, 1, &copy);
+      const vk::MemoryBarrier after{
+          .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+          .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &after,
+                              0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, entries, 2);
+      return words[0] | (uint64_t{words[1]} << 32u);
+    };
+    collect(1);
+    Require(name, "watched with BDA",
+            cache.IsRegionRegistered(base, 2 * page) &&
+                read_entry() == (device_address | BufferCache::BdaWatchBit),
+            "an old buffer was not watched below the memory trigger with BDA "
+            "accesses in use");
+    collect(static_cast<uint32_t>(BufferCache::BdaWatchTicks) - 2u);
+    Require(name, "watch window", cache.IsRegionRegistered(base, 2 * page),
+            "a watched buffer was retired before its watch ended");
+    collect(2);
+    Require(
+        name, "retired with BDA",
+        !cache.IsRegionRegistered(base, 2 * page) && read_entry() == 0u,
+        "an old unreported buffer was kept below the memory trigger with BDA "
+        "accesses in use");
+
+    context.UnmapMemory(base, 2 * page);
+    scheduler.Finish();
+    DestroyBuffer(&entries);
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -62899,6 +62994,7 @@ int main(int argc, char **argv) {
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
     vulkan.CheckBdaWatchedEviction();
+    vulkan.CheckBdaAgeCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
@@ -62916,6 +63012,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBdaWatchedEviction();
+    vulkan.CheckBdaAgeCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -63177,6 +63274,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckBdaWatchedEviction();
+  vulkan.CheckBdaAgeCollection();
   vulkan.CheckBatchedUploads();
   vulkan.CheckScatteredUploads();
   vulkan.CheckLargeSparseImageUpload();
