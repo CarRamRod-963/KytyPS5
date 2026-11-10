@@ -3,9 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <vector>
 
@@ -165,8 +165,8 @@ public:
 	// A label the GPU stored to guest memory, in the guest store epoch current before the store
 	// (see BdaSyncQueue). Replaces the record of the same bytes.
 	void NoteStoredValue(uint64_t address, uint32_t size, uint64_t value, uint64_t epoch) {
-		std::lock_guard lock(m_mutex);
-		m_stored[address] = {value, epoch, size};
+		std::lock_guard lock(m_stored_mutex);
+		m_stored[StoredSlot(address)] = {address, value, epoch, size};
 	}
 
 	// Whether `size` bytes at `address`, read as `observed`, are the value of the GPU's last label
@@ -176,25 +176,37 @@ public:
 	// other than the stored one drops the record: the bytes were written since.
 	[[nodiscard]] bool StoredSince(uint64_t address, uint32_t size, uint64_t observed,
 	                               uint64_t epoch) {
-		std::lock_guard lock(m_mutex);
-		const auto      it = m_stored.find(address);
-		if (it == m_stored.end()) {
+		std::lock_guard lock(m_stored_mutex);
+		auto&           record = m_stored[StoredSlot(address)];
+		if (record.address != address) {
 			return false;
 		}
-		if (it->second.size != size || it->second.value != observed) {
-			m_stored.erase(it);
+		if (record.size != size || record.value != observed) {
+			record = {};
 			return false;
 		}
-		return it->second.epoch >= epoch;
+		return record.epoch >= epoch;
 	}
 
 	// Forgets the label stores of unmapped memory.
 	void ForgetStored(uint64_t address, uint64_t size) {
-		std::lock_guard lock(m_mutex);
-		const auto      begin = m_stored.lower_bound(address > 7 ? address - 7 : 0);
-		const auto      end   = m_stored.lower_bound(address + size);
-		m_stored.erase(begin, end);
+		std::lock_guard lock(m_stored_mutex);
+		const auto      first = address > 7 ? address - 7 : 0;
+		for (auto& record: m_stored) {
+			if (record.address >= first && record.address < address + size) {
+				record = {};
+			}
+		}
 	}
+
+	// The label stores recorded at the moment; at most STORED_CAPACITY.
+	[[nodiscard]] size_t StoredRecords() const {
+		std::lock_guard lock(m_stored_mutex);
+		return static_cast<size_t>(std::ranges::count_if(
+		    m_stored, [](const StoredValue& record) { return record.address != 0; }));
+	}
+
+	static constexpr size_t STORED_CAPACITY = size_t {1} << 16u;
 
 private:
 	static bool Overlaps(const Label& label, uint64_t address, uint64_t size) noexcept {
@@ -221,15 +233,27 @@ private:
 		return nullptr;
 	}
 
+	// The GPU's last label store per address, direct-mapped by address: one record per slot, a
+	// later store to another address in the same slot replaces it. Losing a record only makes a
+	// wait that observes its value order the guest stores, as without a record. A map of every
+	// address ever stored grew for the whole session (Saros stores ~900 labels per frame at
+	// moving addresses) and cost ~0.75 us per store on the GPU thread.
 	struct StoredValue {
-		uint64_t value = 0;
-		uint64_t epoch = 0;
-		uint32_t size  = 0;
+		uint64_t address = 0; // 0: no record.
+		uint64_t value   = 0;
+		uint64_t epoch   = 0;
+		uint32_t size    = 0;
 	};
+
+	static size_t StoredSlot(uint64_t address) noexcept {
+		constexpr uint32_t bits = std::countr_zero(STORED_CAPACITY);
+		return static_cast<size_t>((address * 0x9e3779b97f4a7c15ull) >> (64u - bits));
+	}
 
 	mutable std::mutex              m_mutex;
 	std::vector<Label>              m_labels;
-	std::map<uint64_t, StoredValue> m_stored;
+	mutable std::mutex              m_stored_mutex;
+	std::vector<StoredValue>        m_stored  = std::vector<StoredValue>(STORED_CAPACITY);
 	uint64_t                        m_last_id = 0;
 	std::atomic<uint32_t>           m_elided {0};
 };
