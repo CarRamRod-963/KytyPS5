@@ -181,6 +181,30 @@ void TestStoredValues() {
         "an unmapped label kept its store");
 }
 
+void TestStoredValuesBounded() {
+  PendingLabels labels;
+  // Titles store labels at ever new addresses (rings that move through
+  // memory): the records must not grow with them.
+  constexpr uint64_t count = 4 * PendingLabels::STORED_CAPACITY;
+  for (uint64_t i = 0; i < count; i++) {
+    labels.NoteStoredValue(0x10000000 + i * 8, 4, i, 1);
+  }
+  Check(labels.StoredRecords() <= PendingLabels::STORED_CAPACITY,
+        "label store records grew with the addresses stored");
+  Check(labels.StoredSince(0x10000000 + (count - 1) * 8, 4, count - 1, 1),
+        "the latest label store was not recorded");
+  // A record displaced by another address answers "not the GPU's store",
+  // never a wrong match.
+  uint64_t recognized = 0;
+  for (uint64_t i = 0; i < count; i++) {
+    recognized += labels.StoredSince(0x10000000 + i * 8, 4, i, 1) ? 1 : 0;
+    Check(!labels.StoredSince(0x10000000 + i * 8, 4, i + 1, 0),
+          "a displaced record matched another value");
+  }
+  Check(recognized <= PendingLabels::STORED_CAPACITY,
+        "more stores recognized than records kept");
+}
+
 int main() {
   TestElideAndStore();
   TestPartialAndNewest();
@@ -188,6 +212,7 @@ int main() {
   TestPatchElided();
   TestUnknownValue();
   TestStoredValues();
+  TestStoredValuesBounded();
   std::printf("PendingLabelsTests: ok\n");
   return 0;
 }
