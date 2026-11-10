@@ -1285,7 +1285,11 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Below the memory trigger a cached buffer costs nothing but memory, unless BDA accesses are in
+	// use: then every guest store into its pages is synchronized into it at the next command
+	// ordering point, and its pages are write-protected again, whether or not anything still reads
+	// the buffer. Clean buffers no access has touched for the collection age are retired then too.
+	if (m_total_used_memory < m_trigger_gc_memory && !m_bda_in_use) {
 		return;
 	}
 
