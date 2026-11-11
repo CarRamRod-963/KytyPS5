@@ -160,6 +160,11 @@ static void PrintUsage() {
 	    "                                       draws and dispatches ahead of the GPU thread\n"
 	    "                                       (0 = off, at most 8). Default: 2.\n");
 	::printf(
+	    "  --prepare-threads <n>                Threads that translate the shaders that earlier\n"
+	    "                                       sessions recorded, at low priority from the boot,\n"
+	    "                                       so that their first use needs no translation\n"
+	    "                                       (0 = off, at most 8). Default: 2.\n");
+	::printf(
 	    "  --precompile-only                    Build the recorded compute and graphics pipelines\n"
 	    "                                       and the created compute shaders into the driver\n"
 	    "                                       cache, save it and exit (code 0 when done).\n");
@@ -500,6 +505,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.lookahead_threads) ||
 			    options.config.lookahead_threads > 8u) {
 				::printf("invalid lookahead thread count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--prepare-threads") {
+			if (!ParseUint32(value, options.config.prepare_threads) ||
+			    options.config.prepare_threads > 8u) {
+				::printf("invalid preparation thread count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {

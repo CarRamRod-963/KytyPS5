@@ -34,12 +34,14 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -425,6 +427,369 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	// A program translated from its manifest records before its first use (StartPreparation):
+	// its resource plans and the modules of the recorded specializations, as Get would have made
+	// them over the session that recorded them.
+	struct PreparedProgram {
+		ShaderRecompiler::IR::ResourcePlan                  plan;
+		std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> lookahead_plan;
+		std::vector<Permutation>                            permutations;
+		std::vector<uint32_t>                               push_data_cursors;
+	};
+
+	// The records of one program key, in the order they were first added (one of the two lists).
+	struct PreparationJob {
+		ProgramKey                                               key;
+		std::vector<std::shared_ptr<const ComputeProgramRecord>> compute;
+		std::vector<std::shared_ptr<const GraphicsStageRecord>>  stages;
+	};
+
+	// The programs earlier sessions recorded, translated on helper threads in the order they were
+	// first needed. Get takes a program's translation at its first use: it waits for one that is
+	// being translated and translates a queued one itself (the helpers then skip it).
+	struct Preparation {
+		enum class State : uint8_t { Queued, Running, Done, Taken };
+		struct Slot {
+			State                            state = State::Queued;
+			std::unique_ptr<PreparedProgram> program; // null when the record cannot be translated
+		};
+		std::mutex                                           mutex;
+		std::condition_variable                              changed;
+		std::unordered_map<ProgramKey, Slot, ProgramKeyHash> slots;
+		std::vector<PreparationJob>                          jobs;
+		size_t                                               next    = 0;
+		size_t                                               running = 0;
+		bool                                                 stop    = false;
+		PipelineCache::ProgramPreparationCounts              counts;
+		std::chrono::steady_clock::time_point                started;
+		std::vector<std::thread>                             threads;
+	};
+
+	// The key Get gives the program a record describes, with the input its translation reads (the
+	// record's static input with the fields Get derives from the device).
+	bool PreparationKey(const ComputeProgramRecord& record, ProgramKey& key,
+	                    ShaderComputeInputInfo& input) const {
+		if (record.code == nullptr || record.code->empty()) return false;
+		input                    = record.input;
+		input.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+		input.lds_storage =
+		    input.lds_size_dwords * 4u >
+		    graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+		key.stage           = ShaderType::Compute;
+		key.hash            = record.shader_hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = static_cast<uint32_t>(record.code->size());
+		BuildStageStaticKey(input, key.static_state);
+		return true;
+	}
+	bool PreparationKey(const GraphicsStageRecord& record, ProgramKey& key,
+	                    ShaderVertexInputInfo& vertex, ShaderPixelInputInfo& pixel) const {
+		if (record.code == nullptr || record.code->empty() ||
+		    !GraphicsStageRecord::IsGraphicsStage(record.stage))
+			return false;
+		key.stage           = record.stage;
+		key.hash            = record.shader_hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = static_cast<uint32_t>(record.code->size());
+		if (record.stage == ShaderType::Pixel) {
+			pixel = record.pixel;
+			BuildStageStaticKey(pixel, key.static_state);
+			return true;
+		}
+		vertex = record.vertex;
+		// The fields GetGraphicsPrograms derives from the device.
+		if (record.stage == ShaderType::Mesh) {
+			vertex.mesh.host_subgroup_size = graphics.subgroup_size;
+		}
+		if (vertex.clip_space.enabled) {
+			const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+			vertex.clip_space.half_extent[0] =
+			    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+			vertex.clip_space.half_extent[1] =
+			    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+		}
+		BuildStageStaticKey(vertex, key.static_state);
+		return true;
+	}
+
+	// Translates a record as Get translates the program for a permutation and compiles the
+	// record's specialization into `prepared`; the plans come from the first record that does.
+	// False when the record no longer translates to its specialization.
+	template <typename Record>
+	bool PrepareRecord(const Record& record, PreparedProgram& prepared) const {
+		ProgramKey                       key;
+		ShaderComputeInputInfo           compute {};
+		ShaderVertexInputInfo            vertex {};
+		ShaderPixelInputInfo             pixel {};
+		ShaderRecompiler::CompileOptions options;
+		if constexpr (std::is_same_v<Record, ComputeProgramRecord>) {
+			if (!PreparationKey(record, key, compute)) return false;
+			options.stage              = ShaderType::Compute;
+			options.input_info.compute = &compute;
+			options.wave_size          = compute.wave_size;
+			options.dump_label         = "ShaderRecompiler CS";
+		} else {
+			if (!PreparationKey(record, key, vertex, pixel)) return false;
+			options.stage = record.stage;
+			if (record.stage == ShaderType::Pixel) {
+				options.input_info.pixel = &pixel;
+				options.wave_size        = pixel.wave_size;
+				options.dump_label       = "ShaderRecompiler PS";
+			} else {
+				options.input_info.vertex = &vertex;
+				options.wave_size         = vertex.wave_size;
+				options.user_data_base    = 8;
+				if (record.stage == ShaderType::Mesh ||
+				    record.stage == ShaderType::TessellationControl) {
+					options.user_data_base = 0;
+				}
+				if (record.stage == ShaderType::Mesh) {
+					options.wave_size = vertex.mesh.wave_size;
+				}
+				options.dump_label = "ShaderRecompiler VS";
+			}
+			if (record.back_code != nullptr) {
+				options.back_code = *record.back_code;
+			}
+		}
+		// Translation reads the user-data count; the values only feed the resource walk.
+		const std::vector<uint32_t> user_data(record.user_data_count, 0u);
+		options.user_data       = user_data;
+		options.profile         = &profile;
+		options.shader_hash     = key.hash;
+		options.dump_ir         = false;
+		options.early_dump      = false;
+		options.emit_debug_info = false;
+		const bool                                     first = prepared.permutations.empty();
+		std::optional<ShaderRecompiler::CompileResult> result;
+		try {
+			const Common::RecoverableFatalScope recoverable;
+			auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
+			if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
+			auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+			// A recompiler change may give the shader other resources than the record was made
+			// for.
+			if (!ShaderRecompiler::IR::SpecializationApplies(translated.program,
+			                                                 record.specialization))
+				return false;
+			if (first) {
+				prepared.plan = ShaderRecompiler::IR::ExtractResourcePlan(
+				    translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader);
+				if (lookahead != nullptr && SlotOf(options.stage) != LookaheadSlot::None &&
+				    prepared.plan.srt_code != nullptr) {
+					prepared.lookahead_plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+					    ShaderRecompiler::IR::ExtractResourcePlan(
+					        translated.program, ShaderRecompiler::IR::SrtWalkerLoads::Reader,
+					        ShaderRecompiler::IR::SrtWalkerCompilation::Deferred));
+				}
+			}
+			result = ShaderRecompiler::CompileProgram(
+			    std::move(translated), options, record.specialization, record.push_data_cursor);
+		} catch (const Common::RecoverableFatal& fatal) {
+			PipelineCacheLog("Program preparation: {:016x} cannot be translated: {}", key.hash,
+			                 fatal.message);
+			return false;
+		}
+		if (!ValidateShaderSpirv(options.dump_label, key.hash, result->spirv,
+		                         profile.maintenance8)) {
+			return false;
+		}
+		const auto module = CompileSPV(result->spirv, graphics.device);
+		if (module == nullptr) return false;
+		SetVulkanObjectNameF(graphics.device, module, "{} {:016x}",
+		                     options.stage == ShaderType::Compute ? "cs"
+		                     : options.stage == ShaderType::Pixel ? "ps"
+		                                                          : "vs",
+		                     key.hash);
+		const auto spirv_hash =
+		    XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
+		prepared.permutations.push_back({
+		    .specialization = record.specialization,
+		    .program        = std::move(result->program).TakeCompiledInfo(),
+		    .handle         = {.module = module, .spirv_hash = spirv_hash},
+		    .spirv_hash     = spirv_hash,
+		});
+		prepared.push_data_cursors.push_back(record.push_data_cursor);
+		return true;
+	}
+
+	// Every record of the job's program; null when none of them translates any more.
+	std::unique_ptr<PreparedProgram> Prepare(const PreparationJob& job) const {
+		auto prepared = std::make_unique<PreparedProgram>();
+		for (const auto& record: job.compute) {
+			(void)PrepareRecord(*record, *prepared);
+		}
+		for (const auto& record: job.stages) {
+			(void)PrepareRecord(*record, *prepared);
+		}
+		if (prepared->permutations.empty()) return nullptr;
+		return prepared;
+	}
+
+	void PreparationWorker() {
+		Common::Thread::LowerCurrentThreadPriority();
+		auto&            state = *preparation;
+		std::unique_lock lock(state.mutex);
+		for (;;) {
+			while (!state.stop && state.next < state.jobs.size() &&
+			       state.slots.at(state.jobs[state.next].key).state != Preparation::State::Queued) {
+				state.next++;
+			}
+			if (state.stop || state.next == state.jobs.size()) break;
+			const auto& job  = state.jobs[state.next++];
+			auto&       slot = state.slots.at(job.key);
+			slot.state       = Preparation::State::Running;
+			state.running++;
+			lock.unlock();
+			auto program = Prepare(job);
+			lock.lock();
+			(program != nullptr ? state.counts.prepared : state.counts.failed)++;
+			slot.program = std::move(program);
+			slot.state   = Preparation::State::Done;
+			state.running--;
+			if (state.running == 0 && state.next == state.jobs.size()) {
+				PipelineCacheLog(
+				    "Programs prepared ahead: {} of {} recorded translated in {:.1f} s ({} failed)",
+				    state.counts.prepared, state.counts.queued,
+				    std::chrono::duration<double>(std::chrono::steady_clock::now() - state.started)
+				        .count(),
+				    state.counts.failed);
+			}
+			state.changed.notify_all();
+		}
+		state.changed.notify_all();
+	}
+
+	// Queues every recorded program for translation on `thread_count` low-priority threads, in
+	// first-seen order. A program's records (the permutations an earlier session compiled) are
+	// prepared together, in the order they were recorded, as that session's program ended.
+	void StartPreparation(uint32_t thread_count) {
+		if (thread_count == 0 || preparation != nullptr) return;
+		// Dumps and logs of a translation belong to the program's first use.
+		if (Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		    Config::GraphicsDebugDumpEnabled())
+			return;
+		std::vector<std::pair<uint64_t, PreparationJob>>       ordered;
+		std::unordered_map<ProgramKey, size_t, ProgramKeyHash> index;
+		const auto job_for = [&](uint64_t position, const ProgramKey& key) -> PreparationJob& {
+			const auto [found, added] = index.try_emplace(key, ordered.size());
+			if (added) ordered.emplace_back(position, PreparationJob {.key = key});
+			return ordered[found->second].second;
+		};
+		if (manifest != nullptr) {
+			const auto records = manifest->Records();
+			for (size_t i = 0; i < records.size(); i++) {
+				ProgramKey             key;
+				ShaderComputeInputInfo input {};
+				if (PreparationKey(*records[i], key, input))
+					job_for(FirstSeenPosition(i, records.size()), key)
+					    .compute.push_back(records[i]);
+			}
+		}
+		if (pipeline_manifest != nullptr) {
+			const auto records = pipeline_manifest->Stages();
+			for (size_t i = 0; i < records.size(); i++) {
+				ProgramKey            key;
+				ShaderVertexInputInfo vertex {};
+				ShaderPixelInputInfo  pixel {};
+				if (PreparationKey(*records[i], key, vertex, pixel))
+					job_for(FirstSeenPosition(i, records.size()), key).stages.push_back(records[i]);
+			}
+		}
+		if (ordered.empty()) return;
+		std::ranges::stable_sort(ordered, {}, [](const auto& item) { return item.first; });
+		auto state = std::make_unique<Preparation>();
+		state->jobs.reserve(ordered.size());
+		for (auto& [position, job]: ordered) {
+			(void)position;
+			state->slots.try_emplace(job.key);
+			state->jobs.push_back(std::move(job));
+		}
+		state->counts.queued = state->jobs.size();
+		state->started       = std::chrono::steady_clock::now();
+		preparation          = std::move(state);
+		for (uint32_t i = 0; i < thread_count; i++) {
+			preparation->threads.emplace_back([this] { PreparationWorker(); });
+		}
+	}
+
+	void StopPreparation() {
+		if (preparation == nullptr) return;
+		{
+			std::lock_guard lock(preparation->mutex);
+			preparation->stop = true;
+		}
+		for (auto& thread: preparation->threads) {
+			thread.join();
+		}
+		preparation->threads.clear();
+	}
+
+	// Waits until no recorded program is queued or being translated.
+	void WaitForPreparation() {
+		if (preparation == nullptr) return;
+		std::unique_lock lock(preparation->mutex);
+		preparation->changed.wait(lock, [&] {
+			return preparation->running == 0 &&
+			       (preparation->stop || preparation->next == preparation->jobs.size());
+		});
+	}
+
+	// Takes the translation of the program `key` names, when one was prepared: waits for a
+	// running translation, and keeps the helpers from translating a queued one.
+	std::unique_ptr<PreparedProgram> TakePrepared(const ProgramKey& key) {
+		auto&            state = *preparation;
+		std::unique_lock lock(state.mutex);
+		const auto       found = state.slots.find(key);
+		if (found == state.slots.end()) return nullptr;
+		auto& slot = found->second;
+		if (slot.state == Preparation::State::Queued) {
+			slot.state = Preparation::State::Taken;
+			state.counts.missed++;
+			return nullptr;
+		}
+		if (slot.state == Preparation::State::Running) {
+			state.counts.waited++;
+			state.changed.wait(lock, [&] { return slot.state != Preparation::State::Running; });
+		}
+		if (slot.state != Preparation::State::Done) return nullptr;
+		slot.state = Preparation::State::Taken;
+		if (slot.program != nullptr) state.counts.adopted++;
+		return std::move(slot.program);
+	}
+
+	// Makes a prepared program the program of `lookup_key`, as if Get had translated it at this
+	// use; the draw then specializes and finds its permutation like any later use.
+	template <typename InputInfo>
+	auto AdoptPrepared(ShaderType stage, const ShaderParams& params, const InputInfo& input_info) {
+		auto prepared = TakePrepared(lookup_key);
+		if (prepared == nullptr) return programs.end();
+		auto entry = programs.try_emplace(lookup_key, std::move(prepared->plan), nullptr).first;
+		NoteGraphicsShaderUse(stage, params.code);
+		for (size_t i = 0; i < prepared->permutations.size(); i++) {
+			auto& permutation =
+			    entry->second.permutations.emplace_back(std::move(prepared->permutations[i]));
+			permutation.handle.id = ++next_shader_id;
+			const auto cursor     = prepared->push_data_cursors[i];
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (manifest != nullptr) {
+					permutation.handle.record_key =
+					    RecordComputeProgram(params, input_info, cursor, permutation);
+				}
+			} else {
+				if (pipeline_manifest != nullptr) {
+					permutation.handle.record_key =
+					    RecordGraphicsStage(stage, params, input_info, cursor, permutation);
+				}
+			}
+		}
+		if (prepared->lookahead_plan != nullptr && lookahead != nullptr) {
+			entry->second.lookahead = std::make_shared<LookaheadPlan>(
+			    walker_queue.Submit(std::move(prepared->lookahead_plan)), next_lookahead_helper++);
+		}
+		return entry;
+	}
+
 	// A draw whose GPU-selected resources cannot be enumerated (unmapped guest memory, more
 	// probes than the host reads) or served (a descriptor the plan does not support) is skipped
 	// rather than run with descriptors that may name the wrong memory; the shader's next draw is
@@ -655,6 +1020,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto entry = programs.find(lookup_key);
+		if (entry == programs.end() && preparation != nullptr) {
+			entry = AdoptPrepared(stage, params, input_info);
+		}
 		const auto bind = [&](const Permutation& permutation) {
 			input_info.stage = {.program   = &permutation.program,
 			                    .resources = &entry->second.resources,
@@ -971,6 +1339,16 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 	~ProgramCache() {
+		StopPreparation();
+		if (preparation != nullptr) {
+			for (const auto& [key, slot]: preparation->slots) {
+				(void)key;
+				if (slot.program == nullptr) continue;
+				for (const auto& permutation: slot.program->permutations) {
+					graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+				}
+			}
+		}
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -1019,6 +1397,8 @@ struct PipelineCache::ProgramCache {
 	const void*                                   lookahead_command     = nullptr;
 	uint32_t                                      next_lookahead_helper = 0;
 	std::chrono::steady_clock::time_point         next_lookahead_report {};
+	// Programs translated ahead of their first use (StartPreparation); null without.
+	std::unique_ptr<Preparation> preparation;
 	// Compiles the lookahead plans' walkers. Last, so its thread stops before the entries holding
 	// its jobs are destroyed.
 	SrtWalkerCompileQueue walker_queue;
@@ -1352,7 +1732,23 @@ PipelineCache::~PipelineCache() {
 	}
 }
 
+void PipelineCache::StartProgramPreparation(uint32_t thread_count) {
+	m_program_cache->StartPreparation(thread_count);
+}
+
+PipelineCache::ProgramPreparationCounts PipelineCache::GetProgramPreparationCounts() const {
+	if (m_program_cache->preparation == nullptr) return {};
+	std::lock_guard lock(m_program_cache->preparation->mutex);
+	return m_program_cache->preparation->counts;
+}
+
+void PipelineCache::WaitForProgramPreparation() {
+	m_program_cache->WaitForPreparation();
+}
+
 void PipelineCache::StopBackgroundCompiles() {
+	// Translations use the SPIR-V simplification store, which the destructor detaches.
+	m_program_cache->StopPreparation();
 	if (m_precompile_queue != nullptr) {
 		{
 			// Created shaders stop queueing list entries.
@@ -2219,6 +2615,14 @@ void PipelineCache::LogCoverage() {
 		                 "{} of {} recorded were predicted (by earlier sessions or the list)",
 		                 m_graphics_from_cache, m_graphics_compiled, m_graphics_predicted,
 		                 m_graphics_recorded);
+	}
+	if (programs.preparation != nullptr) {
+		const auto counts = GetProgramPreparationCounts();
+		PipelineCacheLog("Programs prepared ahead: {} of {} recorded translated ({} failed); {} "
+		                 "taken at their first use ({} waited for), {} first used before their "
+		                 "turn",
+		                 counts.prepared, counts.queued, counts.failed, counts.adopted,
+		                 counts.waited, counts.missed);
 	}
 	if (programs.compute_recorded != 0) {
 		PipelineCacheLog("Compute programs this session: {} of {} recorded were predicted",

@@ -106,6 +106,7 @@ struct ConfigOptions {
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
 	uint32_t               lookahead_threads               = 2;
+	uint32_t               prepare_threads                 = 2;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
@@ -194,6 +195,7 @@ bool     RebuildPipelineCacheEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();
+uint32_t PrepareThreads();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
