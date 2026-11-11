@@ -311,7 +311,23 @@ private:
 		uint64_t size;
 		uint64_t sequence;
 	};
+	// Sorted by address; no range is larger than m_watched_max_size.
 	std::vector<WatchedRange>                         m_watched_ranges;
+	uint64_t                                          m_watched_max_size = 0;
+	// Calls func(WatchedRange&) for each watched range that overlaps [vaddr, vaddr + size).
+	template <typename Func>
+	void ForEachWatchedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		// A range that starts more than the largest size before vaddr ends before it.
+		const auto first = vaddr > m_watched_max_size ? vaddr - m_watched_max_size : 0;
+		auto       it    = std::lower_bound(
+		    m_watched_ranges.begin(), m_watched_ranges.end(), first,
+		    [](const WatchedRange& range, uint64_t address) { return range.address < address; });
+		for (; it != m_watched_ranges.end() && it->address < vaddr + size; ++it) {
+			if (vaddr < it->address + it->size) {
+				func(*it);
+			}
+		}
+	}
 	uint64_t                                          m_watched_write_sequence = 0;
 	bool                                              m_watched_write_pending  = false;
 	uint64_t                                          m_gpu_write_sequence     = 0;
