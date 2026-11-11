@@ -71,6 +71,19 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
+	// An uncompressed view of several layers of one level of a block-compressed 2D image (a
+	// shader copying BC mips through integer texels) is a view of a copy of those layers:
+	// NVIDIA drivers (621.14) address only the first layer of such a view correctly, so reads
+	// return other bytes and writes land in other layers' mips. The copy is refreshed from this
+	// image when it is out of date, and goes back into this image before any other access once
+	// a shader wrote it (WriteBlockLayerCopy).
+	[[nodiscard]] static bool NeedsBlockLayerCopy(const VulkanImage&   image,
+	                                              const ImageViewInfo& view) noexcept;
+	// The copy that owns `view`, if any.
+	[[nodiscard]] Image* BlockLayerCopyOf(vk::ImageView view) noexcept;
+	// A shader writes the copy that owns `view` next: its layers are newer than this image's.
+	void WriteBlockLayerCopy(vk::ImageView view);
+
 	// Depth/stencil images cannot be storage images, so a shader that writes a stencil plane
 	// writes an R8_UINT color copy of it instead. `plane` is the plane's guest layout (its
 	// stencil association) and `range` its subresources in this image. Returns the copy holding
@@ -218,6 +231,24 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
+	struct BlockLayerCopy {
+		uint32_t                level       = 0;
+		uint32_t                base_layer  = 0;
+		uint32_t                layer_count = 0;
+		vk::Format              format      = vk::Format::eUndefined;
+		std::unique_ptr<Image>  image;
+		std::unique_ptr<Buffer> staging;
+		// The copy holds this image's values of its layers.
+		bool current = false;
+		// The copy holds values this image does not have yet.
+		bool newer = false;
+	};
+	[[nodiscard]] vk::ImageView FindBlockLayerCopyView(const ImageViewInfo& view);
+	// Copies a copy's layers between it and this image through its staging buffer.
+	void CopyBlockLayers(BlockLayerCopy& copy, bool to_copy);
+	// Copies the copies a shader wrote back into this image.
+	void ReturnBlockLayerCopies();
+
 	struct StencilPlaneCopy {
 		ImageInfo               info;
 		ImageSubresourceRange   range;
@@ -253,6 +284,11 @@ private:
 		size_t                  subresources = 0;
 	};
 	std::optional<SettledTransition> m_settled;
+
+	std::vector<BlockLayerCopy> m_block_layer_copies;
+	bool                        m_block_layer_copy_newer = false;
+	// Set while CopyBlockLayers accesses this image: those accesses keep the copies as they are.
+	bool m_copying_block_layers = false;
 
 	std::vector<StencilPlaneCopy> m_stencil_planes;
 	// The plane whose values the stencil aspect holds, and its subresources in this image.
