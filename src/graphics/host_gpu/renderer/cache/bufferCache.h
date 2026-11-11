@@ -51,6 +51,15 @@ public:
 	// Garbage-collector ticks a watched buffer waits for a reported access before it is evicted:
 	// more than a fault report takes to reach the cache (ProcessFaultBuffer).
 	static constexpr uint64_t BdaWatchTicks = 16;
+	// Collections a clean buffer stays untouched before the collector watches it while BDA
+	// accesses are in use (instead of the plain age of 160). Every cached buffer then costs its
+	// share of each BDA synchronization (write protection, copies of guest stores) whether or
+	// not anything reads it, while a buffer still read through the page table is kept by the
+	// watch and one read through bindings is touched by every use; an evicted buffer that is
+	// used again costs only its re-creation and upload. Shorter ages re-create buffers still in
+	// periodic use (their uploads come back as waits); the collection passes past the watch
+	// window bound how long an idle buffer is kept.
+	static constexpr uint64_t BdaCollectionAge = 20;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
