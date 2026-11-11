@@ -121,6 +121,23 @@ public:
 	// `steady_thread_count` once the game renders or no recorded build is left (see
 	// UpdatePrecompileThreads); zero keeps `thread_count`.
 	void StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count = 0);
+	// Translates the programs the title's manifests recorded in earlier sessions, in the order
+	// they were first needed, on `thread_count` low-priority threads; the first use of such a
+	// program then takes its translation and module instead of translating it on the GPU thread.
+	// Zero, or shader dumps and logs, start nothing.
+	void StartProgramPreparation(uint32_t thread_count);
+	struct ProgramPreparationCounts {
+		// Programs queued, translated, and whose records no longer translate.
+		uint64_t queued   = 0;
+		uint64_t prepared = 0;
+		uint64_t failed   = 0;
+		// First uses that took a translation, waited for a running one, or came before the
+		// helpers reached the program (translated on the GPU thread).
+		uint64_t adopted = 0;
+		uint64_t waited  = 0;
+		uint64_t missed  = 0;
+	};
+	[[nodiscard]] ProgramPreparationCounts GetProgramPreparationCounts() const;
 	// The process is about to end on purpose: running precompile builds are recorded as
 	// interrupted (PrecompileAttempts::Interrupt), not as builds that ended the process, and
 	// builds that have not reached their driver call stop there.
@@ -190,6 +207,9 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
+
+	// Waits until the program preparation has no queued or running translation (tests).
+	void WaitForProgramPreparation();
 
 	// The helpers' jobs (tests); null when the lookahead is off.
 	[[nodiscard]] ResourceLookahead* Lookahead() const;
