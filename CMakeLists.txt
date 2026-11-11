@@ -871,6 +871,7 @@ endfunction()
 add_gpu_test_shader(gpu_test_stencil_plane gpu_test_stencil_plane.comp)
 add_gpu_test_shader(gpu_test_stencil_bits gpu_test_stencil_bits.frag)
 add_gpu_test_shader(gpu_test_store_word gpu_test_store_word.comp)
+add_gpu_test_shader(gpu_test_block_layers gpu_test_block_layers.comp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
