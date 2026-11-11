@@ -1330,7 +1330,9 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t plain_age  = aggressive ? 80 : 160;
+	const uint64_t age =
+	    std::min<uint64_t>(m_bda_in_use ? std::min(plain_age, BdaCollectionAge) : plain_age, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
