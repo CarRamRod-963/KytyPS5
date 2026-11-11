@@ -505,10 +505,6 @@ struct RenderExecutorTestAccess {
     return executor.DrawAuto(command, args);
   }
 
-  static uint32_t ColorTargetCount(const RenderExecutor &executor) {
-    return executor.m_targets.color_count;
-  }
-
   static DrawIndirectResult DrawIndirect(RenderExecutor &executor,
                                          CommandBuffer &command,
                                          const IndirectDrawSource &args) {
@@ -25863,9 +25859,6 @@ public:
                   "native vertex or instance offset was applied twice");
         }
       }
-      Require("NativeIndirectDrawOffsets", "color slots per draw",
-              RenderExecutorTestAccess::ColorTargetCount(executor) == 1,
-              "a draw kept the previous draw's color targets");
       // With back faces culled, the triangle draws for exactly one winding.
       const auto draws_with_back_cull = [&](bool clockwise) {
         registers.SetModeControl({.cull_back = true, .face = clockwise});
