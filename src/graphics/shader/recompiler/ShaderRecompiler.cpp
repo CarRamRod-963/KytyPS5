@@ -704,7 +704,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data, *options.profile,
 	                                options.emit_debug_info);
 	if (spirv.size() >= Spirv::DriverSimplifyMinWords()) {
-		Spirv::SimplifyForDriver(spirv);
+		Spirv::SimplifyForDriverStored(spirv);
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
