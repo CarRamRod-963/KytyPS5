@@ -7444,6 +7444,70 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A GPU write or a host write advances the sequence of every watched range it
+  // overlaps, also one that starts well before the write, and of no other.
+  void CheckWatchedRangeWrites() {
+    constexpr const char *name = "WatchedRangeWrites";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t pages = 12;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), pages * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(
+                    &mapped, pages * page, 0x3, 0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, pages * page);
+
+    // Watched in an order unlike their addresses: a large range first.
+    const std::array<std::pair<uint64_t, uint64_t>, 3> ranges{
+        std::pair{base + 9 * page, page}, std::pair{base, 6 * page},
+        std::pair{base + 7 * page, page}};
+    for (const auto &[address, size] : ranges) {
+      Require(name, "new range", cache.WatchedWriteSequence(address, size) == 0,
+              "an unwritten range has a write sequence");
+    }
+    const auto sequence = [&](size_t i) {
+      return cache.WatchedWriteSequence(ranges[i].first, ranges[i].second);
+    };
+    (void)cache.ConsumeWatchedWritePending();
+    (void)cache.ObtainBuffer(base + 5 * page + 64, 64, true);
+    Require(name, "GPU write",
+            sequence(1) != 0 && sequence(0) == 0 && sequence(2) == 0 &&
+                cache.ConsumeWatchedWritePending(),
+            "a GPU write did not advance exactly the range it overlaps");
+    const auto large = sequence(1);
+    cache.NoteHostWrite(base + 9 * page + 4, 4);
+    Require(name, "host write",
+            sequence(0) > large && sequence(1) == large && sequence(2) == 0,
+            "a host write did not advance exactly the range it overlaps");
+    (void)cache.ObtainBuffer(base + 6 * page, page, true);
+    Require(name, "between ranges", sequence(1) == large && sequence(2) == 0,
+            "a write between two watched ranges advanced one of them");
+
+    scheduler.Finish();
+    context.UnmapMemory(base, pages * page);
+    scheduler.Finish();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, pages * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct,
+                                                             pages * page) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // Taking the CPU-modified state of a range (the texture cache does so to see
   // whether the guest rewrote color metadata) must not drop the guest's stores
   // from the buffer that holds the range.
@@ -62732,6 +62796,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckColorClearCheck();
     vulkan.CheckConsumedCpuStores();
+    vulkan.CheckWatchedRangeWrites();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
@@ -62989,6 +63054,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckColorClearCheck();
     vulkan.CheckConsumedCpuStores();
+    vulkan.CheckWatchedRangeWrites();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -63428,6 +63494,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckColorClearCheck();
     vulkan.CheckConsumedCpuStores();
+    vulkan.CheckWatchedRangeWrites();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
