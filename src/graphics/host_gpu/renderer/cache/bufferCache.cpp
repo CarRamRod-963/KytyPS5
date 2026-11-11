@@ -946,12 +946,13 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		// The joined contents arrive by GPU copies recorded now.
 		NoteOpenWrite(buffer, id);
 	}
+	UploadConsumedUnbuffered(buffer);
 	Register(id);
 	return id;
 }
 
-bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+bool BufferCache::UploadCpuModified(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                    bool is_written) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -965,6 +966,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		RecordUpload(buffer, source, copies);
 	}
+	return !copies.empty();
+}
+
+bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
+                                    bool is_texel_buffer) {
+	(void)UploadCpuModified(buffer, vaddr, size, is_written);
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
@@ -1271,10 +1278,39 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::UploadConsumedUnbuffered(Buffer& buffer) {
+	const auto begin = buffer.CpuAddress();
+	const auto size  = buffer.Size();
+	if (!m_consumed_unbuffered.Intersects(begin, size)) {
+		return;
+	}
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	m_consumed_unbuffered.ForEachInRange(begin, size, [&](uint64_t first, uint64_t last) {
+		copies.emplace_back(total_size, buffer.Offset(first), last - first);
+		total_size += last - first;
+	});
+	m_consumed_unbuffered.Subtract(begin, size);
+	if (const auto source = UploadCopies(buffer, copies, total_size)) {
+		RecordUpload(buffer, source, copies);
+	}
+}
+
 bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
+	// Taking the CPU-modified state of the range also takes it from the buffers that hold the
+	// range, so their parts are synchronized first: the guest's stores reach those buffers
+	// instead of being dropped with the state. Pages no buffer holds are remembered: a buffer
+	// created over them later takes their guest bytes, which their state no longer reports.
 	bool modified = false;
+	ForEachBufferPart(vaddr, vaddr + size, [&](BufferId id, uint64_t first, uint64_t last) {
+		modified |= UploadCpuModified(m_slot_buffers[id], first, last - first, false);
+	});
 	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, false, [&](uint64_t, uint64_t) noexcept { modified = true; },
+	    vaddr, size, false,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    modified = true;
+		    m_consumed_unbuffered.Add(address, bytes);
+	    },
 	    []() noexcept {});
 	return modified;
 }
