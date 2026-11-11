@@ -1049,12 +1049,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 		++m_gpu_write_sequence;
-		for (auto& watched: m_watched_ranges) {
-			if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
-				watched.sequence        = ++m_watched_write_sequence;
-				m_watched_write_pending = true;
-			}
-		}
+		ForEachWatchedRange(vaddr, size, [&](WatchedRange& watched) {
+			watched.sequence        = ++m_watched_write_sequence;
+			m_watched_write_pending = true;
+		});
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1209,22 +1207,24 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 uint64_t BufferCache::WatchedWriteSequence(uint64_t vaddr, uint64_t size) {
 	uint64_t sequence = 0;
 	bool     watched  = false;
-	for (const auto& range: m_watched_ranges) {
-		if (range.address == vaddr && range.size == size) watched = true;
-		if (vaddr < range.address + range.size && range.address < vaddr + size) {
-			sequence = std::max(sequence, range.sequence);
-		}
+	ForEachWatchedRange(vaddr, size, [&](const WatchedRange& range) {
+		watched  = watched || (range.address == vaddr && range.size == size);
+		sequence = std::max(sequence, range.sequence);
+	});
+	if (!watched) {
+		// Sorted by address, so a write finds its watched ranges by a search.
+		const auto position = std::upper_bound(
+		    m_watched_ranges.begin(), m_watched_ranges.end(), vaddr,
+		    [](uint64_t address, const WatchedRange& range) { return address < range.address; });
+		m_watched_ranges.insert(position, {vaddr, size, 0u});
+		m_watched_max_size = std::max(m_watched_max_size, size);
 	}
-	if (!watched) m_watched_ranges.push_back({vaddr, size, 0u});
 	return sequence;
 }
 
 void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
-	for (auto& watched: m_watched_ranges) {
-		if (vaddr < watched.address + watched.size && watched.address < vaddr + size) {
-			watched.sequence = ++m_watched_write_sequence;
-		}
-	}
+	ForEachWatchedRange(
+	    vaddr, size, [&](WatchedRange& watched) { watched.sequence = ++m_watched_write_sequence; });
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
