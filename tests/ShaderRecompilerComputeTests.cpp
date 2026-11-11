@@ -7444,6 +7444,93 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Taking the CPU-modified state of a range (the texture cache does so to see
+  // whether the guest rewrote color metadata) must not drop the guest's stores
+  // from the buffer that holds the range.
+  void CheckConsumedCpuStores() {
+    constexpr const char *name = "ConsumedCpuStores";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * page, 0x3,
+                                                         0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto *words = static_cast<u32 *>(mapped);
+    std::fill_n(words, 2 * page / sizeof(u32), 0x11111111u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 2 * page);
+    // The guest bytes of the first tracker page are taken while no buffer holds
+    // them; the buffer created next must still receive them.
+    Require(name, "consumed unbuffered",
+            cache.ConsumeCpuModified(base, TRACKER_PAGE_SIZE) &&
+                !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "the guest bytes of a mapped page were not reported");
+    const auto [buffer, offset] = cache.ObtainBuffer(base, 2 * page, false);
+    Require(name, "uploaded", !cache.IsRegionCpuModified(base, 2 * page),
+            "the buffer did not take the guest bytes");
+    scheduler.Finish();
+
+    // A guest store into the second tracker page.
+    const auto store = base + TRACKER_PAGE_SIZE;
+    cache.InvalidateMemory(store, sizeof(u32));
+    std::fill_n(words + TRACKER_PAGE_SIZE / sizeof(u32),
+                TRACKER_PAGE_SIZE / sizeof(u32), 0xffffffffu);
+    Require(name, "consumed",
+            cache.ConsumeCpuModified(base, page) &&
+                !cache.IsRegionCpuModified(base, page) &&
+                !cache.ConsumeCpuModified(base, page),
+            "the guest store was not reported once");
+
+    auto readback = CreateHostBuffer(name, 2 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    auto command = scheduler.Current().Handle();
+    const vk::MemoryBarrier before{
+        .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                            vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                            &before, 0, nullptr, 0, nullptr);
+    const std::array<vk::BufferCopy, 2> copies{
+        vk::BufferCopy{offset, 0, sizeof(u32)},
+        vk::BufferCopy{offset + TRACKER_PAGE_SIZE, sizeof(u32), sizeof(u32)}};
+    command.copyBuffer(buffer->Handle(), readback.buffer,
+                       static_cast<uint32_t>(copies.size()), copies.data());
+    const vk::MemoryBarrier after{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eHostRead};
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
+                            nullptr, 0, nullptr);
+    scheduler.Finish();
+    const auto values = ReadBuffer(name, readback, 2);
+    Require(name, "buffer holds the store",
+            values[0] == 0x11111111u && values[1] == 0xffffffffu,
+            "consumed guest bytes did not reach the buffer that holds them");
+
+    context.UnmapMemory(base, 2 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelMunmap(base, 2 * page) == 0 &&
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0,
+        "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -62644,6 +62731,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--color-clear-check-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckColorClearCheck();
+    vulkan.CheckConsumedCpuStores();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
@@ -62900,6 +62988,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckColorClearCheck();
+    vulkan.CheckConsumedCpuStores();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -63338,6 +63427,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckColorClearCheck();
+    vulkan.CheckConsumedCpuStores();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
