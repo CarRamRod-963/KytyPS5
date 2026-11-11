@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 
+#include "graphics/shader/recompiler/backend/spirv/SpirvSimplifiedStore.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -18,7 +20,8 @@ constexpr size_t MaxSpeculatedBlocks       = 8;
 constexpr size_t MaxSpeculatedInstructions = 64;
 constexpr int    MaxObservationDepth       = 64;
 
-std::atomic<uint32_t> g_min_words {0};
+std::atomic<uint32_t>         g_min_words {0};
+std::atomic<SimplifiedStore*> g_store {nullptr};
 
 struct Inst {
 	spv::Op               op     = spv::OpNop;
@@ -1564,6 +1567,30 @@ bool SimplifyForDriver(std::vector<uint32_t>& words, DriverSimplifyStats* stats)
 	if (stats != nullptr) {
 		*stats = local;
 	}
+	return true;
+}
+
+void SetSimplifiedStore(SimplifiedStore* store) {
+	g_store.store(store, std::memory_order_release);
+}
+
+bool SimplifyForDriverStored(std::vector<uint32_t>& words) {
+	auto* store = g_store.load(std::memory_order_acquire);
+	if (store == nullptr) {
+		return SimplifyForDriver(words);
+	}
+	// The simplifier's switches change its output for the same module.
+	static const uint64_t variant = (EnvSwitchOn("KYTY_NO_SPV_PEEPHOLE") ? 1u : 0u) |
+	                                (EnvSwitchOn("KYTY_NO_SPV_CSE") ? 2u : 0u) |
+	                                (EnvSwitchOn("KYTY_NO_SPV_SINK") ? 4u : 0u);
+	const auto            key     = SimplifiedStore::MakeKey(words, variant);
+	if (store->Find(key, words)) {
+		return true;
+	}
+	if (!SimplifyForDriver(words)) {
+		return false;
+	}
+	store->Insert(key, words);
 	return true;
 }
 

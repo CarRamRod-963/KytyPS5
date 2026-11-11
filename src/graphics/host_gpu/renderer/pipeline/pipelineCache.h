@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/programPrecompileQueue.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvSimplifiedStore.h"
 #include "graphics/shader/shader.h"
 
 #include <atomic>
@@ -230,7 +231,10 @@ private:
 
 	GraphicContext&               m_graphics;
 	CommandScheduler*             m_scheduler;
-	std::unique_ptr<ProgramCache> m_program_cache;
+	// Driver simplifications of SPIR-V kept across sessions; destroyed after the program cache,
+	// whose helper threads translate too.
+	std::unique_ptr<ShaderRecompiler::Spirv::SimplifiedStore> m_simplified_store;
+	std::unique_ptr<ProgramCache>                             m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
