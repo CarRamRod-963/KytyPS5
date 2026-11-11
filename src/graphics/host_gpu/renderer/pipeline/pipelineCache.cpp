@@ -20,9 +20,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -1334,6 +1336,7 @@ PipelineCache::~PipelineCache() {
 	}
 	StopBackgroundCompiles();
 	(void)Save();
+	ShaderRecompiler::Spirv::SetSimplifiedStore(nullptr);
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -1476,6 +1479,11 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// A build's simplifier may differ from another's: the file of another build is replaced.
+	m_simplified_store = std::make_unique<ShaderRecompiler::Spirv::SimplifiedStore>(
+	    std::filesystem::path("_PipelineCache") / (title_id + ".v1.simplified"), KYTY_GIT_VERSION);
+	ShaderRecompiler::Spirv::SetSimplifiedStore(m_simplified_store.get());
+	PipelineCacheLog("SPIR-V simplifications: {} stored", m_simplified_store->Loaded());
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -2296,6 +2304,9 @@ bool PipelineCache::Save() {
 	}
 	LogStaleDriverCache();
 	LogCoverage();
+	if (m_simplified_store != nullptr) {
+		m_simplified_store->Flush();
+	}
 	m_driver_cache_writer.Wait();
 	PersistStaleMisses();
 	if (m_driver_cache == nullptr || m_driver_cache_path.empty() ||

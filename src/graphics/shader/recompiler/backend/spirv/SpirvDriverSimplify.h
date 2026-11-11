@@ -21,6 +21,13 @@ struct DriverSimplifyStats {
 
 bool SimplifyForDriver(std::vector<uint32_t>& words, DriverSimplifyStats* stats = nullptr);
 
+class SimplifiedStore;
+// The store SimplifyForDriverStored uses (null: none); the caller keeps it alive while it is set.
+void SetSimplifiedStore(SimplifiedStore* store);
+// SimplifyForDriver through the store: a module simplified before (in this or an earlier session)
+// takes the stored words, a new one is simplified and stored.
+bool SimplifyForDriverStored(std::vector<uint32_t>& words);
+
 uint32_t DriverSimplifyMinWords();
 void     SetDriverSimplifyMinWords(uint32_t words);
 
