@@ -719,6 +719,10 @@ struct PipelineCacheTestAccess {
     return true;
   }
 
+  static void WaitForProgramPreparation(PipelineCache &cache) {
+    cache.WaitForProgramPreparation();
+  }
+
   static void WaitForBackgroundBuilds(PipelineCache &cache) {
     cache.m_compile_queue->WaitIdle();
   }
@@ -55993,6 +55997,40 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
       gate_open = true;
     }
     gate_cv.notify_all();
+  }
+
+  // A recorded program is translated ahead of its first use, which takes that
+  // translation and its module; a program the records do not name is
+  // translated at its first use as before.
+  {
+    PipelineCache cache(graphics, nullptr);
+    auto manifest = std::make_unique<ProgramManifest>();
+    (void)manifest->Add(*record);
+    PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
+                                               nullptr);
+    cache.StartProgramPreparation(2);
+    PipelineCacheTestAccess::WaitForProgramPreparation(cache);
+    auto counts = cache.GetProgramPreparationCounts();
+    Require(name, "prepared ahead",
+            counts.queued == 1 && counts.prepared == 1 && counts.failed == 0,
+            "the recorded program was not translated ahead of its use");
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(regs, input);
+    counts = cache.GetProgramPreparationCounts();
+    Require(name, "prepared program taken",
+            counts.adopted == 1 && program.spirv_hash == record->spirv_hash &&
+                program.record_key == record->Key(),
+            "the first use did not take the prepared translation and module");
+    Require(name, "prepared pipeline",
+            cache.GetComputePipeline(input).pipeline != nullptr,
+            "no pipeline for the prepared program");
+    auto other = regs;
+    other.cs_regs.num_thread_x = 32;
+    ShaderComputeInputInfo other_input{};
+    Require(name, "unrecorded program",
+            static_cast<bool>(cache.GetComputeProgram(other, other_input)) &&
+                cache.GetProgramPreparationCounts().adopted == 1,
+            "a program without a record was not translated at its first use");
   }
   std::printf("[gpu]     %-32s ok%s\n", name,
               probes ? "" : " (no driver-cache probes)");

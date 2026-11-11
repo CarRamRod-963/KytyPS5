@@ -35,6 +35,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		m_pipeline_cache.StartPrecompile(std::clamp(host / 2u, 2u, 8u),
 		                                 std::clamp(host / 8u, 1u, 2u));
 	}
+	if (!Config::PrecompileOnlyEnabled()) {
+		m_pipeline_cache.StartProgramPreparation(std::min(Config::PrepareThreads(), 8u));
+	}
 }
 
 RenderContext::~RenderContext() {
