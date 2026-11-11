@@ -195,6 +195,10 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Uploads the CPU-modified pages of [vaddr, vaddr + size) into `buffer`; true if any were.
+	bool UploadCpuModified(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written);
+	// Uploads the parts of m_consumed_unbuffered that a new buffer covers and forgets them.
+	void               UploadConsumedUnbuffered(Buffer& buffer);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	// Records the copy of `copies` (uploaded to `source`) into `buffer`.
@@ -247,6 +251,9 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	FilteredRangeSet                                   m_gpu_modified_ranges;
+	// Pages whose CPU-modified state ConsumeCpuModified took while no buffer held them; the
+	// next buffer created over them uploads their guest bytes.
+	RangeSet m_consumed_unbuffered;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	// Pages the guest recently read back (a read fault, a CPU write into GPU-dirty bytes or a
