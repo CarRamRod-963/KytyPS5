@@ -90,10 +90,10 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
-	void SynchronizeBda(const RangeSet& mapped);
+	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
 
 private:
@@ -108,12 +108,6 @@ private:
 		uint64_t            begin;
 		uint64_t            end;
 		bool                has_stream_leap;
-	};
-
-	// Copies [previous upload's end, end) go to `buffer`.
-	struct BufferUpload {
-		Buffer* buffer;
-		size_t  end;
 	};
 
 	// The stream copy of a CPU-written range, in a slot picked by its address.
@@ -141,8 +135,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
-	                  uint64_t total_size);
+	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
