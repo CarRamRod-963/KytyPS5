@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "gpu_test_shaders/gpu_test_block_layers_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "gpu_test_shaders/gpu_test_stencil_bits_spv.h"
@@ -13364,6 +13365,297 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "swapped depth direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Saros streams 64-layer BC7/BC4 flipbook arrays: a compute shader copies
+  // each level of the old array into the next level of a bigger one, reading
+  // and writing integer views of all layers. NVIDIA (621.14) addresses only the
+  // first layer of such a view of a BC image correctly (reads return other
+  // bytes, writes land in other layers' mips), so the views are views of copies
+  // of the layers that go back into the BC image before its next use.
+  void CheckBlockLayerViews() {
+    constexpr const char *name = "BlockLayerViews";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t new_offset = 0x200000;
+    constexpr uint32_t layers = 8;
+    constexpr uint32_t copied_levels = 4;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "block layer direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "block layer fixed mapping failed");
+    std::mt19937 random(0x0b1ce5u);
+    std::generate_n(static_cast<uint32_t *>(mapped), allocation_size / 4,
+                    [&] { return static_cast<uint32_t>(random()); });
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+    {
+      auto &resources = context;
+      resources.MapMemory(base, allocation_size);
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+
+      // The old array (64x64, levels 0..3) and the new one (128x128, levels
+      // 0..4).
+      const auto make_array = [&](uint64_t address, uint32_t width,
+                                  uint32_t levels) {
+        auto desc = MakeLinearDesc(address, 0, vk::Format::eBc7UnormBlock,
+                                   Prospero::BufferFormat::kBc7UNorm,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, width, 1}, layers, 16, 1);
+        desc.info.resources.levels = levels;
+        desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        desc.info.UpdateSize();
+        desc.view_info.type = vk::ImageViewType::e2DArray;
+        desc.view_info.level_count = levels;
+        desc.view_info.layer_count = layers;
+        return desc;
+      };
+      auto old_desc = make_array(base, 64, copied_levels);
+      auto new_desc = make_array(base + new_offset, 128, copied_levels + 1);
+      Require(name, "fixture",
+              new_desc.info.data.size <= allocation_size - new_offset &&
+                  old_desc.info.data.size <= new_offset,
+              "the BC arrays do not fit the mapping");
+      const auto old_id = cache.FindImage(old_desc);
+      (void)cache.FindTexture(old_id, old_desc);
+      const auto new_id = cache.FindImage(new_desc);
+      (void)cache.FindTexture(new_id, new_desc);
+      Require(name, "arrays", old_id && new_id && old_id != new_id,
+              "the BC arrays were not created");
+
+      // Every level of an array, layer after layer, as the native image holds
+      // it.
+      const auto read_levels = [&](ImageId id, uint32_t levels) {
+        auto &image = cache.GetImage(id);
+        std::vector<vk::BufferImageCopy> copies;
+        std::vector<std::pair<uint64_t, uint64_t>> spans;
+        uint64_t size = 0;
+        for (uint32_t level = 0; level < levels; level++) {
+          const auto texels = std::max(image.info.extent.width >> level, 1u);
+          const uint64_t bytes =
+              uint64_t{(texels + 3) / 4} * ((texels + 3) / 4) * 16 * layers;
+          vk::BufferImageCopy copy{};
+          copy.bufferOffset = size;
+          copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0,
+                                   layers};
+          copy.imageExtent = vk::Extent3D{texels, texels, 1};
+          copies.push_back(copy);
+          spans.emplace_back(size / 4, bytes / 4);
+          size += bytes;
+        }
+        auto readback =
+            CreateHostBuffer(name, size, vk::BufferUsageFlagBits::eTransferDst,
+                             std::vector<u32>(size / 4));
+        image.Download(copies, readback.buffer, 0, size);
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+            nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, size / 4);
+        DestroyBuffer(&readback);
+        std::vector<std::vector<u32>> result;
+        for (const auto &[first, count] : spans) {
+          result.emplace_back(words.begin() + first,
+                              words.begin() + first + count);
+        }
+        return result;
+      };
+      const auto old_before = read_levels(old_id, copied_levels);
+      const auto new_before = read_levels(new_id, copied_levels + 1);
+
+      // The guest copy shader: an integer read of every layer of one level of
+      // the old array, an integer write of every layer of the next level of the
+      // new one.
+      ShaderRecompiler::IR::Program program{};
+      program.stage = ShaderType::Compute;
+      program.resource_tracking_complete = true;
+      for (const bool storage : {false, true}) {
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class =
+            storage ? ShaderRecompiler::IR::ImageResourceClass::Storage
+                    : ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Uint;
+        resource.dimension =
+            ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+        resource.read = !storage;
+        resource.written = storage;
+        program.info.images.push_back(resource);
+      }
+      for (auto &image : program.info.images) {
+        const auto kind =
+            *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+        const auto index = static_cast<size_t>(kind);
+        image.descriptor_index = program.bindings.descriptor_counts[index];
+        program.bindings.descriptor_counts[index] += image.mip_count;
+        program.bindings.descriptor_mask |= uint64_t{1} << index;
+      }
+      ShaderRecompiler::IR::CompiledShaderInfo info{};
+      info.stage = program.stage;
+      info.info = std::move(program.info);
+      info.bindings = std::move(program.bindings);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      snapshot.images.resize(2);
+      ShaderStageRuntime runtime{&info, &snapshot};
+
+      vk::ShaderModuleCreateInfo module_info{};
+      module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+      module_info.codeSize = sizeof(GPU_TEST_BLOCK_LAYERS_SPV);
+      module_info.pCode = GPU_TEST_BLOCK_LAYERS_SPV;
+      vk::ShaderModule copy_module = nullptr;
+      RequireVk(
+          name, "copy",
+          m_device.createShaderModule(&module_info, nullptr, &copy_module),
+          "vkCreateShaderModule");
+      std::array<vk::DescriptorSetLayoutBinding, 2> set_bindings{};
+      set_bindings[0] = {0, vk::DescriptorType::eSampledImage, 1,
+                         vk::ShaderStageFlagBits::eCompute};
+      set_bindings[1] = {1, vk::DescriptorType::eStorageImage, 1,
+                         vk::ShaderStageFlagBits::eCompute};
+      vk::DescriptorSetLayoutCreateInfo set_info{};
+      set_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+      set_info.flags =
+          vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+      set_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
+      set_info.pBindings = set_bindings.data();
+      vk::DescriptorSetLayout set_layout = nullptr;
+      RequireVk(
+          name, "copy",
+          m_device.createDescriptorSetLayout(&set_info, nullptr, &set_layout),
+          "vkCreateDescriptorSetLayout");
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+      layout_info.setLayoutCount = 1;
+      layout_info.pSetLayouts = &set_layout;
+      vk::PipelineLayout copy_layout = nullptr;
+      RequireVk(
+          name, "copy",
+          m_device.createPipelineLayout(&layout_info, nullptr, &copy_layout),
+          "vkCreatePipelineLayout");
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+      pipeline_info.stage.sType =
+          vk::StructureType::ePipelineShaderStageCreateInfo;
+      pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+      pipeline_info.stage.module = copy_module;
+      pipeline_info.stage.pName = "main";
+      pipeline_info.layout = copy_layout;
+      vk::Pipeline copy_pipeline = nullptr;
+      RequireVk(name, "copy",
+                m_device.createComputePipelines(nullptr, 1, &pipeline_info,
+                                                nullptr, &copy_pipeline),
+                "vkCreateComputePipelines");
+
+      PreparedBindings bindings;
+      bindings.runtime = &runtime;
+      bindings.images.resize(2);
+      for (uint32_t level = 0; level < copied_levels; level++) {
+        auto source = old_desc;
+        auto destination = new_desc;
+        for (auto *desc : {&source, &destination}) {
+          desc->view_info.format = vk::Format::eR32G32B32A32Uint;
+          desc->view_info.level_count = 1;
+        }
+        source.view_info.base_level = level;
+        destination.view_info.base_level = level + 1;
+        destination.type = BindingType::Storage;
+        destination.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const std::array<std::pair<ImageId, TextureCache::ImageDesc>, 2> bound{
+            {{old_id, source}, {new_id, destination}}};
+        for (uint32_t i = 0; i < 2; i++) {
+          auto &binding = bindings.images[i];
+          binding.image_id = bound[i].first;
+          binding.desc = bound[i].second;
+          binding.image_view =
+              cache.FindTexture(binding.image_id, binding.desc);
+        }
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), bindings));
+        std::array<vk::DescriptorImageInfo, 2> image_infos{};
+        std::array<vk::WriteDescriptorSet, 2> writes{};
+        for (uint32_t i = 0; i < 2; i++) {
+          image_infos[i] = {nullptr, bindings.images[i].image_view,
+                            bindings.images[i].layout};
+          writes[i].sType = vk::StructureType::eWriteDescriptorSet;
+          writes[i].dstBinding = i;
+          writes[i].descriptorCount = 1;
+          writes[i].descriptorType = set_bindings[i].descriptorType;
+          writes[i].pImageInfo = &image_infos[i];
+        }
+        const uint32_t blocks = std::max((128u >> (level + 1)) / 4u, 1u);
+        auto handle = scheduler.Current().DispatchHandle(true, false);
+        handle.bindPipeline(vk::PipelineBindPoint::eCompute, copy_pipeline);
+        handle.pushDescriptorSetKHR(
+            vk::PipelineBindPoint::eCompute, copy_layout, 0,
+            static_cast<uint32_t>(writes.size()), writes.data());
+        handle.dispatch((blocks + 7) / 8, (blocks + 7) / 8, layers);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
+      // Reading the BC array back is its next use: the written layers go back
+      // first.
+      const auto new_after = read_levels(new_id, copied_levels + 1);
+      const auto old_after = read_levels(old_id, copied_levels);
+      for (uint32_t level = 0; level < copied_levels; level++) {
+        const auto per_layer = old_before[level].size() / layers;
+        std::string wrong;
+        for (uint32_t layer = 0; layer < layers; layer++) {
+          const auto first = old_before[level].begin() + layer * per_layer;
+          if (!std::equal(first, first + per_layer,
+                          new_after[level + 1].begin() + layer * per_layer)) {
+            wrong += std::to_string(layer) + " ";
+          }
+        }
+        Require(
+            name, "integer views of all layers", wrong.empty(),
+            fmt::format("level {} of the new array lost the copy of layers {}",
+                        level + 1, wrong)
+                .c_str());
+      }
+      Require(name, "untouched subresources",
+              new_after[0] == new_before[0] && old_after == old_before,
+              "integer views of several BC layers changed other mips or the "
+              "source array");
+
+      m_device.destroyPipeline(copy_pipeline, nullptr);
+      m_device.destroyPipelineLayout(copy_layout, nullptr);
+      m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+      m_device.destroyShaderModule(copy_module, nullptr);
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(
+          executor, descriptor_pipelines);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "block layer fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "block layer direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -62762,6 +63054,11 @@ int main(int argc, char **argv) {
     CheckStorageTextureVolumeMipRegions();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--block-layer-views-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBlockLayerViews();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--color-clear-check-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckColorClearCheck();
@@ -63446,6 +63743,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBindlessSlotImageReuse();
   vulkan.CheckSwappedDepthReadback();
   vulkan.CheckStencilPlaneStorage();
+  vulkan.CheckBlockLayerViews();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

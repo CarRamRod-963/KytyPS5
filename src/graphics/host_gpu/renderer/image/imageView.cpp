@@ -322,6 +322,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	if (NeedsBlockLayerCopy(image, normalized)) {
+		return FindBlockLayerCopyView(normalized);
+	}
+
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;

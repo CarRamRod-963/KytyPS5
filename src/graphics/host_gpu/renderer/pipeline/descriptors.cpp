@@ -1551,6 +1551,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 	bool                                    bindless = false;
 	bool                                    stencil_plane_writes = false;
+	bool                                    block_layer_writes   = false;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program     = *prepared->runtime->program;
@@ -1580,6 +1581,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			// An uncompressed view of several layers of a block-compressed image is a view of a
+			// copy of those layers (Image::NeedsBlockLayerCopy): the copy is accessed instead.
+			if (auto* copy = image.BlockLayerCopyOf(binding.image_view); copy != nullptr) {
+				const auto layout =
+				    storage ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal;
+				const auto access =
+				    storage ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+				            : vk::AccessFlagBits2::eShaderRead;
+				for (const auto mip_view: binding.mip_views) {
+					if (auto* mip_copy = image.BlockLayerCopyOf(mip_view); mip_copy != nullptr) {
+						mip_copy->Transit(layout, access, {}, vk_buffer);
+					}
+				}
+				copy->Transit(layout, access, {}, vk_buffer);
+				binding.layout = layout;
+				block_layer_writes |= storage;
+				continue;
+			}
 			if (!storage && image.info.IsDepth()) {
 				// A stencil plane the depth image is not bound with is read from its saved copy.
 				if (auto* plane = image.StencilPlaneCopyOf(binding.image_view); plane != nullptr) {
@@ -1706,6 +1725,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
 			has_push_data = true;
+		}
+	}
+
+	if (block_layer_writes) {
+		for (const auto* prepared: prepared_bindings) {
+			for (const auto& binding: prepared->images) {
+				if (!binding.image_id || binding.desc.type != TextureCache::BindingType::Storage) {
+					continue;
+				}
+				auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+				if (image.BlockLayerCopyOf(binding.image_view) != nullptr) {
+					image.WriteBlockLayerCopy(binding.image_view);
+				}
+			}
 		}
 	}
 

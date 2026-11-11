@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -128,6 +129,18 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	// plane's color copy needs the stencil values back in the stencil aspect.
 	if (m_stencil_plane_newer) {
 		ReturnStencilPlane();
+	}
+	// Likewise for the copies of block layers a shader wrote; a write makes every copy old.
+	if (!m_block_layer_copies.empty() && !m_copying_block_layers) {
+		ReturnBlockLayerCopies();
+		if (destination_access &
+		    (vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+		     vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+		     vk::AccessFlagBits2::eMemoryWrite)) {
+			for (auto& copy: m_block_layer_copies) {
+				copy.current = false;
+			}
+		}
 	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
@@ -652,6 +665,123 @@ void Image::ValidateStencilPlane(const ImageInfo& plane, const ImageSubresourceR
 		EXIT("invalid stencil plane: levels=%u layers=%u+%u extent=%ux%u\n", range.level_count,
 		     range.base_layer, range.layer_count, plane.extent.width, plane.extent.height);
 	}
+}
+
+bool Image::NeedsBlockLayerCopy(const VulkanImage& image, const ImageViewInfo& view) noexcept {
+	return image.image_type == vk::ImageType::e2D && view.layer_count > 1 &&
+	       view.level_count == 1 && view.format != image.format &&
+	       vk::blockExtent(image.format)[0] > 1 && vk::blockExtent(view.format)[0] == 1;
+}
+
+vk::ImageView Image::FindBlockLayerCopyView(const ImageViewInfo& view) {
+	auto copy = std::ranges::find_if(m_block_layer_copies, [&](const BlockLayerCopy& candidate) {
+		return candidate.level == view.base_level && candidate.base_layer == view.base_layer &&
+		       candidate.layer_count == view.layer_count && candidate.format == view.format;
+	});
+	if (copy == m_block_layer_copies.end()) {
+		const auto block      = vk::blockExtent(backing.format);
+		const auto texel_size = vk::blockSize(view.format);
+		ImageInfo  layers {};
+		layers.pixel_format = view.format;
+		layers.guest_format = texel_size == 16 ? Prospero::BufferFormat::k32_32_32_32UInt
+		                                       : Prospero::BufferFormat::k32_32UInt;
+		layers.extent       = {
+		    (std::max(backing.extent.width >> view.base_level, 1u) + block[0] - 1u) / block[0],
+		    (std::max(backing.extent.height >> view.base_level, 1u) + block[1] - 1u) / block[1],
+		    1u};
+		layers.resources       = {1, view.layer_count};
+		layers.pitch           = layers.extent.width;
+		layers.bytes_per_block = texel_size;
+		auto& added            = m_block_layer_copies.emplace_back();
+		added.level            = view.base_level;
+		added.base_layer       = view.base_layer;
+		added.layer_count      = view.layer_count;
+		added.format           = view.format;
+		added.image =
+		    std::make_unique<Image>(m_graphics, m_scheduler, layers, MemoryPriority::Class::Target);
+		added.staging = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+		    uint64_t {layers.extent.width} * layers.extent.height * texel_size * view.layer_count);
+		copy = std::prev(m_block_layer_copies.end());
+	}
+	if (!copy->current) {
+		// Copies a shader wrote go back first: they may hold some of these layers.
+		ReturnBlockLayerCopies();
+		CopyBlockLayers(*copy, true);
+		copy->current = true;
+	}
+	if (!(view.usage & vk::ImageUsageFlagBits::eStorage)) {
+		copy->image->Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+		                     vk::AccessFlagBits2::eShaderRead, {}, m_scheduler.Current().Handle());
+	}
+	auto copy_view       = view;
+	copy_view.base_level = 0;
+	copy_view.base_layer = 0;
+	return copy->image->FindView(copy_view);
+}
+
+Image* Image::BlockLayerCopyOf(vk::ImageView view) noexcept {
+	for (auto& copy: m_block_layer_copies) {
+		if (std::ranges::find(copy.image->views, view, &CachedImageView::view) !=
+		    copy.image->views.end()) {
+			return copy.image.get();
+		}
+	}
+	return nullptr;
+}
+
+void Image::WriteBlockLayerCopy(vk::ImageView view) {
+	auto* written = BlockLayerCopyOf(view);
+	EXIT_IF(written == nullptr);
+	for (auto& copy: m_block_layer_copies) {
+		if (copy.image.get() == written) {
+			copy.newer = copy.current = true;
+		} else {
+			// This image changes when the written copy goes back.
+			copy.current = false;
+		}
+	}
+	m_block_layer_copy_newer = true;
+	HeapChanged();
+}
+
+void Image::ReturnBlockLayerCopies() {
+	if (!m_block_layer_copy_newer) {
+		return;
+	}
+	m_block_layer_copy_newer = false;
+	for (auto& copy: m_block_layer_copies) {
+		if (copy.newer) {
+			copy.newer = false;
+			CopyBlockLayers(copy, false);
+		}
+	}
+}
+
+void Image::CopyBlockLayers(BlockLayerCopy& copy, bool to_copy) {
+	const vk::BufferImageCopy own {
+	    0,
+	    0,
+	    0,
+	    {vk::ImageAspectFlagBits::eColor, copy.level, copy.base_layer, copy.layer_count},
+	    {},
+	    {std::max(backing.extent.width >> copy.level, 1u),
+	     std::max(backing.extent.height >> copy.level, 1u), 1u}};
+	const vk::BufferImageCopy layers {0,  0,
+	                                  0,  {vk::ImageAspectFlagBits::eColor, 0, 0, copy.layer_count},
+	                                  {}, copy.image->info.extent};
+	const auto                staging = copy.staging->Handle();
+	const auto                size    = copy.staging->Size();
+	m_copying_block_layers            = true;
+	if (to_copy) {
+		Download({&own, 1}, staging, 0, size);
+		copy.image->Upload({&layers, 1}, staging, 0, size);
+	} else {
+		copy.image->Download({&layers, 1}, staging, 0, size);
+		Upload({&own, 1}, staging, 0, size);
+	}
+	m_copying_block_layers = false;
 }
 
 bool Image::StencilPlaneCopy::Describes(const ImageInfo&             plane,

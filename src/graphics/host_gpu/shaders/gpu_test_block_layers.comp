@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Copies one level of a block-compressed array into a level of another through integer views
+// of all their layers, one 16-byte block per texel (texture streaming builds bigger BC arrays
+// this way).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform utexture2DArray source;
+layout(set = 0, binding = 1, rgba32ui) uniform writeonly uimage2DArray destination;
+
+void main() {
+	const ivec3 block = ivec3(gl_GlobalInvocationID);
+	if (any(greaterThanEqual(block, imageSize(destination)))) {
+		return;
+	}
+	imageStore(destination, block, texelFetch(source, block, 0));
+}
