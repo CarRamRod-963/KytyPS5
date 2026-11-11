@@ -66,17 +66,27 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
-// Queries take no lock: dirty words are read atomically, and a query runs on the GPU thread, which
-// alone writes GPU-dirty bits while other threads only set CPU-dirty ones, so it sees one instant.
+// Queries take no lock while no state change of the region runs (TryQueryUnlocked); the dirty
+// words are read atomically. A query racing a change takes the lock, as before.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		const auto query = [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); };
+		if (bool modified = false; manager->TryQueryUnlocked(query, modified)) {
+			return modified;
+		}
+		std::scoped_lock lock(manager->lock);
+		return query();
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		const auto query = [&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); };
+		if (bool modified = false; manager->TryQueryUnlocked(query, modified)) {
+			return modified;
+		}
+		std::scoped_lock lock(manager->lock);
+		return query();
 	});
 }
 
