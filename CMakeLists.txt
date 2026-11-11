@@ -811,6 +811,13 @@ add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
 target_link_libraries(driver_cache_file_tests xxhash)
 target_include_directories(driver_cache_file_tests PRIVATE ${inc_headers})
 
+add_executable(spirv_simplified_store_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvSimplifiedStoreTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvSimplifiedStore.cpp"
+)
+target_link_libraries(spirv_simplified_store_tests xxhash)
+target_include_directories(spirv_simplified_store_tests PRIVATE ${inc_headers})
+
 add_executable(driver_cache_history_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DriverCacheHistoryTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/driverCacheFile.cpp"
@@ -931,6 +938,7 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_cache_writer COMMAND $<TARGET_FILE:pipeline_cache_writer_tests>)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME driver_cache_history COMMAND $<TARGET_FILE:driver_cache_history_tests>)
+	add_test(NAME spirv_simplified_store COMMAND $<TARGET_FILE:spirv_simplified_store_tests>)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
@@ -1082,6 +1090,7 @@ if(BUILD_TESTING)
 		pipeline_cache_writer_tests
 		driver_cache_file_tests
 		driver_cache_history_tests
+		spirv_simplified_store_tests
 		pending_draw_policy_tests
 		memory_priority_tests
 		barrier_tracker_tests
