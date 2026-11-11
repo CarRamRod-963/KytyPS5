@@ -3401,12 +3401,33 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	return true;
 }
 
+// Snapshots outlive their walks and move between programs (a lookahead job's snapshot is
+// swapped with the program's at adoption, and the job then walks other programs), so a list
+// sized for the largest walk a snapshot ever held would spread to every snapshot it reaches.
+// A list using less than a quarter of a large allocation gives the rest back.
+static void ReleaseUnusedCapacity(ResourceSnapshot& snapshot) {
+	const auto release = [](auto& list) {
+		using Element = typename std::remove_reference_t<decltype(list)>::value_type;
+		constexpr size_t KeepBytes = 64u << 10u;
+		if (list.capacity() * sizeof(Element) > KeepBytes && list.capacity() / 4u > list.size())
+			list.shrink_to_fit();
+	};
+	release(snapshot.buffers);
+	release(snapshot.images);
+	release(snapshot.samplers);
+	release(snapshot.bindless_uses);
+	release(snapshot.flattened_srt);
+	release(snapshot.user_data);
+	release(snapshot.specialization_reads);
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	auto& reasons       = t_failure_reasons;
 	reasons.speculative = runtime.speculative;
 	reasons.text.clear();
 	const bool done = MaterializeResourcesImpl(program, runtime, snapshot, specialization);
+	ReleaseUnusedCapacity(snapshot);
 	// An unavailable draw has already named its reason.
 	if (!done && !snapshot.unavailable && !reasons.text.empty())
 		ReportSpecializationFailure(program.shader_hash, reasons.text, false);

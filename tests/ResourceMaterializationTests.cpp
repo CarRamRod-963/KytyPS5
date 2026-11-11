@@ -223,6 +223,28 @@ void TestWalkerLoadsBypassSpecializationReader() {
         "walker did not load the mapped SRT DWORD");
 }
 
+// A snapshot keeps no large list a walk left mostly unused: snapshots move
+// between programs (lookahead adoption swaps them), and every one would keep
+// the largest list it ever held.
+void TestSnapshotReleasesUnusedCapacity() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const uint32_t dword = 0x12345678;
+  auto plan = Extract(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  snapshot.specialization_reads.reserve(1u << 16u);
+  snapshot.flattened_srt.reserve(1u << 18u);
+  snapshot.images.reserve(1u << 12u);
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt.size() == 1 &&
+            snapshot.flattened_srt[0] == dword,
+        "the walk failed");
+  Check(snapshot.specialization_reads.capacity() < (1u << 16u) &&
+            snapshot.flattened_srt.capacity() < (1u << 18u) &&
+            snapshot.images.capacity() < (1u << 12u),
+        "a snapshot kept list capacity its walk did not use");
+}
+
 void TestNativeNestedSrtRefresh() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   std::array<uint32_t, 3> first{0u, 0x12345678u, 0xabcdef01u};
@@ -2109,6 +2131,7 @@ int main() {
   TestReaderLoadsWalkOnSeveralThreads();
   TestWalkerLoadsBypassSpecializationReader();
   TestPlanUserDataReads();
+  TestSnapshotReleasesUnusedCapacity();
   TestNativeNestedSrtRefresh();
   TestReaderLoadsThroughCacheView();
   TestResourceLookahead();
