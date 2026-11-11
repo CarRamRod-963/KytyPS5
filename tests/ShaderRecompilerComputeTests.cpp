@@ -7250,7 +7250,8 @@ public:
     const auto id = cache.FindBuffer(base, 2 * page);
     const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
     context.PrepareBda();
-    collect(100);
+    // Older than the aggressive collection needs, younger than the BDA age.
+    collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge));
 
     auto entries = CreateHostBuffer(name, 2 * sizeof(vk::DeviceAddress),
                                     vk::BufferUsageFlagBits::eTransferDst, {});
@@ -7312,7 +7313,7 @@ public:
             "buffer");
 
     // A dropped report keeps every watched buffer too.
-    collect(81);
+    collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
     Require(name, "watched again", read_entries() == watched_entries(true),
             "the buffer was not watched again once it aged");
     cache.NoteLostBdaReports();
@@ -7323,7 +7324,7 @@ public:
             "dropped reports did not keep the watched buffers");
 
     // Without a report the buffer is evicted once the watch ends.
-    collect(81);
+    collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
     Require(name, "watched third", read_entries() == watched_entries(true),
             "the buffer was not watched again once it aged");
     collect(static_cast<uint32_t>(BufferCache::BdaWatchTicks) - 2u);
@@ -7430,6 +7431,21 @@ public:
         !cache.IsRegionRegistered(base, 2 * page) && read_entry() == 0u,
         "an old unreported buffer was kept below the memory trigger with BDA "
         "accesses in use");
+
+    // With BDA accesses in use a buffer is watched once it went unused for the
+    // BDA collection age, not the (longer) age of the plain collection.
+    const auto again = cache.FindBuffer(base, 2 * page);
+    const auto again_address = cache.GetBuffer(again).BufferDeviceAddress();
+    context.PrepareBda();
+    collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge));
+    Require(name, "young with BDA",
+            cache.IsRegionRegistered(base, 2 * page) &&
+                read_entry() == again_address,
+            "a buffer was watched before the BDA collection age");
+    collect(1);
+    Require(name, "aged with BDA",
+            read_entry() == (again_address | BufferCache::BdaWatchBit),
+            "a buffer past the BDA collection age was not watched");
 
     context.UnmapMemory(base, 2 * page);
     scheduler.Finish();
