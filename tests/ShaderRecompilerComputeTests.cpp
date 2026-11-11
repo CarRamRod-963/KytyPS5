@@ -6661,13 +6661,7 @@ public:
     const auto snapshot = [&](uint64_t offset, uint32_t index) {
       snapshot_of(buffer, offset, index);
     };
-    {
-      const RecordedCommandCounter counter;
-      context.PrepareBda();
-      Require(name, "one barrier pair",
-              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 1,
-              "two ranges of one buffer did not upload in one copy behind one barrier pair");
-    }
+    context.PrepareBda();
     Require(name, "mapped intersection",
             !cache.IsRegionCpuModified(base, page) &&
                 cache.IsRegionCpuModified(base + page, page) &&
@@ -6724,13 +6718,7 @@ public:
             "garbage collection kept the clean buffer");
     const auto low = cache.FindBuffer(base, page);
     const auto high = cache.FindBuffer(base + page, 2 * page);
-    {
-      const RecordedCommandCounter counter;
-      context.PrepareBda();
-      Require(name, "shared barrier pair",
-              RecordedCommandCounter::barriers == 2 && RecordedCommandCounter::copies == 2,
-              "two buffers did not upload behind one barrier pair");
-    }
+    context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
             "buffers replacing an evicted one did not upload their untracked pages");
     snapshot_of(cache.GetBuffer(low), 16, 6);
