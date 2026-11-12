@@ -158,8 +158,12 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 // labels in the range whose waits the command streams elided are stored (see PendingLabels).
 // The backing reads above return such labels as stored without waiting.
 void                   SettleLabelAccess(uint64_t vaddr, uint64_t size);
-// Stops at the first hole, or with span_holes at the end of the last committed range.
+// Clamps the range to its mapped part: it stops at the first hole, or with span_holes at the end
+// of the last committed range. Each distinct clamp is logged once, up to ClampReportLimit of
+// them; ClampedRangeReports counts the clamps logged so far.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
+inline constexpr uint64_t ClampReportLimit = 256;
+[[nodiscard]] uint64_t    ClampedRangeReports();
 // The mapped size from vaddr, at most size; 0 when vaddr itself is unmapped.
 [[nodiscard]] uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
