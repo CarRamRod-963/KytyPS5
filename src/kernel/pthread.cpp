@@ -2268,7 +2268,9 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		}
 	}
 
-	LOGF("\trwlock destroy: %s, 0\n", (*rwlock)->name.c_str());
+	if (!(*rwlock)->name.empty()) {
+		LOGF("\trwlock destroy: %s, 0\n", (*rwlock)->name.c_str());
+	}
 
 	delete *rwlock;
 	*rwlock = nullptr;
@@ -2293,7 +2295,9 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
 
 	new_rwlock->name = (name != nullptr ? name : "");
 
-	LOGF("\trwlock init: %s, 0\n", new_rwlock->name.c_str());
+	if (!new_rwlock->name.empty()) {
+		LOGF("\trwlock init: %s, 0\n", new_rwlock->name.c_str());
+	}
 
 	std::atomic_ref<PthreadRwlockPrivate*>(*rwlock).store(new_rwlock, std::memory_order_release);
 
