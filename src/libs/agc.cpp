@@ -1503,18 +1503,18 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
                                         uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
-	     "\t target         = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
+	AgcTrace("\t cmd            = 0x%016" PRIx64 "\n"
+	         "\t target         = 0x%016" PRIx64 "\n"
+	         "\t size_in_dwords = %" PRIu32 "\n",
+	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	auto cmd_id = cmd[0];
 	auto op     = (cmd_id >> 8u) & 0xffu;
 
-	LOGF("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
-	     op, KYTY_PM4_LEN(cmd_id));
+	AgcTrace("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n",
+	         cmd_id, op, KYTY_PM4_LEN(cmd_id));
 
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -1550,7 +1550,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
-	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
+	AgcTrace("\t operation = 0x%08" PRIx32 "\n", operation);
 
 	const auto size_dw = context_state_op_size_dw(operation);
 	if (buf == nullptr || size_dw == 0) {
@@ -1791,20 +1791,20 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
                                     uint32_t size_in_dwords2) {
 	PRINT_NAME();
 
-	LOGF("\t mode             = 0x%02" PRIx8 "\n"
-	     "\t compare_function = 0x%02" PRIx8 "\n"
-	     "\t compare_addr     = 0x%016" PRIx64 "\n"
-	     "\t mask             = 0x%016" PRIx64 "\n"
-	     "\t reference        = 0x%016" PRIx64 "\n"
-	     "\t cache_policy1    = 0x%02" PRIx8 "\n"
-	     "\t buffer1          = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords1  = %" PRIu32 "\n"
-	     "\t cache_policy2    = 0x%02" PRIx8 "\n"
-	     "\t buffer2          = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords2  = %" PRIu32 "\n",
-	     mode, compare_function, reinterpret_cast<uint64_t>(compare_addr), mask, reference,
-	     cache_policy1, reinterpret_cast<uint64_t>(buffer1), size_in_dwords1, cache_policy2,
-	     reinterpret_cast<uint64_t>(buffer2), size_in_dwords2);
+	AgcTrace("\t mode             = 0x%02" PRIx8 "\n"
+	         "\t compare_function = 0x%02" PRIx8 "\n"
+	         "\t compare_addr     = 0x%016" PRIx64 "\n"
+	         "\t mask             = 0x%016" PRIx64 "\n"
+	         "\t reference        = 0x%016" PRIx64 "\n"
+	         "\t cache_policy1    = 0x%02" PRIx8 "\n"
+	         "\t buffer1          = 0x%016" PRIx64 "\n"
+	         "\t size_in_dwords1  = %" PRIu32 "\n"
+	         "\t cache_policy2    = 0x%02" PRIx8 "\n"
+	         "\t buffer2          = 0x%016" PRIx64 "\n"
+	         "\t size_in_dwords2  = %" PRIu32 "\n",
+	         mode, compare_function, reinterpret_cast<uint64_t>(compare_addr), mask, reference,
+	         cache_policy1, reinterpret_cast<uint64_t>(buffer1), size_in_dwords1, cache_policy2,
+	         reinterpret_cast<uint64_t>(buffer2), size_in_dwords2);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -1860,7 +1860,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values) {
 	PRINT_NAME();
 
-	LOGF("\t num_values = %" PRIu32 "\n", num_values);
+	AgcTrace("\t num_values = %" PRIu32 "\n", num_values);
 
 	return 4u * num_values + 8u;
 }
@@ -2100,9 +2100,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       display_buffer_index) {
 	PRINT_NAME();
 
-	LOGF("\t video_out_handle     = %" PRIu32 "\n"
-	     "\t display_buffer_index = %" PRIu32 "\n",
-	     video_out_handle, display_buffer_index);
+	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+	         "\t display_buffer_index = %" PRIu32 "\n",
+	         video_out_handle, display_buffer_index);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2126,10 +2126,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t st
                                                  uint32_t        workload_count) {
 	PRINT_NAME();
 
-	LOGF("\t stream_id      = %" PRIu32 "\n"
-	     "\t workload_ids   = 0x%016" PRIx64 "\n"
-	     "\t workload_count = %" PRIu32 "\n",
-	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+	AgcTrace("\t stream_id      = %" PRIu32 "\n"
+	         "\t workload_ids   = 0x%016" PRIx64 "\n"
+	         "\t workload_count = %" PRIu32 "\n",
+	         stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
 
 	if (buf == nullptr || workload_ids == nullptr || workload_count == 0 ||
 	    workload_count > WORKLOAD_ACTIVE_COUNT_MAX || stream_id < WORKLOAD_STREAM_MIN_ID ||
@@ -2177,9 +2177,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
                                                   uint32_t workload_id) {
 	PRINT_NAME();
 
-	LOGF("\t stream_id   = %" PRIu32 "\n"
-	     "\t workload_id = %" PRIu32 "\n",
-	     stream_id, workload_id);
+	AgcTrace("\t stream_id   = %" PRIu32 "\n"
+	         "\t workload_id = %" PRIu32 "\n",
+	         stream_id, workload_id);
 
 	if (buf == nullptr || stream_id < WORKLOAD_STREAM_MIN_ID ||
 	    stream_id > WORKLOAD_STREAM_MAX_ID || workload_id > WORKLOAD_ID_MAX) {
@@ -2587,14 +2587,14 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
 
-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
-	     "\t arg1           = 0x%016" PRIx64 "\n"
-	     "\t target         = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords = %" PRIu32 "\n"
-	     "\t arg4           = 0x%016" PRIx64 "\n"
-	     "\t arg5           = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), arg1, reinterpret_cast<uint64_t>(target), size_in_dwords,
-	     arg4, arg5);
+	AgcTrace("\t cmd            = 0x%016" PRIx64 "\n"
+	         "\t arg1           = 0x%016" PRIx64 "\n"
+	         "\t target         = 0x%016" PRIx64 "\n"
+	         "\t size_in_dwords = %" PRIu32 "\n"
+	         "\t arg4           = 0x%016" PRIx64 "\n"
+	         "\t arg5           = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(cmd), arg1, reinterpret_cast<uint64_t>(target),
+	         size_in_dwords, arg4, arg5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -2998,9 +2998,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
                                        uint32_t num_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t address    = 0x%016" PRIx64 "\n"
-	     "\t num_dwords = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(address), num_dwords);
+	AgcTrace("\t address    = 0x%016" PRIx64 "\n"
+	         "\t num_dwords = %" PRIu32 "\n",
+	         reinterpret_cast<uint64_t>(address), num_dwords);
 
 	if (buf == nullptr || address == nullptr) {
 		LOGF_COLOR(Log::Color::Red, "\t invalid arguments\n");
@@ -3286,16 +3286,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
                                        uint8_t write_confirm) {
 	PRINT_NAME();
 
-	LOGF("\t dst                      = 0x%02" PRIx8 "\n"
-	     "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
-	     "\t dst_address              = 0x%016" PRIx64 "\n"
-	     "\t src                      = 0x%02" PRIx8 "\n"
-	     "\t src_cache_policy         = 0x%02" PRIx8 "\n"
-	     "\t src_address_or_immediate = 0x%016" PRIx64 "\n"
-	     "\t item_size                = 0x%02" PRIx8 "\n"
-	     "\t write_confirm            = 0x%02" PRIx8 "\n",
-	     dst, dst_cache_policy, dst_address, src, src_cache_policy, src_address_or_immediate,
-	     item_size, write_confirm);
+	AgcTrace("\t dst                      = 0x%02" PRIx8 "\n"
+	         "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
+	         "\t dst_address              = 0x%016" PRIx64 "\n"
+	         "\t src                      = 0x%02" PRIx8 "\n"
+	         "\t src_cache_policy         = 0x%02" PRIx8 "\n"
+	         "\t src_address_or_immediate = 0x%016" PRIx64 "\n"
+	         "\t item_size                = 0x%02" PRIx8 "\n"
+	         "\t write_confirm            = 0x%02" PRIx8 "\n",
+	         dst, dst_cache_policy, dst_address, src, src_cache_policy, src_address_or_immediate,
+	         item_size, write_confirm);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3378,11 +3378,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cac
                                    const uint32_t* target, uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t mode           = 0x%02" PRIx8 "\n"
-	     "\t cache_policy   = 0x%02" PRIx8 "\n"
-	     "\t target         = 0x%016" PRIx64 "\n"
-	     "\t size_in_dwords = %" PRIu32 "\n",
-	     mode, cache_policy, reinterpret_cast<uint64_t>(target), size_in_dwords);
+	AgcTrace("\t mode           = 0x%02" PRIx8 "\n"
+	         "\t cache_policy   = 0x%02" PRIx8 "\n"
+	         "\t target         = 0x%016" PRIx64 "\n"
+	         "\t size_in_dwords = %" PRIu32 "\n",
+	         mode, cache_policy, reinterpret_cast<uint64_t>(target), size_in_dwords);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3420,7 +3420,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) {
 	PRINT_NAME();
 
-	LOGF("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
+	AgcTrace("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3443,12 +3443,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
                                              uint32_t count_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t condition       = 0x%02" PRIx8 "\n"
-	     "\t op              = 0x%02" PRIx8 "\n"
-	     "\t wait_op         = 0x%02" PRIx8 "\n"
-	     "\t address         = 0x%016" PRIx64 "\n"
-	     "\t count_in_dwords = %" PRIu32 "\n",
-	     condition, op, wait_op, reinterpret_cast<uint64_t>(address), count_in_dwords);
+	AgcTrace("\t condition       = 0x%02" PRIx8 "\n"
+	         "\t op              = 0x%02" PRIx8 "\n"
+	         "\t wait_op         = 0x%02" PRIx8 "\n"
+	         "\t address         = 0x%016" PRIx64 "\n"
+	         "\t count_in_dwords = %" PRIu32 "\n",
+	         condition, op, wait_op, reinterpret_cast<uint64_t>(address), count_in_dwords);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3478,12 +3478,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg
                                              uint32_t arg3) {
 	PRINT_NAME();
 
-	LOGF("\t argc = 4\n"
-	     "\t arg0 = 0x%016" PRIx64 "\n"
-	     "\t arg1 = 0x%08" PRIx32 "\n"
-	     "\t arg2 = 0x%08" PRIx32 "\n"
-	     "\t arg3 = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(buf), arg1, arg2, arg3);
+	AgcTrace("\t argc = 4\n"
+	         "\t arg0 = 0x%016" PRIx64 "\n"
+	         "\t arg1 = 0x%08" PRIx32 "\n"
+	         "\t arg2 = 0x%08" PRIx32 "\n"
+	         "\t arg3 = 0x%08" PRIx32 "\n",
+	         reinterpret_cast<uint64_t>(buf), arg1, arg2, arg3);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3543,13 +3543,13 @@ uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
 int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
 	PRINT_NAME();
 
-	LOGF("\t packet      = 0x%016" PRIx64 "\n"
-	     "\t predication = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(packet), predication);
+	AgcTrace("\t packet      = 0x%016" PRIx64 "\n"
+	         "\t predication = 0x%08" PRIx32 "\n",
+	         reinterpret_cast<uint64_t>(packet), predication);
 
-	LOGF("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
-	     ", len = %" PRIu32 "\n",
-	     packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
+	AgcTrace("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
+	         ", len = %" PRIu32 "\n",
+	         packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
 
 	packet[0] = (packet[0] & ~1u) | (static_cast<uint8_t>(predication) == 1 ? 1u : 0u);
 
@@ -3568,10 +3568,10 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
                                          uint32_t predication) {
 	PRINT_NAME();
 
-	LOGF("\t start       = 0x%016" PRIx64 "\n"
-	     "\t end         = 0x%016" PRIx64 "\n"
-	     "\t predication = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
+	AgcTrace("\t start       = 0x%016" PRIx64 "\n"
+	         "\t end         = 0x%016" PRIx64 "\n"
+	         "\t predication = 0x%08" PRIx32 "\n",
+	         reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
 
 	auto* packet    = start;
 	auto* range_end = const_cast<uint32_t*>(reinterpret_cast<const volatile uint32_t*>(end));
@@ -3606,9 +3606,9 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
 	PRINT_NAME();
 
-	LOGF("\t cmd    = 0x%016" PRIx64 "\n"
-	     "\t buffer = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
+	AgcTrace("\t cmd    = 0x%016" PRIx64 "\n"
+	         "\t buffer = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
 	if (cmd == nullptr || buffer == nullptr) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -3709,7 +3709,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 uint32_t KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t num_dwords = %" PRIu32 "\n", num_dwords);
+	AgcTrace("\t num_dwords = %" PRIu32 "\n", num_dwords);
 
 	return 4u * num_dwords + 16u;
 }
@@ -3721,15 +3721,15 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
                                           uint32_t reporting_interval_in_100k_clocks) {
 	PRINT_NAME();
 
-	LOGF("\t cache_policy                      = 0x%02" PRIx8 "\n"
-	     "\t buffer                            = 0x%016" PRIx64 "\n"
-	     "\t buffer_size_in_bytes              = %" PRIu32 "\n"
-	     "\t reset_count                       = %" PRIu32 "\n"
-	     "\t force_reset                       = 0x%02" PRIx8 "\n"
-	     "\t report_and_reset                  = 0x%02" PRIx8 "\n"
-	     "\t reporting_interval_in_100k_clocks = %" PRIu32 "\n",
-	     cache_policy, reinterpret_cast<uint64_t>(buffer), buffer_size_in_bytes, reset_count,
-	     force_reset, report_and_reset, reporting_interval_in_100k_clocks);
+	AgcTrace("\t cache_policy                      = 0x%02" PRIx8 "\n"
+	         "\t buffer                            = 0x%016" PRIx64 "\n"
+	         "\t buffer_size_in_bytes              = %" PRIu32 "\n"
+	         "\t reset_count                       = %" PRIu32 "\n"
+	         "\t force_reset                       = 0x%02" PRIx8 "\n"
+	         "\t report_and_reset                  = 0x%02" PRIx8 "\n"
+	         "\t reporting_interval_in_100k_clocks = %" PRIu32 "\n",
+	         cache_policy, reinterpret_cast<uint64_t>(buffer), buffer_size_in_bytes, reset_count,
+	         force_reset, report_and_reset, reporting_interval_in_100k_clocks);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3802,9 +3802,9 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
 	PRINT_NAME();
 
-	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
-	     "\t reference = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reference);
+	AgcTrace("\t cmd       = 0x%016" PRIx64 "\n"
+	         "\t reference = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(cmd), reference);
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
@@ -3844,9 +3844,9 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
 	PRINT_NAME();
 
-	LOGF("\t cmd  = 0x%016" PRIx64 "\n"
-	     "\t data = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), data);
+	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
+	         "\t data = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(cmd), data);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -4233,20 +4233,20 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
 	PRINT_NAME();
 
-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
-	     "\t packet        = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
+	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
+	         "\t packet        = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
 
 	if (queue_context == nullptr || packet == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const uint32_t queue = get_driver_queue(queue_context);
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
-	     "\t addr  = 0x%016" PRIx64 "\n"
-	     "\t size  = 0x%08" PRIx32 "\n"
-	     "\t flags = 0x%02" PRIx8 "\n",
-	     queue, reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+	AgcTrace("\t queue = 0x%08" PRIx32 "\n"
+	         "\t addr  = 0x%016" PRIx64 "\n"
+	         "\t size  = 0x%08" PRIx32 "\n"
+	         "\t flags = 0x%02" PRIx8 "\n",
+	         queue, reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_command_buffer(queue, packet->addr, packet->dw_num);
 	return OK;
@@ -4258,9 +4258,9 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
                                                      uint32_t         count) {
 	PRINT_NAME();
 
-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
-	     "\t count         = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(queue_context), count);
+	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
+	         "\t count         = %" PRIu32 "\n",
+	         reinterpret_cast<uint64_t>(queue_context), count);
 
 	if (count == 0) {
 		return OK;
@@ -4299,9 +4299,9 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
                                            const uint32_t* sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
 
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
-	     "\t count = %" PRIu32 "\n",
-	     queue, count);
+	AgcTrace("\t queue = 0x%08" PRIx32 "\n"
+	         "\t count = %" PRIu32 "\n",
+	         queue, count);
 
 	if (count == 0) {
 		return OK;
