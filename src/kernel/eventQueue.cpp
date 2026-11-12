@@ -420,7 +420,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		return KERNEL_ERROR_EBADF;
 	}
 	if (*out == 0) {
-		LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
+		if (PRINT_NAME_ENABLED) {
+			LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
+		}
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
 
@@ -466,8 +468,10 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
 
-	LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
-	     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
+		     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	}
 
 	return KernelTriggerEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata);
 }
