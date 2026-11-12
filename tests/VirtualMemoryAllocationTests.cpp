@@ -847,6 +847,34 @@ void TestClampRangeSkipsStateLock() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestClampedRangesReportedOnce() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "ClampedRangesReportedOnce";
+	const auto  page = SceKernelPageSize;
+	const auto  base = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "clamp_reports");
+	CheckOk(test, KernelMunmap(base + 2 * page, page), "KernelMunmap(hole)");
+	const auto before = ClampedRangeReports();
+	for (int i = 0; i < 3; ++i) {
+		Check(test, ClampRangeSize(base, 3 * page) == 2 * page, "range not clamped at the hole");
+	}
+	Check(test, ClampedRangeReports() == before + 1u, "a repeated clamp was reported again");
+	Check(test, ClampRangeSize(base + 0x100, 3 * page) == 2 * page - 0x100,
+	      "range not clamped at the hole");
+	Check(test, ClampedRangeReports() == before + 2u, "a new clamp was not reported");
+	(void)ClampRangeSize(base, 3 * page);
+	std::thread other([&] { (void)ClampRangeSize(base + 0x100, 3 * page); });
+	other.join();
+	Check(test, ClampedRangeReports() == before + 2u,
+	      "a clamp reported before was reported again by another call or thread");
+	for (uint64_t i = 0; i <= ClampReportLimit; ++i) {
+		(void)ClampRangeSize(base, 3 * page + 0x10 * (i + 1));
+	}
+	Check(test, ClampedRangeReports() == ClampReportLimit,
+	      "clamp reports did not stop at ClampReportLimit");
+	CheckOk(test, KernelMunmap(base, 2 * page), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestTrackerProtectSharesBackingReads() {
 	using namespace Libs::LibKernel::Memory;
 	const char* test = "TrackerProtectSharesBackingReads";
@@ -6013,6 +6041,7 @@ int main(int argc, char** argv) {
 	RunTest(TestQueriesWaitForStateChanges);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestClampRangeSkipsStateLock);
+	RunTest(TestClampedRangesReportedOnce);
 	RunTest(TestCompareBackingMatchesRead);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

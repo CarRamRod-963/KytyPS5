@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <compare>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -22,7 +23,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -886,6 +889,43 @@ uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges == nullptr ? 0 : g_virtual_ranges->ClampRangeSize(vaddr, size);
 }
 
+static std::atomic<uint64_t> g_clamp_reports {0};
+
+// A buffer that runs past its mapping is usually bound for every draw that uses it, thousands of
+// times per second, so each distinct clamp is reported once, up to ClampReportLimit of them.
+static void ReportClampedRange(uint64_t vaddr, uint64_t size, uint64_t clamped_size) {
+	struct Clamp {
+		uint64_t vaddr                           = 0;
+		uint64_t size                            = 0;
+		uint64_t clamped_size                    = 0;
+		auto     operator<=>(const Clamp&) const = default;
+	};
+	const Clamp clamp {vaddr, size, clamped_size};
+	// Repeats of the thread's last clamp skip the shared set.
+	thread_local Clamp last {};
+	if (std::exchange(last, clamp) == clamp) {
+		return;
+	}
+	static std::mutex      mutex;
+	static std::set<Clamp> reported;
+	bool                   last_report = false;
+	{
+		std::scoped_lock lock(mutex);
+		if (reported.size() >= ClampReportLimit || !reported.insert(clamp).second) {
+			return;
+		}
+		last_report = reported.size() == ClampReportLimit;
+	}
+	g_clamp_reports.fetch_add(1u, std::memory_order_relaxed);
+	LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64
+	     " (reported once)\n",
+	     vaddr, size, clamped_size);
+	if (last_report) {
+		LOGF("Memory: %u clamped buffer ranges reported, further ones are not\n",
+		     static_cast<unsigned>(ClampReportLimit));
+	}
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
 	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.
@@ -902,11 +942,13 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	if (clamped_size != size) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
+		ReportClampedRange(vaddr, size, clamped_size);
 	}
 	return clamped_size;
+}
+
+uint64_t ClampedRangeReports() {
+	return g_clamp_reports.load(std::memory_order_relaxed);
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
