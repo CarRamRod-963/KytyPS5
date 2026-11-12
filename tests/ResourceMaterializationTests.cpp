@@ -2127,6 +2127,79 @@ void TestReaderLoadsWalkOnSeveralThreads() {
         "a reader walk read a refused address as zero");
 }
 
+// A pooled lookahead job keeps the read buffers of its walks only while its
+// last walk used a good part of them: one large walk does not leave its bytes
+// in the job for every later walk of the session.
+void TestLookaheadReleasesReadBuffers() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint32_t ChunkBytes = 128;
+  constexpr uint32_t LargeLoads = 1024; // 128 KiB of read-cache chunks
+  static std::vector<uint32_t> table(LargeLoads * ChunkBytes / 4u, 7u);
+  const auto table_program = [](uint32_t loads) {
+    auto program = SrtProgram(reinterpret_cast<uint64_t>(table.data()));
+    auto &block = *program.blocks[0];
+    const auto handle = program.srt_reads[0].value.Instruction()->Arg(0);
+    for (uint32_t load = 1; load < loads; ++load) {
+      auto &raw = block.AppendNewInst(
+          ValueOpcode::LoadAddressU32,
+          {handle, Value(load * ChunkBytes), Value(0u), Value(true)});
+      raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+      program.srt_reads.push_back({Value(&raw), load});
+    }
+    return program;
+  };
+  SrtWalkerCompileQueue queue;
+  const auto submit = [&](uint32_t loads) {
+    return queue.Submit(std::make_unique<ResourcePlan>(
+        ExtractResourcePlan(table_program(loads), SrtWalkerLoads::Reader,
+                            SrtWalkerCompilation::Deferred)));
+  };
+  auto large_job = submit(LargeLoads);
+  auto small_job = submit(1u);
+  for (uint32_t wait = 0;
+       wait < 10000u && !(large_job->Ready() && small_job->Ready()); ++wait)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  Check(large_job->Ready() && small_job->Ready(),
+        "the lookahead plans were not compiled");
+  auto large = std::make_shared<LookaheadPlan>(large_job, 0u);
+  auto small = std::make_shared<LookaheadPlan>(small_job, 0u);
+
+  ResourceLookahead lookahead(
+      {.read = LookaheadTestRead, .gpu_dirty = LookaheadTestDirty}, 1u);
+  const int stream = 0;
+  const int command = 0;
+  LookaheadInputs inputs;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto walk = [&](const std::shared_ptr<LookaheadPlan> &plan) {
+    lookahead.BeginRun(&stream);
+    lookahead.Plan(&stream, &command, plan, inputs);
+    lookahead.Kick();
+    lookahead.WaitIdle();
+    return lookahead.TryAdopt(&stream, &command, plan.get(), inputs, snapshot,
+                              specialization);
+  };
+  using Outcome = ResourceLookahead::Outcome;
+  Check(walk(large) == Outcome::Adopted &&
+            snapshot.flattened_srt.size() >= LargeLoads,
+        "the large lookahead walk was not adopted");
+  Check(lookahead.ReadBufferCapacity() >= LargeLoads * ChunkBytes,
+        "the large walk did not record its reads");
+  // The same job walks the small program: the walk right after the large one
+  // may still use its buffers, the next one gives them back.
+  for (uint32_t round = 0; round < 2u; ++round)
+    Check(walk(small) == Outcome::Adopted,
+          "a small lookahead walk was not adopted");
+  Check(
+      lookahead.ReadBufferCapacity() < (64u << 10u),
+      "a pooled lookahead job kept the read buffers of an earlier large walk");
+  // A large walk after that still records and adopts everything.
+  Check(walk(large) == Outcome::Adopted &&
+            snapshot.flattened_srt.size() >= LargeLoads,
+        "a large walk after the release was not adopted");
+}
+
 int main() {
   TestReaderLoadsWalkOnSeveralThreads();
   TestWalkerLoadsBypassSpecializationReader();
@@ -2135,6 +2208,7 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestReaderLoadsThroughCacheView();
   TestResourceLookahead();
+  TestLookaheadReleasesReadBuffers();
   TestSpecializationFailureReports();
   TestResourceLookaheadMergedReads();
   TestRangeOverlapIndex();

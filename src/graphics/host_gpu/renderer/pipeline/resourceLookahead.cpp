@@ -6,6 +6,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -152,6 +153,8 @@ ResourceLookahead::Job* ResourceLookahead::NewJob() {
 	}
 	job->state.store(State::Queued, std::memory_order_relaxed);
 	job->cancelled.store(false, std::memory_order_relaxed);
+	job->last_reads = job->reads.size();
+	job->last_bytes = job->bytes.size();
 	job->reads.clear();
 	job->bytes.clear();
 	job->heap_uses.clear();
@@ -291,7 +294,31 @@ void ResourceLookahead::RunHelper(Helper& helper) {
 	}
 }
 
+// Jobs return to the pool and are reused for walks of any program, and their read lists keep
+// their capacity, so every job would end up holding the largest walk it ever made (Saros: the
+// 6 MB of a large image-heap table, in hundreds of jobs). A list over 64 KiB that the job's last
+// walk used less than a quarter of gives its memory back before the next walk.
+void ResourceLookahead::ReleaseUnusedCapacity(Job& job) {
+	const auto release = [](auto& list, size_t used) {
+		using Element              = typename std::remove_reference_t<decltype(list)>::value_type;
+		constexpr size_t KeepBytes = 64u << 10u;
+		if (list.capacity() * sizeof(Element) > KeepBytes && list.capacity() / 4u > used)
+			std::remove_reference_t<decltype(list)> {}.swap(list);
+	};
+	release(job.reads, job.last_reads);
+	release(job.bytes, job.last_bytes);
+}
+
+size_t ResourceLookahead::ReadBufferCapacity() const {
+	size_t bytes = 0;
+	for (const auto& job: m_storage) {
+		bytes += job->reads.capacity() * sizeof(Read) + job->bytes.capacity();
+	}
+	return bytes;
+}
+
 void ResourceLookahead::RunJob(Job& job) {
+	ReleaseUnusedCapacity(job);
 	const auto* plan = job.plan->Get();
 	if (plan == nullptr) {
 		job.state.store(State::Failed, std::memory_order_release);
