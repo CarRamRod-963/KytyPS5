@@ -1561,17 +1561,19 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 	*status = ctx->flip_status;
 	ctx->mutex.Unlock();
 
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n"
-	     "\t submitProcessTimeCounter = %" PRIu64 "\n"
-	     "\t flipArg = %" PRId64 "\n"
-	     "\t gcQueueNum = %d\n"
-	     "\t flipPendingNum = %d\n"
-	     "\t currentBuffer = %d\n",
-	     status->count, status->processTime, status->processTimeCounter,
-	     status->submitProcessTimeCounter, status->flipArg, status->gcQueueNum,
-	     status->flipPendingNum, status->currentBuffer);
+	if (Config::GraphicsDebugDumpEnabled()) {
+		LOGF("\t count = %" PRIu64 "\n"
+		     "\t processTime = %" PRIu64 "\n"
+		     "\t processTimeCounter = %" PRIu64 "\n"
+		     "\t submitProcessTimeCounter = %" PRIu64 "\n"
+		     "\t flipArg = %" PRId64 "\n"
+		     "\t gcQueueNum = %d\n"
+		     "\t flipPendingNum = %d\n"
+		     "\t currentBuffer = %d\n",
+		     status->count, status->processTime, status->processTimeCounter,
+		     status->submitProcessTimeCounter, status->flipArg, status->gcQueueNum,
+		     status->flipPendingNum, status->currentBuffer);
+	}
 
 	return OK;
 }
@@ -1611,10 +1613,12 @@ KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* stat
 	*status = ctx->vblank_status;
 	ctx->mutex.Unlock();
 
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n",
-	     status->count, status->processTime, status->processTimeCounter);
+	if (Config::GraphicsDebugDumpEnabled()) {
+		LOGF("\t count = %" PRIu64 "\n"
+		     "\t processTime = %" PRIu64 "\n"
+		     "\t processTimeCounter = %" PRIu64 "\n",
+		     status->count, status->processTime, status->processTimeCounter);
+	}
 
 	return OK;
 }
