@@ -3322,6 +3322,8 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		attr = g_pthread_context->GetDefaultAttr();
 	}
 
+	// The switch is per thread: silence the nested calls, then restore the caller's setting.
+	const bool print_name = PRINT_NAME_ENABLED;
 	PRINT_NAME_ENABLE(false);
 
 	auto* created_thread = pthread_pool->Create();
@@ -3371,7 +3373,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	PthreadAttrDbgPrint(&created_thread->attr);
 
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE(print_name);
 
 	if (result < 0) {
 		return result;
