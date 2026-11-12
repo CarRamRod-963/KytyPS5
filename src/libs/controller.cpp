@@ -1464,9 +1464,11 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	LOGF("\t large_motor = %d\n"
-	     "\t small_motor = %d\n",
-	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t large_motor = %d\n"
+		     "\t small_motor = %d\n",
+		     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
+	}
 
 	PlayerForHandle(handle)->SetVibration(param->large_motor, param->small_motor);
 
@@ -1516,7 +1518,9 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %d\n", handle);
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t handle = %d\n", handle);
+	}
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
