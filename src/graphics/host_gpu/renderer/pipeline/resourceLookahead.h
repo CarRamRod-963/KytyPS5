@@ -148,6 +148,10 @@ public:
 	};
 	Stats TakeStats();
 
+	// Owner thread, with the helpers idle (WaitIdle): the bytes the jobs of the pool hold for the
+	// reads of their walks.
+	[[nodiscard]] size_t ReadBufferCapacity() const;
+
 private:
 	struct Read {
 		uint64_t address = 0;
@@ -180,6 +184,9 @@ private:
 		std::vector<Read>                            reads;
 		std::vector<uint8_t>                         bytes;
 		std::vector<HeapUse>                         heap_uses;
+		// The list sizes of the job's last walk (NewJob), for ReleaseUnusedCapacity.
+		size_t last_reads = 0;
+		size_t last_bytes = 0;
 	};
 	struct Stream {
 		const void*       key = nullptr;
@@ -206,6 +213,7 @@ private:
 
 	void    RunHelper(Helper& helper);
 	void    RunJob(Job& job);
+	static void ReleaseUnusedCapacity(Job& job);
 	bool    Unchanged(const Job& job, Outcome& outcome);
 	bool    SameHeapViews(const Job& job);
 	Job*    NewJob();
