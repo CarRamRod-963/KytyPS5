@@ -21,6 +21,7 @@
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/guestFaultReport.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
@@ -546,7 +547,8 @@ struct GuestStackFrame {
 };
 
 static bool IsReadableRange(uint64_t addr, uint64_t size);
-static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info);
+static void AppendHostBacktrace(const Common::HostException::ExceptionInfo& info,
+                                Loader::GuestFaultText*                     out);
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
@@ -653,13 +655,14 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // software-originated exception in ntdll, a library call on a guest thread) names no guest
 // code, and the unwinder walks through the exception dispatcher back to the frame that
 // faulted first.
-static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info) {
+static void AppendHostBacktrace(const Common::HostException::ExceptionInfo& info,
+                                Loader::GuestFaultText*                     out) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (info.native_context == nullptr) {
 		return;
 	}
 	CONTEXT context = *static_cast<const CONTEXT*>(info.native_context);
-	std::printf("host frames:\n");
+	out->Append("host frames:\n");
 	for (int depth = 0; depth < 48; depth++) {
 		const auto pc                    = static_cast<uint64_t>(context.Rip);
 		char       module_name[MAX_PATH] = "";
@@ -670,10 +673,10 @@ static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info)
 		const char* base_name = std::strrchr(module_name, '\\');
 		base_name             = base_name != nullptr ? base_name + 1 : module_name;
 		if (module_base != nullptr) {
-			std::printf("  %2d %s+0x%" PRIx64 " (0x%016" PRIx64 ")\n", depth, base_name,
+			out->Append("  {:2} {}+0x{:x} (0x{:016x})\n", depth, base_name,
 			            pc - reinterpret_cast<uint64_t>(module_base), pc);
 		} else {
-			std::printf("  %2d 0x%016" PRIx64 "\n", depth, pc);
+			out->Append("  {:2} 0x{:016x}\n", depth, pc);
 		}
 		DWORD64 image_base = 0;
 		auto*   function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -697,6 +700,7 @@ static void PrintHostBacktrace(const Common::HostException::ExceptionInfo& info)
 	}
 #else
 	(void)info;
+	(void)out;
 #endif
 }
 
@@ -738,33 +742,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
-			}
-			std::printf("\n");
+		constexpr size_t         CodeBytes  = 2 * Loader::GuestFaultCodeBefore;
+		constexpr size_t         StackWords = 32;
+		constexpr int            MaxFrames  = 16;
+		Loader::GuestFaultReport report;
+		report.thread = thread_name;
+		report.info   = info;
+		if (IsReadableRange(info->exception_address - Loader::GuestFaultCodeBefore, CodeBytes)) {
+			report.code = {reinterpret_cast<const uint8_t*>(info->exception_address -
+			                                                Loader::GuestFaultCodeBefore),
+			               CodeBytes};
 		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
-			}
-			std::printf("\n");
+		if (IsReadableRange(info->rsp, StackWords * sizeof(uint64_t))) {
+			report.stack = {reinterpret_cast<const uint64_t*>(info->rsp), StackWords};
 		}
-		PrintHostBacktrace(*info);
-		std::fflush(stdout);
+		void*     frames[MaxFrames] {};
+		uint64_t  guest_frames[MaxFrames] {};
+		const int depth = WalkGuestStack(info->rbp, info->rsp, frames, MaxFrames);
+		for (int i = 0; i < depth; i++) {
+			guest_frames[i] = reinterpret_cast<uint64_t>(frames[i]);
+		}
+		report.guest_frames = {guest_frames, static_cast<size_t>(std::max(depth, 0))};
+		// Formatted without allocating (the fault may have hit inside the host heap). The log
+		// file is what testers send: the report must not exist on the console only.
+		Loader::GuestFaultText text;
+		Loader::FormatGuestFaultReport(report, &text);
+		AppendHostBacktrace(*info, &text);
+		Log::WriteToConsoleAndLog(text.View());
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
