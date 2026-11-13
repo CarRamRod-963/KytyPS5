@@ -513,6 +513,11 @@ private:
 	friend struct RenderExecutorTestAccess;
 };
 
+// Whether a dispatch of these workgroup counts is valid on the device
+// (VkPhysicalDeviceLimits::maxComputeWorkGroupCount).
+[[nodiscard]] bool ComputeDispatchFits(const std::array<uint32_t, 3>& max_counts, uint32_t group_x,
+                                       uint32_t group_y, uint32_t group_z);
+
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
