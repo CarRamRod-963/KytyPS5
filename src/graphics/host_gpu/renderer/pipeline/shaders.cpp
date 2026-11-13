@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/subgroupPlan.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -877,10 +878,14 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	// A wave64 shader translated for 32-lane subgroups (two guest lanes per invocation) requires
+	// 32 lanes on a device that could run it 64 wide.
+	const auto required_size = RequiredComputeSubgroupSize(
+	    {.compute_size_control = graphics.compute_subgroup_size_control_enabled},
+	    {.min_size = graphics.min_subgroup_size, .max_size = graphics.max_subgroup_size},
+	    input_info.stage.program->wave_size, input_info.host_subgroup_size);
+	if (required_size != 0u) {
+		comp_subgroup_size.requiredSubgroupSize = required_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 

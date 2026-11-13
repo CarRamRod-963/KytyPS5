@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
+#include "graphics/host_gpu/subgroupPlan.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -572,16 +573,27 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.subgroup_size     = properties11.subgroupSize;
 	graphics.min_subgroup_size = subgroup_control.minSubgroupSize;
 	graphics.max_subgroup_size = subgroup_control.maxSubgroupSize;
-	graphics.compute_subgroup_size_control_enabled =
-	    supported13.subgroupSizeControl == VK_TRUE &&
-	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
+	const auto subgroup_plan   = PlanSubgroups(
+	    {.default_size         = graphics.subgroup_size,
+	     .min_size             = graphics.min_subgroup_size,
+	     .max_size             = graphics.max_subgroup_size,
+	     .compute_size_control = supported13.subgroupSizeControl == VK_TRUE &&
+	                             (subgroup_stages & vk::ShaderStageFlagBits::eCompute)},
+	    Config::EmulateWave64Enabled());
+	graphics.compute_subgroup_size_control_enabled = subgroup_plan.compute_size_control;
+	graphics.compute_wave64_emulated =
+	    graphics.SupportsComputeWave64() && subgroup_plan.compute_host_subgroup_size == 32u;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(subgroup_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.SupportsComputeWave64() ? "true" : "false");
+	     graphics.SupportsComputeWave64() ? "true" : "false",
+	     graphics.compute_wave64_emulated ? " (compute emulated on 32 lanes)" : "");
+	if (subgroup_plan.emulation_unavailable) {
+		LOGF("warning: --emulate-wave64 needs 32-lane compute subgroups this device cannot "
+		     "require; wave64 compute shaders run 64 lanes wide\n");
+	}
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
