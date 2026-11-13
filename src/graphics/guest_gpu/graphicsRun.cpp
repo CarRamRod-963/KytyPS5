@@ -1645,7 +1645,8 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 			        }
 		        },
 		        label_id);
-	    });
+	    },
+	    GuestWrites {reinterpret_cast<uint64_t>(dst), sizeof(T)});
 	if (label_tick == 0) {
 		labels.Stored(label_id); // Shutdown: already stored.
 	} else {
@@ -1658,7 +1659,8 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	GetScheduler().DeferPriorityOperationAfterRecorded(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-	    });
+	    },
+	    GuestWrites::None());
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1749,7 +1751,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+	    GuestWrites::None());
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
@@ -1758,7 +1761,8 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); },
+	    GuestWrites::None());
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 }
