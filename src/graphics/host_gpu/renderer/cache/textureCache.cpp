@@ -2251,17 +2251,18 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
-		download.buffer->Invalidate(download.offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
-		if (trapped) {
-			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
-			// Priority operations run in queue order, so this write-back is the oldest.
-			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(m_write_backs.begin());
-		}
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [this, download = std::move(download), range, trapped = m_readback_storage_images] {
+		    download.buffer->Invalidate(download.offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    if (trapped) {
+			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
+			    // Priority operations run in queue order, so this write-back is the oldest.
+			    std::scoped_lock write_back_lock {m_write_back_mutex};
+			    m_write_backs.erase(m_write_backs.begin());
+		    }
+	    },
+	    GuestWrites {range.address, range.size});
 	return true;
 }
 

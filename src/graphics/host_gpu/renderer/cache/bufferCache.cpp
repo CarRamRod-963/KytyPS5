@@ -260,6 +260,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	uint64_t written_begin = UINT64_MAX;
+	uint64_t written_end   = 0;
+	for (const auto& copy: copies) {
+		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
+		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
+	}
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
 	                download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
@@ -270,7 +276,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(
+		    std::move(publish), GuestWrites {written_begin, written_end - written_begin});
 	} else if (batch != nullptr) {
 		batch->emplace_back(std::move(publish));
 	} else {
@@ -814,6 +821,12 @@ void BufferCache::RecordAsyncDownloads() {
 		hot.download_tick  = download_tick;
 		hot.download_epoch = page.epoch;
 	}
+	uint64_t written_begin = UINT64_MAX;
+	uint64_t written_end   = 0;
+	for (const auto& interval: intervals) {
+		written_begin = std::min(written_begin, interval.address);
+		written_end   = std::max(written_end, interval.address + interval.size);
+	}
 	m_scheduler.DeferPriorityOperation(
 	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
 		    m_download_buffer.Invalidate(offset, total);
@@ -840,7 +853,8 @@ void BufferCache::RecordAsyncDownloads() {
 			    std::lock_guard lock(m_published_mutex);
 			    m_published.insert(m_published.end(), published.begin(), published.end());
 		    }
-	    });
+	    },
+	    GuestWrites {written_begin, written_end - written_begin});
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
