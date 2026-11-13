@@ -39,6 +39,8 @@ struct GraphicContext {
 	bool                               pageable_memory_enabled               = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// --emulate-wave64: wave64 compute shaders run 32 lanes wide on a native wave64 device.
+	bool                               compute_wave64_emulated               = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               maximal_reconvergence_enabled         = false;
 	bool                               attachment_feedback_loop_enabled      = false;
@@ -122,6 +124,11 @@ struct GraphicContext {
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	// The host subgroup size compute shaders are translated for (ShaderComputeInputInfo).
+	[[nodiscard]] uint32_t ComputeHostSubgroupSize() const noexcept {
+		return SupportsComputeWave64() && !compute_wave64_emulated ? 64u : 32u;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

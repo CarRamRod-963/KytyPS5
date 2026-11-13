@@ -126,6 +126,10 @@ static void PrintUsage() {
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
+	::printf(
+	    "  --emulate-wave64                     Run wave64 compute shaders 32 lanes wide, two\n"
+	    "                                       guest lanes per invocation, also on GPUs with\n"
+	    "                                       64-lane subgroups. Default: off.\n");
 	::printf("  --native-rt                          Use native RT on the GPU.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -299,6 +303,7 @@ static constexpr Flag FLAGS[] = {
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
+    {"--emulate-wave64", &ConfigOptions::emulate_wave64},
     {"--native-rt", &ConfigOptions::native_rt},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

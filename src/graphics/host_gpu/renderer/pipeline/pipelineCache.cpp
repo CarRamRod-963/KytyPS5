@@ -471,7 +471,7 @@ struct PipelineCache::ProgramCache {
 	                    ShaderComputeInputInfo& input) const {
 		if (record.code == nullptr || record.code->empty()) return false;
 		input                    = record.input;
-		input.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+		input.host_subgroup_size = graphics.ComputeHostSubgroupSize();
 		input.lds_storage =
 		    input.lds_size_dwords * 4u >
 		    graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
@@ -1414,7 +1414,7 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	EXIT_IF(record.code == nullptr || record.code->empty());
 	// The inputs GetComputeProgram derives from the device.
 	auto input               = record.input;
-	input.host_subgroup_size = graphics.SupportsComputeWave64() ? 64u : 32u;
+	input.host_subgroup_size = graphics.ComputeHostSubgroupSize();
 	input.lds_storage = input.lds_size_dwords * 4u >
 	                    graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	// Translation reads the user-data count; the values only feed the resource walk.
@@ -3019,7 +3019,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.host_subgroup_size = m_graphics.ComputeHostSubgroupSize();
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
