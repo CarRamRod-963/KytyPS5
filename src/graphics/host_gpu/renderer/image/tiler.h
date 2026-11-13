@@ -51,8 +51,12 @@ public:
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
+	// `host_target`: the tiled buffer is host memory. The tiler's stores scatter over their
+	// target, and into host memory each one crosses the bus on its own, so the image is tiled in
+	// device memory and copied there whole.
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
-	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
+	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0,
+	               bool host_target = false);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);

@@ -2121,7 +2121,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	if (info.IsTiled()) {
 		const auto copies = info.BufferCopies(0, levels);
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
-		                  levels);
+		                  levels, destination.Usage() == MemoryUsage::Download);
 	} else if (transform != ColorTransform::None) {
 		auto       linear = m_tiler.GetScratchBuffer(destination_size);
 		const auto copies = info.BufferCopies(0, levels);
