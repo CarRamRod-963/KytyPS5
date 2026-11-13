@@ -39,6 +39,22 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Reports an exception nobody handled; must not return.
+using Reporter = void (*)(const ExceptionInfo&);
+
+// Installs `report` for the access violations and illegal instructions that reach the end of the
+// structured exception handler search (Windows only; elsewhere it returns false). The handler of
+// InstallHandler runs first, for every exception, and leaves some of them to that search (see
+// LeaveToModuleHandlers).
+bool InstallUnhandledReporter(Reporter report);
+
+// Whether a handler should leave an exception it cannot resolve to the structured exception
+// handlers of the code that raised it instead of ending the process: a host thread that faults
+// inside a loaded module other than the executable (a GPU driver, a system DLL) may be inside
+// that module's own __try. Windows only, and only while an unhandled reporter is installed, so
+// that an exception nobody handles is still reported.
+bool LeaveToModuleHandlers(const ExceptionInfo& info, bool guest_thread);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 // The host signal that delivers guest signals. Fault handling blocks it, so a guest handler runs

@@ -85,14 +85,13 @@ int GuestSignalDispatchSignal() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
-static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
-	auto* exception_record = exception->ExceptionRecord;
+static std::atomic<Reporter> g_reporter {nullptr};
+static_assert(decltype(g_reporter)::is_always_lock_free);
 
-	if (exception_record->ExceptionCode == 0x406D1388) {
-		// 0x406D1388 only names the thread for an attached debugger.
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-
+// Fills `info` from an access violation, a guard page violation or an illegal instruction;
+// returns false for any other exception.
+static bool ReadException(PEXCEPTION_POINTERS exception, ExceptionInfo* out) {
+	const auto*   exception_record = exception->ExceptionRecord;
 	ExceptionInfo info {};
 	// A guard page another thread touched: Windows handles a thread's own stack guard page in the
 	// kernel, so one that reaches here belongs to some other host thread's stack (the CPU walkers
@@ -100,8 +99,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	// there). The system has already turned the page into a normal one; it is treated as the
 	// access violation it is for anything else, and the guard is put back if the access is handled
 	// without touching it.
-	const bool guard_page = exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || guard_page) {
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+	    exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
 		info.type = ExceptionType::AccessViolation;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
@@ -113,7 +112,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		return EXCEPTION_CONTINUE_SEARCH;
+		return false;
 	}
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
 	info.native_code       = exception_record->ExceptionCode;
@@ -136,6 +135,20 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r13              = registers->R13;
 	info.r14              = registers->R14;
 	info.r15              = registers->R15;
+	*out                  = info;
+	return true;
+}
+
+static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+	if (exception->ExceptionRecord->ExceptionCode == 0x406D1388) {
+		// 0x406D1388 only names the thread for an attached debugger.
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	ExceptionInfo info {};
+	if (!ReadException(exception, &info)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const bool guard_page = info.native_code == STATUS_GUARD_PAGE_VIOLATION;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
@@ -151,6 +164,33 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The top-level filter: runs once the structured exception handler search found no handler.
+static LONG WINAPI UnhandledExceptionFilterReport(PEXCEPTION_POINTERS exception) noexcept {
+	ExceptionInfo info {};
+	if (const auto report = g_reporter.load(std::memory_order_acquire);
+	    report != nullptr && ReadException(exception, &info)) {
+		report(info);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool InstallUnhandledReporter(Reporter report) {
+	g_reporter.store(report, std::memory_order_release);
+	SetUnhandledExceptionFilter(UnhandledExceptionFilterReport);
+	return true;
+}
+
+bool LeaveToModuleHandlers(const ExceptionInfo& info, bool guest_thread) {
+	if (guest_thread || g_reporter.load(std::memory_order_acquire) == nullptr) {
+		return false;
+	}
+	// Guest code and code the host generates at run time belong to no module; the executable's
+	// own faults are its handler's to report.
+	void* module = nullptr;
+	return RtlPcToFileHeader(reinterpret_cast<void*>(info.exception_address), &module) != nullptr &&
+	       module != static_cast<void*>(GetModuleHandleW(nullptr));
 }
 
 #else
@@ -263,6 +303,16 @@ static bool InstallPlatformHandler() {
 #endif
 	return true;
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+bool InstallUnhandledReporter(Reporter /*report*/) {
+	return false;
+}
+
+bool LeaveToModuleHandlers(const ExceptionInfo& /*info*/, bool /*guest_thread*/) {
+	return false;
+}
+#endif
 
 // The first handler stays installed; later calls only report whether it is theirs.
 bool InstallHandler(Handler handler) {
