@@ -6946,6 +6946,35 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Workgroup counts past the device limits are not dispatched: the host
+  // converts thread dimensions from guest arguments, which a game can leave
+  // stale (one asked for 329777152 x 1158303719 x 3305083311 threads).
+  void CheckComputeDispatchLimits() {
+    constexpr const char *name = "ComputeDispatchLimits";
+    vk::PhysicalDeviceProperties properties{};
+    m_physical_device.getProperties(&properties);
+    const std::array<uint32_t, 3> max_counts =
+        properties.limits.maxComputeWorkGroupCount;
+    Require(name, "largest dispatch",
+            ComputeDispatchFits(max_counts, max_counts[0], max_counts[1],
+                                max_counts[2]),
+            "a dispatch at the device limits was refused");
+    Require(name, "x past the limit",
+            !ComputeDispatchFits(max_counts, max_counts[0] + 1u, 1, 1),
+            "a dispatch past the x limit was accepted");
+    Require(name, "y past the limit",
+            !ComputeDispatchFits(max_counts, 1, max_counts[1] + 1u, 1),
+            "a dispatch past the y limit was accepted");
+    Require(name, "z past the limit",
+            !ComputeDispatchFits(max_counts, 1, 1, max_counts[2] + 1u),
+            "a dispatch past the z limit was accepted");
+    Require(
+        name, "stale arguments",
+        !ComputeDispatchFits(max_counts, 5152768u, 1158303719u, 3305083311u),
+        "the dispatch of stale arguments was accepted");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -63453,6 +63482,7 @@ int main(int argc, char **argv) {
     CheckPs5GameExampleImageClearRuntimeShape();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckComputeDispatchLimits();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
