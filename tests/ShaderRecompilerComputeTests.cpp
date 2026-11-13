@@ -12872,6 +12872,44 @@ public:
               "kept GPU or heap-referenced images spent the deletion budget "
               "of the aged clean image behind them");
 
+      // Under pressure, aged images guest memory still holds go before aged
+      // GPU-written ones, which each need a synchronous write-back: fifteen
+      // GPU images oldest, fifteen clean ones behind them, a budget of twenty.
+      constexpr uint64_t gc_order_offset = 0x2e80000;
+      constexpr size_t gc_order_written = 15;
+      std::array<ImageId, gc_order_written * 2> gc_order_lru{};
+      for (size_t index = 0; index < gc_order_lru.size(); index++) {
+        auto desc = MakeLinearDesc(
+            base + gc_order_offset + index * gc_kept_stride, sizeof(uint32_t),
+            vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+        gc_order_lru[index] = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(gc_order_lru[index], desc);
+        if (index < gc_order_written) {
+          texture_cache.MarkGpuWritten(gc_order_lru[index]);
+        }
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, gc_order_lru, 81, 0);
+      texture_cache.RunGarbageCollector();
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      size_t gc_order_written_kept = 0;
+      for (size_t index = 0; index < gc_order_written; index++) {
+        gc_order_written_kept += TextureCacheTestAccess::Contains(
+            texture_cache, gc_order_lru[index]);
+      }
+      Require(name, "pressure eviction of clean images first",
+              gc_order_written_kept == gc_order_written - 5 &&
+                  std::ranges::none_of(
+                      std::span(gc_order_lru).last(gc_order_written),
+                      [&](ImageId image) {
+                        return TextureCacheTestAccess::Contains(texture_cache,
+                                                                image);
+                      }),
+              "GC under pressure wrote back GPU images while aged images "
+              "guest memory holds were left");
+
       auto gc_tiled = MakeLinearDesc(
           base + 0x2f00000, 256 * 256 * sizeof(uint32_t),
           vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm,

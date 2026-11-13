@@ -2540,6 +2540,24 @@ void TextureCache::RunGarbageCollector() {
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
+		const auto evict = [&](ImageId id) {
+			--deletions;
+			FreeImage(id);
+			evicted++;
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+				deletions >>= 2;
+				aggressive = false;
+			}
+			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+				deletions >>= 1;
+				pressured = false;
+			}
+		};
+		// Images whose contents only the GPU holds must be written back to guest memory first,
+		// a synchronous GPU copy each. They go only after the images guest memory still holds,
+		// and only while those did not relieve the pressure.
+		std::vector<ImageId> written_back;
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -2553,22 +2571,24 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
-			if (owner->SafeToDownload() &&
-			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+			if (owner->SafeToDownload()) {
+				if (pressured && !owner->info.HasStencil()) {
+					written_back.push_back(id);
+				}
 				continue;
 			}
-			--deletions;
-			FreeImage(id);
-			evicted++;
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
-				deletions >>= 2;
-				aggressive = false;
+			evict(id);
+		}
+		for (const auto id: written_back) {
+			if (deletions == 0 || !pressured) {
+				break;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
-				deletions >>= 1;
-				pressured = false;
+			auto owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || !owner->SafeToDownload() ||
+			    !DownloadImageMemory(id)) {
+				continue;
 			}
+			evict(id);
 		}
 	};
 	collect(false);
