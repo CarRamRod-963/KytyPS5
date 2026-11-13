@@ -37,6 +37,12 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 16;
+// Under memory pressure an image an overlap displaces is deleted once a whole frame went without
+// it. An image the last frame used belongs to the frame's working set: the next frame binds it
+// again, so deleting it frees nothing and only creates it anew (after a level change Saros stays
+// above the pressure mark, and its transient targets were deleted and created ~1,300 times a
+// second).
+constexpr uint64_t NumFramesBeforePressureRemoval = 1;
 // Submissions an image an overlapping image displaces must go unused before it is marked as
 // displaced (ResolveOverlap); titles submit hundreds of times per frame.
 constexpr uint64_t NumSubmissionsBeforeDisplacement = 32;
@@ -854,12 +860,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	    current_tick - std::min(current_tick, cached.tick_submitted_last) >
 	        NumSubmissionsBeforeDisplacement &&
 	    unreferenced;
-	// Frames since the last use: a lookup (tick_accessed_last) or any bind, render targets
-	// included (TouchImage).
-	const auto last_frame = cached.touched_tick == UINT64_MAX
-	                            ? cached.tick_accessed_last
-	                            : std::max(cached.tick_accessed_last, cached.touched_tick);
-	const bool aged = m_gc_tick - std::min(m_gc_tick, last_frame) > NumFramesBeforeRemoval;
+	const auto frames_unused = FramesUnused(cached);
+	const bool aged          = frames_unused > NumFramesBeforeRemoval;
 	// Memory pressure alone does not delete an image the GPU wrote: on the console those bytes stay
 	// in memory, and the title may bind the image again after a surface over part of its memory
 	// (Saros' 64x64x64 translucency lighting volumes alias a 2304x1296 target bound over their
@@ -868,7 +870,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	// GPU-written images as before.
 	const bool safe_to_delete =
 	    (aged && unreferenced) ||
-	    (displaceable && m_total_used_memory >= m_pressure_gc_memory && !HoldsGpuContents(cached));
+	    (displaceable && m_total_used_memory >= m_pressure_gc_memory &&
+	     frames_unused > NumFramesBeforePressureRemoval && !HoldsGpuContents(cached));
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -989,6 +992,14 @@ bool TextureCache::HoldsGpuContents(const Image& image) {
 	return image.IsGpuModified() && image.SafeToDownload();
 }
 
+uint64_t TextureCache::FramesUnused(const Image& image) const noexcept {
+	// A lookup (tick_accessed_last) or any bind, render targets included (TouchImage).
+	const auto last_frame = image.touched_tick == UINT64_MAX
+	                            ? image.tick_accessed_last
+	                            : std::max(image.tick_accessed_last, image.touched_tick);
+	return m_gc_tick - std::min(m_gc_tick, last_frame);
+}
+
 void TextureCache::MarkDisplaced(ImageId id) {
 	auto& image     = m_slot_images[id];
 	image.displaced = true;
@@ -1013,7 +1024,8 @@ void TextureCache::ReleaseDisplaced(bool pressured) {
 			continue;
 		}
 		if (pressured && m_total_used_memory >= m_pressure_gc_memory && !image->depth_id &&
-		    !HoldsGpuContents(*image) && image->heap_refs.load(std::memory_order_relaxed) == 0u) {
+		    FramesUnused(*image) > NumFramesBeforePressureRemoval && !HoldsGpuContents(*image) &&
+		    image->heap_refs.load(std::memory_order_relaxed) == 0u) {
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			continue;

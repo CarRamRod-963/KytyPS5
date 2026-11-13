@@ -13240,8 +13240,9 @@ public:
               c && !TextureCacheTestAccess::Contains(texture_cache, a),
               "an image unused for frames survived an overlapping image");
 
-      // At or above the memory pressure mark a displaced image is deleted as
-      // before, after NumFramesBeforeRemoval submissions.
+      // At or above the memory pressure mark a displaced image is deleted
+      // once a whole frame went without it: an image the last frame used is
+      // part of the frame's working set and would only be created again.
       auto d_desc = describe(base + 0x8000, 64);
       auto e_desc = describe(base + 0xa000, 32);
       auto f_desc = describe(base + 0x10000, 64);
@@ -13251,10 +13252,21 @@ public:
       const auto d = texture_cache.FindImage(d_desc);
       submissions();
       const auto e = texture_cache.FindImage(e_desc);
+      Require(name, "displaced image of this frame kept under pressure",
+              d && e && TextureCacheTestAccess::Contains(texture_cache, d),
+              "an overlap under memory pressure deleted an image this frame "
+              "used");
+      texture_cache.RunGarbageCollector();
+      Require(name, "displaced image of the last frame kept under pressure",
+              TextureCacheTestAccess::Contains(texture_cache, d),
+              "the collector under memory pressure deleted an image the last "
+              "frame used");
+      texture_cache.RunGarbageCollector();
       Require(name, "displaced image deleted under pressure",
-              d && e && !TextureCacheTestAccess::Contains(texture_cache, d),
-              "a displaced image was kept while the cache was over its "
-              "pressure mark");
+              !TextureCacheTestAccess::Contains(texture_cache, d) &&
+                  TextureCacheTestAccess::Contains(texture_cache, e),
+              "a displaced image a whole frame went without was kept while "
+              "the cache was over its pressure mark");
       // With headroom it is kept, but its superseded contents are no source
       // of guest data, and the collector releases it first once the cache
       // reaches the pressure mark.
@@ -13270,6 +13282,11 @@ public:
           texture_cache.FindImageFromRange(base + 0x10000, 64u * 64u * 4u) != f,
           "a buffer read could copy the contents of a displaced image");
       TextureCacheTestAccess::SetPressureMark(texture_cache, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "displaced image of this frame kept by the collector",
+              TextureCacheTestAccess::Contains(texture_cache, f),
+              "the collector under memory pressure released an image the "
+              "last frame used");
       texture_cache.RunGarbageCollector();
       Require(name, "displaced image released under pressure",
               !TextureCacheTestAccess::Contains(texture_cache, f) &&
