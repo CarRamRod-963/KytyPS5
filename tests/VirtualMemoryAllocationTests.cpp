@@ -326,9 +326,297 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void* g_red_zone_clobber_page = nullptr;
+
+LONG CALLBACK RedZoneClobberHandler(EXCEPTION_POINTERS* exception) {
+	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+	    exception->ContextRecord == nullptr ||
+	    exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+	    reinterpret_cast<void*>(exception->ExceptionRecord->ExceptionInformation[1]) !=
+	        g_red_zone_clobber_page) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	// A host without spare XSAVE space at the top of the exception frame (no AVX-512, or AVX-512
+	// state in use) writes the frame over all 128 bytes below the interrupted RSP.
+	std::memset(reinterpret_cast<void*>(exception->ContextRecord->Rsp - 128), 0xa5, 128);
+	DWORD old_protection = 0;
+	if (VirtualProtect(g_red_zone_clobber_page, 0x1000, PAGE_READWRITE, &old_protection) == FALSE) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void TestWindowsGuestRedZoneFunctionCopy() {
+	const char*        test            = "WindowsGuestRedZoneFunctionCopy";
+	constexpr uint64_t SENTINEL        = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	const auto         mapping         = Libs::LibKernel::Memory::AllocateProgramMemory(
+        0x0000000904000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+        Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_function_copy_test");
+	Check(test, mapping != 0, "failed to allocate test code");
+	std::memset(reinterpret_cast<void*>(mapping), 0xcc, CODE_SIZE);
+
+	g_red_zone_clobber_page =
+	    VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_clobber_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneClobberHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	// Guest functions (SysV ABI), each at its own offset.
+	enum : uint64_t {
+		Leaf       = 0x000, // frameless leaf with data in the red zone across a faulting load
+		Frame      = 0x100, // frame-pointer leaf whose loop count lives at [rbp - 0x40]
+		Exits      = 0x200, // leaves through a conditional and an unconditional jump
+		ReturnOne  = 0x300,
+		ReturnZero = 0x380,
+		Calls      = 0x400, // red zone before a call into guest code
+		AddOne     = 0x500,
+		RipData    = 0x600, // RIP-relative data load
+		Conflict   = 0x700, // another function jumps into its first five bytes
+		IntoMiddle = 0x780,
+		Discovered = 0x800, // reached only by a call: not in the function start list
+		Caller     = 0x900,
+		Switch     = 0xa00, // jump table in read-only data outside the code segment
+		CodeEnd    = 0xc00,
+		Table      = 0xd00,
+	};
+	const auto at = [&](uint64_t offset) { return reinterpret_cast<uint8_t*>(mapping + offset); };
+	const auto make = [&](uint64_t offset, auto&& body) {
+		Xbyak::CodeGenerator code(0x100, at(offset));
+		body(code);
+		Check(test, Xbyak::GetError() == 0, "failed to generate red-zone fixture");
+	};
+	using Xbyak::CodeGenerator;
+	make(Leaf, [&](CodeGenerator& c) {
+		c.mov(c.rax, SENTINEL);
+		c.mov(c.qword[c.rsp - 24], c.rax);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rax, c.qword[c.rsp - 24]);
+		c.mov(c.rcx, SENTINEL);
+		c.cmp(c.rax, c.rcx);
+		c.sete(c.al);
+		c.movzx(c.eax, c.al);
+		c.ret();
+	});
+	make(Frame, [&](CodeGenerator& c) {
+		Xbyak::Label loop;
+		Xbyak::Label done;
+		c.push(c.rbp);
+		c.mov(c.rbp, c.rsp);
+		c.push(c.rbx);
+		c.mov(c.dword[c.rbp - 0x40], c.esi); // below RSP (= RBP - 8)
+		c.xor_(c.ebx, c.ebx);
+		c.L(loop);
+		c.mov(c.ptr[c.rdi + c.rbx * 8], c.rbx); // the first store faults
+		c.inc(c.ebx);
+		c.cmp(c.ebx, 0x200); // stay inside the page when the count is lost
+		c.je(done);
+		c.cmp(c.dword[c.rbp - 0x40], c.ebx);
+		c.jne(loop);
+		c.L(done);
+		c.mov(c.eax, c.ebx);
+		c.pop(c.rbx);
+		c.pop(c.rbp);
+		c.ret();
+	});
+	make(Exits, [&](CodeGenerator& c) {
+		c.mov(c.qword[c.rsp - 16], c.rsi);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rax, c.qword[c.rsp - 16]);
+		c.cmp(c.rax, c.rsi);
+		c.jne(at(ReturnZero));
+		c.jmp(at(ReturnOne), CodeGenerator::T_NEAR);
+	});
+	make(ReturnOne, [&](CodeGenerator& c) {
+		c.mov(c.eax, 1);
+		c.ret();
+	});
+	make(ReturnZero, [&](CodeGenerator& c) {
+		c.xor_(c.eax, c.eax);
+		c.ret();
+	});
+	make(Calls, [&](CodeGenerator& c) {
+		c.mov(c.qword[c.rsp - 8], c.rsi);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rsi, c.qword[c.rsp - 8]);
+		c.push(c.rbx);
+		c.call(at(AddOne));
+		c.pop(c.rbx);
+		c.ret();
+	});
+	make(AddOne, [&](CodeGenerator& c) {
+		c.lea(c.rax, c.ptr[c.rsi + 1]);
+		c.ret();
+	});
+	make(RipData, [&](CodeGenerator& c) {
+		Xbyak::Label data;
+		c.mov(c.qword[c.rsp - 32], c.rsi);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rax, c.ptr[c.rip + data]);
+		c.add(c.rax, c.qword[c.rsp - 32]);
+		c.ret();
+		c.align(8);
+		c.L(data);
+		c.dq(SENTINEL);
+	});
+	make(Conflict, [&](CodeGenerator& c) {
+		c.xor_(c.eax, c.eax); // two bytes: IntoMiddle jumps past them
+		c.mov(c.qword[c.rsp - 8], c.rsi);
+		c.mov(c.rcx, c.ptr[c.rdi]);
+		c.mov(c.rcx, c.qword[c.rsp - 8]);
+		c.cmp(c.rcx, c.rsi);
+		c.sete(c.cl);
+		c.movzx(c.ecx, c.cl);
+		c.add(c.eax, c.ecx);
+		c.ret();
+	});
+	make(IntoMiddle, [&](CodeGenerator& c) {
+		c.mov(c.eax, 2);
+		c.jmp(at(Conflict + 2), CodeGenerator::T_NEAR);
+	});
+	make(Discovered, [&](CodeGenerator& c) {
+		c.mov(c.qword[c.rsp - 40], c.rsi);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rax, c.qword[c.rsp - 40]);
+		c.sub(c.rax, c.rsi);
+		c.ret();
+	});
+	make(Caller, [&](CodeGenerator& c) {
+		c.push(c.rbx);
+		c.call(at(Discovered));
+		c.pop(c.rbx);
+		c.ret();
+	});
+	make(Switch, [&](CodeGenerator& c) {
+		std::array<Xbyak::Label, 4> cases;
+		Xbyak::Label                other;
+		c.mov(c.qword[c.rsp - 16], c.rsi);
+		c.mov(c.eax, c.esi);
+		c.and_(c.eax, 7);
+		c.cmp(c.eax, 3);
+		c.ja(other, CodeGenerator::T_NEAR);
+		// lea r9, [rip + Table]
+		const auto lea_end = reinterpret_cast<intptr_t>(c.getCurr()) + 7;
+		c.db(0x4c);
+		c.db(0x8d);
+		c.db(0x0d);
+		c.dd(static_cast<uint32_t>(static_cast<int32_t>(static_cast<intptr_t>(mapping + Table) -
+		                                                 lea_end)));
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+		for (size_t index = 0; index < cases.size(); ++index) {
+			c.L(cases[index]);
+			c.mov(c.rcx, c.ptr[c.rdi]); // faults
+			c.mov(c.rax, c.qword[c.rsp - 16]);
+			c.add(c.rax, static_cast<uint32_t>(index));
+			c.ret();
+		}
+		c.L(other);
+		c.xor_(c.eax, c.eax);
+		c.ret();
+		for (size_t index = 0; index < cases.size(); ++index) {
+			const auto offset = static_cast<int32_t>(
+			    reinterpret_cast<intptr_t>(cases[index].getAddress()) -
+			    static_cast<intptr_t>(mapping + Table));
+			std::memcpy(at(Table) + index * sizeof(offset), &offset, sizeof(offset));
+		}
+	});
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush generated test code");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(void*, uint64_t);
+	const auto call = [&](uint64_t offset, uint64_t argument, bool fault) {
+		DWORD old_protection = 0;
+		Check(test,
+		      VirtualProtect(g_red_zone_clobber_page, 0x1000, fault ? PAGE_NOACCESS : PAGE_READWRITE,
+		                     &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return reinterpret_cast<GuestFunction>(mapping + offset)(g_red_zone_clobber_page, argument);
+	};
+	struct Case {
+		const char* name;
+		uint64_t    offset;
+		uint64_t    argument;
+		uint64_t    expected;
+	};
+	const std::array<Case, 7> cases = {{
+	    {"leaf", Leaf, 0, 1},
+	    {"frame pointer loop", Frame, 16, 16},
+	    {"exits", Exits, SENTINEL, 1},
+	    {"guest call", Calls, 41, 42},
+	    {"rip-relative data", RipData, 5, SENTINEL + 5},
+	    {"discovered by call", Caller, 77, 0},
+	    {"jump table", Switch, 0x41, 0x42},
+	}};
+	bool reproduced = true;
+	for (const auto& entry: cases) {
+		const uint64_t value = call(entry.offset, entry.argument, true);
+		std::printf("[host]    red-zone copy %-20s unpatched=%llx\n", entry.name,
+		            static_cast<unsigned long long>(value));
+		reproduced &= value != entry.expected;
+	}
+
+	const std::array<uintptr_t, 12> function_starts = {
+	    mapping + Leaf,     mapping + Frame,   mapping + Exits,    mapping + ReturnOne,
+	    mapping + ReturnZero, mapping + Calls, mapping + AddOne,   mapping + RipData,
+	    mapping + Conflict, mapping + IntoMiddle, mapping + Caller, mapping + Switch};
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
+	                                            reinterpret_cast<void*>(mapping + CODE_SIZE),
+	                                            TRAMPOLINE_SIZE);
+	const std::array<std::pair<uint64_t, uint64_t>, 1> data_ranges = {
+	    {{mapping + Table, 4 * sizeof(int32_t)}}};
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, CodeEnd, function_starts, false, false, Loader::GetGuestInstructionHostFeatures(), 0,
+	    true, data_ranges);
+	std::printf("[host]    red-zone copy candidates=%llu rewritten=%llu discovered=%llu "
+	            "conflicts=%llu unsupported=%llu early=%llu\n",
+	            static_cast<unsigned long long>(result.red_zone_copy_candidate_count),
+	            static_cast<unsigned long long>(result.rewritten_function_count),
+	            static_cast<unsigned long long>(result.discovered_function_count),
+	            static_cast<unsigned long long>(result.copy_entry_conflict_count),
+	            static_cast<unsigned long long>(result.copy_unsupported_count),
+	            static_cast<unsigned long long>(result.partially_rewritten_function_count));
+
+	bool preserved = true;
+	for (const auto& entry: cases) {
+		const uint64_t faulted   = call(entry.offset, entry.argument, true);
+		const uint64_t unfaulted = call(entry.offset, entry.argument, false);
+		std::printf("[host]    red-zone copy %-20s patched=%llx without fault=%llx\n", entry.name,
+		            static_cast<unsigned long long>(faulted),
+		            static_cast<unsigned long long>(unfaulted));
+		preserved &= faulted == entry.expected && unfaulted == entry.expected;
+	}
+	// The function with a jump into its entry bytes stays unchanged and keeps working.
+	const bool conflict_intact =
+	    call(Conflict, 9, false) == 1 && call(IntoMiddle, 9, false) == 3;
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_clobber_page, 0, MEM_RELEASE);
+	g_red_zone_clobber_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, reproduced, "test handler did not reproduce red-zone corruption");
+	Check(test,
+	      result.rewritten_function_count == 7 && result.red_zone_copy_candidate_count == 8 &&
+	          result.copy_entry_conflict_count == 1 && result.discovered_function_count >= 1 &&
+	          result.partially_rewritten_function_count == 1,
+	      "unexpected function copy counts");
+	Check(test, preserved, "a copied function lost its red zone or changed its result");
+	Check(test, conflict_intact, "a function with a jump into its entry was modified");
+	Check(test, freed, "failed to free test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+}
+
+void TestWindowsGuestRedZoneFunctionCopy() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneFunctionCopy");
 }
 #endif
 
@@ -6014,6 +6302,7 @@ int main(int argc, char** argv) {
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
+		RunTest(TestWindowsGuestRedZoneFunctionCopy);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
@@ -6030,6 +6319,7 @@ int main(int argc, char** argv) {
 	RunTest(TestTimeStampCounterPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestWindowsGuestRedZoneFunctionCopy);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
