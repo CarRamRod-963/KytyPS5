@@ -9,12 +9,28 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// The guest memory a priority operation writes: an unmap of other memory need not wait for it.
+// The default is any memory.
+struct GuestWrites {
+	uint64_t address = 0;
+	uint64_t size    = UINT64_MAX;
+
+	[[nodiscard]] static constexpr GuestWrites None() noexcept { return {0, 0}; }
+	[[nodiscard]] constexpr bool Overlaps(uint64_t other, uint64_t other_size) const noexcept {
+		if (size == 0 || other_size == 0) return false;
+		if (size == UINT64_MAX) return true;
+		return address < other + other_size && other < address + size;
+	}
+};
 
 class CommandScheduler {
 public:
@@ -41,16 +57,19 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
-	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// `writes` is the guest memory a priority operation writes.
+	void DeferOperation(Common::UniqueFunction<void>&& operation);
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, GuestWrites writes = {});
 	// For an operation that depends only on GPU work recorded before this call, such as an
 	// end-of-pipe label: while the current command buffer holds no commands it completes with
 	// the previous submission, so it needs no submission of its own. Returns the tick the
 	// operation waits for (0 when it ran at once during shutdown).
-	uint64_t DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation);
+	uint64_t DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation,
+	                                             GuestWrites                    writes = {});
 	// The tick the running priority operation waited for; 0 outside one.
-	[[nodiscard]] uint64_t    ActivePriorityTick();
-	[[nodiscard]] bool        HasPendingPriorityOperations();
+	[[nodiscard]] uint64_t ActivePriorityTick();
+	// Whether a queued or running priority operation writes guest memory in the range.
+	[[nodiscard]] bool        HasPendingPriorityWrites(uint64_t address, uint64_t size);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -91,12 +110,13 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		GuestWrites                  writes;
 	};
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	uint64_t QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-	                        bool after_recorded = false);
+	                        bool after_recorded = false, GuestWrites writes = {});
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
 
@@ -108,11 +128,12 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
+	GuestWrites                  m_priority_active_writes = GuestWrites::None();
 	uint64_t                     m_last_priority_tick   = 0; // Priority ticks never decrease.
 	uint64_t                     m_last_queued_tick     = 0; // Highest tick an operation waits for.
 	OperationState               m_operation_state      = OperationState::Open;

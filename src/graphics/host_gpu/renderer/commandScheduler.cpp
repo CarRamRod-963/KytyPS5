@@ -220,13 +220,15 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	QueueOperation(std::move(operation), false);
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              GuestWrites                    writes) {
+	QueueOperation(std::move(operation), true, false, writes);
 }
 
 uint64_t
-CommandScheduler::DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation) {
-	return QueueOperation(std::move(operation), true, true);
+CommandScheduler::DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation,
+                                                      GuestWrites                    writes) {
+	return QueueOperation(std::move(operation), true, true, writes);
 }
 
 uint64_t CommandScheduler::ActivePriorityTick() {
@@ -235,13 +237,12 @@ uint64_t CommandScheduler::ActivePriorityTick() {
 }
 
 uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-                                          bool after_recorded) {
+                                          bool after_recorded, GuestWrites writes) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		auto  tick  = CurrentTick();
+		auto tick = CurrentTick();
 		if (after_recorded && !m_command.IsInvalid() && !m_command.HasCommands()) {
 			// Everything the operation depends on was submitted with an earlier tick. The
 			// priority queue runs in order, so it cannot complete before an earlier entry.
@@ -249,9 +250,11 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 		}
 		if (priority) {
 			m_last_priority_tick = tick;
+			m_priority_operations.push_back({std::move(operation), tick, writes});
+		} else {
+			m_pending_operations.push({std::move(operation), tick});
 		}
 		m_last_queued_tick = std::max(m_last_queued_tick, tick);
-		queue.push({std::move(operation), tick});
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -267,9 +270,14 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 	return 0;
 }
 
-bool CommandScheduler::HasPendingPriorityOperations() {
+bool CommandScheduler::HasPendingPriorityWrites(uint64_t address, uint64_t size) {
 	std::lock_guard lock(m_operation_mutex);
-	return !m_priority_operations.empty() || m_priority_active_tick != 0;
+	if (m_priority_active_tick != 0 && m_priority_active_writes.Overlaps(address, size)) {
+		return true;
+	}
+	return std::ranges::any_of(m_priority_operations, [address, size](const auto& operation) {
+		return operation.writes.Overlaps(address, size);
+	});
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -285,8 +293,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active_tick   = operation.tick;
+			m_priority_active_writes = operation.writes;
 		}
 		WaitTick(operation.tick);
 		if (!stop.stop_requested()) {
@@ -294,7 +303,8 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active_tick = 0;
+			m_priority_active_tick   = 0;
+			m_priority_active_writes = GuestWrites::None();
 		}
 		m_operation_available.notify_all();
 	}

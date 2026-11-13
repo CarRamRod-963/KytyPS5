@@ -4318,6 +4318,49 @@ public:
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
             "unmap returned before an earlier guest-memory callback");
 
+    // A callback that names the guest memory it writes holds back only an unmap
+    // of that memory.
+    const auto unmap_beside_parked = [&](GuestWrites writes) {
+      std::binary_semaphore entered{0};
+      std::binary_semaphore release{0};
+      gpu.SendCommandSync([&] {
+        scheduler.DeferPriorityOperation(
+            [&] {
+              entered.release();
+              release.acquire();
+            },
+            writes);
+        scheduler.Flush();
+      });
+      entered.acquire();
+      resources.MapMemory(empty_unmap_base, empty_unmap_size);
+      std::binary_semaphore complete{0};
+      std::jthread unmapper([&] {
+        resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+        complete.release();
+      });
+      const bool returned = complete.try_acquire_for(std::chrono::seconds(1));
+      release.release();
+      if (!returned) {
+        complete.acquire();
+      }
+      unmapper.join();
+      gpu.SendCommandSync([&] { scheduler.DrainPriorityOperations(); });
+      return returned;
+    };
+    Require("GpuCommandLane", "unmap beside a callback's writes",
+            unmap_beside_parked(
+                GuestWrites{empty_unmap_base + empty_unmap_size, 0x1000}) &&
+                unmap_beside_parked(GuestWrites::None()) &&
+                !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "an unmap waited for a callback that writes other guest memory");
+    Require("GpuCommandLane", "unmap under a callback's writes",
+            !unmap_beside_parked(
+                GuestWrites{empty_unmap_base + empty_unmap_size - 8, 8}) &&
+                !unmap_beside_parked(GuestWrites{}) &&
+                !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "an unmap returned before a callback that writes its memory");
+
     constexpr uintptr_t fault_base = 0x0000000200500000ull;
     constexpr uint64_t fault_size = 0x40000;
     int64_t fault_direct_offset = -1;
