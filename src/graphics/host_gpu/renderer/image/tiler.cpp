@@ -538,8 +538,36 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                            uint32_t levels) {
+                            uint32_t levels, bool host_target) {
 	EXIT_IF(regions.empty());
+	if (host_target) {
+		// The staging copy starts as the target: tiling writes texels only, and the bytes between
+		// them stay what the target holds.
+		const auto staging = GetScratchBuffer(tiled_capacity);
+		m_scheduler.EndRendering();
+		const auto        command = m_scheduler.Current().PipelineHandle();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                        vk::AccessFlagBits::eHostWrite;
+		barrier.dstAccessMask =
+		    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		command.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+		    vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		const vk::BufferCopy in {tiled_offset, staging.offset, tiled_capacity};
+		command.copyBuffer(tiled, staging.buffer, 1, &in);
+		TileImage(image, regions, staging.buffer, staging.offset, tiled_capacity, levels);
+		// Record leaves the staging copy readable by transfers.
+		const auto           copy_out = m_scheduler.Current().PipelineHandle();
+		const vk::BufferCopy out {staging.offset, tiled_offset, tiled_capacity};
+		copy_out.copyBuffer(staging.buffer, tiled, 1, &out);
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = LaterAccess;
+		copy_out.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+		                         nullptr, 0, nullptr);
+		return;
+	}
 	const auto linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
 	const auto tiling =
