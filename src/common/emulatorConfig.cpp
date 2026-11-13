@@ -289,6 +289,10 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
+bool EmulateWave64Enabled() {
+	return g_config->emulate_wave64;
+}
+
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
