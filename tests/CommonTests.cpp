@@ -22,6 +22,10 @@
 #include <string_view>
 #include <thread>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h> // IWYU pragma: keep
+#endif
+
 namespace {
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -76,6 +80,86 @@ TEST(HostException, TheFirstHandlerStaysInstalledAndResolvesFaults) {
 	    },
 	    testing::ExitedWithCode(0), "");
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr int REPORTED_EXIT_STATUS = 77;
+// Never mapped: the low 64 KiB of the address space.
+constexpr uint64_t UNMAPPED = 0x100;
+
+[[noreturn]] void ReportAndExit(const Common::HostException::ExceptionInfo& /*info*/) {
+	std::_Exit(REPORTED_EXIT_STATUS);
+}
+
+// The loader's policy: what no one resolves is reported, unless it is left to the faulting
+// module's own handlers.
+bool ReportUnlessLeftToModule(const Common::HostException::ExceptionInfo& info) {
+	if (Common::HostException::LeaveToModuleHandlers(info, false)) {
+		return false;
+	}
+	ReportAndExit(info);
+}
+
+void InstallReportingHandlers() {
+	(void)Common::HostException::InstallHandler(ReportUnlessLeftToModule);
+	(void)Common::HostException::InstallUnhandledReporter(ReportAndExit);
+}
+
+TEST(HostException, AFaultASystemDllHandlesItselfDoesNotEndTheProcess) {
+	EXPECT_EXIT(
+	    {
+		    InstallReportingHandlers();
+		    // IsBadReadPtr reads the range inside its own __try: the read faults in kernelbase.dll
+		    // and the DLL's handler turns the fault into the result.
+		    const bool bad = IsBadReadPtr(reinterpret_cast<const void*>(UNMAPPED), 16) != 0;
+		    std::_Exit(bad ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+
+TEST(HostException, AFaultNoModuleHandlesIsReported) {
+	EXPECT_EXIT(
+	    {
+		    InstallReportingHandlers();
+		    using CompareMemory = SIZE_T(WINAPI*)(const void*, const void*, SIZE_T);
+		    auto* compare       = reinterpret_cast<CompareMemory>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlCompareMemory"));
+		    if (compare == nullptr) {
+			    std::_Exit(1);
+		    }
+		    // On a thread of its own: the test framework guards test bodies with __try.
+		    std::thread([compare] {
+			    (void)compare(reinterpret_cast<const void*>(UNMAPPED),
+			                  reinterpret_cast<const void*>(UNMAPPED + 64), 16);
+		    }).join();
+		    std::_Exit(1);
+	    },
+	    testing::ExitedWithCode(REPORTED_EXIT_STATUS), "");
+}
+
+TEST(HostException, OnlyHostThreadFaultsInsideOtherModulesAreLeftToTheirHandlers) {
+	EXPECT_EXIT(
+	    {
+		    namespace HostException = Common::HostException;
+		    HostException::ExceptionInfo in_dll;
+		    in_dll.exception_address = reinterpret_cast<uint64_t>(
+		        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlCompareMemory"));
+		    HostException::ExceptionInfo in_exe;
+		    in_exe.exception_address = reinterpret_cast<uint64_t>(&ReportAndExit);
+		    HostException::ExceptionInfo outside_modules;
+		    outside_modules.exception_address = UNMAPPED;
+		    // Nothing is left before a reporter exists: it would end without a report.
+		    const bool before = HostException::LeaveToModuleHandlers(in_dll, false);
+		    InstallReportingHandlers();
+		    const bool ok = !before && in_dll.exception_address != 0 &&
+		                    HostException::LeaveToModuleHandlers(in_dll, false) &&
+		                    !HostException::LeaveToModuleHandlers(in_dll, true) &&
+		                    !HostException::LeaveToModuleHandlers(in_exe, false) &&
+		                    !HostException::LeaveToModuleHandlers(outside_modules, false);
+		    std::_Exit(ok ? 0 : 1);
+	    },
+	    testing::ExitedWithCode(0), "");
+}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 volatile sig_atomic_t g_dispatched = 0;

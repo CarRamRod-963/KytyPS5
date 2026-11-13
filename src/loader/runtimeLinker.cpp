@@ -705,6 +705,9 @@ static void AppendHostBacktrace(const Common::HostException::ExceptionInfo& info
 #endif
 }
 
+[[noreturn]] static void
+ReportUnhandledHostException(const Common::HostException::ExceptionInfo& exception_info);
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -734,6 +737,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	// A host thread faulting inside a driver or system DLL may be inside that module's own __try;
+	// the unhandled-exception filter reports the exception if nobody handles it.
+	const bool guest_thread = Libs::LibKernel::PthreadSelfOrNull() != nullptr;
+	if (Common::HostException::LeaveToModuleHandlers(*info, guest_thread)) {
+		return false;
+	}
+	ReportUnhandledHostException(*info);
+}
+
+static void
+ReportUnhandledHostException(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info = &exception_info;
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
@@ -1986,6 +2001,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
+	Common::HostException::InstallUnhandledReporter(ReportUnhandledHostException);
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
