@@ -38,6 +38,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -86,6 +87,27 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 	return false;
+}
+
+bool ComputeDispatchFits(const std::array<uint32_t, 3>& max_counts, uint32_t group_x,
+                         uint32_t group_y, uint32_t group_z) {
+	return group_x <= max_counts[0] && group_y <= max_counts[1] && group_z <= max_counts[2];
+}
+
+// Once per shader: a game that sends one such dispatch tends to send it every frame.
+static void ReportOversizedDispatch(uint64_t shader_hash, uint32_t group_x, uint32_t group_y,
+                                    uint32_t group_z) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	{
+		std::lock_guard lock(mutex);
+		if (!reported.insert(shader_hash).second) {
+			return;
+		}
+	}
+	LOGF("GraphicsRenderDispatchDirect: skipping a dispatch of more workgroups than the device "
+	     "takes: shader=0x%016" PRIx64 " groups=%ux%ux%u\n",
+	     shader_hash, group_x, group_y, group_z);
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -432,6 +454,16 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		thread_group_x = input_info.workgroup_counts[0];
 		thread_group_y = input_info.workgroup_counts[1];
 		thread_group_z = input_info.workgroup_counts[2];
+	}
+	// More workgroups than the device takes is invalid Vulkan usage, and with arguments the
+	// guest built from wrong data such a dispatch would keep the GPU busy indefinitely.
+	const auto& max_counts =
+	    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxComputeWorkGroupCount;
+	if (!ComputeDispatchFits(max_counts, thread_group_x, thread_group_y, thread_group_z)) {
+		ReportOversizedDispatch(program.shader_hash, thread_group_x, thread_group_y,
+		                        thread_group_z);
+		ResetBindings();
+		return;
 	}
 
 	buffer.EndRendering();
