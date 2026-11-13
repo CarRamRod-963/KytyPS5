@@ -209,6 +209,12 @@
               <property name="text"><string>Emulate wave64 compute shaders</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_no_async_pipelines">
+              <property name="toolTip"><string>Build each new shader pipeline fully optimized before it is used, instead of a quick unoptimized build first. New shaders take longer to appear; can help on GPUs whose driver crashes during the quick build.</string></property>
+              <property name="text"><string>Build shader pipelines fully optimized (no quick first build)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
