@@ -795,6 +795,11 @@ add_executable(memory_budget_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(memory_budget_tests PRIVATE ${inc_headers})
 
+add_executable(subgroup_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubgroupPlanTests.cpp"
+)
+target_include_directories(subgroup_plan_tests PRIVATE ${inc_headers})
+
 add_executable(memory_priority_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryPriorityTests.cpp"
 )
@@ -961,6 +966,7 @@ if(BUILD_TESTING)
 	add_test(NAME spirv_simplified_store COMMAND $<TARGET_FILE:spirv_simplified_store_tests>)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
+	add_test(NAME subgroup_plan COMMAND $<TARGET_FILE:subgroup_plan_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -1114,6 +1120,7 @@ if(BUILD_TESTING)
 		spirv_simplified_store_tests
 		pending_draw_policy_tests
 		memory_priority_tests
+		subgroup_plan_tests
 		barrier_tracker_tests
 		memory_tracker_tests
 		page_manager_tests
