@@ -553,6 +553,20 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
+	{
+		// Crash reports from other GPUs name the driver release only through this line.
+		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties>
+		            driver_chain;
+		const auto& driver = driver_chain.get<vk::PhysicalDeviceDriverProperties>();
+		physical_device.getProperties2(&driver_chain.get<vk::PhysicalDeviceProperties2>());
+		const auto& device = graphics.physical_device_properties;
+		LOGF("Vulkan driver: %s, %s (id %u), driver version 0x%08x, API %u.%u.%u, vendor 0x%04x, "
+		     "device 0x%04x\n",
+		     driver.driverName.data(), driver.driverInfo.data(),
+		     static_cast<uint32_t>(driver.driverID), device.driverVersion,
+		     VK_API_VERSION_MAJOR(device.apiVersion), VK_API_VERSION_MINOR(device.apiVersion),
+		     VK_API_VERSION_PATCH(device.apiVersion), device.vendorID, device.deviceID);
+	}
 
 	const auto subgroup_stages = subgroup_control.requiredSubgroupSizeStages;
 	graphics.subgroup_size     = properties11.subgroupSize;
