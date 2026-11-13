@@ -136,6 +136,7 @@ public:
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
 	bool                   emulate_wave64              = false;
+	bool                   no_async_pipelines          = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -190,6 +191,7 @@ public:
 		relaxed_shader_float        = other.relaxed_shader_float;
 		native_rt                   = other.native_rt;
 		emulate_wave64              = other.emulate_wave64;
+		no_async_pipelines          = other.no_async_pipelines;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
