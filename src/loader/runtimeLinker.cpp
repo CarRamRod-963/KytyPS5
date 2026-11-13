@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -993,6 +994,187 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	return g_tls_cached_main_tcb;
 }
 
+struct GuestPatchOptions {
+	bool     protect_memory_faults   = false;
+	bool     emulate_amd             = false;
+	bool     copy_red_zone_functions = false;
+	uint64_t tsc_multiplier          = 0;
+
+	[[nodiscard]] bool Any() const {
+		return protect_memory_faults || emulate_amd || copy_red_zone_functions ||
+		       tsc_multiplier != 0;
+	}
+};
+
+static GuestPatchOptions GetGuestPatchOptions() {
+	GuestPatchOptions options;
+	options.emulate_amd = Config::AmdCpuEnabled();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	options.protect_memory_faults = Config::RedZoneProtectionEnabled();
+	// Windows writes exception frames directly below the guest RSP, over the SysV red zone. How
+	// many bytes below RSP survive depends on the host CPU's XSAVE layout and on which register
+	// state is in use at the fault, so the protection is always on.
+	options.copy_red_zone_functions = true;
+#endif
+	options.tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	return options;
+}
+
+// Function entries the unwind table does not list: exported functions and code addresses stored
+// by relocations (vtables, function pointer tables).
+static void CollectDynamicFunctionStarts(const Program* program, uint64_t code_start,
+                                         uint64_t code_end, std::vector<uintptr_t>* starts) {
+	const auto* info = program->dynamic_info.get();
+	if (info == nullptr) {
+		return;
+	}
+	const auto in_code = [&](uint64_t address) {
+		return address >= code_start && address < code_end;
+	};
+	if (info->symbol_table != nullptr) {
+		for (uint64_t i = 0; i < info->symbol_table_total_size / sizeof(Elf64_Sym); ++i) {
+			const auto& symbol  = info->symbol_table[i];
+			const auto  address = program->base_vaddr + symbol.st_value;
+			if (symbol.GetType() == STT_FUNC && symbol.st_shndx != 0 && in_code(address)) {
+				starts->push_back(address);
+			}
+		}
+	}
+	if (info->rela_table != nullptr) {
+		for (uint64_t i = 0; i < info->rela_table_total_size / sizeof(Elf64_Rela); ++i) {
+			const auto& relocation = info->rela_table[i];
+			const auto  address    = program->base_vaddr + relocation.r_addend;
+			if (relocation.GetType() == R_X86_64_RELATIVE && in_code(address)) {
+				starts->push_back(address);
+			}
+		}
+	}
+}
+
+// Applies the guest instruction patches to the executable segments of a loaded program, once its
+// dynamic information is parsed.
+static void PatchGuestCode(Program* program) {
+	const auto options = GetGuestPatchOptions();
+	if (!options.Any() || program->instruction_trampoline_size == 0) {
+		return;
+	}
+	const auto* ehdr = program->elf->GetEhdr();
+	const auto* phdr = program->elf->GetPhdr();
+
+	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
+	std::vector<std::pair<uint64_t, uint64_t>> readable_segments;
+	uint64_t                                   eh_frame_header_addr = 0;
+	uint64_t                                   eh_frame_header_size = 0;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_memsz != 0 && phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0) {
+			executable_segments.emplace_back(phdr[i].p_vaddr + program->base_vaddr,
+			                                 phdr[i].p_filesz);
+		}
+		if (phdr[i].p_filesz != 0 && phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_R) != 0) {
+			readable_segments.emplace_back(phdr[i].p_vaddr + program->base_vaddr, phdr[i].p_filesz);
+		}
+		if (phdr[i].p_type == PT_GNU_EH_FRAME) {
+			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
+			eh_frame_header_size = phdr[i].p_memsz;
+		}
+	}
+
+	const auto             patch_start = std::chrono::steady_clock::now();
+	std::vector<uintptr_t> function_starts;
+	const bool             have_function_starts =
+	    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size, &function_starts) &&
+	    !function_starts.empty();
+	const auto module_name = Common::PathToString(program->file_name.filename());
+	if (options.copy_red_zone_functions) {
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			CollectDynamicFunctionStarts(program, segment_addr, segment_addr + segment_size,
+			                             &function_starts);
+		}
+	}
+	if (!have_function_starts && !options.copy_red_zone_functions) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+		    module_name));
+	}
+	const bool                  protect_memory_faults = options.protect_memory_faults;
+	const bool                  emulate_amd           = options.emulate_amd;
+	GuestInstructionPatchResult totals {};
+	for (const auto& [segment_addr, segment_size]: executable_segments) {
+		const auto result = PatchGuestInstructions(
+		    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+		    GetGuestInstructionHostFeatures(), options.tsc_multiplier,
+		    options.copy_red_zone_functions, readable_segments);
+		totals.reciprocal_sqrt += result.reciprocal_sqrt;
+		totals.extrq += result.extrq;
+		totals.insertq += result.insertq;
+		totals.rdpid += result.rdpid;
+		totals.clwb += result.clwb;
+		totals.rdtsc += result.rdtsc;
+		totals.function_count += result.function_count;
+		totals.discovered_function_count += result.discovered_function_count;
+		totals.red_zone_copy_candidate_count += result.red_zone_copy_candidate_count;
+		totals.rewritten_function_count += result.rewritten_function_count;
+		totals.rewritten_function_bytes += result.rewritten_function_bytes;
+		totals.partially_rewritten_function_count += result.partially_rewritten_function_count;
+		totals.unprotected_instruction_count += result.unprotected_instruction_count;
+		totals.copy_entry_conflict_count += result.copy_entry_conflict_count;
+		totals.copy_unsupported_count += result.copy_unsupported_count;
+		totals.copy_no_space_count += result.copy_no_space_count;
+		if (protect_memory_faults) {
+			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+			     module_name.c_str(), result.function_count, result.red_zone_function_count,
+			     result.memory_instruction_count, result.patched_memory_instruction_count,
+			     result.short_memory_instruction_count,
+			     result.stack_dependent_memory_instruction_count,
+			     result.control_flow_memory_instruction_count,
+			     result.unrelocatable_memory_instruction_count);
+		}
+	}
+	if (options.copy_red_zone_functions) {
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		    std::chrono::steady_clock::now() - patch_start);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Guest red-zone protection: {}: {} of {} functions copied ({} KiB; {} leave the copy "
+		    "early, {} unprotected instructions; not copied: {} entry conflicts, {} unsupported, "
+		    "{} out of space); {} functions analyzed ({} found by the code sweep) in {} ms\n",
+		    module_name, totals.rewritten_function_count, totals.red_zone_copy_candidate_count,
+		    totals.rewritten_function_bytes / 1024, totals.partially_rewritten_function_count,
+		    totals.unprotected_instruction_count, totals.copy_entry_conflict_count,
+		    totals.copy_unsupported_count, totals.copy_no_space_count, totals.function_count,
+		    totals.discovered_function_count, elapsed.count()));
+	}
+	if (totals.rdtsc.found != 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+		                totals.rdtsc.native, totals.rdtsc.Skipped()));
+	}
+	if (emulate_amd && have_function_starts) {
+		InstructionPatchCounts combined {};
+		std::string            details;
+		for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
+		                                  {"EXTRQ", totals.extrq},
+		                                  {"INSERTQ", totals.insertq},
+		                                  {"RDPID", totals.rdpid},
+		                                  {"CLWB", totals.clwb}}) {
+			combined += counts;
+			if (!details.empty()) details += "; ";
+			details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
+			                       counts.trapped, counts.Skipped());
+		}
+		const auto  found   = combined.found;
+		const auto  skipped = combined.Skipped();
+		const char* status  = found == 0         ? "no matching instructions"
+		                      : skipped == found ? "not patched"
+		                      : skipped != 0     ? "partially patched"
+		                                         : "patched";
+		Log::WriteToConsoleAndLog(
+		    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+	}
+}
+
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
@@ -1253,6 +1435,7 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	if (program->elf->IsValid()) {
 		LoadProgramToMemory(program);
 		ParseProgramDynamicInfo(program);
+		PatchGuestCode(program);
 		CreateSymbolDatabase(program);
 	} else {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
@@ -1706,6 +1889,16 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	return base_size;
 }
 
+static uint64_t CalcExecutableSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
+	uint64_t size = 0;
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0) {
+			size += phdr[i].p_filesz;
+		}
+	}
+	return size;
+}
+
 // A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
 // since it lies inside an RW LOAD.
 uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
@@ -1746,21 +1939,17 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-	const bool emulate_amd = Config::AmdCpuEnabled();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
-#else
-	const bool protect_memory_faults = false;
-#endif
-	const uint64_t tsc_multiplier =
-	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
-	const bool patch_guest_instructions =
-	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
+	const auto patch_options = GetGuestPatchOptions();
 
-	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (patch_guest_instructions) {
-		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+	uint64_t instruction_trampoline_size = 8u * 1024u * 1024u;
+	if (patch_options.copy_red_zone_functions) {
+		// Room for copies of the red-zone functions of the executable segments.
+		instruction_trampoline_size +=
+		    AlignUp(CalcExecutableSize(ehdr, phdr) / 16, GUEST_PAGE_SIZE);
+	}
+	if (patch_options.Any()) {
+		EXIT_IF(instruction_trampoline_size > UINT64_MAX - program->mapped_size);
+		program->mapped_size += instruction_trampoline_size;
 	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
@@ -1770,9 +1959,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
 	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
-	if (patch_guest_instructions) {
+	if (patch_options.Any()) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
-		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		program->instruction_trampoline_size = instruction_trampoline_size;
 		RegisterGuestInstructionPatchModule(
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
@@ -1798,10 +1987,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
 
-	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-	uint64_t                                   eh_frame_header_addr = 0;
-	uint64_t                                   eh_frame_header_size = 0;
-
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
 			uint64_t segment_addr        = phdr[i].p_vaddr + program->base_vaddr;
@@ -1823,7 +2008,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
 				PatchProgram(program, segment_addr, segment_memory_size);
-				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
 			if (!skip_protect) {
@@ -1857,76 +2041,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			EXIT_IF(phdr[i].p_vaddr >= program->base_size);
 
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
-		}
-
-		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
-			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
-			eh_frame_header_size = phdr[i].p_memsz;
-		}
-	}
-
-	if (patch_guest_instructions) {
-		std::vector<uintptr_t> function_starts;
-		const bool             have_function_starts =
-		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                &function_starts) &&
-		    !function_starts.empty();
-		const auto module_name = Common::PathToString(program->file_name.filename());
-		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
-			    module_name));
-		}
-		GuestInstructionPatchResult totals {};
-		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(
-			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
-			    GetGuestInstructionHostFeatures(), tsc_multiplier);
-			totals.reciprocal_sqrt += result.reciprocal_sqrt;
-			totals.extrq += result.extrq;
-			totals.insertq += result.insertq;
-			totals.rdpid += result.rdpid;
-			totals.clwb += result.clwb;
-			totals.rdtsc += result.rdtsc;
-			if (protect_memory_faults) {
-				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
-				     result.memory_instruction_count, result.patched_memory_instruction_count,
-				     result.short_memory_instruction_count,
-				     result.stack_dependent_memory_instruction_count,
-				     result.control_flow_memory_instruction_count,
-				     result.unrelocatable_memory_instruction_count);
-			}
-		}
-		if (totals.rdtsc.found != 0) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
-			                totals.rdtsc.native, totals.rdtsc.Skipped()));
-		}
-		if (emulate_amd && have_function_starts) {
-			InstructionPatchCounts combined {};
-			std::string            details;
-			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
-			                                  {"EXTRQ", totals.extrq},
-			                                  {"INSERTQ", totals.insertq},
-			                                  {"RDPID", totals.rdpid},
-			                                  {"CLWB", totals.clwb}}) {
-				combined += counts;
-				if (!details.empty()) details += "; ";
-				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
-				                       counts.trapped, counts.Skipped());
-			}
-			const auto  found   = combined.found;
-			const auto  skipped = combined.Skipped();
-			const char* status  = found == 0         ? "no matching instructions"
-			                      : skipped == found ? "not patched"
-			                      : skipped != 0     ? "partially patched"
-			                                         : "patched";
-			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
 
