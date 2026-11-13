@@ -10,6 +10,8 @@
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <bitset>
 #include <climits>
 #include <cstring>
@@ -19,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <xbyak/xbyak.h>
@@ -111,12 +114,24 @@ struct DecodedCodeInstruction {
 	std::optional<s64>                                       stack_pointer_delta;
 };
 
+// A resolved `movsxd target, [table + index * 4]; add target, table; jmp target` dispatch.
+struct JumpTable {
+	uintptr_t              load {};    // the MOVSXD
+	uintptr_t              address {}; // table base: entries are offsets from it
+	std::vector<uintptr_t> entries;    // target of each index
+};
+
+// Readable module memory outside the code segment (jump tables live in read-only data).
+using AddressRanges = std::span<const std::pair<uint64_t, uint64_t>>;
+
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
+	std::map<uintptr_t, JumpTable>              jump_tables; // by branch address
 	std::set<uintptr_t>                         branch_targets;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
+	bool                                        red_zone_liveness_exact {};
 };
 
 enum class InstructionReplacement {
@@ -261,6 +276,11 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 		}
 	}
 
+	if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+		// The return address and the callee's frame overwrite everything below RSP, so the ABI
+		// keeps no red-zone data across a call.
+		decoded.red_zone_def.set();
+	}
 	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
 		const auto& operand = decoded.operands[index];
 		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
@@ -315,7 +335,7 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
                         uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+                        uintptr_t segment_end, AddressRanges data_ranges, JumpTable* table) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -467,10 +487,16 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 		return std::nullopt;
 	}
 
+	const auto table_fits = [&](uintptr_t table_address, uintptr_t start, uintptr_t end) {
+		return table_address >= start && table_address <= end &&
+		       *table_size <= (end - table_address) / sizeof(s32);
+	};
 	std::optional<std::vector<uintptr_t>> resolved_targets;
 	for (const uintptr_t table_address: table_candidates) {
-		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
+		if (!table_fits(table_address, segment_start, segment_end) &&
+		    std::ranges::none_of(data_ranges, [&](const auto& range) {
+			    return table_fits(table_address, range.first, range.first + range.second);
+		    })) {
 			continue;
 		}
 
@@ -493,18 +519,178 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 		if (!valid) {
 			continue;
 		}
-		std::ranges::sort(targets);
-		targets.erase(std::ranges::unique(targets).begin(), targets.end());
 		if (resolved_targets) {
 			return std::nullopt;
 		}
+		if (table != nullptr) {
+			*table = {.load = load->first, .address = table_address, .entries = targets};
+		}
+		std::ranges::sort(targets);
+		targets.erase(std::ranges::unique(targets).begin(), targets.end());
 		resolved_targets = std::move(targets);
 	}
 	return resolved_targets;
 }
 
+bool IsFramePointerRegister(ZydisRegister reg) {
+	return reg != ZYDIS_REGISTER_NONE &&
+	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RBP;
+}
+
+bool WritesFramePointer(const DecodedCodeInstruction& decoded) {
+	for (u8 index = 0; index < decoded.instruction.operand_count; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    IsFramePointerRegister(operand.reg.value) &&
+		    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Clang's frame-pointer prologue (push rbp; mov rbp, rsp; push ...) lets a leaf function address
+// its red zone through RBP: [rbp - d] lies below RSP once d exceeds the bytes pushed after the
+// MOV. Windows writes its exception frame there, so map such operands onto the RSP-relative red
+// zone bits the liveness analysis uses. Offsets come from a forward pass over the known RSP
+// deltas; anything the pass cannot prove makes the function conservative.
+void ModelFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
+	auto&      instructions = function.instructions;
+	const auto push_rbp     = instructions.find(function_start);
+	if (push_rbp == instructions.end() ||
+	    push_rbp->second.instruction.mnemonic != ZYDIS_MNEMONIC_PUSH ||
+	    push_rbp->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    push_rbp->second.operands[0].reg.value != ZYDIS_REGISTER_RBP) {
+		return;
+	}
+	const auto mov_rbp = instructions.find(function_start + push_rbp->second.instruction.length);
+	if (mov_rbp == instructions.end() ||
+	    mov_rbp->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
+	    mov_rbp->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    mov_rbp->second.operands[0].reg.value != ZYDIS_REGISTER_RBP ||
+	    mov_rbp->second.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    mov_rbp->second.operands[1].reg.value != ZYDIS_REGISTER_RSP) {
+		return;
+	}
+
+	// State before each instruction: RSP relative to RBP (RBP = entry RSP - 8), or nothing
+	// when unknown or RBP no longer holds the frame.
+	struct State {
+		bool known {};
+		s64  rsp_minus_rbp {};
+	};
+	std::map<uintptr_t, State> state_in;
+	std::vector<uintptr_t>     work;
+	bool                       conflict = false;
+	const auto                 merge    = [&](uintptr_t address, State state) {
+		if (!instructions.contains(address)) {
+			return;
+		}
+		auto [entry, inserted] = state_in.try_emplace(address, state);
+		if (inserted) {
+			work.push_back(address);
+			return;
+		}
+		if (entry->second.known &&
+		    (!state.known || state.rsp_minus_rbp != entry->second.rsp_minus_rbp)) {
+			conflict |= state.known;
+			entry->second.known = false;
+			work.push_back(address);
+		}
+	};
+	merge(mov_rbp->first + mov_rbp->second.instruction.length, {.known = true, .rsp_minus_rbp = 0});
+	while (!work.empty()) {
+		const uintptr_t address = work.back();
+		work.pop_back();
+		const auto& decoded = instructions.at(address);
+		State       out     = state_in.at(address);
+		if (out.known) {
+			if (WritesFramePointer(decoded)) {
+				out.known = false;
+			} else if (decoded.changes_stack_pointer) {
+				if (decoded.stack_pointer_delta.has_value() && !decoded.replaces_stack_pointer) {
+					out.rsp_minus_rbp += *decoded.stack_pointer_delta;
+				} else {
+					out.known = false;
+				}
+			}
+		}
+		const uintptr_t next_address  = address + decoded.instruction.length;
+		const uintptr_t branch_target = GetRelativeTarget(decoded);
+		if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			merge(next_address, out);
+			merge(branch_target, out);
+		} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+			merge(branch_target, out);
+			if (const auto table = function.jump_tables.find(address);
+			    table != function.jump_tables.end()) {
+				for (const uintptr_t target: table->second.entries) {
+					merge(target, out);
+				}
+			}
+		} else if (!IsControlFlowTerminator(decoded.instruction)) {
+			merge(next_address, out);
+		}
+	}
+
+	for (auto& [address, decoded]: instructions) {
+		const auto state               = state_in.find(address);
+		bool       only_frame_operands = true;
+		bool       has_memory_operand  = false;
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+				continue;
+			}
+			has_memory_operand = true;
+			if (!IsFramePointerRegister(operand.mem.base) || operand.mem.disp.value >= 0) {
+				only_frame_operands = false;
+				continue;
+			}
+			if (state == state_in.end() || !state->second.known || conflict ||
+			    operand.mem.index != ZYDIS_REGISTER_NONE ||
+			    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
+				// A frame access whose place relative to RSP is unknown, or a pointer into it.
+				if (state != state_in.end() || conflict) {
+					decoded.has_red_zone_operand                     = true;
+					decoded.has_unmodeled_red_zone_operand           = true;
+					function.uses_red_zone                           = true;
+					function.requires_conservative_red_zone_tracking = true;
+				}
+				only_frame_operands = false;
+				continue;
+			}
+			// Offset of the access from the current RSP.
+			const s64 access_start = operand.mem.disp.value - state->second.rsp_minus_rbp;
+			const s64 access_size  = std::max<s64>(operand.size / 8, 1);
+			if (access_start >= 0) {
+				continue;
+			}
+			decoded.has_red_zone_operand = true;
+			function.uses_red_zone       = true;
+			const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
+			const s64 range_end   = std::min<s64>(access_start + access_size, 0);
+			for (s64 offset = range_start; offset < range_end; ++offset) {
+				const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
+				if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+					decoded.red_zone_use.set(bit);
+				}
+				if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
+					decoded.red_zone_def.set(bit);
+				}
+			}
+		}
+		// Stack accesses through the frame never fault: keep them out of the rewrite set.
+		if (has_memory_operand && only_frame_operands && state != state_in.end() &&
+		    state->second.known && !conflict) {
+			decoded.accesses_memory = false;
+		}
+	}
+}
+
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t segment_start, uintptr_t segment_end,
+                               AddressRanges data_ranges = {}) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -559,11 +745,14 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			if (resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			JumpTable  table;
+			const auto targets =
+			    ResolveBoundedJumpTable(function, branch_address, function_start, function_end,
+			                            segment_start, segment_end, data_ranges, &table);
 			if (!targets) {
 				continue;
 			}
+			function.jump_tables.emplace(branch_address, std::move(table));
 			resolved_indirect_branches.insert(branch_address);
 			for (const uintptr_t target: *targets) {
 				function.branch_targets.insert(target);
@@ -578,6 +767,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	ModelFramePointerRedZone(function, function_start);
 	return function;
 }
 
@@ -649,6 +839,12 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 				add_successor(branch_target);
 			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
 				add_successor(branch_target);
+				if (const auto table = function.jump_tables.find(decoded.address);
+				    table != function.jump_tables.end()) {
+					for (const uintptr_t target: table->second.entries) {
+						add_successor(target);
+					}
+				}
 			} else if (!IsControlFlowTerminator(decoded.instruction)) {
 				add_successor(next_address);
 			}
@@ -671,11 +867,13 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 	for (size_t index = 0; index < instructions.size(); ++index) {
 		instructions[index]->red_zone_live = live_in[index];
 	}
+	function.red_zone_liveness_exact = true;
 }
 
 bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
                                 Xbyak::CodeGenerator& generator, s64 stack_adjustment = 0,
-                                ZydisMnemonic replacement = ZYDIS_MNEMONIC_INVALID) {
+                                ZydisMnemonic replacement       = ZYDIS_MNEMONIC_INVALID,
+                                s64           memory_adjustment = 0) {
 	ZydisEncoderRequest request;
 	if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(
 	        &decoded.instruction, decoded.operands.data(),
@@ -707,6 +905,8 @@ bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
 		} else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
 		           IsStackPointerRegister(operand.mem.base)) {
 			request.operands[index].mem.displacement += stack_adjustment;
+		} else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+			request.operands[index].mem.displacement += memory_adjustment;
 		}
 	}
 
@@ -1515,6 +1715,612 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
 	}
 }
+
+// Instruction starts and direct branch targets of a code segment, from a linear sweep. Clang keeps
+// jump tables and other data out of the text, so the sweep stays in step with the code.
+struct CodeSweep {
+	uintptr_t              start {};
+	uintptr_t              end {};
+	std::vector<u64>       boundaries;
+	std::vector<u64>       targets;
+	std::vector<u64>       stack_below; // [rsp - d] or [rbp - d] operands: possible red-zone uses
+	std::vector<uintptr_t> references;
+
+	static void SetBit(std::vector<u64>& bits, size_t index) {
+		std::atomic_ref(bits[index / 64])
+		    .fetch_or(u64 {1} << (index % 64), std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool TestBit(const std::vector<u64>& bits, uintptr_t address) const {
+		if (address < start || address >= end) {
+			return false;
+		}
+		const size_t index = address - start;
+		return (bits[index / 64] & (u64 {1} << (index % 64))) != 0;
+	}
+	[[nodiscard]] bool IsBoundary(uintptr_t address) const { return TestBit(boundaries, address); }
+	[[nodiscard]] bool IsBranchTarget(uintptr_t address) const { return TestBit(targets, address); }
+	// Whether an instruction in [first, last) addresses memory below RSP or RBP.
+	[[nodiscard]] bool MayUseRedZone(uintptr_t first, uintptr_t last) const {
+		first = std::max(first, start);
+		last  = std::min(last, end);
+		for (uintptr_t address = first; address < last;) {
+			const size_t index = address - start;
+			const u64    word  = stack_below[index / 64] >> (index % 64);
+			if (word != 0) {
+				return address + std::countr_zero(word) < last;
+			}
+			address += 64 - index % 64;
+		}
+		return false;
+	}
+};
+
+void SweepPiece(CodeSweep& sweep, uintptr_t piece_start, uintptr_t piece_end,
+                std::vector<uintptr_t>& references) {
+	ZydisDecodedInstruction instruction {};
+	for (uintptr_t address = piece_start; address < piece_end;) {
+		if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&GetDecoder(), nullptr,
+		                                                reinterpret_cast<const void*>(address),
+		                                                sweep.end - address, &instruction))) {
+			++address;
+			continue;
+		}
+		CodeSweep::SetBit(sweep.boundaries, address - sweep.start);
+		if ((instruction.attributes & ZYDIS_ATTRIB_HAS_MODRM) != 0 &&
+		    instruction.raw.modrm.mod != 3 && instruction.raw.disp.value < 0) {
+			const bool sib  = instruction.raw.modrm.rm == 4;
+			const u8   base = sib ? instruction.raw.sib.base : instruction.raw.modrm.rm;
+			// RSP (4) or RBP (5); base 5 with mod 0 is RIP or none. REX.B selects R12/R13 instead;
+			// VEX/EVEX/XOP bases are not told apart here (R12/R13 bases only cost an analysis).
+			const bool rex_base =
+			    (instruction.attributes & ZYDIS_ATTRIB_HAS_REX) != 0 && instruction.raw.rex.B != 0;
+			if (!rex_base && (base == 4 || (base == 5 && instruction.raw.modrm.mod != 0))) {
+				CodeSweep::SetBit(sweep.stack_below, address - sweep.start);
+			}
+		}
+		const uintptr_t next     = address + instruction.length;
+		const auto      category = instruction.meta.category;
+		if ((category == ZYDIS_CATEGORY_CALL || category == ZYDIS_CATEGORY_COND_BR ||
+		     category == ZYDIS_CATEGORY_UNCOND_BR) &&
+		    instruction.raw.imm[0].is_relative) {
+			const uintptr_t target = next + static_cast<uintptr_t>(instruction.raw.imm[0].value.s);
+			if (target >= sweep.start && target < sweep.end) {
+				CodeSweep::SetBit(sweep.targets, target - sweep.start);
+				if (category == ZYDIS_CATEGORY_CALL) {
+					references.push_back(target);
+				}
+			}
+		} else if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+		           (instruction.attributes & ZYDIS_ATTRIB_HAS_MODRM) != 0 &&
+		           instruction.raw.modrm.mod == 0 && instruction.raw.modrm.rm == 5) {
+			// RIP-relative LEA: a function pointer taken in code.
+			const uintptr_t target = next + static_cast<uintptr_t>(instruction.raw.disp.value);
+			if (target >= sweep.start && target < sweep.end) {
+				references.push_back(target);
+			}
+		}
+		address = next;
+	}
+}
+
+// Sweeps [start, end) in pieces that begin at known instruction starts (sorted), on several
+// threads.
+CodeSweep SweepCode(uintptr_t start, uintptr_t end, std::span<const uintptr_t> known_starts,
+                    size_t thread_count) {
+	CodeSweep    sweep {.start = start, .end = end};
+	const size_t words = (end - start + 63) / 64;
+	sweep.boundaries.assign(words, 0);
+	sweep.targets.assign(words, 0);
+	sweep.stack_below.assign(words, 0);
+
+	std::vector<uintptr_t> pieces {start};
+	for (size_t piece = 1; piece < thread_count; ++piece) {
+		const uintptr_t wanted = start + (end - start) / thread_count * piece;
+		const auto      known  = std::ranges::lower_bound(known_starts, wanted);
+		if (known != known_starts.end() && *known > pieces.back() && *known < end) {
+			pieces.push_back(*known);
+		}
+	}
+	pieces.push_back(end);
+	std::vector<std::vector<uintptr_t>> references(pieces.size() - 1);
+	const auto                          sweep_piece = [&](size_t piece) {
+		SweepPiece(sweep, pieces[piece], pieces[piece + 1], references[piece]);
+	};
+	std::vector<std::thread> threads;
+	for (size_t piece = 1; piece + 1 < pieces.size(); ++piece) {
+		threads.emplace_back(sweep_piece, piece);
+	}
+	sweep_piece(0);
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	for (const auto& piece_references: references) {
+		sweep.references.insert(sweep.references.end(), piece_references.begin(),
+		                        piece_references.end());
+	}
+	// Only references that land on an instruction start can be function entries.
+	std::erase_if(sweep.references, [&](uintptr_t target) { return !sweep.IsBoundary(target); });
+	return sweep;
+}
+
+// Whole-function red-zone protection. Windows writes its exception frame directly below the
+// interrupted RSP, so a guest fault inside a function that keeps data in its SysV red zone
+// destroys that data (only hosts with unused XSAVE components at the top of the frame, such as
+// AVX-512 hosts with clean ZMM state, happen to leave it intact). A protected function runs from
+// a copy in which RSP stays 128 bytes below the guest value: red-zone bytes then lie above RSP,
+// out of reach of an exception frame.
+// - Instructions that use RSP as a register or implicitly (PUSH, POP, RET, LEAVE, SUB RSP,
+//   MOV RBP, RSP, ...) run unchanged with the guest RSP restored around them. They access only
+//   the stack, which never takes a handled fault.
+// - Explicit stack operands [rsp + d] are re-encoded as [rsp + d + 128].
+// - Branch targets inside the copy are entered with the lowered RSP. Every way out of the copy
+//   (RET, branches outside the function, indirect jumps, calls into guest code, falling off the
+//   end) restores the guest RSP first and continues at the original address, so code outside the
+//   copy, including the unmodified original body, sees exactly the original state.
+// The original entry is replaced by a jump to the copy.
+class RedZoneFunctionWriter {
+public:
+	enum class Outcome {
+		Rewritten,
+		EntryConflict,
+		Unsupported,
+		NoSpace,
+	};
+
+	RedZoneFunctionWriter(PatchModule* module, const DecodedFunction& function,
+	                      uintptr_t function_start, uintptr_t function_end, const CodeSweep& sweep,
+	                      const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+	                      u64                                            tsc_multiplier)
+	    : m_module(module), m_function(function), m_start(function_start), m_end(function_end),
+	      m_sweep(sweep), m_rewrite_sites(rewrite_sites), m_tsc_multiplier(tsc_multiplier),
+	      m_gen(module->trampoline_gen) {}
+
+	Outcome Write(GuestInstructionPatchResult& result) {
+		const auto entry_end = EntryPatchEnd();
+		if (!entry_end) {
+			return Outcome::EntryConflict;
+		}
+		const size_t offset = m_gen.getSize();
+		Xbyak::ClearError();
+		// Jump tables of the copy come first: their loads in the body need their addresses.
+		m_tables.clear();
+		for (const auto& [branch, table]: m_function.jump_tables) {
+			m_gen.align(sizeof(s32));
+			m_tables.emplace(table.load, CopiedTable {&table, m_gen.getCurr()});
+			for (size_t index = 0; index < table.entries.size(); ++index) {
+				m_gen.dd(0);
+			}
+		}
+		const auto* copy    = m_gen.getCurr();
+		bool        written = false;
+		int         error   = 0;
+		{
+			std::map<uintptr_t, Xbyak::Label> labels;
+			for (const uintptr_t target: m_function.branch_targets) {
+				if (m_function.instructions.contains(target)) {
+					labels[target];
+				}
+			}
+			written = EmitBody(labels) && Xbyak::GetError() == 0 && !m_gen.hasUndefinedLabel();
+			error   = Xbyak::GetError();
+			if (written) {
+				// Entries relative to the original table base, which the code still adds.
+				for (const auto& [load, copied]: m_tables) {
+					auto* entry = const_cast<u8*>(copied.entries);
+					for (const uintptr_t target: copied.table->entries) {
+						const auto label = labels.find(target);
+						if (label == labels.end()) {
+							written = false;
+							break;
+						}
+						const auto offset_to_target =
+						    reinterpret_cast<intptr_t>(label->second.getAddress()) -
+						    static_cast<intptr_t>(copied.table->address);
+						const auto value = static_cast<s32>(offset_to_target);
+						written &= value == offset_to_target;
+						std::memcpy(entry, &value, sizeof(value));
+						entry += sizeof(value);
+					}
+				}
+			}
+			if (!written) {
+				// Detach the labels before the rollback below forgets them.
+				m_gen.reset();
+			}
+		}
+		if (!written) {
+			m_gen.reset();
+			m_gen.setSize(offset);
+			Xbyak::ClearError();
+			if (error != 0 && !HandleTrampolineError(m_module, error)) {
+				EXIT("Guest red-zone function copy failed: %s\n",
+				     Xbyak::ConvertErrorToString(error));
+			}
+			return error == Xbyak::ERR_CODE_IS_TOO_BIG ? Outcome::NoSpace : Outcome::Unsupported;
+		}
+
+		auto& patch_gen = m_module->patch_gen;
+		patch_gen.reset();
+		patch_gen.setSize(m_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+		patch_gen.jmp(copy, Xbyak::CodeGenerator::LabelType::T_NEAR);
+		for (uintptr_t address = m_start + NearJumpSize; address < *entry_end; ++address) {
+			patch_gen.db(0xcc);
+		}
+		EXIT_IF(Xbyak::GetError() != 0);
+		m_module->patched.insert(reinterpret_cast<u8*>(m_start));
+		result.rewritten_function_bytes += m_gen.getSize() - offset;
+		result.unprotected_instruction_count += m_unprotected;
+		result.partially_rewritten_function_count += m_leaves_early ? 1 : 0;
+		for (const auto& [address, rewrite]: m_rewrite_sites) {
+			if (rewrite.replacement != InstructionReplacement::None &&
+			    m_function.instructions.contains(address)) {
+				++ReplacementCounts(result, rewrite.replacement).native;
+			}
+		}
+		return Outcome::Rewritten;
+	}
+
+private:
+	struct CopiedTable {
+		const JumpTable* table {};
+		const u8*        entries {};
+	};
+
+	struct Shape {
+		bool stack_register {}; // RSP read or written as a register, or implicitly.
+		bool stack_operand {};  // An explicit [rsp + ...] operand.
+		bool other_memory {};   // A data access that is not on the stack.
+		bool rip_relative {};
+		bool relative {}; // A relative immediate (branches).
+	};
+
+	// End of the instructions the entry jump overwrites, if no other code can land inside them.
+	[[nodiscard]] std::optional<uintptr_t> EntryPatchEnd() const {
+		uintptr_t address = m_start;
+		while (address < m_start + NearJumpSize) {
+			const auto decoded = m_function.instructions.find(address);
+			if (decoded == m_function.instructions.end() || address >= m_end) {
+				return std::nullopt;
+			}
+			address += decoded->second.instruction.length;
+		}
+		for (uintptr_t inside = m_start + 1; inside < address; ++inside) {
+			if (m_function.branch_targets.contains(inside) || m_sweep.IsBranchTarget(inside)) {
+				return std::nullopt;
+			}
+		}
+		return address;
+	}
+
+	void Lower() {
+		if (!m_lowered) {
+			m_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+			m_lowered = true;
+		}
+	}
+
+	void Raise() {
+		if (m_lowered) {
+			m_gen.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+			m_lowered = false;
+		}
+	}
+
+	// Leaves the copy: continue at an original address with the guest RSP.
+	bool Exit(uintptr_t target) {
+		if (target > m_start && target < m_start + NearJumpSize) {
+			return false;
+		}
+		Raise();
+		m_gen.jmp(reinterpret_cast<const void*>(target), Xbyak::CodeGenerator::LabelType::T_NEAR);
+		return true;
+	}
+
+	void EmitConditionalJump(u8 opcode, const Xbyak::Label& label) {
+		constexpr auto Near = Xbyak::CodeGenerator::LabelType::T_NEAR;
+		switch (opcode & 0x0f) {
+			case 0x0: m_gen.jo(label, Near); break;
+			case 0x1: m_gen.jno(label, Near); break;
+			case 0x2: m_gen.jb(label, Near); break;
+			case 0x3: m_gen.jnb(label, Near); break;
+			case 0x4: m_gen.jz(label, Near); break;
+			case 0x5: m_gen.jnz(label, Near); break;
+			case 0x6: m_gen.jbe(label, Near); break;
+			case 0x7: m_gen.jnbe(label, Near); break;
+			case 0x8: m_gen.js(label, Near); break;
+			case 0x9: m_gen.jns(label, Near); break;
+			case 0xa: m_gen.jp(label, Near); break;
+			case 0xb: m_gen.jnp(label, Near); break;
+			case 0xc: m_gen.jl(label, Near); break;
+			case 0xd: m_gen.jnl(label, Near); break;
+			case 0xe: m_gen.jle(label, Near); break;
+			default: m_gen.jnle(label, Near); break;
+		}
+	}
+
+	static Shape Classify(const DecodedCodeInstruction& decoded) {
+		Shape       shape {};
+		const auto& instruction = decoded.instruction;
+		shape.relative          = GetRelativeTarget(decoded) != 0;
+		for (u8 index = 0; index < instruction.operand_count; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				shape.stack_register |= IsStackPointerRegister(operand.reg.value);
+				continue;
+			}
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+				continue;
+			}
+			if (IsStackPointerRegister(operand.mem.index) ||
+			    (IsStackPointerRegister(operand.mem.base) &&
+			     index >= instruction.operand_count_visible)) {
+				shape.stack_register = true;
+			} else if (IsStackPointerRegister(operand.mem.base)) {
+				shape.stack_operand = true;
+			} else {
+				shape.rip_relative |= operand.mem.base == ZYDIS_REGISTER_RIP ||
+				                      operand.mem.base == ZYDIS_REGISTER_EIP;
+				shape.other_memory |= instruction.mnemonic != ZYDIS_MNEMONIC_LEA &&
+				                      instruction.mnemonic != ZYDIS_MNEMONIC_NOP &&
+				                      operand.mem.type != ZYDIS_MEMOP_TYPE_AGEN;
+			}
+		}
+		const auto category = instruction.meta.category;
+		shape.stack_register |= category == ZYDIS_CATEGORY_CALL || category == ZYDIS_CATEGORY_RET ||
+		                        category == ZYDIS_CATEGORY_SYSCALL ||
+		                        category == ZYDIS_CATEGORY_SYSTEM ||
+		                        category == ZYDIS_CATEGORY_INTERRUPT;
+		return shape;
+	}
+
+	// Copies an instruction, fixing RIP-relative operands and (with adjust) stack operands.
+	bool EmitInstruction(const DecodedCodeInstruction& decoded, const Shape& shape, bool adjust) {
+		if (shape.rip_relative || adjust) {
+			return EncodeRelocatedInstruction(decoded, m_gen, adjust ? GuestRedZoneSize : 0);
+		}
+		m_gen.db(reinterpret_cast<const u8*>(decoded.address), decoded.instruction.length);
+		return true;
+	}
+
+	bool EmitReplacement(const DecodedCodeInstruction& decoded, InstructionReplacement replacement,
+	                     const Shape& shape) {
+		switch (replacement) {
+			case InstructionReplacement::ReciprocalSquareRoot:
+				Lower();
+				GenerateReciprocalSquareRoot(decoded, m_gen);
+				return true;
+			case InstructionReplacement::ExtractQ:
+				Lower();
+				GenerateExtractQ(decoded, m_gen);
+				return true;
+			case InstructionReplacement::ReadTimeStampCounter:
+				GenerateReadTimeStampCounter(decoded, m_tsc_multiplier, m_gen);
+				return true;
+			case InstructionReplacement::CacheLineWriteBack:
+				Lower();
+				return EncodeRelocatedInstruction(decoded, m_gen,
+				                                  shape.stack_operand ? GuestRedZoneSize : 0,
+				                                  ZYDIS_MNEMONIC_CLFLUSH);
+			default:
+				// Replacements that rely on a trap keep the original function.
+				return false;
+		}
+	}
+
+	static bool IsCounterBranch(ZydisMnemonic mnemonic) {
+		return mnemonic == ZYDIS_MNEMONIC_JRCXZ || mnemonic == ZYDIS_MNEMONIC_JECXZ ||
+		       mnemonic == ZYDIS_MNEMONIC_JCXZ || mnemonic == ZYDIS_MNEMONIC_LOOP ||
+		       mnemonic == ZYDIS_MNEMONIC_LOOPE || mnemonic == ZYDIS_MNEMONIC_LOOPNE;
+	}
+
+	bool EmitBody(std::map<uintptr_t, Xbyak::Label>& labels) {
+		struct Stub {
+			Xbyak::Label label;
+			uintptr_t    target {};
+		};
+		std::vector<std::unique_ptr<Stub>> stubs;
+		// Address the previous instruction continues at, while control can fall through.
+		std::optional<uintptr_t> fallthrough = m_start;
+
+		for (const auto& [address, decoded]: m_function.instructions) {
+			if (fallthrough && *fallthrough != address) {
+				// The previous instruction continues in bytes that were not decoded.
+				if (!Exit(*fallthrough)) {
+					return false;
+				}
+				fallthrough.reset();
+			}
+			if (const auto label = labels.find(address); label != labels.end()) {
+				if (fallthrough) {
+					Lower();
+				}
+				m_lowered = true;
+				m_gen.L(label->second);
+			} else if (!fallthrough) {
+				// Reached only from outside the copy: never executed here.
+				m_lowered = true;
+			}
+			fallthrough.reset();
+
+			const auto&     instruction = decoded.instruction;
+			const auto      category    = instruction.meta.category;
+			const Shape     shape       = Classify(decoded);
+			const uintptr_t next        = address + instruction.length;
+			const uintptr_t target      = GetRelativeTarget(decoded);
+
+			if (const auto rewrite = m_rewrite_sites.find(address);
+			    rewrite != m_rewrite_sites.end() &&
+			    rewrite->second.replacement != InstructionReplacement::None) {
+				if (!EmitReplacement(decoded, rewrite->second.replacement, shape)) {
+					return false;
+				}
+				fallthrough = next;
+				continue;
+			}
+
+			if (category == ZYDIS_CATEGORY_COND_BR) {
+				if (!shape.relative || IsCounterBranch(instruction.mnemonic) ||
+				    (target > m_start && target < m_start + NearJumpSize)) {
+					return false;
+				}
+				Lower();
+				if (const auto label = labels.find(target); label != labels.end()) {
+					EmitConditionalJump(instruction.opcode, label->second);
+				} else {
+					auto& stub   = stubs.emplace_back(std::make_unique<Stub>());
+					stub->target = target;
+					EmitConditionalJump(instruction.opcode, stub->label);
+				}
+				fallthrough = next;
+				continue;
+			}
+
+			if (category == ZYDIS_CATEGORY_UNCOND_BR) {
+				if (shape.relative) {
+					if (const auto label = labels.find(target); label != labels.end()) {
+						Lower();
+						m_gen.jmp(label->second, Xbyak::CodeGenerator::LabelType::T_NEAR);
+					} else if (!Exit(target)) {
+						return false;
+					}
+				} else if (m_function.jump_tables.contains(address)) {
+					// The copied table sends the jump to a label of the copy.
+					Lower();
+					if (!EmitInstruction(decoded, shape, false)) {
+						return false;
+					}
+				} else {
+					// Other indirect jumps (tail calls) continue in original code.
+					Raise();
+					m_leaves_early = true;
+					m_unprotected += shape.other_memory ? 1 : 0;
+					if (!EmitInstruction(decoded, shape, false)) {
+						return false;
+					}
+				}
+				continue;
+			}
+
+			if (category == ZYDIS_CATEGORY_CALL) {
+				if (shape.relative && (target < reinterpret_cast<uintptr_t>(m_module->start) ||
+				                       target >= reinterpret_cast<uintptr_t>(m_module->end))) {
+					// Emulator stubs patched into guest code (thread-local storage access) take no
+					// stack arguments: call them with the lowered RSP, so that their return address
+					// and spills stay below the red zone.
+					Lower();
+					m_gen.call(reinterpret_cast<const void*>(target));
+					fallthrough = next;
+					continue;
+				}
+				// A call into guest code runs from the original instruction: the callee returns to
+				// original code and unwinders see original return addresses.
+				m_leaves_early = true;
+				if (!Exit(address)) {
+					return false;
+				}
+				continue;
+			}
+
+			if (category == ZYDIS_CATEGORY_RET) {
+				Raise();
+				m_gen.db(reinterpret_cast<const u8*>(address), instruction.length);
+				continue;
+			}
+
+			if (shape.relative) {
+				// Other relative forms (XBEGIN) would reach original code with the lowered RSP.
+				return false;
+			}
+
+			if (const auto table = m_tables.find(address); table != m_tables.end()) {
+				Lower();
+				if (!EncodeRelocatedInstruction(
+				        decoded, m_gen, 0, ZYDIS_MNEMONIC_INVALID,
+				        reinterpret_cast<intptr_t>(table->second.entries) -
+				            static_cast<intptr_t>(table->second.table->address))) {
+					return false;
+				}
+				fallthrough = next;
+				continue;
+			}
+
+			if (shape.stack_register) {
+				Raise();
+				m_unprotected += shape.other_memory ? 1 : 0;
+				if (!EmitInstruction(decoded, shape, false)) {
+					return false;
+				}
+			} else if (shape.stack_operand) {
+				Lower();
+				if (!EmitInstruction(decoded, shape, true)) {
+					return false;
+				}
+			} else {
+				if (shape.other_memory) {
+					Lower();
+				}
+				if (!EmitInstruction(decoded, shape, false)) {
+					return false;
+				}
+			}
+			if (!IsControlFlowTerminator(instruction)) {
+				fallthrough = next;
+			}
+		}
+		if (fallthrough && !Exit(*fallthrough)) {
+			return false;
+		}
+		for (auto& stub: stubs) {
+			m_gen.L(stub->label);
+			m_lowered = true;
+			if (!Exit(stub->target)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	PatchModule*                                   m_module;
+	const DecodedFunction&                         m_function;
+	uintptr_t                                      m_start;
+	uintptr_t                                      m_end;
+	const CodeSweep&                               m_sweep;
+	const std::map<uintptr_t, InstructionRewrite>& m_rewrite_sites;
+	u64                                            m_tsc_multiplier;
+	Xbyak::CodeGenerator&                          m_gen;
+	bool                                           m_lowered      = false;
+	bool                                           m_leaves_early = false;
+	u64                                            m_unprotected  = 0;
+	std::map<uintptr_t, CopiedTable>               m_tables; // by load address
+};
+
+size_t AnalysisThreadCount() {
+	return std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+}
+
+// Whether a fault-capable access may run while red-zone bytes are live. When the liveness of a
+// function is unknown (stack realignment, dynamic allocation, unresolved jumps), calls into guest
+// code decide: compilers keep data in the red zone only in functions without calls (clang and GCC
+// use it in leaf functions only), so such functions are not copied.
+bool NeedsRedZoneFunctionCopy(const DecodedFunction& function, const PatchModule& module) {
+	if (!function.uses_red_zone ||
+	    std::ranges::none_of(function.instructions, [](const auto& entry) {
+		    return entry.second.accesses_memory && entry.second.red_zone_live.any();
+	    })) {
+		return false;
+	}
+	if (function.red_zone_liveness_exact) {
+		return true;
+	}
+	return std::ranges::none_of(function.instructions, [&](const auto& entry) {
+		const auto& decoded = entry.second;
+		if (decoded.instruction.meta.category != ZYDIS_CATEGORY_CALL) {
+			return false;
+		}
+		const auto* target = reinterpret_cast<const u8*>(GetRelativeTarget(decoded));
+		return target == nullptr || (target >= module.start && target < module.end);
+	});
+}
 } // namespace
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
@@ -1537,14 +2343,15 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features,
-                                                   u64                          tsc_multiplier) {
+                                                   u64 tsc_multiplier, bool copy_red_zone_functions,
+                                                   AddressRanges data_ranges) {
 	GuestInstructionPatchResult result {};
-	const bool                  tsc_only = !protect_memory && !emulate_amd;
+	const bool tsc_only = !protect_memory && !emulate_amd && !copy_red_zone_functions;
 	if (tsc_only && tsc_multiplier == 0) {
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
-	if (module == nullptr || function_starts.empty()) {
+	if (module == nullptr || (function_starts.empty() && !copy_red_zone_functions)) {
 		return result;
 	}
 
@@ -1556,46 +2363,147 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			starts.push_back(start);
 		}
 	}
+	std::optional<CodeSweep> sweep;
+	if (copy_red_zone_functions) {
+		// Unwind tables list only some functions (a large title had 17.6k FDEs for ~400k
+		// functions): add direct call targets and function pointers taken in code.
+		std::ranges::sort(starts);
+		starts.erase(std::ranges::unique(starts).begin(), starts.end());
+		sweep              = SweepCode(segment_addr, segment_end, starts, AnalysisThreadCount());
+		const size_t known = starts.size();
+		starts.insert(starts.end(), sweep->references.begin(), sweep->references.end());
+		std::ranges::sort(starts);
+		starts.erase(std::ranges::unique(starts).begin(), starts.end());
+		result.discovered_function_count = starts.size() - std::min(known, starts.size());
+	}
 	std::ranges::sort(starts);
 	const auto unique_end = std::ranges::unique(starts).begin();
 	starts.erase(unique_end, starts.end());
 
 	std::unique_lock lock {module->mutex};
 	const size_t     trampoline_begin = module->trampoline_gen.getSize();
-	bool analyze_red_zone = protect_memory;
+	bool             analyze_red_zone = protect_memory || copy_red_zone_functions;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
-	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
-		const uintptr_t function_start = starts[function_index];
-		const uintptr_t function_end =
-		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
-		if (function_end <= function_start ||
-		    (tsc_only && !MayReadTimeStampCounter(function_start, function_end))) {
-			continue;
+	// Decode and analyze on several threads; patch in address order on this one.
+	struct FunctionWork {
+		size_t                                  index {};
+		DecodedFunction                         function;
+		std::map<uintptr_t, InstructionRewrite> replacements;
+		bool                                    copy {};
+	};
+	// Only the red-zone copy is wanted: functions without operands below RSP/RBP need nothing.
+	const bool copy_only =
+	    copy_red_zone_functions && !protect_memory && !emulate_amd && tsc_multiplier == 0;
+	const auto function_end_of = [&](size_t index) {
+		return index + 1 < starts.size() ? starts[index + 1] : segment_end;
+	};
+	const size_t                             thread_count = AnalysisThreadCount();
+	std::vector<std::vector<FunctionWork>>   thread_work(thread_count);
+	std::vector<GuestInstructionPatchResult> thread_results(thread_count);
+	std::atomic<size_t>                      next_index {0};
+	constexpr size_t                         Batch   = 256;
+	const auto                               analyze = [&](size_t thread_index) {
+		auto& work   = thread_work[thread_index];
+		auto& counts = thread_results[thread_index];
+		for (size_t first = next_index.fetch_add(Batch); first < starts.size();
+		     first        = next_index.fetch_add(Batch)) {
+			for (size_t index = first; index < std::min(first + Batch, starts.size()); ++index) {
+				const uintptr_t function_start = starts[index];
+				const uintptr_t function_end   = function_end_of(index);
+				if (function_end <= function_start ||
+				    (tsc_only && !MayReadTimeStampCounter(function_start, function_end))) {
+					continue;
+				}
+				++counts.function_count;
+				if (copy_only && !sweep->MayUseRedZone(function_start, function_end)) {
+					continue;
+				}
+				FunctionWork item {.index = index};
+				item.function  = DecodeFunction(function_start, function_end, segment_addr,
+				                                segment_end, data_ranges);
+				auto& function = item.function;
+				if (analyze_red_zone) {
+					AnalyzeRedZoneLiveness(function);
+				}
+				counts.instruction_count += function.instructions.size();
+				if (function.uses_red_zone) {
+					++counts.red_zone_function_count;
+					counts.indirect_red_zone_function_count += function.has_indirect_branch;
+				}
+				if (emulate_amd) {
+					CollectAmdInstructions(function, item.replacements, counts, host_features);
+				}
+				if (tsc_multiplier != 0) {
+					CollectTscInstructions(function, item.replacements, counts);
+				}
+				item.copy = copy_red_zone_functions && NeedsRedZoneFunctionCopy(function, *module);
+				if (item.copy || !item.replacements.empty() ||
+				    (protect_memory && function.uses_red_zone)) {
+					work.push_back(std::move(item));
+				}
+			}
 		}
+	};
+	{
+		std::vector<std::thread> threads;
+		for (size_t thread_index = 1; thread_index < thread_count; ++thread_index) {
+			threads.emplace_back(analyze, thread_index);
+		}
+		analyze(0);
+		for (auto& thread: threads) {
+			thread.join();
+		}
+	}
+	std::vector<FunctionWork*> ordered;
+	for (size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
+		const auto& counts = thread_results[thread_index];
+		result.function_count += counts.function_count;
+		result.instruction_count += counts.instruction_count;
+		result.red_zone_function_count += counts.red_zone_function_count;
+		result.indirect_red_zone_function_count += counts.indirect_red_zone_function_count;
+		result.reciprocal_sqrt += counts.reciprocal_sqrt;
+		result.extrq += counts.extrq;
+		result.insertq += counts.insertq;
+		result.rdpid += counts.rdpid;
+		result.clwb += counts.clwb;
+		result.rdtsc += counts.rdtsc;
+		for (auto& item: thread_work[thread_index]) {
+			ordered.push_back(&item);
+		}
+	}
+	std::ranges::sort(ordered, {}, &FunctionWork::index);
 
-		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
-		if (analyze_red_zone) {
-			AnalyzeRedZoneLiveness(function);
+	for (auto* item: ordered) {
+		const uintptr_t function_start = starts[item->index];
+		const uintptr_t function_end   = function_end_of(item->index);
+		const auto&     function       = item->function;
+		const auto&     replacements   = item->replacements;
+		if (item->copy) {
+			++result.red_zone_copy_candidate_count;
+			RedZoneFunctionWriter writer(module, function, function_start, function_end, *sweep,
+			                             replacements, tsc_multiplier);
+			switch (writer.Write(result)) {
+				case RedZoneFunctionWriter::Outcome::Rewritten:
+					++result.rewritten_function_count;
+					continue;
+				case RedZoneFunctionWriter::Outcome::EntryConflict:
+					++result.copy_entry_conflict_count;
+					break;
+				case RedZoneFunctionWriter::Outcome::Unsupported:
+					++result.copy_unsupported_count;
+					break;
+				case RedZoneFunctionWriter::Outcome::NoSpace: ++result.copy_no_space_count; break;
+			}
 		}
-		result.instruction_count += function.instructions.size();
 
 		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
-
-		if (function.uses_red_zone) {
-			++result.red_zone_function_count;
-			result.indirect_red_zone_function_count += function.has_indirect_branch;
-		}
 		if (protect_memory) {
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
-		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
-		}
-		if (tsc_multiplier != 0) {
-			CollectTscInstructions(function, rewrite_sites, result);
+		for (const auto& [address, replacement]: replacements) {
+			rewrite_sites[address].replacement = replacement.replacement;
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result, tsc_multiplier);
