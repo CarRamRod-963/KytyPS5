@@ -603,15 +603,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
 			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
-			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
-			if (base_level >= physical_levels ||
-			    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u "
-				     "max=%u extent=%ux%ux%u tile=%u\n",
-				     base_level, last_level, max_mip, width, height, depth,
-				     static_cast<uint32_t>(tile));
-			}
-			view_levels                = physical_levels - base_level;
+			// MAX_MIP. A view whose BASE_LEVEL lies past the stored chain (a streamed texture whose
+			// T# describes the full chain) samples the last stored level, and dynamic-mip views see
+			// the stored levels only, instead of failing the draw.
+			view_base                  = std::min<uint32_t>(base_level, max_mip);
+			view_levels                = physical_levels - view_base;
+			levels                     = physical_levels;
 			desc.info.resources.levels = physical_levels;
 			desc.info.data.size        = 0;
 			desc.info.UpdateSize();
