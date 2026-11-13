@@ -488,10 +488,12 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.clear_mask.reset();
+    metadata.size = size;
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -6951,6 +6953,8 @@ public:
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
+    constexpr uint64_t covered_meta = 0x0000000204202200ull;
+    constexpr uint64_t reused_meta = 0x0000000204202300ull;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -6962,6 +6966,10 @@ public:
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+    // The dispatches below write 128 bytes.
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, covered_meta, 128);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, reused_meta,
+                                              0x8000);
 
     // An empty dispatch must not inspect even an unreadable shader address.
     shaders.SetCsShader({.data_addr = 1});
@@ -7049,6 +7057,32 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+
+    ShaderRecompiler::IR::CompiledShaderInfo covered_program{};
+    ShaderRecompiler::IR::ResourceSnapshot covered_snapshot;
+    const auto covered_input =
+        MakeInput(covered_meta, false, true, covered_program, covered_snapshot);
+    Require(
+        name, "covering write consumed",
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, covered_input, command) &&
+            texture_cache.IsMetaCleared(covered_meta, 0),
+        "a write of the whole metadata surface was not consumed as a clear");
+
+    // A game reused the memory of a depth target's HTile for indirect dispatch
+    // arguments: the dispatch that initializes them writes a few hundred bytes
+    // at the HTile address. Consumed as a clear, it never ran, and the
+    // arguments built on the stale bytes asked for billions of workgroups.
+    ShaderRecompiler::IR::CompiledShaderInfo reused_program{};
+    ShaderRecompiler::IR::ResourceSnapshot reused_snapshot;
+    const auto reused_input =
+        MakeInput(reused_meta, false, true, reused_program, reused_snapshot);
+    Require(
+        name, "smaller write at a metadata address preserved",
+        !RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, reused_input, command) &&
+            !texture_cache.IsMetaCleared(reused_meta, 0),
+        "a write smaller than the metadata surface was replaced by a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }

@@ -77,7 +77,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				// The guest reuses metadata memory for other buffers: a smaller write at the
+				// address of a metadata surface is an ordinary dispatch.
+				if (cache.ClearMetaByWrite(descriptor.Base48(), descriptor.GetSize())) {
 					return true;
 				}
 			}
