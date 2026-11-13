@@ -1097,7 +1097,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	(void)m_texture_cache.ClearMetaByWrite(vaddr, size);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// What the write faults of the guest mapping would do, without taking one per page:
 		// cached buffers and images of the range are invalidated and stop watching it.
