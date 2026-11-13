@@ -737,6 +737,12 @@ add_executable(layout_change_log_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(layout_change_log_tests PRIVATE ${inc_headers})
 
+add_executable(guest_fault_report_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestFaultReportTests.cpp"
+)
+target_include_directories(guest_fault_report_tests PRIVATE ${inc_headers})
+target_link_libraries(guest_fault_report_tests fmt::fmt)
+
 add_executable(scalar_read_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarReadCacheTests.cpp"
 )
@@ -942,6 +948,7 @@ if(BUILD_TESTING)
 	add_test(NAME pending_labels COMMAND $<TARGET_FILE:pending_labels_tests>)
 	add_test(NAME scalar_read_cache COMMAND $<TARGET_FILE:scalar_read_cache_tests>)
 	add_test(NAME layout_change_log COMMAND $<TARGET_FILE:layout_change_log_tests>)
+	add_test(NAME guest_fault_report COMMAND $<TARGET_FILE:guest_fault_report_tests>)
 	add_test(NAME dcc_constant COMMAND $<TARGET_FILE:dcc_constant_tests>)
 	add_test(NAME dcc_retile COMMAND $<TARGET_FILE:dcc_retile_tests>)
 	add_test(NAME gpu_timing COMMAND $<TARGET_FILE:gpu_timing_tests>)
@@ -1095,6 +1102,7 @@ if(BUILD_TESTING)
 		pending_labels_tests
 		scalar_read_cache_tests
 		layout_change_log_tests
+		guest_fault_report_tests
 		dcc_constant_tests
 		dcc_retile_tests
 		gpu_timing_tests
