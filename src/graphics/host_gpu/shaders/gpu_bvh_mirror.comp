@@ -17,7 +17,9 @@
 
 layout(local_size_x = 64) in;
 
-// Guest page -> host device address of the page, plus 1 once a DMA access synchronized it.
+// Guest page -> host device address of the page (0 while no buffer backs it), plus 1 while the host
+// watches the page (BufferCache::BdaWatchBit): an access to a watched page is reported in the
+// fault bitmap and still made, as the recompiled BDA loads do.
 layout(std430, binding = 0) readonly buffer PageTable { uint64_t pages[]; };
 layout(std430, binding = 1) buffer Faults { uint faults[]; };
 
@@ -111,7 +113,7 @@ const uvec3 FAN[4] = uvec3[4](uvec3(0u, 1u, 2u), uvec3(1u, 3u, 2u), uvec3(2u, 3u
 
 bool g_present = true;
 
-// The host address of guest `address`, or 0 when its page is not synchronized yet. A 64-byte
+// The host address of guest `address`, or 0 while no buffer backs its page. A 64-byte
 // node or an 8-byte record lies in one page.
 uint64_t Host(uint64_t address) {
 	const uint64_t packed = address >= params.extended_base ? address - params.fold : address;
@@ -120,13 +122,16 @@ uint64_t Host(uint64_t address) {
 		g_present = false;
 		return 0ul;
 	}
-	const uint64_t entry = pages[uint(page)];
-	if ((entry & 1ul) == 0ul) {
+	const uint64_t raw   = pages[uint(page)];
+	const uint64_t entry = raw & ~1ul;
+	if (entry == 0ul || (raw & 1ul) != 0ul) {
 		atomicOr(faults[uint(page >> 5)], 1u << uint(page & 31ul));
+	}
+	if (entry == 0ul) {
 		g_present = false;
 		return 0ul;
 	}
-	return entry - 1ul + (address & ((1ul << params.page_bits) - 1ul));
+	return entry + (address & ((1ul << params.page_bits) - 1ul));
 }
 
 uint Read(uint64_t host, uint offset) {
