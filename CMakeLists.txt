@@ -623,6 +623,7 @@ target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
 add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
+	"${KYTY_TESTS_DIR}/AjmAt9Internals.c"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
 target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)

@@ -18,6 +18,10 @@
 
 using namespace Libs::Audio::Ajm;
 
+// AjmAt9Internals.c
+extern "C" void AjmTestAt9BandUnits(const void* handle, int* quantization_units,
+                                    int* stereo_units);
+
 namespace {
 
 void Check(bool condition, const char* message) {
@@ -514,6 +518,39 @@ void At9BandExtensionNeedsItsBandRange() {
 	}
 }
 
+// Frames LibAtrac9 cannot unpack leave no half-read band parameters behind, and a block that
+// claims to continue a superframe at its start is rejected: such a block reused a stereo block's
+// stale parameters, its secondary channel coded more quantization units than the block had
+// precisions for, and the spectrum read through a null Huffman codebook.
+void At9FramesKeepConsistentBandParameters() {
+	const auto Decode = [](void* handle, std::array<uint8_t, 2> bits) {
+		std::vector<uint8_t> frame(16 * 1024, 0);
+		std::copy(bits.begin(), bits.end(), frame.begin());
+		std::vector<int16_t> pcm(2 * 256, 0);
+		int                  used = 0;
+		return Atrac9Decode(handle, frame.data(), pcm.data(), &used, 0);
+	};
+
+	// 48 kHz stereo, one 128-byte frame per superframe.
+	unsigned char stereo[4] = {0xfe, 0x74, 0x0f, 0xe0};
+	void*         handle    = Atrac9GetHandle();
+	Check(handle != nullptr && Atrac9InitDecoder(handle, stereo) == 0,
+	      "initialize a stereo ATRAC9 handle");
+	int units = 0, stereo_units = 0;
+	AjmTestAt9BandUnits(handle, &units, &stereo_units);
+	// First block of a superframe, new band parameters, 3 bands, stereo band 4 (past the bands).
+	Check(Decode(handle, {0x00, 0x40}) == ERR_UNPACK_BAND_PARAMS_INVALID,
+	      "a stereo band past the band count is rejected");
+	int units_after = 0, stereo_units_after = 0;
+	AjmTestAt9BandUnits(handle, &units_after, &stereo_units_after);
+	Check(units_after == units && stereo_units_after == stereo_units,
+	      "a rejected frame stores none of its band parameters");
+	// A block that continues a superframe and reuses its band parameters, at the superframe's start.
+	Check(Decode(handle, {0xc0, 0x00}) == ERR_UNPACK_SUPERFRAME_FLAG_INVALID,
+	      "a superframe cannot start with a continuing block");
+	Atrac9ReleaseHandle(handle);
+}
+
 // Instance ids have 14 slot bits. Saros creates and destroys ATRAC9 instances all the time; once
 // ids wrapped, a new instance took the id of a live one, replaced its decoder and fed it another
 // stream's frames (LibAtrac9 then read a null Huffman table). A live instance keeps its id.
@@ -578,6 +615,7 @@ void InstanceIdsNeverAliasLiveInstances() {
 
 int main(int argc, char** argv) {
 	InstanceIdsNeverAliasLiveInstances();
+	At9FramesKeepConsistentBandParameters();
 	Mp3ParseFrame();
 	UndecodableAt9FrameIsSilent();
 	At9FramesReadOnlyTheirInput();
