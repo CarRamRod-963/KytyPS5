@@ -289,6 +289,10 @@ bool MaximalReconvergenceDisabled() {
 	return g_config->no_maximal_reconvergence;
 }
 
+bool ShaderSimplificationDisabled() {
+	return g_config->no_shader_simplification;
+}
+
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
