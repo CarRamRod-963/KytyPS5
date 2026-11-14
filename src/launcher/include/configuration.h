@@ -130,6 +130,7 @@ public:
 	bool                   emulate_wave64              = false;
 	bool                   no_async_pipelines          = false;
 	bool                   no_maximal_reconvergence    = false;
+	bool                   no_shader_simplification    = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -184,6 +185,7 @@ public:
 		emulate_wave64              = other.emulate_wave64;
 		no_async_pipelines          = other.no_async_pipelines;
 		no_maximal_reconvergence    = other.no_maximal_reconvergence;
+		no_shader_simplification    = other.no_shader_simplification;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
