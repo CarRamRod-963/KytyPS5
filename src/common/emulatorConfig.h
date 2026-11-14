@@ -112,6 +112,7 @@ struct ConfigOptions {
 	bool                   relaxed_shader_float        = false;
 	bool                   emulate_wave64                  = false;
 	bool                   no_maximal_reconvergence        = false;
+	bool                   no_shader_simplification        = false;
 	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
@@ -203,6 +204,7 @@ bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 bool                  EmulateWave64Enabled();
 bool                  MaximalReconvergenceDisabled();
+bool                  ShaderSimplificationDisabled();
 bool NativeRtEnabled();
 bool LodStatsEnabled();
 bool TrophyEnabled();

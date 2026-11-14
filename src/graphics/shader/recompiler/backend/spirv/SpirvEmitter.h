@@ -25,6 +25,8 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// Emitted modules go through SimplifyForDriver (see SimplifiesForDriver).
+	bool driver_simplify = true;
 };
 
 inline constexpr Profile DefaultProfile {};

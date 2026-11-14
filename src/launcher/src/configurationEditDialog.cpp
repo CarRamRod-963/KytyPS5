@@ -312,6 +312,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_emulate_wave64->setChecked(info.emulate_wave64);
 	m_ui->checkBox_no_async_pipelines->setChecked(info.no_async_pipelines);
 	m_ui->checkBox_no_maximal_reconvergence->setChecked(info.no_maximal_reconvergence);
+	m_ui->checkBox_no_shader_simplification->setChecked(info.no_shader_simplification);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
@@ -566,6 +567,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.emulate_wave64            = ui.checkBox_emulate_wave64->isChecked();
 	info.no_async_pipelines        = ui.checkBox_no_async_pipelines->isChecked();
 	info.no_maximal_reconvergence  = ui.checkBox_no_maximal_reconvergence->isChecked();
+	info.no_shader_simplification  = ui.checkBox_no_shader_simplification->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();

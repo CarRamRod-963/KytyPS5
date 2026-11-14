@@ -215,7 +215,8 @@ ShaderRecompiler::Spirv::Profile HostShaderProfile(const GraphicContext& graphic
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .driver_simplify        = !Config::ShaderSimplificationDisabled()};
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -1875,11 +1876,17 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
-	// A build's simplifier may differ from another's: the file of another build is replaced.
-	m_simplified_store = std::make_unique<ShaderRecompiler::Spirv::SimplifiedStore>(
-	    std::filesystem::path("_PipelineCache") / (title_id + ".v1.simplified"), KYTY_GIT_VERSION);
-	ShaderRecompiler::Spirv::SetSimplifiedStore(m_simplified_store.get());
-	PipelineCacheLog("SPIR-V simplifications: {} stored", m_simplified_store->Loaded());
+	if (Config::ShaderSimplificationDisabled()) {
+		// Nothing is simplified: the stored simplifications are neither read nor replaced.
+		PipelineCacheLog("SPIR-V simplifications: off (--no-shader-simplification)");
+	} else {
+		// A build's simplifier may differ from another's: the file of another build is replaced.
+		m_simplified_store = std::make_unique<ShaderRecompiler::Spirv::SimplifiedStore>(
+		    std::filesystem::path("_PipelineCache") / (title_id + ".v1.simplified"),
+		    KYTY_GIT_VERSION);
+		ShaderRecompiler::Spirv::SetSimplifiedStore(m_simplified_store.get());
+		PipelineCacheLog("SPIR-V simplifications: {} stored", m_simplified_store->Loaded());
+	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {

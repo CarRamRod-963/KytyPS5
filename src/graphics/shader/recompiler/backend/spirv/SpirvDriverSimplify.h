@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVDRIVERSIMPLIFY_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVDRIVERSIMPLIFY_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -30,6 +31,12 @@ bool SimplifyForDriverStored(std::vector<uint32_t>& words);
 
 uint32_t DriverSimplifyMinWords();
 void     SetDriverSimplifyMinWords(uint32_t words);
+
+// Whether an emitted module of `words` words goes through SimplifyForDriver: modules of at least
+// `min_words` words, unless the profile turns the pass off (--no-shader-simplification).
+constexpr bool SimplifiesForDriver(bool enabled, size_t words, uint32_t min_words) {
+	return enabled && words >= min_words;
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

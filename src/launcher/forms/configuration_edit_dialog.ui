@@ -221,6 +221,12 @@
               <property name="text"><string>Disable maximal reconvergence in shaders</string></property>
              </widget>
             </item>
+            <item row="15" column="1">
+             <widget class="QCheckBox" name="checkBox_no_shader_simplification">
+              <property name="toolTip"><string>Give the GPU driver the shaders as translated, without the emulator's simplification pass. Can help on GPUs whose driver crashes while building shaders; first builds may take longer.</string></property>
+              <property name="text"><string>Skip shader simplification for the driver</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

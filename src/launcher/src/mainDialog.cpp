@@ -285,6 +285,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.emulate_wave64, "--emulate-wave64");
 	AddFlag(args, info.no_async_pipelines, "--no-async-pipelines");
 	AddFlag(args, info.no_maximal_reconvergence, "--no-maximal-reconvergence");
+	AddFlag(args, info.no_shader_simplification, "--no-shader-simplification");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

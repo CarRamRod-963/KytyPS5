@@ -133,6 +133,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-maximal-reconvergence           Do not request maximal reconvergence in shaders,\n"
 	    "                                       even where the GPU supports it. Default: off.\n");
+	::printf("  --no-shader-simplification           Give the GPU driver shaders without the\n"
+	         "                                       driver simplification pass. Default: off.\n");
 	::printf("  --native-rt                         Use native RT on the GPU.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -308,6 +310,7 @@ static constexpr Flag FLAGS[] = {
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--emulate-wave64", &ConfigOptions::emulate_wave64},
     {"--no-maximal-reconvergence", &ConfigOptions::no_maximal_reconvergence},
+    {"--no-shader-simplification", &ConfigOptions::no_shader_simplification},
     {"--native-rt", &ConfigOptions::native_rt},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
