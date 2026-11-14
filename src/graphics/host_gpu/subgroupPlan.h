@@ -59,12 +59,38 @@ constexpr uint32_t RequiredComputeSubgroupSize(const SubgroupPlan&   plan,
 	return size >= device.min_size && size <= device.max_size ? size : 0u;
 }
 
-// Shaders request maximal reconvergence (SPV_KHR_maximal_reconvergence) when the device supports it
-// and the user did not turn it off. The request makes some drivers rewrite every loop with subgroup
-// operations; disabled leaves reconvergence to the driver.
-constexpr bool UseMaximalReconvergence(bool uniform_control_flow, bool maximal_reconvergence,
-                                       bool disabled) {
-	return uniform_control_flow && maximal_reconvergence && !disabled;
+// The user's choice for the maximal reconvergence request (--maximal-reconvergence).
+enum class MaximalReconvergenceRequest { Auto, On, Off };
+
+// VkDriverId values of the drivers that compile shaders with AMD's LLPC.
+inline constexpr uint32_t DriverIdAmdProprietary = 1; // VK_DRIVER_ID_AMD_PROPRIETARY
+inline constexpr uint32_t DriverIdAmdOpenSource  = 2; // VK_DRIVER_ID_AMD_OPEN_SOURCE
+
+struct MaximalReconvergenceDecision {
+	bool        enabled = false;
+	const char* reason  = "";
+};
+
+// Shaders request maximal reconvergence (SPV_KHR_maximal_reconvergence) only where the device
+// supports it. AMD's LLPC compiler (AMD's proprietary driver and AMDVLK) crashed building our
+// compute modules whenever they requested it (RX 9070 XT and RX 9060 XT, driver 26.11.1) and
+// built them without the request, so Auto leaves reconvergence to LLPC drivers; every other
+// driver gets the request. On and Off override Auto.
+constexpr MaximalReconvergenceDecision
+DecideMaximalReconvergence(bool uniform_control_flow, bool maximal_reconvergence,
+                           uint32_t driver_id, MaximalReconvergenceRequest request) {
+	if (!uniform_control_flow || !maximal_reconvergence) {
+		return {false, "not supported by the device"};
+	}
+	switch (request) {
+		case MaximalReconvergenceRequest::On: return {true, "on"};
+		case MaximalReconvergenceRequest::Off: return {false, "off"};
+		case MaximalReconvergenceRequest::Auto: break;
+	}
+	if (driver_id == DriverIdAmdProprietary || driver_id == DriverIdAmdOpenSource) {
+		return {false, "auto: AMD LLPC driver"};
+	}
+	return {true, "auto"};
 }
 
 } // namespace Libs::Graphics

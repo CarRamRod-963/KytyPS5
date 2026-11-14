@@ -28,6 +28,9 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class PssrUpscaler { Linear, DLSS, FSR };
 
+// --maximal-reconvergence: Auto requests it except on drivers whose compiler mishandles it.
+enum class MaximalReconvergence { Auto, On, Off };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -111,7 +114,7 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
 	bool                   emulate_wave64                  = false;
-	bool                   no_maximal_reconvergence        = false;
+	MaximalReconvergence   maximal_reconvergence           = MaximalReconvergence::Auto;
 	bool                   no_shader_simplification        = false;
 	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;
@@ -203,7 +206,7 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 bool                  EmulateWave64Enabled();
-bool                  MaximalReconvergenceDisabled();
+MaximalReconvergence  GetMaximalReconvergence();
 bool                  ShaderSimplificationDisabled();
 bool NativeRtEnabled();
 bool LodStatsEnabled();

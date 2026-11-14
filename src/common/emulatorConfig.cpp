@@ -285,8 +285,8 @@ bool EmulateWave64Enabled() {
 	return g_config->emulate_wave64;
 }
 
-bool MaximalReconvergenceDisabled() {
-	return g_config->no_maximal_reconvergence;
+MaximalReconvergence GetMaximalReconvergence() {
+	return g_config->maximal_reconvergence;
 }
 
 bool ShaderSimplificationDisabled() {
