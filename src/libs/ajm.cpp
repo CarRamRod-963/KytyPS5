@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -81,6 +82,7 @@ enum class AjmCodec : uint32_t {
 
 constexpr int32_t AJM_ERROR_INVALID_CONTEXT     = static_cast<int32_t>(0x80930002u);
 constexpr int32_t AJM_ERROR_INVALID_PARAMETER   = static_cast<int32_t>(0x80930005u);
+constexpr int32_t AJM_ERROR_OUT_OF_RESOURCES    = static_cast<int32_t>(0x80930007u);
 constexpr int32_t AJM_ERROR_CODEC_NOT_SUPPORTED = static_cast<int32_t>(0x80930008u);
 constexpr int32_t AJM_ERROR_JOB_CREATION        = static_cast<int32_t>(0x80930012u);
 constexpr size_t  AJM_JOB_CONTROL_SIZE          = 48;
@@ -109,7 +111,10 @@ constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_OFFSET    = 7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
 
-static std::atomic_uint32_t g_ajm_next_instance {1};
+// An instance id holds the codec above bit 14 and a slot below it.
+constexpr uint32_t AJM_INSTANCE_SLOT_BITS  = 14u;
+constexpr uint32_t AJM_INSTANCE_SLOT_COUNT = 1u << AJM_INSTANCE_SLOT_BITS;
+
 static std::atomic_uint32_t g_ajm_next_batch {1};
 
 static uint32_t AjmGetFlagChannelCount(uint64_t flags) {
@@ -199,6 +204,25 @@ struct AjmInstanceState {
 
 static std::mutex                                     g_ajm_instances_mutex;
 static std::unordered_map<uint32_t, AjmInstanceState> g_ajm_instances;
+// Slots of live instances, and the slot last handed out (slot 0 is never used).
+static std::bitset<AJM_INSTANCE_SLOT_COUNT> g_ajm_instance_slots;
+static uint32_t                             g_ajm_last_instance_slot = 0;
+
+// The next free slot after the last one handed out, so a destroyed instance's id is not reused
+// at once. A slot is never shared by two live instances: games create and destroy instances all
+// the time (Saros creates ~16k ATRAC9 instances in minutes), and an id aliasing a live instance
+// replaced its decoder and fed it another stream's frames.
+static uint32_t AjmAllocateInstanceSlotLocked() {
+	for (uint32_t i = 1; i < AJM_INSTANCE_SLOT_COUNT; i++) {
+		const auto slot = (g_ajm_last_instance_slot + i) % AJM_INSTANCE_SLOT_COUNT;
+		if (slot != 0 && !g_ajm_instance_slots.test(slot)) {
+			g_ajm_instance_slots.set(slot);
+			g_ajm_last_instance_slot = slot;
+			return slot;
+		}
+	}
+	return 0;
+}
 
 static bool AjmCodecIsSupported(uint32_t codec) {
 	return codec == static_cast<uint32_t>(AjmCodec::DecMp3) ||
@@ -688,9 +712,6 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	EXIT_NOT_IMPLEMENTED(instance == nullptr);
 	const auto supported = AjmLogCodecSupport(codec);
 
-	const auto slot = (g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) & 0x3fffu);
-	*instance       = (codec << 14u) | slot;
-
 	auto state    = AjmInstanceState {};
 	state.context = context;
 	state.codec   = codec;
@@ -699,6 +720,12 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 
 	{
 		std::scoped_lock lock(g_ajm_instances_mutex);
+		const auto       slot = AjmAllocateInstanceSlotLocked();
+		if (slot == 0) {
+			LOGF("\t no free instance slot\n");
+			return AJM_ERROR_OUT_OF_RESOURCES;
+		}
+		*instance                  = (codec << AJM_INSTANCE_SLOT_BITS) | slot;
 		g_ajm_instances[*instance] = std::move(state);
 	}
 
@@ -719,7 +746,9 @@ int KYTY_SYSV_ABI AjmInstanceDestroy(uint32_t context, uint32_t instance) {
 	LOGF("\t context = %" PRIu32 ", instance = 0x%08" PRIx32 "\n", context, instance);
 
 	std::scoped_lock lock(g_ajm_instances_mutex);
-	g_ajm_instances.erase(instance);
+	if (g_ajm_instances.erase(instance) != 0) {
+		g_ajm_instance_slots.reset(instance % AJM_INSTANCE_SLOT_COUNT);
+	}
 
 	return OK;
 }
