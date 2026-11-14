@@ -610,6 +610,106 @@ void TestWindowsGuestRedZoneFunctionCopy() {
 	Check(test, freed, "failed to free test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// Single-instruction red-zone patches (--redzone) of functions that cannot be copied must not
+// take the trampoline room of the function copies that follow them in the segment.
+void TestWindowsGuestRedZoneCopySpace() {
+	const char*        test            = "WindowsGuestRedZoneCopySpace";
+	constexpr uint64_t SENTINEL        = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x1000; // far less than the patches of Filler need
+	constexpr int      FILLER_LOADS    = 200;
+	enum : uint64_t {
+		Filler  = 0x000, // red zone live across many loads; not copyable (Jumper enters it)
+		Jumper  = 0x800,
+		Leaf    = 0x900, // copy candidate after Filler
+		CodeEnd = 0xa00,
+	};
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000908000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_copy_space_test");
+	Check(test, mapping != 0, "failed to allocate test code");
+	std::memset(reinterpret_cast<void*>(mapping), 0xcc, CODE_SIZE);
+	const auto at = [&](uint64_t offset) { return reinterpret_cast<uint8_t*>(mapping + offset); };
+
+	g_red_zone_clobber_page =
+	    VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_clobber_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneClobberHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	{
+		Xbyak::CodeGenerator c(Jumper, at(Filler));
+		c.xor_(c.eax, c.eax); // two bytes: Jumper jumps past them
+		c.mov(c.qword[c.rsp - 8], c.rsi);
+		for (int index = 0; index < FILLER_LOADS; ++index) {
+			c.mov(c.rcx, c.ptr[c.rdi + 0x100 + index * 8]);
+		}
+		c.mov(c.rax, c.qword[c.rsp - 8]);
+		c.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate filler fixture");
+	}
+	{
+		Xbyak::CodeGenerator c(0x100, at(Jumper));
+		c.mov(c.eax, 2);
+		c.jmp(at(Filler + 2), Xbyak::CodeGenerator::T_NEAR);
+		Check(test, Xbyak::GetError() == 0, "failed to generate jumper fixture");
+	}
+	{
+		Xbyak::CodeGenerator c(0x100, at(Leaf));
+		c.mov(c.rax, SENTINEL);
+		c.mov(c.qword[c.rsp - 24], c.rax);
+		c.mov(c.rax, c.ptr[c.rdi]); // faults
+		c.mov(c.rax, c.qword[c.rsp - 24]);
+		c.mov(c.rcx, SENTINEL);
+		c.cmp(c.rax, c.rcx);
+		c.sete(c.al);
+		c.movzx(c.eax, c.al);
+		c.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate leaf fixture");
+	}
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush generated test code");
+
+	const std::array<uintptr_t, 3> function_starts = {mapping + Filler, mapping + Jumper,
+	                                                  mapping + Leaf};
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
+	                                            reinterpret_cast<void*>(mapping + CODE_SIZE),
+	                                            TRAMPOLINE_SIZE);
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, CodeEnd, function_starts, true, false, Loader::GetGuestInstructionHostFeatures(), 0,
+	    true);
+	DWORD old_protection = 0;
+	Check(test,
+	      VirtualProtect(g_red_zone_clobber_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+	      "failed to reset fault page protection");
+	using GuestFunction  = uint64_t(KYTY_SYSV_ABI*)(void*, uint64_t);
+	const uint64_t leaf  = reinterpret_cast<GuestFunction>(mapping + Leaf)(g_red_zone_clobber_page, 0);
+	std::printf("[host]    red-zone copy space patched=%llu conflicts=%llu candidates=%llu "
+	            "copied=%llu out of space=%llu leaf=%llx\n",
+	            static_cast<unsigned long long>(result.patched_memory_instruction_count),
+	            static_cast<unsigned long long>(result.copy_entry_conflict_count),
+	            static_cast<unsigned long long>(result.red_zone_copy_candidate_count),
+	            static_cast<unsigned long long>(result.rewritten_function_count),
+	            static_cast<unsigned long long>(result.copy_no_space_count),
+	            static_cast<unsigned long long>(leaf));
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_clobber_page, 0, MEM_RELEASE);
+	g_red_zone_clobber_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	// Filler's single-instruction patches ran out of room, the copy of Leaf did not.
+	Check(test,
+	      result.copy_entry_conflict_count == 1 && result.patched_memory_instruction_count > 0 &&
+	          result.patched_memory_instruction_count < FILLER_LOADS,
+	      "the fixture did not exhaust the trampoline room");
+	Check(test, result.rewritten_function_count == 1 && result.copy_no_space_count == 0 && leaf == 1,
+	      "instruction patches took the room of a red-zone function copy");
+	Check(test, freed, "failed to free test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
@@ -617,6 +717,10 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 
 void TestWindowsGuestRedZoneFunctionCopy() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneFunctionCopy");
+}
+
+void TestWindowsGuestRedZoneCopySpace() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneCopySpace");
 }
 #endif
 
@@ -6303,6 +6407,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		RunTest(TestWindowsGuestRedZoneFunctionCopy);
+		RunTest(TestWindowsGuestRedZoneCopySpace);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
@@ -6320,6 +6425,7 @@ int main(int argc, char** argv) {
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestWindowsGuestRedZoneFunctionCopy);
+	RunTest(TestWindowsGuestRedZoneCopySpace);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
