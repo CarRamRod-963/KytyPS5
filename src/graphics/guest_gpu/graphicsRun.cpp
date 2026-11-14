@@ -781,6 +781,23 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 			case Pm4::IT_NOP:
 				if (KYTY_PM4_R(header) == Pm4::R_DISPATCH_RESET) return Stop(packet);
 				break;
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+				// A flip block or a flip-done wait block is one unit for the parser
+				// (CpOpSetUconfigReg). Neither changes the commands after it: the flip's label
+				// tells the display a buffer is shown, and the wait in the other block only keeps
+				// rendering off a buffer the display still reads.
+				if (KYTY_PM4_R(header) != 1u || packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2) break;
+				const auto tag   = packet[2] & 0xff000000u;
+				const auto block = tag == Pm4::USERDATA_TAG_FLIP ? Pm4::FLIP_PACKET_DW
+				                   : tag == Pm4::USERDATA_TAG_WAIT_FLIP_DONE
+				                       ? Pm4::WAIT_FLIP_DONE_PACKET_DW
+				                       : 0u;
+				if (block == 0u) break;
+				if (block > remaining) return Stop(packet);
+				offset += block;
+				continue;
+			}
 			case Pm4::IT_DISPATCH_DIRECT:
 				if (size != 5u) return Stop(packet);
 				if (m_lookahead_budget == 0) return false;
