@@ -398,7 +398,114 @@ void TestCopyRunsAgainstModel() {
 
 } // namespace
 
+void TestIndirectDispatchReads() {
+  BarrierTracker tracker;
+  tracker.BeginBuffer();
+  (void)tracker.BeforeDispatch(true);
+  Check(
+      tracker.BeforeIndirectDispatch(),
+      "the first indirect dispatch of a buffer waits for earlier submissions");
+  (void)tracker.BeforeDispatch(true);
+  Check(!tracker.BeforeIndirectDispatch(),
+        "an indirect dispatch need not wait for dispatches the guest did not "
+        "flush");
+  (void)tracker.BeforeDispatch(true);
+  Check(!tracker.BeforeIndirectDispatch(), "nor a chain of them");
+  (void)tracker.Flush();
+  (void)tracker.BeforeDispatch(true);
+  Check(tracker.BeforeIndirectDispatch(),
+        "a guest flush orders earlier writes before the argument read, even "
+        "one left to the next dispatch");
+  (void)tracker.BeforeCommand();
+  (void)tracker.BeforeDispatch(false);
+  Check(tracker.BeforeIndirectDispatch(),
+        "another command's writes are ordered before the argument read");
+  (void)tracker.BeforeBarrier();
+  (void)tracker.BeforeDispatch(false);
+  Check(tracker.BeforeIndirectDispatch(),
+        "so are those before a barrier recorded by other code");
+  tracker.BeginBuffer();
+  (void)tracker.BeforeDispatch(false);
+  Check(tracker.BeforeIndirectDispatch(),
+        "and those of earlier command buffers");
+
+  BarrierTracker serialized;
+  serialized.SetSerializeDispatches(true);
+  (void)serialized.BeforeDispatch(true);
+  (void)serialized.BeforeIndirectDispatch();
+  (void)serialized.BeforeDispatch(true);
+  Check(serialized.BeforeIndirectDispatch(),
+        "with serialized dispatches every dispatch is ordered before the next "
+        "argument read");
+
+  // Random sequences against the rule: an indirect argument read waits for
+  // every earlier write of another command, of an earlier command buffer, of a
+  // dispatch the guest flushed before it (or of any dispatch when dispatches
+  // are serialized); a barrier to the read covers every command before it.
+  for (int serialize = 0; serialize < 2; serialize++) {
+    std::mt19937 random(serialize != 0 ? 77 : 78);
+    for (int round = 0; round < 3000; round++) {
+      BarrierTracker model;
+      model.SetSerializeDispatches(serialize != 0);
+      struct Write {
+        bool dispatch;
+        uint32_t flushes;
+        uint32_t buffer;
+        uint32_t barriers; // indirect barriers recorded before it
+      };
+      std::vector<Write> writes;
+      uint32_t flushes = 0;
+      uint32_t buffer = 0;
+      uint32_t barriers = 0;
+      model.BeginBuffer();
+      const auto length = 1 + random() % 32;
+      for (uint32_t i = 0; i < length; i++) {
+        switch (random() % 7) {
+        case 0:
+        case 1:
+        case 2: {
+          const bool indirect = random() % 2 == 0;
+          (void)model.BeforeDispatch(true, random() % 4 == 0);
+          if (indirect) {
+            if (model.BeforeIndirectDispatch()) {
+              barriers++;
+            }
+            for (const auto &write : writes) {
+              const bool needed = !write.dispatch || write.buffer != buffer ||
+                                  write.flushes != flushes || serialize != 0;
+              if (needed && write.barriers == barriers) {
+                Check(false, "an indirect argument read lost the order of a "
+                             "write it must see");
+              }
+            }
+          }
+          writes.push_back({true, flushes, buffer, barriers});
+          break;
+        }
+        case 3:
+          (void)model.BeforeCommand();
+          writes.push_back({false, flushes, buffer, barriers});
+          break;
+        case 4:
+          (void)model.Flush();
+          flushes++;
+          break;
+        case 5:
+          (void)model.BeforeBarrier();
+          break;
+        case 6:
+          (void)model.BeforeBarrier();
+          model.BeginBuffer();
+          buffer++;
+          break;
+        }
+      }
+    }
+  }
+}
+
 int main() {
+  TestIndirectDispatchReads();
   TestSerializedDispatchSequences();
   TestDispatchRuns();
   TestFlushes();
