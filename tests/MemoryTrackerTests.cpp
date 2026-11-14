@@ -403,6 +403,37 @@ void TestRangeSetCursor() {
   }
 }
 
+// A set holds maximal ranges (touching ones merge): it contains a run of
+// adjacent ranges exactly when it contains each of them (the color-metadata
+// check asks once for the slices of a full-slice view).
+void TestRangeSetContainsRun() {
+  TestRandom random{0x0badf00du};
+  for (int round = 0; round < 2000; round++) {
+    RangeSet set;
+    const auto count = random() % 16u;
+    for (uint32_t i = 0; i < count; i++) {
+      const uint64_t address = uint64_t{1 + random() % 64u} << 12u;
+      const uint64_t size = uint64_t{1 + random() % 6u} << 12u;
+      if (random() % 4u == 0) {
+        set.Subtract(address, size);
+      } else {
+        set.Add(address, size);
+      }
+    }
+    for (int query = 0; query < 16; query++) {
+      const uint64_t slice = uint64_t{1 + random() % 4u} << 12u;
+      const uint64_t base = uint64_t{1 + random() % 64u} << 12u;
+      const uint32_t slices = 1 + random() % 8u;
+      bool each = true;
+      for (uint32_t i = 0; i < slices; i++) {
+        each = each && set.Contains(base + slice * i, slice);
+      }
+      Check(set.Contains(base, slice * slices) == each,
+            "a range set holds a run of ranges unlike each of its ranges");
+    }
+  }
+}
+
 void TestBdaSyncQueue() {
   using Ranges_t = std::vector<std::pair<uint64_t, uint64_t>>;
   Libs::Graphics::BdaSyncQueue queue;
@@ -1891,6 +1922,7 @@ int main(int argc, char **argv) {
   TestRangeSet();
   TestRangeSetUnion();
   TestRangeSetCursor();
+  TestRangeSetContainsRun();
   TestBdaSyncQueue();
   TestBdaSyncQueueModel();
   TestBdaSyncQueueEpochs();
