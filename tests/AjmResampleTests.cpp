@@ -514,9 +514,70 @@ void At9BandExtensionNeedsItsBandRange() {
 	}
 }
 
+// Instance ids have 14 slot bits. Saros creates and destroys ATRAC9 instances all the time; once
+// ids wrapped, a new instance took the id of a live one, replaced its decoder and fed it another
+// stream's frames (LibAtrac9 then read a null Huffman table). A live instance keeps its id.
+void InstanceIdsNeverAliasLiveInstances() {
+	std::array<uint8_t, 4096> batch_data {};
+	AjmBatchInfo              batch {};
+	const auto                Batch = [&]() {
+		batch = {batch_data.data(), 0, batch_data.size(), nullptr, nullptr};
+		return &batch;
+	};
+	const auto CodecInfo = [&](uint32_t instance) {
+		struct {
+			AjmSidebandResult          result;
+			AjmSidebandDecAt9CodecInfo info;
+		} result {};
+		AjmBatchJobGetCodecInfo(Batch(), instance, &result, sizeof(result));
+		return result.info;
+	};
+	const uint32_t at9 = static_cast<uint32_t>(AjmCodec::DecAt9);
+	uint32_t       live = 0;
+	Check(AjmInstanceCreate(1, at9, 0x1001, &live) == OK, "create a live ATRAC9 instance");
+	const AjmDecAt9InitializeParameters mono {{0xfe, 0x70, 0x07, 0xe0}, 0};
+	AjmSidebandResult                   init_result {};
+	AjmBatchJobInitialize(Batch(), live, &mono, sizeof(mono), &init_result);
+	Check(init_result.result == OK && CodecInfo(live).super_frame_size == 64,
+	      "initialize the live instance");
+
+	for (uint32_t i = 0; i < 2 * AJM_INSTANCE_SLOT_COUNT; i++) {
+		uint32_t other = 0;
+		Check(AjmInstanceCreate(1, at9, 0x1001, &other) == OK, "create a short-lived instance");
+		Check(other != live, "a new instance never takes a live instance's id");
+		Check(other % AJM_INSTANCE_SLOT_COUNT != 0, "slot 0 is not handed out");
+		Check(AjmInstanceDestroy(1, other) == OK, "destroy the short-lived instance");
+	}
+	Check(CodecInfo(live).super_frame_size == 64, "the live instance keeps its decoder");
+
+	// Every slot taken: creation fails until one is freed, then that slot is handed out.
+	std::vector<uint32_t> all;
+	for (;;) {
+		uint32_t   other  = 0;
+		const auto result = AjmInstanceCreate(1, at9, 0x1001, &other);
+		if (result != OK) {
+			Check(result == AJM_ERROR_OUT_OF_RESOURCES, "creation past the last slot fails");
+			break;
+		}
+		all.push_back(other);
+	}
+	Check(all.size() == AJM_INSTANCE_SLOT_COUNT - 2, "every slot but 0 and the live one is used");
+	const auto freed = all[all.size() / 2];
+	Check(AjmInstanceDestroy(1, freed) == OK, "free one slot");
+	uint32_t again = 0;
+	Check(AjmInstanceCreate(1, at9, 0x1001, &again) == OK && again == freed,
+	      "the freed slot is handed out again");
+	all[all.size() / 2] = again;
+	for (const auto instance: all) {
+		AjmInstanceDestroy(1, instance);
+	}
+	AjmInstanceDestroy(1, live);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+	InstanceIdsNeverAliasLiveInstances();
 	Mp3ParseFrame();
 	UndecodableAt9FrameIsSilent();
 	At9FramesReadOnlyTheirInput();
