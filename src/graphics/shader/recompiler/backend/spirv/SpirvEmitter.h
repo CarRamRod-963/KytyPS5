@@ -27,6 +27,8 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// Emitted modules go through SimplifyForDriver (see SimplifiesForDriver).
+	bool driver_simplify = true;
 };
 
 inline constexpr Profile DefaultProfile {};

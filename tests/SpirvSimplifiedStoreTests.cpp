@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvSimplifiedStore.h"
 
 #include <chrono>
@@ -12,6 +13,7 @@
 namespace {
 
 using Libs::Graphics::ShaderRecompiler::Spirv::SimplifiedStore;
+using Libs::Graphics::ShaderRecompiler::Spirv::SimplifiesForDriver;
 using namespace std::chrono_literals;
 
 void Check(bool value, const char *text) {
@@ -146,6 +148,19 @@ void TestTornRecord() {
   }
 }
 
+// The pass runs on modules of at least the minimum size, and never when it is
+// turned off.
+void TestSimplifyDecision() {
+  Check(SimplifiesForDriver(true, 100, 0), "an enabled pass skips a module");
+  Check(SimplifiesForDriver(true, 100, 100),
+        "an enabled pass skips a module of the minimum size");
+  Check(!SimplifiesForDriver(true, 99, 100),
+        "an enabled pass takes a module below the minimum size");
+  Check(!SimplifiesForDriver(false, 100, 0), "a disabled pass takes a module");
+  Check(!SimplifiesForDriver(false, 100, UINT32_MAX),
+        "a disabled pass takes a module with any minimum size");
+}
+
 } // namespace
 
 int main() {
@@ -153,6 +168,7 @@ int main() {
   TestAcrossSessions();
   TestWriterAppends();
   TestTornRecord();
+  TestSimplifyDecision();
   std::filesystem::remove_all(std::filesystem::temp_directory_path() /
                               "kyty_spirv_simplified_store_tests");
   std::printf("SpirvSimplifiedStoreTests: all tests passed\n");
