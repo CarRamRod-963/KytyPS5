@@ -215,7 +215,8 @@ ShaderRecompiler::Spirv::Profile HostShaderProfile(const GraphicContext& graphic
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .ray_query              = graphics.ray_query_enabled};
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
