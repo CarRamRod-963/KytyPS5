@@ -7694,6 +7694,23 @@ public:
     Require(name, "between ranges", sequence(1) == large && sequence(2) == 0,
             "a write between two watched ranges advanced one of them");
 
+    // A range whose consumer read it on the GPU last needs no early submission
+    // for its next writer; one read on the host again does. The sequence moves
+    // either way.
+    (void)cache.ConsumeWatchedWritePending();
+    cache.NoteWatchedRead(ranges[1].first, ranges[1].second, false);
+    (void)cache.ObtainBuffer(base + 2 * page, 64, true);
+    Require(name, "read on the GPU",
+            sequence(1) > large && !cache.ConsumeWatchedWritePending(),
+            "a write to a range read on the GPU asked for an early submission "
+            "or did not advance its sequence");
+    // Read on the host again.
+    cache.NoteWatchedRead(ranges[1].first, ranges[1].second, true);
+    (void)cache.ObtainBuffer(base + 2 * page, 64, true);
+    Require(name, "read on the host", cache.ConsumeWatchedWritePending(),
+            "a write to a range read on the host did not ask for an early "
+            "submission");
+
     scheduler.Finish();
     context.UnmapMemory(base, pages * page);
     scheduler.Finish();
