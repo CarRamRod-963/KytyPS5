@@ -95,6 +95,21 @@ void CommandBuffer::OrderDispatches() const {
 	RecordBarrier(m_barriers.BeforeBarrier());
 }
 
+void CommandBuffer::OrderIndirectDispatchReads() const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	if (!m_barriers.BeforeIndirectDispatch()) {
+		return;
+	}
+	// Barriers to all commands leave indirect-argument reads out (LaterAccess), so this one
+	// covers every earlier write.
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
+	                         0, nullptr);
+}
+
 void CommandBuffer::OrderIndirectReads() const {
 	EXIT_IF(IsInvalid());
 	if (m_rendering && m_render_passes == m_indirect_reads_since) {
@@ -318,6 +333,7 @@ void CommandBuffer::Begin() {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	// The previous buffer recorded the barrier of its copies when it ended.
 	(void)m_copies.BeforeOther();
+	m_barriers.BeginBuffer();
 	EXIT_IF(!m_scatter_pieces.empty());
 	m_has_commands         = false;
 	m_command_count        = 0;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -67,6 +68,10 @@ public:
 		if (barrier != Barrier::None) {
 			ClearComputeOrder();
 		}
+		if (m_serialize_dispatches) {
+			// Every dispatch is ordered before the next one, its argument read included.
+			m_indirect_reads_pending = true;
+		}
 		m_compute_since_compute_order = true;
 		m_compute_writes_since_compute_order |= writes;
 		m_shared_since_compute_order |= shared;
@@ -80,15 +85,35 @@ public:
 		const auto barrier          = OrderDispatches();
 		m_other_since_compute_order = true;
 		m_other_since_flush         = true;
+		m_indirect_reads_pending    = true;
 		return barrier;
 	}
 
 	// A pipeline barrier recorded by other code, the start of a render pass instance or the end
 	// of the command buffer: pending dispatches are ordered first, as they were before.
-	[[nodiscard]] Barrier BeforeBarrier() noexcept { return OrderDispatches(); }
+	[[nodiscard]] Barrier BeforeBarrier() noexcept {
+		m_indirect_reads_pending = true;
+		return OrderDispatches();
+	}
+
+	// A command buffer begins: commands of earlier submissions are ordered before its indirect
+	// argument reads only by a barrier in it.
+	void BeginBuffer() noexcept { m_indirect_reads_pending = true; }
+
+	// A guest dispatch that reads its arguments from memory is about to be recorded (after
+	// BeforeDispatch): whether a barrier from all earlier writes to indirect-argument reads must
+	// come first. The command processor reads the arguments when it issues the dispatch, without
+	// waiting for dispatches the guest did not flush, so their writes need no barrier to the read.
+	// Writes the guest ordered with a flush, those of every other command (copies, uploads, draws,
+	// emulator passes) and those of earlier command buffers do; one barrier covers them for every
+	// later indirect dispatch until one of these is recorded again.
+	[[nodiscard]] bool BeforeIndirectDispatch() noexcept {
+		return std::exchange(m_indirect_reads_pending, false);
+	}
 
 	// A guest flush: all earlier commands -> all later commands.
 	[[nodiscard]] Barrier Flush() noexcept {
+		m_indirect_reads_pending = true;
 		if (!m_other_since_flush) {
 			// Only guest dispatches since the last flush; the next dispatch that needs it orders
 			// them, and the deferred barrier orders them against every later command.
@@ -145,6 +170,9 @@ private:
 	bool m_other_since_compute_order = true;
 	bool m_other_since_flush         = true;
 	bool m_serialize_dispatches      = false;
+	// Writes an indirect-argument read must wait for were recorded since the last barrier to
+	// such reads. Unknown at the start.
+	bool m_indirect_reads_pending = true;
 };
 
 // Chooses the pipeline barriers around the buffer copies that upload guest data. Each copy used

@@ -662,14 +662,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.DispatchHandle(DispatchMayWriteMemory(program, bindings),
 	                                             DispatchUsesSharedMemory(program, bindings));
-	// Barriers to all commands leave indirect-argument reads out (LaterAccess), so this one
-	// covers every earlier write.
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
-	                          0, nullptr);
+	buffer.OrderIndirectDispatchReads();
 	buffer.BindComputePipeline(pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
