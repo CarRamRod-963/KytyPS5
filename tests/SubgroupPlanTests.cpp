@@ -7,11 +7,14 @@
 
 namespace {
 
+using Libs::Graphics::DecideMaximalReconvergence;
+using Libs::Graphics::DriverIdAmdOpenSource;
+using Libs::Graphics::DriverIdAmdProprietary;
+using Libs::Graphics::MaximalReconvergenceRequest;
 using Libs::Graphics::PlanSubgroups;
 using Libs::Graphics::RequiredComputeSubgroupSize;
 using Libs::Graphics::SubgroupDevice;
 using Libs::Graphics::SubgroupPlan;
-using Libs::Graphics::UseMaximalReconvergence;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -129,16 +132,51 @@ void TestNarrowDevice() {
         "an 8-32 lane device requires a subgroup size");
 }
 
-// Maximal reconvergence needs both device features and is off when disabled.
+// VkDriverId values of drivers that keep the request in Auto.
+constexpr uint32_t DriverIdMesaRadv = 3;
+constexpr uint32_t DriverIdNvidiaProprietary = 4;
+constexpr uint32_t DriverIdIntelWindows = 5;
+
+bool Use(bool uniform_control_flow, bool maximal_reconvergence,
+         uint32_t driver_id, MaximalReconvergenceRequest request) {
+  return DecideMaximalReconvergence(uniform_control_flow, maximal_reconvergence,
+                                    driver_id, request)
+      .enabled;
+}
+
+// Maximal reconvergence needs both device features; Auto leaves it to AMD's
+// LLPC drivers, On and Off override Auto.
 void TestMaximalReconvergence() {
-  Check(UseMaximalReconvergence(true, true, false),
-        "a supporting device does not request maximal reconvergence");
-  Check(!UseMaximalReconvergence(true, true, true),
-        "disabled maximal reconvergence is still requested");
-  Check(!UseMaximalReconvergence(false, true, false),
-        "maximal reconvergence without uniform control flow is requested");
-  Check(!UseMaximalReconvergence(true, false, false),
-        "maximal reconvergence without device support is requested");
+  constexpr auto Auto = MaximalReconvergenceRequest::Auto;
+  constexpr auto On = MaximalReconvergenceRequest::On;
+  constexpr auto Off = MaximalReconvergenceRequest::Off;
+  for (uint32_t driver : {0u, DriverIdMesaRadv, DriverIdNvidiaProprietary,
+                          DriverIdIntelWindows}) {
+    Check(Use(true, true, driver, Auto),
+          "auto does not request maximal reconvergence on a non-LLPC driver");
+    Check(Use(true, true, driver, On),
+          "on does not request maximal reconvergence");
+    Check(!Use(true, true, driver, Off),
+          "off still requests maximal reconvergence");
+  }
+  for (uint32_t driver : {DriverIdAmdProprietary, DriverIdAmdOpenSource}) {
+    Check(!Use(true, true, driver, Auto),
+          "auto requests maximal reconvergence on an AMD LLPC driver");
+    Check(Use(true, true, driver, On),
+          "on does not request maximal reconvergence on an AMD LLPC driver");
+    Check(!Use(true, true, driver, Off),
+          "off still requests maximal reconvergence on an AMD LLPC driver");
+  }
+  for (auto request : {Auto, On, Off}) {
+    Check(!Use(false, true, DriverIdNvidiaProprietary, request),
+          "maximal reconvergence without uniform control flow is requested");
+    Check(!Use(true, false, DriverIdNvidiaProprietary, request),
+          "maximal reconvergence without device support is requested");
+  }
+  const auto llpc =
+      DecideMaximalReconvergence(true, true, DriverIdAmdProprietary, Auto);
+  Check(llpc.reason != nullptr && llpc.reason[0] != '\0',
+        "the auto decision on an LLPC driver has no reason");
 }
 
 } // namespace

@@ -370,6 +370,28 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 }
 
+// The driver of the device (Vulkan 1.2 core).
+static vk::PhysicalDeviceDriverProperties GetDriverProperties(vk::PhysicalDevice physical_device) {
+	vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties> chain;
+	physical_device.getProperties2(&chain.get<vk::PhysicalDeviceProperties2>());
+	auto driver  = chain.get<vk::PhysicalDeviceDriverProperties>();
+	driver.pNext = nullptr;
+	return driver;
+}
+
+static_assert(DriverIdAmdProprietary == static_cast<uint32_t>(vk::DriverId::eAmdProprietary));
+static_assert(DriverIdAmdOpenSource == static_cast<uint32_t>(vk::DriverId::eAmdOpenSource));
+
+static MaximalReconvergenceRequest
+ToMaximalReconvergenceRequest(Config::MaximalReconvergence mode) {
+	switch (mode) {
+		case Config::MaximalReconvergence::On: return MaximalReconvergenceRequest::On;
+		case Config::MaximalReconvergence::Off: return MaximalReconvergenceRequest::Off;
+		case Config::MaximalReconvergence::Auto: break;
+	}
+	return MaximalReconvergenceRequest::Auto;
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
                                      std::vector<const char*> device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -513,13 +535,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
-	graphics.maximal_reconvergence_enabled =
-	    UseMaximalReconvergence(uniform_control_flow.shaderSubgroupUniformControlFlow == VK_TRUE,
-	                            maximal_reconvergence.shaderMaximalReconvergence == VK_TRUE,
-	                            Config::MaximalReconvergenceDisabled());
-	LOGF("Vulkan maximal reconvergence: %s%s\n",
-	     graphics.maximal_reconvergence_enabled ? "true" : "false",
-	     Config::MaximalReconvergenceDisabled() ? " (--no-maximal-reconvergence)" : "");
+	const auto driver_properties                = GetDriverProperties(physical_device);
+	const auto reconvergence                    = DecideMaximalReconvergence(
+	    uniform_control_flow.shaderSubgroupUniformControlFlow == VK_TRUE,
+	    maximal_reconvergence.shaderMaximalReconvergence == VK_TRUE,
+	    static_cast<uint32_t>(driver_properties.driverID),
+	    ToMaximalReconvergenceRequest(Config::GetMaximalReconvergence()));
+	graphics.maximal_reconvergence_enabled = reconvergence.enabled;
+	LOGF("Vulkan maximal reconvergence: %s (%s)\n", reconvergence.enabled ? "true" : "false",
+	     reconvergence.reason);
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
@@ -562,10 +586,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
 	{
 		// Crash reports from other GPUs name the driver release only through this line.
-		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties>
-		            driver_chain;
-		const auto& driver = driver_chain.get<vk::PhysicalDeviceDriverProperties>();
-		physical_device.getProperties2(&driver_chain.get<vk::PhysicalDeviceProperties2>());
+		const auto& driver = driver_properties;
 		const auto& device = graphics.physical_device_properties;
 		LOGF("Vulkan driver: %s, %s (id %u), driver version 0x%08x, API %u.%u.%u, vendor 0x%04x, "
 		     "device 0x%04x\n",

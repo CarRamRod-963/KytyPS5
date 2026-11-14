@@ -90,6 +90,9 @@ public:
 	enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
 	Q_ENUM(AudioOutput)
 
+	enum class MaximalReconvergence { Auto, On, Off };
+	Q_ENUM(MaximalReconvergence)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -137,7 +140,7 @@ public:
 	bool                   native_rt                   = false;
 	bool                   emulate_wave64              = false;
 	bool                   no_async_pipelines          = false;
-	bool                   no_maximal_reconvergence    = false;
+	MaximalReconvergence   maximal_reconvergence       = MaximalReconvergence::Auto;
 	bool                   no_shader_simplification    = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
@@ -194,7 +197,7 @@ public:
 		native_rt                   = other.native_rt;
 		emulate_wave64              = other.emulate_wave64;
 		no_async_pipelines          = other.no_async_pipelines;
-		no_maximal_reconvergence    = other.no_maximal_reconvergence;
+		maximal_reconvergence       = other.maximal_reconvergence;
 		no_shader_simplification    = other.no_shader_simplification;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;

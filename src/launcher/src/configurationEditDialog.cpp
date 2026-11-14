@@ -315,7 +315,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_native_rt->setChecked(info.native_rt);
 	m_ui->checkBox_emulate_wave64->setChecked(info.emulate_wave64);
 	m_ui->checkBox_no_async_pipelines->setChecked(info.no_async_pipelines);
-	m_ui->checkBox_no_maximal_reconvergence->setChecked(info.no_maximal_reconvergence);
+	ListInit(m_ui->comboBox_maximal_reconvergence, info.maximal_reconvergence);
 	m_ui->checkBox_no_shader_simplification->setChecked(info.no_shader_simplification);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
@@ -574,7 +574,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.native_rt                 = ui.checkBox_native_rt->isChecked();
 	info.emulate_wave64            = ui.checkBox_emulate_wave64->isChecked();
 	info.no_async_pipelines        = ui.checkBox_no_async_pipelines->isChecked();
-	info.no_maximal_reconvergence  = ui.checkBox_no_maximal_reconvergence->isChecked();
+	info.maximal_reconvergence     = TextToEnum<Configuration::MaximalReconvergence>(
+	    ui.comboBox_maximal_reconvergence->currentText());
 	info.no_shader_simplification  = ui.checkBox_no_shader_simplification->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();

@@ -44,7 +44,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(emulate_wave64);
 	KYTY_CFG_SET(no_async_pipelines);
-	KYTY_CFG_SET(no_maximal_reconvergence);
+	KYTY_CFG_SET(maximal_reconvergence);
 	KYTY_CFG_SET(no_shader_simplification);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -112,7 +112,17 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(native_rt);
 	KYTY_CFG_GET(emulate_wave64);
 	KYTY_CFG_GET(no_async_pipelines);
-	KYTY_CFG_GET(no_maximal_reconvergence);
+	if (s.contains(QStringLiteral("maximal_reconvergence"))) {
+		KYTY_CFG_GET(maximal_reconvergence);
+		if (EnumToText(maximal_reconvergence).isEmpty()) {
+			maximal_reconvergence = MaximalReconvergence::Auto;
+		}
+	} else {
+		// Settings from before the three-way choice stored a checkbox.
+		maximal_reconvergence = s.value(QStringLiteral("no_maximal_reconvergence")).toBool()
+		                            ? MaximalReconvergence::Off
+		                            : MaximalReconvergence::Auto;
+	}
 	KYTY_CFG_GET(no_shader_simplification);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
