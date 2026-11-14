@@ -176,6 +176,10 @@ public:
 	// the render pass instances that follow such a barrier back to back only draws ran, so it
 	// records nothing there; otherwise it ends the current instance for the barrier.
 	void OrderIndirectReads() const;
+	// After DispatchHandle for a guest dispatch that reads its arguments on the GPU: makes the
+	// writes it must see visible to indirect-argument reads, unless nothing that needs it was
+	// recorded since the last such barrier (BarrierTracker::BeforeIndirectDispatch).
+	void OrderIndirectDispatchReads() const;
 	// Records a copy of staged bytes into a buffer, ordered after every earlier command and
 	// before every later one. Inside a batch (BatchCopies), copies recorded back to back share
 	// their barriers (CopyRunTracker); outside one each copy gets its own pair. The source must
