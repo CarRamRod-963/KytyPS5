@@ -25,6 +25,9 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -499,6 +502,34 @@ static uint64_t GraphicsFingerprint(const GraphicsPipelineInputs&   inputs,
 	return XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
 }
 
+// The stage tag of `stage` in PipelineTrace lines.
+static const char* TraceStageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Pixel: return "PS";
+		default: return "unknown";
+	}
+}
+
+// Appends " <stage>=<guest shader hash>" to `out` (size `size`, kept terminated); a driver that
+// crashes inside a pipeline build is identified by the begin line's hashes.
+static void AppendTraceStage(char* out, size_t size, const ShaderStageRuntime& stage) {
+	if (stage.program == nullptr) {
+		return;
+	}
+	const size_t used = std::strlen(out);
+	if (used + 1 >= size) {
+		return;
+	}
+	std::snprintf(out + used, size - used, " %s=%016" PRIx64, TraceStageName(stage.program->stage),
+	              stage.program->shader_hash);
+}
+
 // Identifies a compute pipeline's create info across sessions (see GraphicsFingerprint).
 static uint64_t ComputeFingerprint(const ComputePipelineInputs& inputs, uint64_t spirv_hash,
                                    uint64_t layout) {
@@ -846,11 +877,19 @@ PipelineCompileQueue::Job CreatePipelineInternal(
 	pipeline_info.layout                  = pipeline.pipeline_layout;
 	pipeline_info.basePipelineIndex       = -1;
 
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
+	// Precompile builds run on worker threads; only their outcome is traced.
+	if (mode != PipelineBuildMode::Precompile && mode != PipelineBuildMode::Unoptimized) {
+		std::array<char, 160> stages {};
+		for (const auto& stage: vertex_info) {
+			AppendTraceStage(stages.data(), stages.size(), stage.stage);
+		}
+		if (ps_active) {
+			AppendTraceStage(stages.data(), stages.size(), ps_input_info->stage);
+		}
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin%s programs=%" PRIu64 ",%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program->id : 0,
+		     stages.data(), vertex_program.id, ps_active ? pixel_program->id : 0,
 		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
@@ -935,8 +974,10 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 	inputs->info.basePipelineIndex = -1;
 
 	if (trace) {
-		LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-		     static_cast<void*>(pipeline.pipeline_layout));
+		LOGF("PipelineTrace: vkCreateComputePipelines begin CS=%016" PRIx64
+		     " wave=%u subgroup=%u layout=%p\n",
+		     input_info.stage.program->shader_hash, input_info.stage.program->wave_size,
+		     required_size, static_cast<void*>(pipeline.pipeline_layout));
 	}
 	const auto fingerprint = ComputeFingerprint(
 	    *inputs, input_info.stage.handle != nullptr ? input_info.stage.handle->spirv_hash : 0,
