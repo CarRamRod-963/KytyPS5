@@ -16795,9 +16795,15 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
-        // The writers' trailing barriers already cover indirect argument reads.
-        Require(name, "no argument barrier", RecordedCommandCounter::indirect_barriers == 0,
-                "the indirect dispatch recorded its own argument barrier");
+        // Barriers to all commands leave indirect argument reads out on this
+        // branch: one argument barrier covers every earlier write the guest
+        // ordered (BarrierTracker::BeforeIndirectDispatch), never one per
+        // dispatch.
+        Require(name, "one argument barrier",
+                RecordedCommandCounter::indirect_barriers <= 1,
+                "the indirect dispatch recorded " +
+                    std::to_string(RecordedCommandCounter::indirect_barriers) +
+                    " argument barriers");
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
                   "workgroup-count arguments caused a host submission or readback");
