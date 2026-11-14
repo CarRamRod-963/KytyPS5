@@ -1293,6 +1293,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				}
 				command.endRendering();
 				CommitGpuWrite(image);
+				// The next writer of the metadata need not submit early for this reader.
+				m_buffer_cache.NoteWatchedRead(range.address, range.size, false);
 				return;
 			}
 		}
@@ -1305,6 +1307,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const Common::GpuTiming::SyncScope sync_reason(
 		    Common::GpuTiming::SyncReason::MetadataCheck);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
+		m_buffer_cache.NoteWatchedRead(range.address, range.size, true);
 		metadata_written = true;
 	}
 	if (m_buffer_cache.ConsumeCpuModified(range.address, range.size)) {
