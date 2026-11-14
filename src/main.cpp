@@ -130,7 +130,10 @@ static void PrintUsage() {
 	    "  --emulate-wave64                     Run wave64 compute shaders 32 lanes wide, two\n"
 	    "                                       guest lanes per invocation, also on GPUs with\n"
 	    "                                       64-lane subgroups. Default: off.\n");
-	::printf("  --native-rt                          Use native RT on the GPU.\n");
+	::printf(
+	    "  --no-maximal-reconvergence           Do not request maximal reconvergence in shaders,\n"
+	    "                                       even where the GPU supports it. Default: off.\n");
+	::printf("  --native-rt                         Use native RT on the GPU.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -304,6 +307,7 @@ static constexpr Flag FLAGS[] = {
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--emulate-wave64", &ConfigOptions::emulate_wave64},
+    {"--no-maximal-reconvergence", &ConfigOptions::no_maximal_reconvergence},
     {"--native-rt", &ConfigOptions::native_rt},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

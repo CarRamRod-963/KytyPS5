@@ -510,10 +510,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 	graphics.maximal_reconvergence_enabled =
-	    uniform_control_flow.shaderSubgroupUniformControlFlow &&
-	    maximal_reconvergence.shaderMaximalReconvergence;
-	LOGF("Vulkan maximal reconvergence: %s\n",
-	     graphics.maximal_reconvergence_enabled ? "true" : "false");
+	    UseMaximalReconvergence(uniform_control_flow.shaderSubgroupUniformControlFlow == VK_TRUE,
+	                            maximal_reconvergence.shaderMaximalReconvergence == VK_TRUE,
+	                            Config::MaximalReconvergenceDisabled());
+	LOGF("Vulkan maximal reconvergence: %s%s\n",
+	     graphics.maximal_reconvergence_enabled ? "true" : "false",
+	     Config::MaximalReconvergenceDisabled() ? " (--no-maximal-reconvergence)" : "");
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;

@@ -11,6 +11,7 @@ using Libs::Graphics::PlanSubgroups;
 using Libs::Graphics::RequiredComputeSubgroupSize;
 using Libs::Graphics::SubgroupDevice;
 using Libs::Graphics::SubgroupPlan;
+using Libs::Graphics::UseMaximalReconvergence;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -128,6 +129,18 @@ void TestNarrowDevice() {
         "an 8-32 lane device requires a subgroup size");
 }
 
+// Maximal reconvergence needs both device features and is off when disabled.
+void TestMaximalReconvergence() {
+  Check(UseMaximalReconvergence(true, true, false),
+        "a supporting device does not request maximal reconvergence");
+  Check(!UseMaximalReconvergence(true, true, true),
+        "disabled maximal reconvergence is still requested");
+  Check(!UseMaximalReconvergence(false, true, false),
+        "maximal reconvergence without uniform control flow is requested");
+  Check(!UseMaximalReconvergence(true, false, false),
+        "maximal reconvergence without device support is requested");
+}
+
 } // namespace
 
 int main() {
@@ -135,6 +148,7 @@ int main() {
   TestWave32Device();
   TestUncontrolledWave64Device();
   TestNarrowDevice();
+  TestMaximalReconvergence();
   std::printf("SubgroupPlanTests: ok\n");
   return 0;
 }
