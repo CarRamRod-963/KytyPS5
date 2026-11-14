@@ -1280,10 +1280,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				keys |= 1u << key;
 			}
 		}
-		// No selected key to clear, or none left since the last check.
+		// No selected key to clear, or none left since the last check. Runs that fill their slices
+		// are one contiguous range, and a checked set holds maximal ranges: it contains every run
+		// exactly when it contains `viewed` (one lookup per key instead of one per key and slice).
 		bool checked = true;
-		for (uint32_t slice = 0; slice < count && checked; slice++) {
-			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+		if (mip.size == slice_size) {
+			checked = m_buffer_cache.IsColorMetadataChecked(viewed.address, viewed.size, keys);
+		} else {
+			for (uint32_t slice = 0; slice < count && checked; slice++) {
+				checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+			}
 		}
 		if (checked) {
 			return;
