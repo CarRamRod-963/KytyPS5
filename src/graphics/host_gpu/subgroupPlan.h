@@ -59,6 +59,14 @@ constexpr uint32_t RequiredComputeSubgroupSize(const SubgroupPlan&   plan,
 	return size >= device.min_size && size <= device.max_size ? size : 0u;
 }
 
+// Shaders request maximal reconvergence (SPV_KHR_maximal_reconvergence) when the device supports it
+// and the user did not turn it off. The request makes some drivers rewrite every loop with subgroup
+// operations; disabled leaves reconvergence to the driver.
+constexpr bool UseMaximalReconvergence(bool uniform_control_flow, bool maximal_reconvergence,
+                                       bool disabled) {
+	return uniform_control_flow && maximal_reconvergence && !disabled;
+}
+
 } // namespace Libs::Graphics
 
 #endif /* KYTY_GRAPHICS_HOST_GPU_SUBGROUP_PLAN_H_ */

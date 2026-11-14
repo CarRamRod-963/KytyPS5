@@ -215,6 +215,12 @@
               <property name="text"><string>Build shader pipelines fully optimized (no quick first build)</string></property>
              </widget>
             </item>
+            <item row="14" column="1">
+             <widget class="QCheckBox" name="checkBox_no_maximal_reconvergence">
+              <property name="toolTip"><string>Do not ask the GPU driver for maximal reconvergence in shaders. Can help on GPUs whose driver crashes while building shaders with it.</string></property>
+              <property name="text"><string>Disable maximal reconvergence in shaders</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

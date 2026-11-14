@@ -41,6 +41,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(relaxed_shader_float);
 	KYTY_CFG_SET(emulate_wave64);
 	KYTY_CFG_SET(no_async_pipelines);
+	KYTY_CFG_SET(no_maximal_reconvergence);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
@@ -104,6 +105,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(relaxed_shader_float);
 	KYTY_CFG_GET(emulate_wave64);
 	KYTY_CFG_GET(no_async_pipelines);
+	KYTY_CFG_GET(no_maximal_reconvergence);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);

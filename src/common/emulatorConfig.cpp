@@ -285,6 +285,10 @@ bool EmulateWave64Enabled() {
 	return g_config->emulate_wave64;
 }
 
+bool MaximalReconvergenceDisabled() {
+	return g_config->no_maximal_reconvergence;
+}
+
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
