@@ -1160,6 +1160,17 @@ static void PatchGuestCode(Program* program) {
 		    totals.unprotected_instruction_count, totals.copy_entry_conflict_count,
 		    totals.copy_unsupported_count, totals.copy_no_space_count, totals.function_count,
 		    totals.discovered_function_count, elapsed.count()));
+		const auto not_copied =
+		    totals.red_zone_copy_candidate_count - totals.rewritten_function_count;
+		if (not_copied != 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: guest red-zone protection: {}: {} of {} red-zone functions are not "
+			    "protected ({} entry conflicts, {} unsupported, {} out of space); a host exception "
+			    "inside them can overwrite their red zone\n",
+			    module_name, not_copied, totals.red_zone_copy_candidate_count,
+			    totals.copy_entry_conflict_count, totals.copy_unsupported_count,
+			    totals.copy_no_space_count));
+		}
 	}
 	if (totals.rdtsc.found != 0) {
 		Log::WriteToConsoleAndLog(

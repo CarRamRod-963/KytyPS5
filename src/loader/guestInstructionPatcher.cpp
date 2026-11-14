@@ -2475,40 +2475,47 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	}
 	std::ranges::sort(ordered, {}, &FunctionWork::index);
 
-	for (auto* item: ordered) {
-		const uintptr_t function_start = starts[item->index];
-		const uintptr_t function_end   = function_end_of(item->index);
-		const auto&     function       = item->function;
-		const auto&     replacements   = item->replacements;
-		if (item->copy) {
-			++result.red_zone_copy_candidate_count;
-			RedZoneFunctionWriter writer(module, function, function_start, function_end, *sweep,
-			                             replacements, tsc_multiplier);
-			switch (writer.Write(result)) {
-				case RedZoneFunctionWriter::Outcome::Rewritten:
-					++result.rewritten_function_count;
-					continue;
-				case RedZoneFunctionWriter::Outcome::EntryConflict:
-					++result.copy_entry_conflict_count;
-					break;
-				case RedZoneFunctionWriter::Outcome::Unsupported:
-					++result.copy_unsupported_count;
-					break;
-				case RedZoneFunctionWriter::Outcome::NoSpace: ++result.copy_no_space_count; break;
-			}
-		}
-
+	const auto patch_instructions = [&](const FunctionWork& item) {
 		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 		if (protect_memory) {
-			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
+			CollectRedZoneMemoryInstructions(item.function, rewrite_sites, result);
 		}
-		for (const auto& [address, replacement]: replacements) {
+		for (const auto& [address, replacement]: item.replacements) {
 			rewrite_sites[address].replacement = replacement.replacement;
 		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result, tsc_multiplier);
-			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
+			RelocateGuestInstructions(module, item.function, rewrite_sites, result, tsc_multiplier);
+			TrapUnrelocatedInstructions(*module, item.function, rewrite_sites, result);
 		}
+	};
+	// Copies first: single-instruction patches of the other functions (--redzone makes hundreds of
+	// thousands) must not take the room the copies need.
+	std::vector<FunctionWork*> uncopied;
+	for (auto* item: ordered) {
+		if (!item->copy) {
+			uncopied.push_back(item);
+			continue;
+		}
+		++result.red_zone_copy_candidate_count;
+		RedZoneFunctionWriter writer(module, item->function, starts[item->index],
+		                             function_end_of(item->index), *sweep, item->replacements,
+		                             tsc_multiplier);
+		switch (writer.Write(result)) {
+			case RedZoneFunctionWriter::Outcome::Rewritten:
+				++result.rewritten_function_count;
+				continue;
+			case RedZoneFunctionWriter::Outcome::EntryConflict:
+				++result.copy_entry_conflict_count;
+				break;
+			case RedZoneFunctionWriter::Outcome::Unsupported:
+				++result.copy_unsupported_count;
+				break;
+			case RedZoneFunctionWriter::Outcome::NoSpace: ++result.copy_no_space_count; break;
+		}
+		uncopied.push_back(item);
+	}
+	for (const auto* item: uncopied) {
+		patch_instructions(*item);
 	}
 	const auto trampoline_addr =
 	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
