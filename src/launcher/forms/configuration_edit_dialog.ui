@@ -221,10 +221,14 @@
               <property name="text"><string>Build shader pipelines fully optimized (no quick first build)</string></property>
              </widget>
             </item>
+            <item row="15" column="0">
+             <widget class="QLabel" name="label_maximal_reconvergence">
+              <property name="text"><string>Maximal reconvergence:</string></property>
+             </widget>
+            </item>
             <item row="15" column="1">
-             <widget class="QCheckBox" name="checkBox_no_maximal_reconvergence">
-              <property name="toolTip"><string>Do not ask the GPU driver for maximal reconvergence in shaders. Can help on GPUs whose driver crashes while building shaders with it.</string></property>
-              <property name="text"><string>Disable maximal reconvergence in shaders</string></property>
+             <widget class="QComboBox" name="comboBox_maximal_reconvergence">
+              <property name="toolTip"><string>Whether shaders ask the GPU driver for maximal reconvergence. Auto asks for it except on AMD drivers, whose shader compiler crashes with it; On and Off override Auto.</string></property>
              </widget>
             </item>
             <item row="16" column="1">

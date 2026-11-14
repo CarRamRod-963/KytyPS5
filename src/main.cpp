@@ -131,8 +131,11 @@ static void PrintUsage() {
 	    "                                       guest lanes per invocation, also on GPUs with\n"
 	    "                                       64-lane subgroups. Default: off.\n");
 	::printf(
-	    "  --no-maximal-reconvergence           Do not request maximal reconvergence in shaders,\n"
-	    "                                       even where the GPU supports it. Default: off.\n");
+	    "  --maximal-reconvergence <value>      Auto, On, or Off: request maximal reconvergence\n"
+	    "                                       in shaders where the GPU supports it. Auto asks\n"
+	    "                                       for it except on AMD's LLPC drivers. Default: "
+	    "Auto.\n"
+	    "  --no-maximal-reconvergence           Same as --maximal-reconvergence Off.\n");
 	::printf("  --no-shader-simplification           Give the GPU driver shaders without the\n"
 	         "                                       driver simplification pass. Default: off.\n");
 	::printf("  --native-rt                         Use native RT on the GPU.\n");
@@ -309,7 +312,6 @@ static constexpr Flag FLAGS[] = {
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--emulate-wave64", &ConfigOptions::emulate_wave64},
-    {"--no-maximal-reconvergence", &ConfigOptions::no_maximal_reconvergence},
     {"--no-shader-simplification", &ConfigOptions::no_shader_simplification},
     {"--native-rt", &ConfigOptions::native_rt},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
@@ -350,6 +352,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (const auto* flag = std::ranges::find(FLAGS, arg, &Flag::name); flag != std::end(FLAGS)) {
 			options.config.*flag->field = flag->value;
+			continue;
+		}
+
+		if (arg == "--no-maximal-reconvergence") {
+			options.config.maximal_reconvergence = Config::MaximalReconvergence::Off;
 			continue;
 		}
 
@@ -481,6 +488,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--maximal-reconvergence") {
+			if (!ParseEnum(value, options.config.maximal_reconvergence)) {
+				::printf("invalid maximal reconvergence: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--pssr-upscaler") {
