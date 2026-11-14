@@ -1075,8 +1075,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		ForgetColorMetadataChecks(vaddr, size);
 		++m_gpu_write_sequence;
 		ForEachWatchedRange(vaddr, size, [&](WatchedRange& watched) {
-			watched.sequence        = ++m_watched_write_sequence;
-			m_watched_write_pending = true;
+			watched.sequence = ++m_watched_write_sequence;
+			m_watched_write_pending |= watched.read_on_host;
 		});
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1245,6 +1245,14 @@ uint64_t BufferCache::WatchedWriteSequence(uint64_t vaddr, uint64_t size) {
 		m_watched_max_size = std::max(m_watched_max_size, size);
 	}
 	return sequence;
+}
+
+void BufferCache::NoteWatchedRead(uint64_t vaddr, uint64_t size, bool on_host) {
+	ForEachWatchedRange(vaddr, size, [&](WatchedRange& watched) {
+		if (watched.address == vaddr && watched.size == size) {
+			watched.read_on_host = on_host;
+		}
+	});
 }
 
 void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {

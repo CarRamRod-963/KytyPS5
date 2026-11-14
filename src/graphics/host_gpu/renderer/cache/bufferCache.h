@@ -138,9 +138,14 @@ public:
 	// Advances the watched sequence of a range the host wrote in guest memory on the GPU's
 	// behalf (a compute dispatch it executed itself), as binding it for a GPU write would.
 	void NoteHostWrite(uint64_t vaddr, uint64_t size);
-	// Whether a watched range was bound for GPU writing since the last call: the host reads
-	// such a range soon (a clear code), and a readback of a pending writer flushes the whole
-	// recorded command buffer, so the recorder submits early instead.
+	// How the consumer of the watched range [vaddr, vaddr + size) read it last: on the host (a
+	// readback, which waits for every pending writer) or on the GPU (a check the GPU evaluates
+	// itself). A range counts as read on the host until its consumer reports otherwise.
+	void NoteWatchedRead(uint64_t vaddr, uint64_t size, bool on_host);
+	// Whether a watched range read on the host was bound for GPU writing since the last call:
+	// the host reads such a range soon (a clear code), and a readback of a pending writer
+	// flushes the whole recorded command buffer, so the recorder submits early instead. Writes
+	// to ranges read on the GPU leave the recorded commands to the normal submissions.
 	[[nodiscard]] bool ConsumeWatchedWritePending() noexcept {
 		return std::exchange(m_watched_write_pending, false);
 	}
@@ -333,6 +338,8 @@ private:
 		uint64_t address;
 		uint64_t size;
 		uint64_t sequence;
+		// The consumer read the range on the host the last time (NoteWatchedRead).
+		bool read_on_host = true;
 	};
 	// Sorted by address; no range is larger than m_watched_max_size.
 	std::vector<WatchedRange>                         m_watched_ranges;
