@@ -17679,6 +17679,69 @@ public:
         Require(name, case_name, !scan({}),
                 "a scan kept the writes an earlier scan saw");
       }
+      // A flip block and a flip-done wait block (AgcDcbSetFlip,
+      // AgcDcbWaitUntilSafeForRendering) are one unit each for the parser: the
+      // scan passes them although the wait's label still holds the flip's 1.
+      {
+        constexpr const char *case_name = "lookahead passes flip blocks";
+        constexpr auto label_address = base + 0xfc200;
+        const uint64_t shown = 1;
+        Require(name, case_name,
+                LibKernel::Memory::TryWriteBacking(label_address, &shown,
+                                                   sizeof(shown)),
+                "the display buffer label could not be set");
+        const auto lo = static_cast<u32>(label_address);
+        const auto hi = static_cast<u32>(label_address >> 32u);
+        std::vector<u32> commands(Pm4::FLIP_PACKET_DW +
+                                  Pm4::WAIT_FLIP_DONE_PACKET_DW);
+        auto *flip = commands.data();
+        flip[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u);
+        flip[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+        flip[2] = Pm4::USERDATA_TAG_FLIP | 0x10000u | 0x7u;
+        flip[4] = KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u);
+        flip[5] = 0x06010000u;
+        flip[6] = 0xc343u;
+        flip[10] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
+        flip[11] = 0x06200504u;
+        flip[12] = 0x42010000u;
+        flip[13] = lo;
+        flip[14] = hi;
+        flip[15] = 1u;
+        flip[18] = KYTY_PM4(Pm4::FLIP_PACKET_DW - 18u, Pm4::IT_NOP, 0u);
+        auto *wait = flip + Pm4::FLIP_PACKET_DW;
+        wait[0] = KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 1u);
+        wait[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+        wait[2] = Pm4::USERDATA_TAG_WAIT_FLIP_DONE;
+        // WAIT_REG_MEM_64: memory space, function 3 (equal) on 0.
+        wait[3] = KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u);
+        wait[4] = 0x13u;
+        wait[5] = lo;
+        wait[6] = hi;
+        wait[9] = 0xffffffffu;
+        wait[10] = 0xffffffffu;
+        wait[11] = 0x40u;
+        wait[12] = KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 1u);
+        wait[13] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+        wait[14] = Pm4::USERDATA_TAG_WAIT_FLIP_DONE | 0x20u;
+        wait[15] =
+            KYTY_PM4(Pm4::WAIT_FLIP_DONE_PACKET_DW - 15u, Pm4::IT_NOP, 0u);
+        const Pm4Execution idle;
+        processor.PlanLookahead(idle, commands);
+        const auto *stop = CommandProcessorTestAccess::LookaheadStop(processor);
+        Require(name, case_name, stop == nullptr,
+                "the scan stopped at dword " +
+                    (stop != nullptr ? std::to_string(stop - commands.data())
+                                     : "?") +
+                    " of the flip and flip-done wait blocks");
+        // A block cut off by the end of the commands is not passed.
+        processor.PlanLookahead(idle, std::span<const u32>(commands).first(
+                                          Pm4::FLIP_PACKET_DW - 1u));
+        Require(
+            name, case_name,
+            CommandProcessorTestAccess::LookaheadStop(processor) ==
+                commands.data(),
+            "the scan passed a flip block cut off by the end of the commands");
+      }
       // A scan that reaches the end of the running submission continues into
       // the ones queued behind it on the same queue, whose first commands run
       // right after it, and plans each program recently used at a shader
