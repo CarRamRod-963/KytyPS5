@@ -139,6 +139,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(Buffer& buffer) {
+	// A deleted buffer waits only for its slot to be freed: its LRU item is free and its page
+	// table entries are cleared, and neither may come back.
+	if (buffer.is_deleted) {
+		return;
+	}
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	if (buffer.bda_watch_tick != 0) {
 		buffer.bda_watch_tick = 0;
@@ -193,10 +198,13 @@ void BufferCache::KeepAccessedBdaBuffers() {
 			return true;
 		}
 		auto& buffer = m_slot_buffers[id];
+		if (buffer.is_deleted) {
+			return true;
+		}
 		if (m_bda_reports_lost) {
 			TouchBuffer(buffer);
 		}
-		return buffer.is_deleted || buffer.bda_watch_tick == 0;
+		return buffer.bda_watch_tick == 0;
 	});
 	m_bda_reports_lost = false;
 }
