@@ -365,18 +365,16 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	// Bindings of empty buffers read this one, so it must hold zeros, not leftover memory.
 	GetBuffer(null_id).Fill(0, 16, 0);
-	if (!m_graphics.CanReportMemoryUsage()) {
+	UpdateGcMarks();
+}
+
+void BufferCache::UpdateGcMarks() {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage() ||
+	    !m_gc_marks.Update(m_graphics.GetTotalMemoryBudget())) {
 		return;
 	}
-	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	m_trigger_gc_memory  = m_gc_marks.Buffer().trigger;
+	m_critical_gc_memory = m_gc_marks.Buffer().critical;
 }
 
 BufferCache::~BufferCache() {
@@ -1360,6 +1358,7 @@ void BufferCache::RunGarbageCollector() {
 	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
+		UpdateGcMarks();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	// Below the memory trigger a cached buffer costs nothing but memory, unless BDA accesses are in
