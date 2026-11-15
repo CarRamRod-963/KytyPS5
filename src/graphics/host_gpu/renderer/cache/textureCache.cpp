@@ -174,17 +174,23 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
       m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
-	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	UpdateGcMarks();
+}
+
+void TextureCache::UpdateGcMarks() {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage() ||
+	    !m_gc_marks.Update(m_graphics.GetTotalMemoryBudget())) {
+		return;
 	}
+	const auto marks     = m_gc_marks.Texture();
+	m_trigger_gc_memory  = marks.trigger;
+	m_pressure_gc_memory = marks.pressure;
+	m_critical_gc_memory = marks.critical;
+	using MemoryBudget::MiB;
+	LOGF("TextureCache: device memory budget %" PRIu64 " MiB, collection marks %" PRIu64 "/%" PRIu64
+	     "/%" PRIu64 " MiB (trigger/pressure/critical)\n",
+	     m_gc_marks.Budget() / MiB, marks.trigger / MiB, marks.pressure / MiB,
+	     marks.critical / MiB);
 }
 
 TextureCache::~TextureCache() {
@@ -2537,6 +2543,7 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
+		UpdateGcMarks();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	ReleaseDisplaced(m_total_used_memory >= m_pressure_gc_memory);

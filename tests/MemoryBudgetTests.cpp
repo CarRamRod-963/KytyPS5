@@ -1,19 +1,24 @@
 #include "graphics/host_gpu/memoryBudget.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 namespace {
 
+using Libs::Graphics::MemoryBudget::BufferMarks;
 using Libs::Graphics::MemoryBudget::CacheLimit;
+using Libs::Graphics::MemoryBudget::CollectionMarks;
 using Libs::Graphics::MemoryBudget::DriverHeadroom;
 using Libs::Graphics::MemoryBudget::DriverUsage;
 using Libs::Graphics::MemoryBudget::GiB;
 using Libs::Graphics::MemoryBudget::HeapState;
+using Libs::Graphics::MemoryBudget::LiveMarks;
 using Libs::Graphics::MemoryBudget::LostAccessReport;
 using Libs::Graphics::MemoryBudget::MiB;
 using Libs::Graphics::MemoryBudget::Monitor;
+using Libs::Graphics::MemoryBudget::TextureMarks;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -53,6 +58,65 @@ void TestLimit() {
   // A driver that owns more than the budget leaves nothing to the caches.
   Check(CacheLimit({.budget = 4 * GiB, .usage = 5 * GiB, .blocks = GiB}) == 0,
         "the limit underflows");
+}
+
+// The marks the caches computed once at start before they followed the budget.
+CollectionMarks ReferenceTextureMarks(int64_t budget) {
+  constexpr int64_t gib = 1024ll * 1024 * 1024;
+  const auto threshold = std::min<int64_t>(budget, 8 * gib);
+  return {
+      .trigger =
+          static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0)),
+      .pressure = static_cast<uint64_t>(std::max<int64_t>(
+          std::min(budget - 6 * threshold / 10, budget - gib), gib + gib / 2)),
+      .critical = static_cast<uint64_t>(std::max<int64_t>(
+          std::min(budget - 2 * threshold / 10, budget - gib / 2), 3 * gib))};
+}
+
+CollectionMarks ReferenceBufferMarks(int64_t budget) {
+  constexpr int64_t gib = 1024ll * 1024 * 1024;
+  const auto threshold = std::min<int64_t>(budget, 8 * gib);
+  const auto trigger = static_cast<uint64_t>(std::max<int64_t>(
+      std::min(budget - 6 * threshold / 10, budget - gib), gib));
+  return {
+      .trigger = trigger,
+      .pressure = trigger,
+      .critical = static_cast<uint64_t>(std::max<int64_t>(
+          std::min(budget - 2 * threshold / 10, budget - gib / 2), 2 * gib))};
+}
+
+void TestMarks() {
+  for (uint64_t budget = 0; budget <= 40 * GiB; budget += 37 * MiB + 13) {
+    Check(TextureMarks(budget) ==
+              ReferenceTextureMarks(static_cast<int64_t>(budget)),
+          "texture marks differ from the formula at start");
+    Check(BufferMarks(budget) ==
+              ReferenceBufferMarks(static_cast<int64_t>(budget)),
+          "buffer marks differ from the formula at start");
+  }
+
+  // A 12 GB card: 11,172 MiB of budget at start, 10,251 MiB later in the
+  // session (both minus the 1 GiB reserve of GetTotalMemoryBudget).
+  LiveMarks marks;
+  Check(marks.Update(10148 * MiB), "the first budget sets no marks");
+  Check(marks.Texture() == TextureMarks(10148 * MiB),
+        "the texture marks do not follow the first budget");
+  Check(marks.Texture().pressure / MiB == 5232 &&
+            marks.Texture().critical / MiB == 8509,
+        "a 12 GB card's marks moved");
+  Check(!marks.Update(10148 * MiB + 511 * MiB),
+        "a change below the hysteresis moves the marks");
+  Check(!marks.Update(10148 * MiB - 511 * MiB),
+        "a drop below the hysteresis moves the marks");
+  Check(marks.Budget() == 10148 * MiB, "the hysteresis moved the budget");
+  Check(marks.Update(9227 * MiB), "a budget drop is not followed");
+  Check(marks.Texture() == TextureMarks(9227 * MiB) &&
+            marks.Buffer() == BufferMarks(9227 * MiB),
+        "the marks do not follow the dropped budget");
+  Check(marks.Texture().critical < TextureMarks(10148 * MiB).critical,
+        "a smaller budget does not lower the critical mark");
+  Check(!marks.Update(9227 * MiB + 300 * MiB), "a fluctuation moves the marks");
+  Check(marks.Update(9227 * MiB + 512 * MiB), "a 512 MiB rise is not followed");
 }
 
 void TestLostAccessReport() {
@@ -160,6 +224,7 @@ void TestMonitor() {
 
 int main() {
   TestLimit();
+  TestMarks();
   TestMonitor();
   TestLostAccessReport();
   std::printf("MemoryBudgetTests: all tests passed\n");
