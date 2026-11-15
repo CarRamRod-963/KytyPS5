@@ -229,6 +229,10 @@ struct BufferCacheTestAccess {
 
   static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
 
+  static bool LruConsistent(const BufferCache &cache) {
+    return cache.m_lru_cache.IsConsistent();
+  }
+
   // Serves a readback on the calling thread, as the GPU thread would.
   static void ReadBack(BufferCache &cache, uint64_t address, uint64_t size) {
     const BufferCache::GuestReadback request{
@@ -8065,6 +8069,38 @@ public:
     Require(name, "page table cleared",
             read_entries() == std::array<uint64_t, 2>{0u, 0u},
             "an evicted buffer left page table entries behind");
+    // A dropped report made before the evicted buffer's slot is freed (the
+    // erase waits for the submission) neither brings the buffer's page table
+    // entries back nor links its freed LRU item again: the next buffer would
+    // take that item, link it twice and leave the collection walking a cycle.
+    {
+      (void)cache.FindBuffer(base, 2 * page);
+      context.PrepareBda();
+      collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
+      collect(static_cast<uint32_t>(BufferCache::BdaWatchTicks));
+      Require(name, "evicted again", !cache.IsRegionRegistered(base, 2 * page),
+              "an unreported watched buffer was kept");
+      cache.NoteLostBdaReports();
+      collect(1);
+      Require(name, "lost reports after eviction",
+              BufferCacheTestAccess::LruConsistent(cache),
+              "dropped reports linked the freed LRU item of an evicted buffer "
+              "again");
+      Require(name, "no entries after eviction",
+              read_entries() == std::array<uint64_t, 2>{0u, 0u},
+              "dropped reports wrote the page table entries of an evicted "
+              "buffer back");
+      // The next buffers take the freed items; the collection still ends.
+      (void)cache.FindBuffer(base, 2 * page);
+      context.PrepareBda();
+      collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) +
+              static_cast<uint32_t>(BufferCache::BdaWatchTicks) + 2u);
+      Require(name, "collection after reuse",
+              BufferCacheTestAccess::LruConsistent(cache) &&
+                  !cache.IsRegionRegistered(base, 2 * page),
+              "the LRU list of the buffer collection is broken");
+    }
+
     // An access after the eviction found no buffer: it is lost.
     {
       const auto lost_evicted = cache.LostBdaAccesses();
