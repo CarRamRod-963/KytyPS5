@@ -34,6 +34,10 @@ public:
 	bool Wait(uint64_t tick);
 
 private:
+	// Ends the process after a failed semaphore call (a lost device), with the result and the
+	// device memory state in the log.
+	[[noreturn]] void Failed(const char* call, vk::Result result, uint64_t tick) const;
+
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
