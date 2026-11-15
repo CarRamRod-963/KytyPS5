@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -122,8 +123,9 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
-	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
+	const auto area         = m_current_area;
+	const auto window_start = std::exchange(m_last_scan_tick, m_scheduler.CurrentTick());
+	m_scheduler.DeferOperation([this, mapped, offset, area, window_start] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
@@ -136,7 +138,7 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
-			if (m_buffer_cache.NoteBdaAccess(address)) {
+			if (m_buffer_cache.NoteBdaAccess(address, window_start)) {
 				// A watched resident page (BufferCache::BdaWatchBit): the access was made.
 				continue;
 			}

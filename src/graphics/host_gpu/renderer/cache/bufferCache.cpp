@@ -125,6 +125,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.bda_watch_tick = 0;
+		buffer.registered_tick = m_scheduler.CurrentTick();
 		WriteBdaEntries(buffer, false);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
@@ -161,9 +162,16 @@ void BufferCache::WriteBdaEntries(const Buffer& buffer, bool watched) {
 	                addresses.size() * sizeof(vk::DeviceAddress));
 }
 
-bool BufferCache::NoteBdaAccess(uint64_t address) {
+bool BufferCache::NoteBdaAccess(uint64_t address, uint64_t window_start) {
 	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
-	if (owner == nullptr || !*owner || m_slot_buffers[*owner].bda_watch_tick == 0) {
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	// A resident page reports only through a watched entry (or a cleared one). A buffer that is
+	// no longer watched but was registered before the reporting dispatches ran was watched when
+	// they accessed it: a report processed earlier unwatched it, and the access was made.
+	const auto& buffer = m_slot_buffers[*owner];
+	if (buffer.bda_watch_tick == 0 && buffer.registered_tick >= window_start) {
 		return false;
 	}
 	m_bda_accessed.push_back(address);
