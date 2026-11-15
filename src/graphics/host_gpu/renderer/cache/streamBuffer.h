@@ -89,6 +89,8 @@ public:
 	// The garbage-collector tick (plus one) since which shaders report their accesses to the
 	// buffer's pages (BufferCache::BdaWatchBit), or 0.
 	uint64_t bda_watch_tick = 0;
+	// The scheduler tick whose commands wrote the buffer's page table entries (registration).
+	uint64_t registered_tick = 0;
 	// The scheduler tick that holds the latest GPU write of the buffer, valid while no write is
 	// open (marked by a command still being prepared; BufferCache::NoteCommandBoundary).
 	uint64_t gpu_write_tick = 0;
