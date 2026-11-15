@@ -43,6 +43,14 @@ constexpr uint64_t NumFramesBeforeRemoval = 16;
 // above the pressure mark, and its transient targets were deleted and created ~1,300 times a
 // second).
 constexpr uint64_t NumFramesBeforePressureRemoval = 1;
+// Above the device memory usage limit (MemoryBudget::UsageLimit) the OS pages device memory over
+// the bus around each submission once the budget is passed, which costs far more than creating
+// images again: images unused for this many frames are deleted, oldest first, until usage is
+// back under the limit (the age-based passes above wait 80 to 160 frames for an image).
+constexpr uint64_t NumFramesBeforeOverLimitRemoval = 16;
+// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
+// each, landing when it completes); at most this many bytes per collection.
+constexpr uint64_t OverLimitWriteBackBytes = 256ull << 20u;
 // Submissions an image an overlapping image displaces must go unused before it is marked as
 // displaced (ResolveOverlap); titles submit hundreds of times per frame.
 constexpr uint64_t NumSubmissionsBeforeDisplacement = 32;
@@ -2615,6 +2623,9 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+	if (const auto heaps = m_graphics.SampleMemoryHeaps(); heaps.device.budget != 0) {
+		evicted += CollectOverLimit(tick, MemoryBudget::UsageLimit(heaps.device.budget));
+	}
 	m_gc_evicted += evicted;
 	if (m_total_used_memory >= m_pressure_gc_memory) {
 		const auto now = std::chrono::steady_clock::now();
@@ -2629,6 +2640,60 @@ void TextureCache::RunGarbageCollector() {
 			m_gc_evicted = 0;
 		}
 	}
+}
+
+size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
+	if (m_total_used_memory <= limit) {
+		return 0;
+	}
+	// Backings kept for reuse and idle tiling scratch are freed first.
+	m_graphics.DestroyRecycledImages();
+	m_tiler.ReleaseScratch();
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(tick - std::min(NumFramesBeforeOverLimitRemoval, tick),
+	                             [&](ImageId id) { candidates.push_back(id); });
+	size_t               evicted = 0;
+	std::vector<ImageId> written_back;
+	for (const auto id: candidates) {
+		if (m_total_used_memory <= limit) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			continue;
+		}
+		if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
+			TouchImage(*owner);
+			continue;
+		}
+		if (owner->SafeToDownload()) {
+			if (!owner->info.HasStencil()) {
+				written_back.push_back(id);
+			}
+			continue;
+		}
+		FreeImage(id);
+		evicted++;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	}
+	uint64_t written = 0;
+	for (const auto id: written_back) {
+		if (m_total_used_memory <= limit || written >= OverLimitWriteBackBytes) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || !owner->SafeToDownload()) {
+			continue;
+		}
+		written += owner->AccountedSize();
+		if (!DownloadImageMemory(id)) {
+			continue;
+		}
+		FreeImage(id);
+		evicted++;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	}
+	return evicted;
 }
 
 void TextureCache::ProcessDownloadImages() {

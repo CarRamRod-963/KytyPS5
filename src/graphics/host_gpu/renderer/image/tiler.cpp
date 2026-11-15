@@ -567,7 +567,9 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
 	size = Common::AlignUp(size, 4);
-	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
+	const size_t slot    = m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0;
+	auto&        buffer  = m_scratch[slot];
+	m_scratch_used[slot] = true;
 	if (!buffer || buffer->Size() < size) {
 		if (buffer) {
 			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
@@ -577,6 +579,24 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer inpu
 		        vk::BufferUsageFlagBits::eTransferDst, size);
 	}
 	return {buffer->Handle(), 0, size};
+}
+
+void TileManager::ReleaseScratch() {
+	for (size_t slot = 0; slot < m_scratch.size(); slot++) {
+		if (m_scratch[slot] && !m_scratch_used[slot]) {
+			m_scheduler.DeferOperation(
+			    [old = std::move(m_scratch[slot])]() mutable { old.reset(); });
+		}
+		m_scratch_used[slot] = false;
+	}
+}
+
+uint64_t TileManager::ScratchBytes() const {
+	uint64_t bytes = 0;
+	for (const auto& buffer: m_scratch) {
+		bytes += buffer ? buffer->Size() : 0;
+	}
+	return bytes;
 }
 
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {
