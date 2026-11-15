@@ -2160,7 +2160,10 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!image.SafeToDownload()) {
+	// A buffer write that overlapped the image since its last native write left newer bytes in
+	// its memory (TextureCache::PrepareGpuBufferWrite): copying the image over them would undo
+	// that write, so the buffer keeps what it holds.
+	if (!image.SafeToDownload() || image.buffer_written) {
 		return false;
 	}
 	// A range that starts at a stencil plane selects its depth image.
