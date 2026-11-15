@@ -195,6 +195,7 @@ void TestMonitor() {
   Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 96 * s,
                        GiB) == Monitor::Report::Priorities,
         "promotion out of low priority is not reported");
+
   // Usage above the budget is reported every period, and once more when it is
   // back within the budget.
   const auto over = [](uint64_t usage) {

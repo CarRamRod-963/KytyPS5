@@ -462,6 +462,22 @@ struct TextureCacheTestAccess {
     return owner != nullptr && owner->registered;
   }
 
+  // Runs the over-limit collection with the cache's device usage set to `used`.
+  static size_t CollectOverLimit(TextureCache &cache, uint64_t used,
+                                 uint64_t limit) {
+    std::scoped_lock lock{cache.m_lock};
+    cache.m_total_used_memory = used;
+    return cache.CollectOverLimit(cache.m_gc_tick, limit);
+  }
+
+  static uint64_t UsedMemory(const TextureCache &cache) {
+    return cache.m_total_used_memory;
+  }
+
+  static uint64_t AccountedSize(TextureCache &cache, ImageId id) {
+    return cache.m_slot_images[id].AccountedSize();
+  }
+
   // Returns the previous pressure mark.
   static uint64_t SetPressureMark(TextureCache &cache, uint64_t pressure) {
     cache.m_gc_marks_pinned = true;
@@ -13566,6 +13582,145 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "pressure-retired direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Over the device memory limit the collector deletes images unused for a few
+  // frames, oldest first, until usage is back under the limit: those guest
+  // memory holds first, then GPU-written ones after writing them back. Images
+  // the last frames used stay even while usage remains over the limit.
+  void CheckOverLimitCollection() {
+    constexpr const char *name = "OverLimitCollection";
+    constexpr uintptr_t base = 0x000000020c800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stride = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 16;
+    constexpr uint64_t image_size = uint64_t{width} * height * 4u;
+    constexpr uint32_t written = 0x55667788u;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "over-limit direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "over-limit fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      // Sampled images hold what guest memory holds; the GPU writes storage
+      // ones.
+      const auto describe = [&](uint64_t address, bool storage = false) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, 4, 1);
+        desc.type = storage ? BindingType::Storage : BindingType::Texture;
+        desc.view_info.usage = storage ? vk::ImageUsageFlagBits::eStorage
+                                       : vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      const auto create = [&](uint64_t address, bool storage = false) {
+        auto desc = describe(address, storage);
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindTexture(id, desc);
+        return id;
+      };
+      const auto contains = [&](ImageId id) {
+        return TextureCacheTestAccess::Contains(cache, id);
+      };
+
+      // Three old images guest memory holds, an old GPU-written one and two
+      // the last frame used.
+      const std::array old_ids{create(base), create(base + stride),
+                               create(base + 2 * stride)};
+      auto gpu_desc = describe(base + 3 * stride, true);
+      const auto gpu_id = create(base + 3 * stride, true);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = written;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), gpu_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      cache.MarkGpuWritten(gpu_id);
+      const std::array recent_ids{create(base + 4 * stride),
+                                  create(base + 5 * stride)};
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          cache, std::array{old_ids[0], old_ids[1], gpu_id, old_ids[2]}, 100,
+          UINT64_MAX);
+      const auto size =
+          TextureCacheTestAccess::AccountedSize(cache, old_ids[0]);
+      Require(name, "fixtures",
+              size != 0 && std::ranges::all_of(old_ids, contains) &&
+                  contains(gpu_id) &&
+                  std::ranges::all_of(recent_ids, contains) &&
+                  TextureCacheTestAccess::AccountedSize(cache, gpu_id) == size,
+              "the cached images were not created");
+
+      // 2.5 images over the limit: the three old images guest memory holds go
+      // (two do not suffice), the GPU-written one stays.
+      constexpr uint64_t used = 64ull << 20u;
+      const auto limit = used - 2 * size - size / 2;
+      const auto collected =
+          TextureCacheTestAccess::CollectOverLimit(cache, used, limit);
+      Require(name, "guest-held images first",
+              std::ranges::none_of(old_ids, contains) && contains(gpu_id),
+              "the collection did not free the oldest images guest memory "
+              "holds, or freed the GPU-written one with them");
+      Require(name, "only what the limit needs",
+              collected == 3 &&
+                  TextureCacheTestAccess::UsedMemory(cache) == used - 3 * size,
+              "the collection did not stop once usage was under the limit");
+
+      // Still over the limit: the GPU-written image is written back and goes;
+      // the images the last frame used stay although usage remains over it.
+      Require(name, "write-back, recent images kept",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+                  !contains(gpu_id) &&
+                  std::ranges::all_of(recent_ids, contains),
+              "the collection kept the old GPU-written image or deleted "
+              "images the last frame used");
+      // The write-back lands in guest memory when its copy completes.
+      scheduler.Finish();
+      const auto again_id = cache.FindImage(gpu_desc);
+      (void)cache.FindTexture(again_id, gpu_desc);
+      Require(name, "written-back contents",
+              ReadCachedTexel(name, context, again_id) ==
+                      std::vector<u32>{written} &&
+                  ReadCachedTexel(name, context, again_id,
+                                  {static_cast<int32_t>(width) - 1,
+                                   static_cast<int32_t>(height) - 1, 0}) ==
+                      std::vector<u32>{written},
+              "the deleted GPU-written image was not written back");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "over-limit fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "over-limit direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -64169,12 +64324,14 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
+    vulkan.CheckOverLimitCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--transient-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
+    vulkan.CheckOverLimitCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {

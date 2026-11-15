@@ -58,6 +58,11 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0,
 	               bool host_target = false);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	// Frees the scratch buffers no tiling used since the previous call (they only grow, up to the
+	// largest image detiled since). Called between frames, when no scratch result is pending.
+	void ReleaseScratch();
+	// Bytes of the scratch buffers now held.
+	[[nodiscard]] uint64_t ScratchBytes() const;
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
@@ -148,6 +153,7 @@ private:
 	CommandScheduler&                       m_scheduler;
 	StreamBuffer&                           m_stream_buffer;
 	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
+	std::array<bool, 2>                          m_scratch_used {};
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
