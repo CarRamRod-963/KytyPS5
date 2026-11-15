@@ -153,12 +153,18 @@ public:
 	// since the last boundary take the current tick as the tick of their latest write.
 	void               NoteCommandBoundary();
 	void               ProcessFaultBuffer();
-	// A fault report of a resident page whose buffer is watched (BdaWatchBit): records the
-	// access for the next collection and returns true; false when the page needs a buffer.
-	[[nodiscard]] bool NoteBdaAccess(uint64_t address);
+	// A fault report of a resident page whose buffer is watched (BdaWatchBit), or was watched
+	// when the reporting dispatches ran (they ran after the scheduler tick `window_start`):
+	// records the access for the next collection and returns true; false when the page needs
+	// a buffer (the access was lost).
+	[[nodiscard]] bool NoteBdaAccess(uint64_t address, uint64_t window_start);
 	// Fault reports were dropped (the report area was full): every watched buffer counts as
 	// accessed at the next collection.
 	void               NoteLostBdaReports() noexcept { m_bda_reports_lost = true; }
+	// Shader accesses through the page table that found no buffer (lost for their dispatch).
+	[[nodiscard]] uint64_t LostBdaAccesses() const noexcept {
+		return m_fault_manager.LostAccesses();
+	}
 	void               SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool at_ordering_point = false);

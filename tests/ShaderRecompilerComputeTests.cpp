@@ -8007,6 +8007,21 @@ public:
             "a reported access of a watched page did not keep and unwatch its "
             "buffer");
 
+    // A later scan reports the page again for a dispatch that ran while the
+    // buffer was still watched: the access was made, not lost.
+    const auto lost_before = cache.LostBdaAccesses();
+    cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                 sizeof(u32), 1u << (reported_page & 31u));
+    cache.ProcessFaultBuffer();
+    scheduler.Finish();
+    collect(1);
+    Require(name, "late report",
+            cache.LostBdaAccesses() == lost_before &&
+                cache.FindBuffer(base, 2 * page) == id &&
+                read_entries() == watched_entries(false),
+            "a report of a page whose buffer was watched when the access ran "
+            "counted as a lost access");
+
     // A dropped report keeps every watched buffer too.
     collect(static_cast<uint32_t>(BufferCache::BdaCollectionAge) + 1u);
     Require(name, "watched again", read_entries() == watched_entries(true),
@@ -8031,6 +8046,17 @@ public:
     Require(name, "page table cleared",
             read_entries() == std::array<uint64_t, 2>{0u, 0u},
             "an evicted buffer left page table entries behind");
+    // An access after the eviction found no buffer: it is lost.
+    {
+      const auto lost_evicted = cache.LostBdaAccesses();
+      cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                   sizeof(u32), 1u << (reported_page & 31u));
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      Require(name, "lost after eviction",
+              cache.LostBdaAccesses() == lost_evicted + 1,
+              "an access of an evicted page was not counted as lost");
+    }
 
     context.UnmapMemory(base, 2 * page);
     scheduler.Finish();

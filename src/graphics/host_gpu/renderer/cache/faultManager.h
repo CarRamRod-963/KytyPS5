@@ -22,6 +22,8 @@ public:
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
+	// Reported accesses to memory without a cached buffer (each lost for its dispatch).
+	[[nodiscard]] uint64_t LostAccesses() const noexcept { return m_lost_accesses.Total(); }
 
 private:
 	GraphicContext&                            m_graphics;
@@ -31,6 +33,9 @@ private:
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	// The scheduler tick of the previous fault-buffer scan: the accesses a scan reports ran
+	// after it.
+	uint64_t m_last_scan_tick = 0;
 	// Accesses to memory without a cached buffer (each lost for its dispatch); GPU thread.
 	MemoryBudget::LostAccessReport             m_lost_accesses;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
