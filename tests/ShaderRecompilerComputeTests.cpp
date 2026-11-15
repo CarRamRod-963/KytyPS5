@@ -236,6 +236,7 @@ struct BufferCacheTestAccess {
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
+    cache.m_gc_marks_pinned = true;
     cache.m_trigger_gc_memory = trigger;
     cache.m_critical_gc_memory = critical;
   }
@@ -434,6 +435,7 @@ struct TextureCacheTestAccess {
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
+    cache.m_gc_marks_pinned = true;
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
@@ -467,6 +469,7 @@ struct TextureCacheTestAccess {
 
   // Returns the previous pressure mark.
   static uint64_t SetPressureMark(TextureCache &cache, uint64_t pressure) {
+    cache.m_gc_marks_pinned = true;
     return std::exchange(cache.m_pressure_gc_memory, pressure);
   }
 

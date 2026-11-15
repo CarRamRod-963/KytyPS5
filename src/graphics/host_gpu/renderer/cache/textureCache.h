@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/smallVector.h"
+#include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/layoutChangeLog.h"
@@ -272,6 +273,8 @@ private:
 	[[nodiscard]] uint64_t FramesUnused(const Image& image) const noexcept;
 	// Under memory pressure, frees displaced images oldest first until the pressure mark.
 	void                             ReleaseDisplaced(bool pressured);
+	// Derives the collection marks from the current device memory budget.
+	void UpdateGcMarks();
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
@@ -361,6 +364,9 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	// Displaced images in the order they were displaced, with their serial (ids are reused).
 	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
+	MemoryBudget::LiveMarks                           m_gc_marks;
+	// Set by tests that configure the marks themselves.
+	bool                                              m_gc_marks_pinned    = false;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;
