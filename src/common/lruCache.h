@@ -14,8 +14,9 @@ class LeastRecentlyUsedCache {
 	struct Item {
 		Object object {};
 		Tick   tick {};
-		Item*  next = nullptr;
-		Item*  prev = nullptr;
+		Item*  next   = nullptr;
+		Item*  prev   = nullptr;
+		bool   linked = false;
 	};
 
 public:
@@ -35,9 +36,10 @@ public:
 		return id;
 	}
 
+	// A freed item is not in the list: touching it would link it again while it waits for reuse.
 	void Touch(size_t id, Tick tick) {
 		auto& item = m_items[id];
-		if (item.tick >= tick) {
+		if (!item.linked || item.tick >= tick) {
 			return;
 		}
 		item.tick = tick;
@@ -48,8 +50,35 @@ public:
 	}
 
 	void Free(size_t id) {
-		Detach(m_items[id]);
+		auto& item = m_items[id];
+		if (!item.linked) {
+			return;
+		}
+		Detach(item);
 		m_free.push_back(id);
+	}
+
+	// The list runs from the oldest to the newest item through every live item exactly once,
+	// and no freed item is in it (for tests).
+	[[nodiscard]] bool IsConsistent() const {
+		const size_t live  = m_items.size() - m_free.size();
+		size_t       count = 0;
+		const Item*  prev  = nullptr;
+		for (const auto* item = m_first; item != nullptr; item = item->next) {
+			if (!item->linked || item->prev != prev || ++count > live) {
+				return false;
+			}
+			prev = item;
+		}
+		if (prev != m_last || count != live) {
+			return false;
+		}
+		for (const auto id: m_free) {
+			if (m_items[id].linked) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	template <typename Function>
@@ -73,8 +102,9 @@ public:
 
 private:
 	void Attach(Item& item) {
-		item.prev = m_last;
-		item.next = nullptr;
+		item.prev   = m_last;
+		item.next   = nullptr;
+		item.linked = true;
 		if (m_last != nullptr) {
 			m_last->next = &item;
 		} else {
@@ -94,6 +124,7 @@ private:
 		} else {
 			m_last = item.prev;
 		}
+		item.linked = false;
 	}
 
 	std::deque<Item>    m_items;
