@@ -11,6 +11,7 @@ using Libs::Graphics::MemoryBudget::DriverHeadroom;
 using Libs::Graphics::MemoryBudget::DriverUsage;
 using Libs::Graphics::MemoryBudget::GiB;
 using Libs::Graphics::MemoryBudget::HeapState;
+using Libs::Graphics::MemoryBudget::LostAccessReport;
 using Libs::Graphics::MemoryBudget::MiB;
 using Libs::Graphics::MemoryBudget::Monitor;
 
@@ -52,6 +53,28 @@ void TestLimit() {
   // A driver that owns more than the budget leaves nothing to the caches.
   Check(CacheLimit({.budget = 4 * GiB, .usage = 5 * GiB, .blocks = GiB}) == 0,
         "the limit underflows");
+}
+
+void TestLostAccessReport() {
+  constexpr uint64_t s = 1000;
+  LostAccessReport report;
+  Check(report.Summary(0) == 0, "an empty report summarizes");
+  for (uint64_t i = 0; i < LostAccessReport::FirstReports; i++) {
+    Check(report.Note(), "one of the first accesses is not logged on its own");
+  }
+  Check(report.Summary(s) == 0, "accesses logged on their own are summarized");
+  for (int i = 0; i < 1000; i++) {
+    Check(!report.Note(), "a later access is logged on its own");
+  }
+  Check(report.Summary(2 * s) == 1000, "the first summary is not due at once");
+  Check(!report.Note(), "a later access is logged on its own");
+  Check(report.Summary(2 * s + LostAccessReport::PeriodMs - 1) == 0,
+        "summaries are not limited to one per period");
+  Check(report.Summary(2 * s + LostAccessReport::PeriodMs) == 1,
+        "the access after a summary is not summarized a period later");
+  Check(report.Summary(100 * s) == 0, "a summary repeats");
+  Check(report.Total() == LostAccessReport::FirstReports + 1001,
+        "the total is not counted");
 }
 
 void TestMonitor() {
@@ -138,6 +161,7 @@ void TestMonitor() {
 int main() {
   TestLimit();
   TestMonitor();
+  TestLostAccessReport();
   std::printf("MemoryBudgetTests: all tests passed\n");
   return 0;
 }
