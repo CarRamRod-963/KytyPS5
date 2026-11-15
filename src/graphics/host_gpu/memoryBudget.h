@@ -41,7 +41,10 @@ struct HeapState {
 // device memory grew, the driver's memory in the host heap grew (allocations demoted out
 // of device memory land there), or the memory at low residency priority (the first to be
 // demoted) moved by PriorityChange in either direction. Shrinking driver memory moves the
-// reference down silently. O(1) per sample.
+// reference down silently. While the device heaps use more than their budget it reports every
+// period (the OS then pages allocations in and out around each submission: a 12 GB card ran
+// 60-128 ms of GPU time per frame instead of ~35), and once more when usage is back within the
+// budget. O(1) per sample.
 class Monitor {
 public:
 	static constexpr uint64_t PeriodMs       = 10'000;
@@ -49,7 +52,15 @@ public:
 	static constexpr uint64_t HostGrowth     = 64 * MiB;
 	static constexpr uint64_t PriorityChange = 512 * MiB;
 
-	enum class Report : uint8_t { None, First, DriverGrew, Demoted, Priorities };
+	enum class Report : uint8_t {
+		None,
+		First,
+		DriverGrew,
+		Demoted,
+		Priorities,
+		OverBudget,
+		WithinBudget
+	};
 
 	[[nodiscard]] Report Sample(const HeapState& device, const HeapState& host, uint64_t now_ms,
 	                            uint64_t low_priority = 0) {
@@ -64,12 +75,17 @@ public:
 		const bool moved   = !first && demoted >= m_demoted + HostGrowth;
 		const bool aged    = !first && (low_priority >= m_low + PriorityChange ||
 		                                m_low >= low_priority + PriorityChange);
+		const bool over    = device.usage > device.budget;
+		const bool back    = m_over && !over;
 		m_sampled          = true;
-		if (first || grew || moved || aged) {
+		m_over             = over;
+		if (first || grew || moved || aged || over || back) {
 			m_driver  = driver;
 			m_demoted = demoted;
 			m_low     = low_priority;
 			return first   ? Report::First
+			       : over  ? Report::OverBudget
+			       : back  ? Report::WithinBudget
 			       : moved ? Report::Demoted
 			       : grew  ? Report::DriverGrew
 			               : Report::Priorities;
@@ -85,6 +101,7 @@ private:
 	uint64_t m_demoted = 0;
 	uint64_t m_low     = 0;
 	bool     m_sampled = false;
+	bool     m_over    = false;
 };
 
 } // namespace Libs::Graphics::MemoryBudget

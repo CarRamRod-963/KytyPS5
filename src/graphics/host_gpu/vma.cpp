@@ -251,7 +251,12 @@ void GraphicContext::MonitorMemoryBudget() {
 	LOGF("%sGPU memory: device %" PRIu64 " of %" PRIu64 " MiB budget, driver %" PRIu64
 	     " MiB, caches %" PRIu64 " MiB (limit %" PRIu64
 	     " MiB); driver memory in the host heap %" PRIu64 " MiB\n",
-	     report == MemoryBudget::Monitor::Report::Demoted
+	     report == MemoryBudget::Monitor::Report::OverBudget
+	         ? "Warning: device memory over budget (the OS pages it over the bus; expect low frame "
+	           "rates). "
+	     : report == MemoryBudget::Monitor::Report::WithinBudget
+	         ? "Device memory back within budget. "
+	     : report == MemoryBudget::Monitor::Report::Demoted
 	         ? "Warning: driver memory grew in the host heap (demoted from device memory?). "
 	         : "",
 	     device.usage / MiB, device.budget / MiB, MemoryBudget::DriverUsage(device) / MiB,
