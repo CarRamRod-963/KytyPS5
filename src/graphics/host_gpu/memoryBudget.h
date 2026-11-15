@@ -37,6 +37,48 @@ struct HeapState {
 	return heap.budget > reserved ? heap.budget - reserved : 0;
 }
 
+// Accesses through the BDA page table to memory no buffer caches are lost for their dispatch (a
+// read sees zeros, a write is dropped). Over the device budget a collector can evict buffers that
+// shaders still use, and one 12 GB session logged 108,527 of them, a line each. The first
+// FirstReports are logged one by one; later ones are counted and summarized at most once per
+// period. O(1) per access.
+class LostAccessReport {
+public:
+	static constexpr uint64_t FirstReports = 32;
+	static constexpr uint64_t PeriodMs     = 10'000;
+
+	// Returns true when this access is to be logged on its own.
+	bool Note() {
+		m_total++;
+		if (m_total <= FirstReports) {
+			return true;
+		}
+		m_unreported++;
+		return false;
+	}
+
+	// Returns the accesses to summarize now (0 when nothing is due): those not logged on their
+	// own, once a period has passed since the last summary.
+	[[nodiscard]] uint64_t Summary(uint64_t now_ms) {
+		if (m_unreported == 0 || (m_summarized && now_ms - m_last_ms < PeriodMs)) {
+			return 0;
+		}
+		m_summarized     = true;
+		m_last_ms        = now_ms;
+		const auto count = m_unreported;
+		m_unreported     = 0;
+		return count;
+	}
+
+	[[nodiscard]] uint64_t Total() const { return m_total; }
+
+private:
+	uint64_t m_total      = 0;
+	uint64_t m_unreported = 0;
+	uint64_t m_last_ms    = 0;
+	bool     m_summarized = false;
+};
+
 // Decides when to print the heap state: at most once per period, and only when the driver's
 // device memory grew, the driver's memory in the host heap grew (allocations demoted out
 // of device memory land there), or the memory at low residency priority (the first to be

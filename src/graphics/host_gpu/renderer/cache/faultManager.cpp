@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -146,7 +147,18 @@ void FaultManager::ProcessFaultBuffer() {
 			    Libs::LibKernel::Memory::MappedRangeSize(address, block_end - address);
 			fault_ranges.Add(address,
 			                 mapped_size != 0 ? mapped_size : BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			if (m_lost_accesses.Note()) {
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			}
+		}
+		const auto now_ms =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                              std::chrono::steady_clock::now().time_since_epoch())
+		                              .count());
+		if (const auto unlogged = m_lost_accesses.Summary(now_ms); unlogged != 0) {
+			LOGF("Accessed non-GPU cached memory %" PRIu64 " more times (%" PRIu64
+			     " in total); each access was lost for its dispatch\n",
+			     unlogged, m_lost_accesses.Total());
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
