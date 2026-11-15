@@ -10494,6 +10494,58 @@ public:
             "buffer bytes");
       }
       {
+        // A texel-buffer read at an image's base synchronizes its buffer from
+        // the image only while no buffer write overlapped the image since its
+        // last native write: bytes such a write produced (Saros keeps a culling
+        // queue's state in transient memory a GPU-written image also covers)
+        // must survive the read.
+        constexpr uint32_t newer_value = 0x5eed1234u;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto image_address = buffer_alias_desc.info.data.address;
+        constexpr uint64_t inner_offset = 12;
+        texture_cache.PrepareGpuBufferWrite(image_address + inner_offset,
+                                            sizeof(uint32_t));
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            image_address + inner_offset, sizeof(uint32_t), true, false);
+        Require(name, "image alias buffer allocation",
+                writable.first != nullptr,
+                "failed to allocate the image alias write buffer");
+        writable.first->Fill(writable.second, sizeof(uint32_t), newer_value);
+        texture_cache.InvalidateMemoryFromGPU(image_address + inner_offset,
+                                              sizeof(uint32_t));
+        auto texel = resources.GetBufferCache().ObtainBuffer(
+            image_address, 4 * sizeof(uint32_t), false, true);
+        Require(name, "image alias texel buffer", texel.first != nullptr,
+                "failed to obtain the texel buffer over the image");
+        auto readback = CreateHostBuffer(
+            name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        vk::MemoryBarrier to_copy{};
+        to_copy.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        to_copy.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_copy, 0, nullptr,
+            0, nullptr);
+        const vk::BufferCopy copy{texel.second + inner_offset, 0,
+                                  sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(texel.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(
+            name, "newer buffer bytes survive a texel read of the image",
+            ReadBuffer(name, readback, 1) == std::vector<u32>{newer_value},
+            "a texel-buffer read synchronized the buffer from an image a later "
+            "buffer write had overlapped, undoing that write");
+        DestroyBuffer(&readback);
+      }
+      {
         // Transient resources share heap memory: a large target bound later
         // spans a smaller GPU-written image further in. Which of their texels
         // the memory holds is unknown (binding a target does not write all of
