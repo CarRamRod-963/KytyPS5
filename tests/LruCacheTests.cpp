@@ -144,6 +144,55 @@ void TestFreeAndIdReuse() {
   Check(Collect(cache, 70).size() == 1, "touching a rebuilt item failed");
 }
 
+// A freed item stays out of the list whatever touches or frees it until an
+// insert takes it: linked again, the insert that reuses it would link it twice
+// and could close the list into a cycle that ForEachItemBelow never leaves.
+void TestStaleTouchAndFree() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  (void)cache.Insert("a", 10);
+  const auto b = cache.Insert("b", 20);
+  const auto c = cache.Insert("c", 30);
+  Check(cache.IsConsistent(), "a fresh list is not consistent");
+
+  cache.Free(b);
+  cache.Touch(b, 40); // a stale holder of the freed id
+  Check(cache.IsConsistent(), "touching a freed id linked it again");
+  cache.Free(b);
+  Check(cache.IsConsistent(), "freeing a freed id twice broke the list");
+
+  // The freed (newest) item is reused, then ages below the walk's tick.
+  cache.Free(c);
+  cache.Touch(c, 50);
+  (void)cache.Insert("d", 60);
+  (void)cache.Insert("e", 70);
+  Check(cache.IsConsistent(), "reusing a stale-touched id broke the list");
+  size_t visits = 0;
+  cache.ForEachItemBelow(UINT64_MAX,
+                         [&](const std::string &) { return ++visits > 16; });
+  Check(visits == 3, "the walk did not visit every live item exactly once");
+}
+
+// A longer cycle without any reuse: a stale touch of a freed item relinks it
+// from its stale neighbours, and freeing one of them closes a cycle of two
+// items (found by a search over short free/touch/insert sequences of the
+// unguarded cache).
+void TestStaleTouchTwoItemCycle() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  (void)cache.Insert("a", 10);
+  const auto b = cache.Insert("b", 20);
+  const auto c = cache.Insert("c", 30);
+  const auto d = cache.Insert("d", 40);
+  cache.Free(c);
+  cache.Touch(b, 50);
+  cache.Touch(c, 60); // a stale holder of the freed id
+  cache.Free(d);
+  Check(cache.IsConsistent(), "a stale touch of a freed item broke the list");
+  size_t visits = 0;
+  cache.ForEachItemBelow(UINT64_MAX,
+                         [&](const std::string &) { return ++visits > 16; });
+  Check(visits == 2, "the walk did not visit every live item exactly once");
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +200,8 @@ int main() {
   TestEarlyExitCallback();
   TestTouchReordersAndSkips();
   TestFreeAndIdReuse();
+  TestStaleTouchAndFree();
+  TestStaleTouchTwoItemCycle();
   std::puts("LruCacheTests: all cases passed");
   return 0;
 }
