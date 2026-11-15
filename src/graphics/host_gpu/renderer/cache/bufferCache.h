@@ -9,6 +9,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/bdaSyncQueue.h"
 #include "graphics/host_gpu/filteredRangeSet.h"
+#include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -175,6 +176,8 @@ public:
 	void                   NoteBdaOrderingPoint(uint64_t epoch = BdaSyncQueue::AllEpochs);
 	void                   TakeBdaSync(BdaSyncDue& due);
 	void               RunGarbageCollector();
+	// Derives the collection marks from the current device memory budget.
+	void UpdateGcMarks();
 	// Called before every submission on the GPU thread: records downloads of the hot read-back
 	// pages the GPU wrote since the last submission, published into guest memory when the
 	// submission completes, so the guest finds them clean instead of faulting into a
@@ -363,6 +366,9 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	MemoryBudget::LiveMarks                           m_gc_marks;
+	// Set by tests that configure the marks themselves.
+	bool     m_gc_marks_pinned    = false;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
