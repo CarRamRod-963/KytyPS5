@@ -37,6 +37,14 @@ struct HeapState {
 	return heap.budget > reserved ? heap.budget - reserved : 0;
 }
 
+// Usage of the device heaps (VMA's blocks plus the driver's memory) above which the caches give
+// memory back at once: past it the driver headroom is used up, and past the budget the OS pages
+// allocations over the bus around each submission.
+[[nodiscard]] constexpr uint64_t UsageLimit(uint64_t budget) {
+	const auto headroom = DriverHeadroom(budget);
+	return budget > headroom ? budget - headroom : 0;
+}
+
 // Device-memory usage marks of a cache's garbage collector, derived from the budget the caches
 // work with (GraphicContext::GetTotalMemoryBudget: the device-local budget minus a reserve).
 // Above `trigger` the collector deletes entries nobody used for a while, above `pressure` it

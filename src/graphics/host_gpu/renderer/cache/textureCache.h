@@ -283,6 +283,9 @@ private:
 	void                             ReleaseDisplaced(bool pressured);
 	// Derives the collection marks from the current device memory budget.
 	void UpdateGcMarks();
+	// Above the device memory usage limit (MemoryBudget::UsageLimit): deletes images unused for a
+	// few frames, oldest first, until usage is back under it. Returns the images deleted.
+	size_t                           CollectOverLimit(uint64_t tick, uint64_t limit);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
