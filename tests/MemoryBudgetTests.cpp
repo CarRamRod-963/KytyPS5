@@ -108,6 +108,29 @@ void TestMonitor() {
   Check(monitor.Sample(device(GiB / 8 + 64 * MiB), host(128 * MiB), 96 * s,
                        GiB) == Monitor::Report::Priorities,
         "promotion out of low priority is not reported");
+  // Usage above the budget is reported every period, and once more when it is
+  // back within the budget.
+  const auto over = [](uint64_t usage) {
+    return HeapState{.budget = 10 * GiB, .usage = usage, .blocks = usage - GiB};
+  };
+  Monitor paging;
+  Check(paging.Sample(over(9 * GiB), host(0), 0) == Monitor::Report::First,
+        "the first sample is not reported");
+  Check(paging.Sample(over(10 * GiB), host(0), 10 * s) == Monitor::Report::None,
+        "usage at the budget is reported as over it");
+  Check(paging.Sample(over(10 * GiB + MiB), host(0), 20 * s) ==
+            Monitor::Report::OverBudget,
+        "usage over the budget is not reported");
+  Check(paging.Sample(over(12 * GiB), host(0), 25 * s) == Monitor::Report::None,
+        "over-budget reports are not limited to one per period");
+  Check(paging.Sample(over(10 * GiB + MiB), host(0), 30 * s) ==
+            Monitor::Report::OverBudget,
+        "usage that stays over the budget is not reported again");
+  Check(paging.Sample(over(9 * GiB), host(0), 40 * s) ==
+            Monitor::Report::WithinBudget,
+        "the return within the budget is not reported");
+  Check(paging.Sample(over(9 * GiB), host(0), 50 * s) == Monitor::Report::None,
+        "usage within the budget is reported again");
 }
 
 } // namespace
