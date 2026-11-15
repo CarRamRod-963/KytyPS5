@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <chrono>
+#include <cinttypes>
 
 namespace Libs::Graphics {
 
@@ -28,13 +29,22 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		Failed("vkGetSemaphoreCounterValue", result, 0);
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
 	}
+}
+
+void MasterSemaphore::Failed(const char* call, vk::Result result, uint64_t tick) const {
+	// A lost device usually ends here: name the result and the memory state for the report.
+	m_graphics.LogMemoryBudget();
+	EXIT("%s failed: %s (waiting for tick %" PRIu64 ", GPU at %" PRIu64 ")\n", call,
+	     vk::to_string(result).c_str(), tick, m_gpu_tick.load(std::memory_order_relaxed));
 }
 
 bool MasterSemaphore::Wait(uint64_t tick) {
@@ -56,7 +66,9 @@ bool MasterSemaphore::Wait(uint64_t tick) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 		                                         Common::DebugCounters::Counter::GpuWaitNs);
 		const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		if (result != vk::Result::eSuccess) {
+			Failed("vkWaitSemaphores", result, tick);
+		}
 	}
 	const auto waited = std::chrono::steady_clock::now() - start;
 	Common::GpuTiming::Sync().AddWait(
