@@ -186,19 +186,22 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 void TextureCache::UpdateGcMarks() {
-	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage() ||
-	    !m_gc_marks.Update(m_graphics.GetTotalMemoryBudget())) {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
-	const auto marks     = m_gc_marks.Texture();
+	const auto live = m_graphics.UpdateCacheMarks();
+	if (live.Generation() == m_gc_marks_generation) {
+		return;
+	}
+	m_gc_marks_generation = live.Generation();
+	const auto marks      = live.Texture();
 	m_trigger_gc_memory  = marks.trigger;
 	m_pressure_gc_memory = marks.pressure;
 	m_critical_gc_memory = marks.critical;
 	using MemoryBudget::MiB;
 	LOGF("TextureCache: device memory budget %" PRIu64 " MiB, collection marks %" PRIu64 "/%" PRIu64
 	     "/%" PRIu64 " MiB (trigger/pressure/critical)\n",
-	     m_gc_marks.Budget() / MiB, marks.trigger / MiB, marks.pressure / MiB,
-	     marks.critical / MiB);
+	     live.Budget() / MiB, marks.trigger / MiB, marks.pressure / MiB, marks.critical / MiB);
 }
 
 TextureCache::~TextureCache() {

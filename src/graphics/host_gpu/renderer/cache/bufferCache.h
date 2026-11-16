@@ -387,7 +387,8 @@ private:
 	uint64_t                                          m_draw_window = 0;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
-	MemoryBudget::LiveMarks                           m_gc_marks;
+	// GraphicContext::UpdateCacheMarks generation the marks were taken from.
+	uint64_t m_gc_marks_generation = 0;
 	// Set by tests that configure the marks themselves.
 	bool     m_gc_marks_pinned    = false;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

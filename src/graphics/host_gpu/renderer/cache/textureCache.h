@@ -385,7 +385,8 @@ private:
 	std::atomic<uint64_t> m_release_pending {0};
 	// Displaced images in the order they were displaced, with their serial (ids are reused).
 	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
-	MemoryBudget::LiveMarks                           m_gc_marks;
+	// GraphicContext::UpdateCacheMarks generation the marks were taken from.
+	uint64_t m_gc_marks_generation = 0;
 	// Set by tests that configure the marks themselves.
 	bool                                              m_gc_marks_pinned    = false;
 	uint64_t                                          m_trigger_gc_memory  = 0;
