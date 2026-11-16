@@ -144,6 +144,10 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// The collection marks of the texture and buffer caches, updated from the current budget
+	// (GetTotalMemoryBudget). One object for both: each cache following the budget on its own
+	// settled on budgets up to the hysteresis apart.
+	[[nodiscard]] MemoryBudget::LiveMarks UpdateCacheMarks();
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
@@ -206,6 +210,8 @@ struct GraphicContext {
 	std::atomic<uint64_t> image_fallback_count = 0;
 	uint32_t              memory_budget_frame  = 0;
 	MemoryBudget::Monitor memory_budget_monitor;
+	std::mutex                               cache_marks_mutex;
+	MemoryBudget::LiveMarks                  cache_marks;
 	MemoryPriority::Tracker                  memory_priority;
 	std::mutex                               priority_pools_mutex;
 	std::array<VmaPool, VK_MAX_MEMORY_TYPES> priority_pools {};
