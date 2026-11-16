@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -160,6 +161,30 @@ public:
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
+	// The image holds what its memory holds: GPU-written contents that no buffer write overlapped
+	// since (buffer_written). Only then may all of the image be copied over its memory.
+	[[nodiscard]] bool HoldsCurrentContents() const noexcept {
+		return SafeToDownload() && !buffer_written;
+	}
+	// The part of the image's memory buffer writes may have produced since its last native write
+	// (empty when none did): one range around all of them, clipped to the image.
+	[[nodiscard]] GuestRange BufferWrittenRange() const noexcept {
+		return buffer_written ? buffer_written_range : GuestRange {};
+	}
+	void NoteBufferWrite(uint64_t address, uint64_t size) noexcept {
+		const auto begin = std::max(address, info.data.address);
+		const auto end   = std::min(address + size, info.data.End());
+		if (begin >= end) {
+			return;
+		}
+		if (buffer_written_range.size != 0) {
+			const auto old_end   = buffer_written_range.End();
+			const auto first     = std::min(begin, buffer_written_range.address);
+			buffer_written_range = {first, std::max(end, old_end) - first};
+		} else {
+			buffer_written_range = {begin, end - begin};
+		}
+	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
@@ -220,7 +245,8 @@ public:
 	uint64_t         metadata_write_sequence = 0;
 	// A GPU buffer write overlapped the image since its last native write (TextureCache::
 	// PrepareGpuBufferWrite): its memory may hold newer bytes than the image.
-	bool buffer_written = false;
+	bool       buffer_written = false;
+	GuestRange buffer_written_range {};
 
 private:
 	friend struct ImageTestAccess;
