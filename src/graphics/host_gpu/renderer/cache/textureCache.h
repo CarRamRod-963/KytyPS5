@@ -122,7 +122,11 @@ public:
 	// Called before a GPU buffer write of guest memory is recorded. The write refreshes images
 	// from guest memory (InvalidateMemoryFromGPU); one it covers only partly keeps its other
 	// GPU-written contents, which move into the buffer cache ahead of the write.
-	void               PrepareGpuBufferWrite(uint64_t address, uint64_t size);
+	// A conservative range bounds the write (a written V#'s extent); an exact one is written
+	// whole (fills and copies).
+	enum class BufferWriteExtent : uint8_t { Conservative, Exact };
+	void PrepareGpuBufferWrite(uint64_t address, uint64_t size,
+	                           BufferWriteExtent extent = BufferWriteExtent::Conservative);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.

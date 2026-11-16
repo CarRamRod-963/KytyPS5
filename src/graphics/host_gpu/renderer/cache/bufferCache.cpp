@@ -1146,7 +1146,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
-	m_texture_cache.PrepareGpuBufferWrite(vaddr, size);
+	m_texture_cache.PrepareGpuBufferWrite(vaddr, size, TextureCache::BufferWriteExtent::Exact);
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
@@ -1187,7 +1187,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 
 	if (dst_memory) {
-		m_texture_cache.PrepareGpuBufferWrite(dst_vaddr, size);
+		m_texture_cache.PrepareGpuBufferWrite(dst_vaddr, size,
+		                                      TextureCache::BufferWriteExtent::Exact);
 	}
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {

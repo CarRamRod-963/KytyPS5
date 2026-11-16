@@ -243,6 +243,11 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Runs `download` (an image copied into `buffer` over `copied`) and keeps the buffer's bytes
+	// in `written`, the part of the image's memory later buffer writes may have produced.
+	template <typename Download>
+	void KeepBufferWrittenBytes(Buffer& buffer, GuestRange written, GuestRange copied,
+	                            Download&& download);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse. A
 	// synchronous download given a batch only records its copies and appends its publication:
 	// the caller submits once for the whole batch, waits, and runs the publications in order.
