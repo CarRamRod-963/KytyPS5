@@ -122,23 +122,40 @@ void TestMarks() {
 void TestLostAccessReport() {
   constexpr uint64_t s = 1000;
   LostAccessReport report;
-  Check(report.Summary(0) == 0, "an empty report summarizes");
+  Check(!report.Summary(0), "an empty report summarizes");
   for (uint64_t i = 0; i < LostAccessReport::FirstReports; i++) {
     Check(report.Note(), "one of the first accesses is not logged on its own");
   }
-  Check(report.Summary(s) == 0, "accesses logged on their own are summarized");
+  Check(!report.Summary(s), "accesses logged on their own are summarized");
   for (int i = 0; i < 1000; i++) {
     Check(!report.Note(), "a later access is logged on its own");
   }
-  Check(report.Summary(2 * s) == 1000, "the first summary is not due at once");
+  Check(report.Summary(2 * s).accesses == 1000,
+        "the first summary is not due at once");
   Check(!report.Note(), "a later access is logged on its own");
-  Check(report.Summary(2 * s + LostAccessReport::PeriodMs - 1) == 0,
+  Check(!report.Summary(2 * s + LostAccessReport::PeriodMs - 1),
         "summaries are not limited to one per period");
-  Check(report.Summary(2 * s + LostAccessReport::PeriodMs) == 1,
+  Check(report.Summary(2 * s + LostAccessReport::PeriodMs).accesses == 1,
         "the access after a summary is not summarized a period later");
-  Check(report.Summary(100 * s) == 0, "a summary repeats");
+  Check(!report.Summary(100 * s), "a summary repeats");
   Check(report.Total() == LostAccessReport::FirstReports + 1001,
         "the total is not counted");
+
+  // Overflows of the fault report area are summarized like accesses, also on
+  // their own (the dropped reports hold no lost access to count).
+  report.NoteOverflow();
+  report.NoteOverflow();
+  const auto overflowed = report.Summary(200 * s);
+  Check(overflowed && overflowed.accesses == 0 && overflowed.overflows == 2,
+        "overflows of the report area are not summarized");
+  report.NoteOverflow();
+  Check(!report.Summary(200 * s + LostAccessReport::PeriodMs - 1),
+        "overflow summaries are not limited to one per period");
+  Check(report.Summary(200 * s + LostAccessReport::PeriodMs).overflows == 1,
+        "an overflow after a summary is not summarized a period later");
+  Check(report.Overflows() == 3 &&
+            report.Total() == LostAccessReport::FirstReports + 1001,
+        "the overflow total is not counted apart from the accesses");
 }
 
 void TestMonitor() {
