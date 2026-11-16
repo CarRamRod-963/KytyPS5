@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 
 // Device-memory budget arithmetic for the caches. Vulkan-free so it can be unit tested; the
 // numbers come from VK_EXT_memory_budget through VMA.
@@ -148,26 +149,42 @@ public:
 		return false;
 	}
 
-	// Returns the accesses to summarize now (0 when nothing is due): those not logged on their
-	// own, once a period has passed since the last summary.
-	[[nodiscard]] uint64_t Summary(uint64_t now_ms) {
-		if (m_unreported == 0 || (m_summarized && now_ms - m_last_ms < PeriodMs)) {
-			return 0;
+	// The fault report area overflowed: reports past its end were dropped, so the accesses they
+	// held are neither logged nor counted (watched buffers count as accessed instead).
+	void NoteOverflow() {
+		m_overflows++;
+		m_unreported_overflows++;
+	}
+
+	struct Due {
+		uint64_t accesses  = 0;
+		uint64_t overflows = 0;
+
+		[[nodiscard]] explicit operator bool() const { return accesses != 0 || overflows != 0; }
+	};
+
+	// Returns what to summarize now (nothing when nothing is due): the accesses not logged on
+	// their own and the overflows since the last summary, once a period has passed since it.
+	[[nodiscard]] Due Summary(uint64_t now_ms) {
+		if ((m_unreported == 0 && m_unreported_overflows == 0) ||
+		    (m_summarized && now_ms - m_last_ms < PeriodMs)) {
+			return {};
 		}
-		m_summarized     = true;
-		m_last_ms        = now_ms;
-		const auto count = m_unreported;
-		m_unreported     = 0;
-		return count;
+		m_summarized = true;
+		m_last_ms    = now_ms;
+		return {std::exchange(m_unreported, 0), std::exchange(m_unreported_overflows, 0)};
 	}
 
 	[[nodiscard]] uint64_t Total() const { return m_total; }
+	[[nodiscard]] uint64_t Overflows() const { return m_overflows; }
 
 private:
-	uint64_t m_total      = 0;
-	uint64_t m_unreported = 0;
-	uint64_t m_last_ms    = 0;
-	bool     m_summarized = false;
+	uint64_t m_total                = 0;
+	uint64_t m_unreported           = 0;
+	uint64_t m_overflows            = 0;
+	uint64_t m_unreported_overflows = 0;
+	uint64_t m_last_ms              = 0;
+	bool     m_summarized           = false;
 };
 
 // Decides when to print the heap state: at most once per period, and only when the driver's
