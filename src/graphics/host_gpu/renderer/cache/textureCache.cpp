@@ -2782,7 +2782,12 @@ size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
 			TouchImage(*owner);
 			continue;
 		}
-		if (owner->SafeToDownload()) {
+		// A displaced image is never written back: an overlapping image superseded its contents.
+		// Once unused for NumFramesBeforeRemoval frames, ResolveOverlap deletes it without
+		// write-back the next time an overlapping image is looked up; over the limit it goes now
+		// (otherwise no collector frees it, and the old end of the LRU fills up with them).
+		const bool superseded = owner->displaced && FramesUnused(*owner) > NumFramesBeforeRemoval;
+		if (owner->SafeToDownload() && !superseded) {
 			if (!owner->info.HasStencil()) {
 				written_back.push_back(id);
 			}
