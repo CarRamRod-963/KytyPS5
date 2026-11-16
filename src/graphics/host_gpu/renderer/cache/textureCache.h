@@ -369,6 +369,9 @@ private:
 	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
+	// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
+	// each, landing when it completes); at most this many bytes per collection.
+	uint64_t m_over_limit_write_back_bytes = 256ull << 20u;
 	// Displaced images in the order they were displaced, with their serial (ids are reused).
 	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
 	MemoryBudget::LiveMarks                           m_gc_marks;
