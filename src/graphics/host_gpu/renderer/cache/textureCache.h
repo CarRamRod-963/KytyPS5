@@ -372,6 +372,8 @@ private:
 	// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
 	// each, landing when it completes); at most this many bytes per collection.
 	uint64_t m_over_limit_write_back_bytes = 256ull << 20u;
+	// Accounted bytes of deleted images whose backing waits for its deferred release.
+	std::atomic<uint64_t> m_release_pending {0};
 	// Displaced images in the order they were displaced, with their serial (ids are reused).
 	std::vector<std::pair<ImageId, uint64_t>>         m_displaced_images;
 	MemoryBudget::LiveMarks                           m_gc_marks;
