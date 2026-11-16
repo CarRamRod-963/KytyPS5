@@ -486,6 +486,15 @@ struct TextureCacheTestAccess {
     return cache.m_total_used_memory;
   }
 
+  static void SetOverLimitWriteBackBytes(TextureCache &cache, uint64_t bytes) {
+    cache.m_over_limit_write_back_bytes = bytes;
+  }
+
+  static void MarkDisplaced(TextureCache &cache, ImageId id) {
+    std::scoped_lock lock{cache.m_lock};
+    cache.MarkDisplaced(id);
+  }
+
   static uint64_t AccountedSize(TextureCache &cache, ImageId id) {
     return cache.m_slot_images[id].AccountedSize();
   }
@@ -14178,11 +14187,35 @@ public:
                       std::vector<u32>{written},
               "the deleted GPU-written image was not written back");
 
+      // A GPU-written image the collection cannot write back (displaced: an
+      // overlapping image superseded it) in front of one it can: only the
+      // completed write-back costs the quota, so the second image goes.
+      const auto written_image = [&](uint64_t address) {
+        const auto id = create(address, true);
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        cache.MarkGpuWritten(id);
+        return id;
+      };
+      const auto displaced_id = written_image(base + 6 * stride);
+      const auto downloadable_id = written_image(base + 7 * stride);
+      TextureCacheTestAccess::MarkDisplaced(cache, displaced_id);
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          cache, std::array{displaced_id, downloadable_id}, 200, UINT64_MAX);
+      TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, size);
+      Require(name, "refused write-back costs no quota",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+                  contains(displaced_id) && !contains(downloadable_id),
+              "an image the collection could not write back used up the "
+              "write-back quota");
+      TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, 256ull << 20u);
+      scheduler.Finish();
       // An image a buffer write overlapped since its last native write holds
       // older bytes than its memory there: the collection writes back the rest
       // of the image and frees it.
       {
-        const auto overlapped_address = base + 6 * stride;
+        const auto overlapped_address = base + 12 * stride;
         const auto overlapped_id = create(overlapped_address, true);
         TextureCacheTestAccess::ClearImage(
             cache, scheduler.Current(), overlapped_id,
