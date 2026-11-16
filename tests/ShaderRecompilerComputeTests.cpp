@@ -487,6 +487,11 @@ struct TextureCacheTestAccess {
     cache.MarkDisplaced(id);
   }
 
+  // The frame of the image's last lookup, without touching it in the LRU.
+  static void SetLastAccess(TextureCache &cache, ImageId id, uint64_t tick) {
+    cache.m_slot_images[id].tick_accessed_last = tick;
+  }
+
   static uint64_t AccountedSize(TextureCache &cache, ImageId id) {
     return cache.m_slot_images[id].AccountedSize();
   }
@@ -13951,8 +13956,10 @@ public:
               "a deficit the pool covered");
 
       // A GPU-written image the collection cannot write back (displaced: an
-      // overlapping image superseded it) in front of one it can: only the
-      // completed write-back costs the quota, so the second image goes.
+      // overlapping image superseded it; looked up in the last frames, so not
+      // yet aged out) in front of one it can: only the completed write-back
+      // costs the quota, so the second image goes. A displaced image unused
+      // for longer goes without a write-back.
       const auto written_image = [&](uint64_t address) {
         const auto id = create(address, true);
         TextureCacheTestAccess::ClearImage(
@@ -13961,19 +13968,32 @@ public:
         cache.MarkGpuWritten(id);
         return id;
       };
+      const auto aged_id = written_image(base + 8 * stride);
       const auto displaced_id = written_image(base + 6 * stride);
       const auto downloadable_id = written_image(base + 7 * stride);
+      TextureCacheTestAccess::MarkDisplaced(cache, aged_id);
       TextureCacheTestAccess::MarkDisplaced(cache, displaced_id);
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          cache, std::array{displaced_id, downloadable_id}, 200, UINT64_MAX);
+          cache, std::array{aged_id, displaced_id, downloadable_id}, 200,
+          UINT64_MAX);
+      TextureCacheTestAccess::SetLastAccess(cache, displaced_id, 199);
       TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, size);
       Require(name, "refused write-back costs no quota",
-              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+              TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 2 &&
                   contains(displaced_id) && !contains(downloadable_id),
               "an image the collection could not write back used up the "
               "write-back quota");
+      Require(name, "aged displaced image freed", !contains(aged_id),
+              "a displaced image unused for longer than the overlap age was "
+              "kept above the limit");
       TextureCacheTestAccess::SetOverLimitWriteBackBytes(cache, 256ull << 20u);
       scheduler.Finish();
+      const auto *aged_bytes =
+          static_cast<const uint8_t *>(mapped) + 8 * stride;
+      Require(name, "aged displaced image not written back",
+              std::all_of(aged_bytes, aged_bytes + image_size,
+                          [](uint8_t value) { return value == 0x5a; }),
+              "the displaced image's superseded contents reached guest memory");
       // An image a buffer write overlapped since its last native write holds
       // older bytes than its memory there: the collection writes back the rest
       // of the image and frees it.
