@@ -1,3 +1,6 @@
+// The stale-id cases below touch and free items that are not in the list on
+// purpose.
+#define KYTY_LRU_CACHE_ALLOW_STALE
 #include "common/lruCache.h"
 
 #include <cstdint>
@@ -159,6 +162,8 @@ void TestStaleTouchAndFree() {
   Check(cache.IsConsistent(), "touching a freed id linked it again");
   cache.Free(b);
   Check(cache.IsConsistent(), "freeing a freed id twice broke the list");
+  Check(cache.StaleOperations() == 2,
+        "stale touches and frees were not counted");
 
   // The freed (newest) item is reused, then ages below the walk's tick.
   cache.Free(c);
@@ -170,6 +175,8 @@ void TestStaleTouchAndFree() {
   cache.ForEachItemBelow(UINT64_MAX,
                          [&](const std::string &) { return ++visits > 16; });
   Check(visits == 3, "the walk did not visit every live item exactly once");
+  Check(cache.StaleOperations() == 3,
+        "a stale touch of a freed id was not counted");
 }
 
 // A longer cycle without any reuse: a stale touch of a freed item relinks it
