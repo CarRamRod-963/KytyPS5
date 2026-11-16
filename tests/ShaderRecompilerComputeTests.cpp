@@ -13837,6 +13837,8 @@ public:
     {
       context.MapMemory(base, allocation_size);
       auto &cache = context.GetTextureCache();
+      // Recycled backings of earlier cases would count against the deficit.
+      context.GetGraphics().DestroyRecycledImages();
       // Sampled images hold what guest memory holds; the GPU writes storage
       // ones.
       const auto describe = [&](uint64_t address, bool storage = false) {
@@ -13899,6 +13901,15 @@ public:
               collected == 3 &&
                   TextureCacheTestAccess::UsedMemory(cache) == used - 3 * size,
               "the collection did not stop once usage was under the limit");
+      // The next collection samples the same usage: the deleted images'
+      // backings are released only when their deferred destruction runs, so
+      // they count as released and nothing more goes.
+      Require(name, "pending releases count",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, limit) ==
+                      0 &&
+                  contains(gpu_id) && std::ranges::all_of(recent_ids, contains),
+              "the collection evicted again for memory whose release was "
+              "already pending");
 
       // Still over the limit: the GPU-written image is written back and goes;
       // the images the last frame used stay although usage remains over it.
@@ -13920,6 +13931,24 @@ public:
                                    static_cast<int32_t>(height) - 1, 0}) ==
                       std::vector<u32>{written},
               "the deleted GPU-written image was not written back");
+
+      // The deleted sampled images' backings are in the recycle pool now. A
+      // deficit of one byte destroys one of them, not the pool, and deletes no
+      // image.
+      auto &graphics = context.GetGraphics();
+      const auto pooled = [&] {
+        std::scoped_lock pool_lock{graphics.recycled_images_mutex};
+        return graphics.recycled_images.size();
+      };
+      const auto pooled_before = pooled();
+      Require(name, "recycled backings", pooled_before >= 2,
+              "the deleted images' backings were not recycled");
+      Require(name, "pool trimmed to the deficit",
+              TextureCacheTestAccess::CollectOverLimit(cache, used, used - 1) ==
+                      0 &&
+                  pooled() == pooled_before - 1,
+              "the collection emptied the recycle pool or deleted images for "
+              "a deficit the pool covered");
 
       // A GPU-written image the collection cannot write back (displaced: an
       // overlapping image superseded it) in front of one it can: only the

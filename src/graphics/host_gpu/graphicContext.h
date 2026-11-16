@@ -167,6 +167,9 @@ struct GraphicContext {
 	            MemoryPriority::Class memory_class = MemoryPriority::Class::Cache);
 	void                   DeleteImage(VulkanImage& image);
 	void                   DestroyRecycledImages();
+	// Destroys recycled backings, oldest first, until at least `bytes` are freed or none are left.
+	// Returns the bytes freed.
+	uint64_t TrimRecycledImages(uint64_t bytes);
 
 	// Residency priorities (memoryPriority.h). Target and Pinned allocations come from pools
 	// created with a high priority, so they never share a block with cached textures.
