@@ -135,6 +135,7 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto count    = std::min<uint64_t>(reported, MaxPageFaults - 1);
 		if (reported != count) {
 			m_buffer_cache.NoteLostBdaReports();
+			m_lost_accesses.NoteOverflow();
 		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
@@ -159,10 +160,11 @@ void FaultManager::ProcessFaultBuffer() {
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 		                              std::chrono::steady_clock::now().time_since_epoch())
 		                              .count());
-		if (const auto unlogged = m_lost_accesses.Summary(now_ms); unlogged != 0) {
+		if (const auto due = m_lost_accesses.Summary(now_ms)) {
 			LOGF("Accessed non-GPU cached memory %" PRIu64 " more times (%" PRIu64
-			     " in total); each access was lost for its dispatch\n",
-			     unlogged, m_lost_accesses.Total());
+			     " in total); each access was lost for its dispatch. The fault report area "
+			     "overflowed %" PRIu64 " times (%" PRIu64 " in total)\n",
+			     due.accesses, m_lost_accesses.Total(), due.overflows, m_lost_accesses.Overflows());
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
