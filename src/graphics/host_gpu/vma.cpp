@@ -81,6 +81,22 @@ void GraphicContext::DestroyRecycledImages() {
 	recycled_image_bytes = 0;
 }
 
+uint64_t GraphicContext::TrimRecycledImages(uint64_t bytes) {
+	std::scoped_lock lock(recycled_images_mutex);
+	uint64_t         freed = 0;
+	size_t           count = 0;
+	for (; count < recycled_images.size() && freed < bytes; count++) {
+		const auto& recycled = recycled_images[count];
+		UntrackAllocation(recycled.memory, recycled.memory_class);
+		vmaDestroyImage(allocator, recycled.image, recycled.allocation);
+		freed += recycled.bytes;
+	}
+	recycled_images.erase(recycled_images.begin(),
+	                      recycled_images.begin() + static_cast<ptrdiff_t>(count));
+	recycled_image_bytes -= freed;
+	return freed;
+}
+
 void GraphicContext::PreparePriorityAllocation(VmaAllocationCreateInfo& info,
                                                MemoryPriority::Class    memory_class,
                                                uint32_t                 memory_type) {

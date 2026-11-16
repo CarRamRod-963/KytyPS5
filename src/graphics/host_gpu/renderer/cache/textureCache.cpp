@@ -336,9 +336,15 @@ void TextureCache::DeleteImage(ImageId id) {
 			m_surface_metas.erase(metadata);
 		}
 	}
+	const auto released = image.AccountedSize();
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		// The backing is released by the erase, once the commands that use it completed.
+		m_release_pending.fetch_add(released, std::memory_order_relaxed);
+		m_scheduler.DeferOperation([this, id, released] {
+			m_release_pending.fetch_sub(released, std::memory_order_relaxed);
+			m_slot_images.erase(id);
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -2720,11 +2726,20 @@ void TextureCache::RunGarbageCollector() {
 }
 
 size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
+	// Images deleted earlier release their memory only when their deferred destruction runs, about
+	// a frame later, and the sampled usage still holds them until then: without them in the
+	// deficit, each collection would evict the same bytes again. The images this collection frees
+	// leave m_total_used_memory at once.
+	const auto pending =
+	    std::min(m_release_pending.load(std::memory_order_relaxed), m_total_used_memory);
+	limit = limit > UINT64_MAX - pending ? UINT64_MAX : limit + pending;
 	if (m_total_used_memory <= limit) {
 		return 0;
 	}
-	// Backings kept for reuse and idle tiling scratch are freed first.
-	m_graphics.DestroyRecycledImages();
+	// Backings kept for reuse go first, but only as many bytes as the deficit: the pool absorbs
+	// the transient targets deleted and created again each frame. Idle tiling scratch next.
+	m_total_used_memory -=
+	    std::min(m_total_used_memory, m_graphics.TrimRecycledImages(m_total_used_memory - limit));
 	m_tiler.ReleaseScratch();
 	std::vector<ImageId> candidates;
 	m_lru_cache.ForEachItemBelow(tick - std::min(NumFramesBeforeOverLimitRemoval, tick),
