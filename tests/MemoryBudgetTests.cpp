@@ -97,26 +97,64 @@ void TestMarks() {
 
   // A 12 GB card: 11,172 MiB of budget at start, 10,251 MiB later in the
   // session (both minus the 1 GiB reserve of GetTotalMemoryBudget).
+  constexpr uint64_t s = 1000;
   LiveMarks marks;
-  Check(marks.Update(10148 * MiB), "the first budget sets no marks");
+  Check(marks.Generation() == 0, "marks without a budget have a generation");
+  Check(marks.Update(10148 * MiB, 0), "the first budget sets no marks");
+  Check(marks.Generation() == 1, "the first marks did not start a generation");
   Check(marks.Texture() == TextureMarks(10148 * MiB),
         "the texture marks do not follow the first budget");
   Check(marks.Texture().pressure / MiB == 5232 &&
             marks.Texture().critical / MiB == 8509,
         "a 12 GB card's marks moved");
-  Check(!marks.Update(10148 * MiB + 511 * MiB),
+  Check(!marks.Update(10148 * MiB + 511 * MiB, s),
         "a change below the hysteresis moves the marks");
-  Check(!marks.Update(10148 * MiB - 511 * MiB),
+  Check(!marks.Update(10148 * MiB - 511 * MiB, 2 * s),
         "a drop below the hysteresis moves the marks");
   Check(marks.Budget() == 10148 * MiB, "the hysteresis moved the budget");
-  Check(marks.Update(9227 * MiB), "a budget drop is not followed");
+  Check(marks.Update(9227 * MiB, 3 * s),
+        "a budget drop is not followed at once");
   Check(marks.Texture() == TextureMarks(9227 * MiB) &&
-            marks.Buffer() == BufferMarks(9227 * MiB),
+            marks.Buffer() == BufferMarks(9227 * MiB) &&
+            marks.Generation() == 2,
         "the marks do not follow the dropped budget");
   Check(marks.Texture().critical < TextureMarks(10148 * MiB).critical,
         "a smaller budget does not lower the critical mark");
-  Check(!marks.Update(9227 * MiB + 300 * MiB), "a fluctuation moves the marks");
-  Check(marks.Update(9227 * MiB + 512 * MiB), "a 512 MiB rise is not followed");
+  Check(!marks.Update(9227 * MiB + 300 * MiB, 4 * s),
+        "a fluctuation moves the marks");
+
+  // A rise is followed only once it held for RiseHoldMs, to the lowest
+  // budget seen meanwhile.
+  constexpr uint64_t hold = LiveMarks::RiseHoldMs;
+  Check(!marks.Update(9227 * MiB + 900 * MiB, 10 * s),
+        "a budget rise is followed at once");
+  Check(!marks.Update(9227 * MiB + 600 * MiB, 10 * s + hold / 2),
+        "a budget rise is followed before it held");
+  Check(marks.Update(9227 * MiB + 900 * MiB, 10 * s + hold),
+        "a budget rise that held is not followed");
+  Check(marks.Budget() == 9227 * MiB + 600 * MiB && marks.Generation() == 3,
+        "the held rise did not move the marks to its lowest budget");
+
+  // A budget that flaps (a 16 GB card: 14,185 <-> ~13,300 MiB about every
+  // minute) keeps the lower marks: a rise that falls back before it held
+  // restarts the hold.
+  LiveMarks flap;
+  Check(flap.Update(14185 * MiB, 0) && flap.Update(13287 * MiB, 60 * s),
+        "the flapping budget's first drop is not followed");
+  for (uint64_t i = 0; i < 6; i++) {
+    const uint64_t t = 70 * s + i * 50 * s;
+    Check(!flap.Update(14185 * MiB, t) &&
+              !flap.Update(14185 * MiB, t + hold - 1),
+          "a flapping budget's rise is followed before it held");
+    Check(!flap.Update(13406 * MiB, t + hold),
+          "a fall-back inside the hysteresis moves the marks");
+  }
+  Check(flap.Budget() == 13287 * MiB && flap.Generation() == 2,
+        "the flapping budget moved the marks");
+  Check(!flap.Update(14185 * MiB, 1000 * s) &&
+            flap.Update(14185 * MiB, 1000 * s + hold),
+        "a rise that held after the flapping is not followed");
+  Check(flap.Texture() == TextureMarks(14185 * MiB), "the marks are not back");
 }
 
 void TestLostAccessReport() {
