@@ -1,7 +1,11 @@
 #ifndef EMULATOR_SRC_COMMON_LRUCACHE_H_
 #define EMULATOR_SRC_COMMON_LRUCACHE_H_
 
+#include "common/config.h"
+
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <type_traits>
 #include <utility>
@@ -39,7 +43,11 @@ public:
 	// A freed item is not in the list: touching it would link it again while it waits for reuse.
 	void Touch(size_t id, Tick tick) {
 		auto& item = m_items[id];
-		if (!item.linked || item.tick >= tick) {
+		if (!item.linked) {
+			NoteStale("touch");
+			return;
+		}
+		if (item.tick >= tick) {
 			return;
 		}
 		item.tick = tick;
@@ -52,11 +60,15 @@ public:
 	void Free(size_t id) {
 		auto& item = m_items[id];
 		if (!item.linked) {
+			NoteStale("free");
 			return;
 		}
 		Detach(item);
 		m_free.push_back(id);
 	}
+
+	// Touches and frees of items that were not in the list (ignored, see NoteStale).
+	[[nodiscard]] size_t StaleOperations() const noexcept { return m_stale_operations; }
 
 	// The list runs from the oldest to the newest item through every live item exactly once,
 	// and no freed item is in it (for tests).
@@ -101,6 +113,18 @@ public:
 	}
 
 private:
+	// A touch or free of an item that is not in the list comes from a holder of a stale id.
+	// Release builds ignore it; debug builds stop so that the holder is found (tests that
+	// exercise stale ids define KYTY_LRU_CACHE_ALLOW_STALE).
+	void NoteStale([[maybe_unused]] const char* operation) {
+		m_stale_operations++;
+#if KYTY_BUILD == KYTY_BUILD_DEBUG && !defined(KYTY_LRU_CACHE_ALLOW_STALE)
+		std::fprintf(stderr, "LeastRecentlyUsedCache: %s of an item that is not in the list\n",
+		             operation);
+		std::abort();
+#endif
+	}
+
 	void Attach(Item& item) {
 		item.prev   = m_last;
 		item.next   = nullptr;
@@ -131,6 +155,7 @@ private:
 	std::vector<size_t> m_free;
 	Item*               m_first = nullptr;
 	Item*               m_last  = nullptr;
+	size_t              m_stale_operations = 0;
 };
 
 } // namespace Common
