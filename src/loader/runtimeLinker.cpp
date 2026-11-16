@@ -1070,6 +1070,7 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 			guest_frames[i] = reinterpret_cast<uint64_t>(frames[i]);
 		}
 		report.guest_frames = {guest_frames, static_cast<size_t>(std::max(depth, 0))};
+		report.copy         = Loader::FindGuestFunctionCopy(info->exception_address);
 		// Formatted without allocating (the fault may have hit inside the host heap). The log
 		// file is what testers send: the report must not exist on the console only.
 		Loader::GuestFaultText text;
