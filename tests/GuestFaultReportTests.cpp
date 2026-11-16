@@ -449,6 +449,41 @@ void TestMemoryReportFits() {
         "with room to spare");
 }
 
+void TestCopyLocation() {
+  // A fault inside a red-zone function copy names the guest code it runs.
+  Common::HostException::ExceptionInfo info;
+  info.exception_address = 0x9100000040ull;
+  info.rsp = 0x7ec1c3f80ull;
+  Loader::GuestFaultReport report;
+  report.thread = "Foreground Worker #1";
+  report.info = &info;
+  report.copy = Loader::GuestCopyLocation{.module = 0x900000000ull,
+                                          .function = 0x9001feffeull,
+                                          .copy = 0x9100000000ull,
+                                          .instruction = 0x9001ff0f3ull,
+                                          .lowered = true};
+  Loader::GuestFaultText out;
+  Loader::FormatGuestFaultReport(report, &out);
+  const std::string text(out.View());
+  Check(Contains(text,
+                 "pc is in the red-zone copy of guest function 0x9001feffe "
+                 "(module+0x1feffe, copy at 0x9100000000), at its "
+                 "instruction 0x9001ff0f3 (module+0x1ff0f3)\n"),
+        "copy location");
+  Check(Contains(text, "guest rsp=0x00000007ec1c4000\n"),
+        "guest rsp of a lowered copy");
+
+  report.copy->lowered = false;
+  report.copy->instruction = 0;
+  Loader::GuestFaultText plain;
+  Loader::FormatGuestFaultReport(report, &plain);
+  const std::string plain_text(plain.View());
+  Check(Contains(plain_text, "(module+0x1feffe, copy at 0x9100000000)\n"),
+        "copy location without an instruction");
+  Check(!Contains(plain_text, "guest rsp="),
+        "no rsp line where RSP is the guest's");
+}
+
 } // namespace
 
 int main() {
@@ -462,6 +497,7 @@ int main() {
   TestHandledFaultRing();
   TestHandledFaultReport();
   TestMemoryReportFits();
+  TestCopyLocation();
   std::printf("GuestFaultReportTests: all cases passed\n");
   return 0;
 }

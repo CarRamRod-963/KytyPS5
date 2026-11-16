@@ -960,6 +960,269 @@ void TestWindowsGuestRedZoneCopySpace() {
 	Check(test, freed, "failed to free test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// Jump tables the copies cannot prove: a table base the resolver only guessed
+// (an earlier LEA of the function, while another value reaches the load) must
+// not be redirected to the copy's table, and an entry patch must not cover a
+// case label of the function before (a start found by the sweep or a relocation
+// splits it). A fault inside a copy maps back to the guest code.
+void TestWindowsGuestRedZoneCopyProofs() {
+  const char *test = "WindowsGuestRedZoneCopyProofs";
+  constexpr uint64_t CODE_SIZE = 0x4000;
+  constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+  enum : uint64_t {
+    Guessed = 0x000, // dispatches through Real; the resolver can only see the
+                     // LEA of Decoy
+    Hoisted = 0x200, // table LEA hoisted above a loop: provable, stays inside
+                     // the copy
+    Split = 0x400,   // its table has a case label two bytes into Entered
+    Entered =
+        0x480, // red-zone function whose start is a separate (relocation) start
+    CodeEnd = 0x600,
+    Real = 0xd00,
+    Decoy = 0xd40,
+    Loop = 0xd80,
+    Cases = 0xdc0,
+  };
+  const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+      0x000000090c000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+      Common::VirtualMemory::Mode::ExecuteReadWrite,
+      "red_zone_copy_proofs_test");
+  Check(test, mapping != 0, "failed to allocate test code");
+  std::memset(reinterpret_cast<void *>(mapping), 0xcc, CODE_SIZE);
+  const auto at = [&](uint64_t offset) {
+    return reinterpret_cast<uint8_t *>(mapping + offset);
+  };
+  const auto put_table = [&](uint64_t table, const auto &targets) {
+    for (size_t index = 0; index < targets.size(); ++index) {
+      const auto offset =
+          static_cast<int32_t>(reinterpret_cast<intptr_t>(targets[index]) -
+                               static_cast<intptr_t>(mapping + table));
+      std::memcpy(at(table) + index * sizeof(offset), &offset, sizeof(offset));
+    }
+  };
+  // lea reg, [rip + table] with REX.W (+REX.R for r8-r15), ModRM reg field =
+  // low bits of reg.
+  const auto lea_table = [&](Xbyak::CodeGenerator &c, int reg, uint64_t table) {
+    const auto end = reinterpret_cast<intptr_t>(c.getCurr()) + 7;
+    c.db(reg >= 8 ? 0x4c : 0x48);
+    c.db(0x8d);
+    c.db(0x05 | ((reg & 7) << 3));
+    c.dd(static_cast<uint32_t>(
+        static_cast<int32_t>(static_cast<intptr_t>(mapping + table) - end)));
+  };
+
+  g_red_zone_clobber_page =
+      VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+  Check(test, g_red_zone_clobber_page != nullptr,
+        "failed to allocate fault page");
+  auto *handler = AddVectoredExceptionHandler(1, RedZoneClobberHandler);
+  Check(test, handler != nullptr, "failed to install test exception handler");
+
+  using Xbyak::CodeGenerator;
+  {
+    // rsi = argument; returns argument + case number of Real (Decoy has them
+    // reversed).
+    CodeGenerator c(0x200, at(Guessed));
+    std::array<Xbyak::Label, 4> cases;
+    Xbyak::Label other;
+    c.mov(c.qword[c.rsp - 16], c.rsi);
+    lea_table(c, 9, Decoy);     // the only LEA into r9: the resolver's guess
+    c.mov(c.rcx, c.ptr[c.rdi]); // faults
+    lea_table(c, 10, Real);
+    c.mov(c.r9, c.r10); // nearest writer of the base is not a LEA
+    c.mov(c.eax, c.esi);
+    c.and_(c.eax, 3);
+    c.cmp(c.eax, 3);
+    c.ja(other, CodeGenerator::T_NEAR);
+    c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+    c.add(c.rax, c.r9);
+    c.jmp(c.rax);
+    for (size_t index = 0; index < cases.size(); ++index) {
+      c.L(cases[index]);
+      c.mov(c.rax, c.qword[c.rsp - 16]);
+      c.add(c.rax, static_cast<uint32_t>(index));
+      c.ret();
+    }
+    c.L(other);
+    c.xor_(c.eax, c.eax);
+    c.ret();
+    Check(test, Xbyak::GetError() == 0,
+          "failed to generate guessed-table fixture");
+    put_table(Real, std::array{cases[0].getAddress(), cases[1].getAddress(),
+                               cases[2].getAddress(), cases[3].getAddress()});
+    put_table(Decoy, std::array{cases[3].getAddress(), cases[2].getAddress(),
+                                cases[1].getAddress(), cases[0].getAddress()});
+  }
+  {
+    // Sums (index & 1) + 1 over rsi iterations through a table loaded once
+    // before the loop.
+    CodeGenerator c(0x200, at(Hoisted));
+    std::array<Xbyak::Label, 2> cases;
+    Xbyak::Label loop;
+    Xbyak::Label next;
+    Xbyak::Label done;
+    c.mov(c.qword[c.rsp - 16], c.rsi);
+    c.mov(c.rcx, c.ptr[c.rdi]); // faults
+    lea_table(c, 9, Loop);
+    c.xor_(c.edx, c.edx);
+    c.xor_(c.r8d, c.r8d);
+    c.L(loop);
+    c.cmp(c.r8, c.qword[c.rsp - 16]);
+    c.jae(done, CodeGenerator::T_NEAR);
+    c.mov(c.eax, c.r8d);
+    c.and_(c.eax, 1);
+    c.cmp(c.eax, 1);
+    c.ja(done, CodeGenerator::T_NEAR);
+    c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+    c.add(c.rax, c.r9);
+    c.jmp(c.rax);
+    c.L(cases[0]);
+    c.add(c.rdx, 1);
+    c.jmp(next, CodeGenerator::T_NEAR);
+    c.L(cases[1]);
+    c.add(c.rdx, 2);
+    c.L(next);
+    c.inc(c.r8);
+    c.jmp(loop, CodeGenerator::T_NEAR);
+    c.L(done);
+    c.mov(c.rax, c.rdx);
+    c.ret();
+    Check(test, Xbyak::GetError() == 0,
+          "failed to generate hoisted-table fixture");
+    put_table(Loop, std::array{cases[0].getAddress(), cases[1].getAddress()});
+  }
+  {
+    // Index 1 continues two bytes into Entered (a tail shared with the next
+    // start); eax then holds the low half of that address.
+    CodeGenerator c(Entered - Split, at(Split));
+    Xbyak::Label other;
+    Xbyak::Label zero;
+    c.mov(c.eax, c.esi);
+    c.cmp(c.eax, 1);
+    c.ja(other, CodeGenerator::T_NEAR);
+    lea_table(c, 9, Cases);
+    c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+    c.add(c.rax, c.r9);
+    c.jmp(c.rax);
+    c.L(zero);
+    c.mov(c.eax, 7);
+    c.ret();
+    c.L(other);
+    c.xor_(c.eax, c.eax);
+    c.ret();
+    Check(test, Xbyak::GetError() == 0, "failed to generate split fixture");
+    put_table(Cases, std::array{zero.getAddress(),
+                                static_cast<const uint8_t *>(at(Entered + 2))});
+  }
+  {
+    CodeGenerator c(0x100, at(Entered));
+    c.xor_(c.eax, c.eax); // two bytes: Split continues after them
+    c.mov(c.qword[c.rsp - 8], c.rsi);
+    c.mov(c.rcx, c.ptr[c.rdi]); // faults
+    c.mov(c.rcx, c.qword[c.rsp - 8]);
+    c.cmp(c.rcx, c.rsi);
+    c.sete(c.cl);
+    c.movzx(c.ecx, c.cl);
+    c.add(c.eax, c.ecx);
+    c.ret();
+    Check(test, Xbyak::GetError() == 0, "failed to generate entered fixture");
+  }
+  Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+        "failed to flush generated test code");
+
+  const std::array<uintptr_t, 4> function_starts = {
+      mapping + Guessed, mapping + Hoisted, mapping + Split, mapping + Entered};
+  Loader::RegisterGuestInstructionPatchModule(
+      reinterpret_cast<void *>(mapping), CODE_SIZE,
+      reinterpret_cast<void *>(mapping + CODE_SIZE), TRAMPOLINE_SIZE);
+  const std::array<std::pair<uint64_t, uint64_t>, 1> data_ranges = {
+      {{mapping + Real, Cases + 2 * sizeof(int32_t) - Real}}};
+  const auto result = Loader::PatchGuestInstructions(
+      mapping, CodeEnd, function_starts, false, false,
+      Loader::GetGuestInstructionHostFeatures(), 0, true, data_ranges);
+  std::printf(
+      "[host]    red-zone copy proofs candidates=%llu rewritten=%llu "
+      "conflicts=%llu "
+      "early=%llu\n",
+      static_cast<unsigned long long>(result.red_zone_copy_candidate_count),
+      static_cast<unsigned long long>(result.rewritten_function_count),
+      static_cast<unsigned long long>(result.copy_entry_conflict_count),
+      static_cast<unsigned long long>(
+          result.partially_rewritten_function_count));
+  // Guessed and Hoisted are copied (Guessed leaves through its original jump);
+  // Entered is not.
+  const bool counts = result.red_zone_copy_candidate_count == 3 &&
+                      result.rewritten_function_count == 2 &&
+                      result.copy_entry_conflict_count == 1 &&
+                      result.partially_rewritten_function_count == 1;
+  const bool entry_untouched = at(Entered)[0] != 0xe9; // no jump to a copy
+
+  using GuestFunction = uint64_t(KYTY_SYSV_ABI *)(void *, uint64_t);
+  const auto call = [&](uint64_t offset, uint64_t argument, bool fault) {
+    DWORD old_protection = 0;
+    Check(test,
+          VirtualProtect(g_red_zone_clobber_page, 0x1000,
+                         fault ? PAGE_NOACCESS : PAGE_READWRITE,
+                         &old_protection) != FALSE,
+          "failed to reset fault page protection");
+    return reinterpret_cast<GuestFunction>(mapping + offset)(
+        g_red_zone_clobber_page, argument);
+  };
+  bool results = true;
+  for (const uint64_t argument : {0x40ull, 0x41ull, 0x42ull, 0x43ull}) {
+    const uint64_t expected = argument + (argument & 3);
+    const uint64_t value = call(Guessed, argument, true);
+    std::printf(
+        "[host]    red-zone copy guessed table %llx -> %llx (expected %llx)\n",
+        static_cast<unsigned long long>(argument),
+        static_cast<unsigned long long>(value),
+        static_cast<unsigned long long>(expected));
+    results &= value == expected;
+  }
+  results &= call(Hoisted, 5, true) == 3 + 2 * 2; // 1 + 2 + 1 + 2 + 1
+  if (entry_untouched) {
+    // Only safe to run when the entry was left alone: a patched entry is jumped
+    // into.
+    results &= call(Split, 1, false) ==
+                   static_cast<uint32_t>(mapping + Entered + 2) + 1ull &&
+               call(Split, 0, false) == 7;
+    results &= call(Entered, 9, false) == 1;
+  }
+
+  // A pc inside a copy names the guest function; outside any copy nothing.
+  const auto *copied_entry = at(Guessed);
+  const uint64_t copy_address = static_cast<uint64_t>(
+      reinterpret_cast<intptr_t>(copied_entry) + 5 +
+      static_cast<int32_t>(copied_entry[1] | (copied_entry[2] << 8) |
+                           (copied_entry[3] << 16) |
+                           (static_cast<uint32_t>(copied_entry[4]) << 24)));
+  const auto location = copied_entry[0] == 0xe9
+                            ? Loader::FindGuestFunctionCopy(copy_address)
+                            : std::nullopt;
+  const bool attributed =
+      location.has_value() && location->function == mapping + Guessed &&
+      location->module == mapping &&
+      location->instruction == mapping + Guessed &&
+      !Loader::FindGuestFunctionCopy(mapping + Entered).has_value();
+
+  Loader::UnregisterGuestInstructionPatchModule(
+      reinterpret_cast<void *>(mapping));
+  RemoveVectoredExceptionHandler(handler);
+  VirtualFree(g_red_zone_clobber_page, 0, MEM_RELEASE);
+  g_red_zone_clobber_page = nullptr;
+  const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(
+      mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+  Check(test, counts, "unexpected function copy counts");
+  Check(test, entry_untouched,
+        "an entry patch covers a case label of the function before");
+  Check(test, results, "a copied function dispatched through the wrong table");
+  Check(test, attributed,
+        "a pc inside a copy was not mapped back to its guest function");
+  Check(test, freed, "failed to free test code");
+  std::printf("[host]    %-48s ok\n", test);
+}
 #else
 void TestWindowsGuestRedZoneJumpTableBounds() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneJumpTableBounds");
@@ -975,6 +1238,10 @@ void TestWindowsGuestRedZoneFunctionCopy() {
 
 void TestWindowsGuestRedZoneCopySpace() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneCopySpace");
+}
+
+void TestWindowsGuestRedZoneCopyProofs() {
+  std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneCopyProofs");
 }
 #endif
 
@@ -7026,7 +7293,8 @@ int main(int argc, char** argv) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		RunTest(TestWindowsGuestRedZoneFunctionCopy);
 		RunTest(TestWindowsGuestRedZoneCopySpace);
-		return g_failed_tests == 0 ? 0 : 1;
+                RunTest(TestWindowsGuestRedZoneCopyProofs);
+                return g_failed_tests == 0 ? 0 : 1;
 	}
 
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
@@ -7045,7 +7313,8 @@ int main(int argc, char** argv) {
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestWindowsGuestRedZoneFunctionCopy);
 	RunTest(TestWindowsGuestRedZoneCopySpace);
-	RunTest(TestProsperoArgumentAndInfoSizeContracts);
+        RunTest(TestWindowsGuestRedZoneCopyProofs);
+        RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);

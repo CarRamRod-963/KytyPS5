@@ -3,6 +3,7 @@
 
 #include "common/hostException.h"
 #include "loader/guestFaultHistory.h"
+#include "loader/guestInstructionPatcher.h"
 
 #include <algorithm>
 #include <array>
@@ -54,6 +55,7 @@ struct GuestFaultReport {
 	std::span<const uint8_t>                    code;         // pc-48 .. pc+48, or empty
 	std::span<const uint64_t>                   stack;        // words from rsp, or empty
 	std::span<const uint64_t>                   guest_frames; // return addresses, rbp chain
+	std::optional<GuestCopyLocation>            copy;         // pc inside a red-zone copy
 };
 
 inline constexpr size_t GuestFaultCodeBefore = 48;
@@ -70,6 +72,21 @@ inline void FormatGuestFaultReport(const GuestFaultReport& report, GuestFaultTex
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+	}
+	if (const auto& copy = report.copy; copy.has_value()) {
+		// The pc above is the copy's: name the guest code it runs, as module offsets.
+		out->Append("pc is in the red-zone copy of guest function 0x{:x} (module+0x{:x}, copy at "
+		            "0x{:x})",
+		            copy->function, copy->function - copy->module, copy->copy);
+		if (copy->instruction != 0) {
+			out->Append(", at its instruction 0x{:x} (module+0x{:x})", copy->instruction,
+			            copy->instruction - copy->module);
+		}
+		out->Append("\n");
+		if (report.info != nullptr && copy->lowered) {
+			out->Append("rsp is 128 bytes below the guest rsp there: guest rsp=0x{:016x}\n",
+			            report.info->rsp + 128);
+		}
 	}
 	if (report.code.size() > GuestFaultCodeBefore) {
 		out->Append("code (pc-{} .. pc+{}, fault at byte {}):", GuestFaultCodeBefore,

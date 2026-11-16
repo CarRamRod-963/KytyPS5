@@ -44,6 +44,18 @@ using s64 = int64_t;
 
 constexpr size_t NearJumpSize = 5;
 
+struct GuestFunctionCopy {
+	struct Instruction {
+		uintptr_t copy {};     // first byte emitted for it (prelude included)
+		uintptr_t original {}; // guest address
+		bool      lowered {};  // RSP below the guest RSP while it runs
+	};
+	uintptr_t                start {};
+	uintptr_t                end {};
+	uintptr_t                function {};
+	std::vector<Instruction> instructions; // by copy address
+};
+
 struct PatchModule {
 	std::mutex           mutex {};
 	u8*                  start = nullptr;
@@ -52,6 +64,8 @@ struct PatchModule {
 	Xbyak::CodeGenerator patch_gen;
 	Xbyak::CodeGenerator trampoline_gen;
 	bool                 trampoline_exhaustion_reported = false;
+	// Red-zone function copies in trampoline order (= address order), for fault reports.
+	std::vector<GuestFunctionCopy> copies;
 
 	PatchModule(u8* module_ptr, u64 module_size, u8* trampoline_ptr, u64 trampoline_size)
 	    : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
@@ -1952,10 +1966,10 @@ public:
 	RedZoneFunctionWriter(PatchModule* module, const DecodedFunction& function,
 	                      uintptr_t function_start, uintptr_t function_end, const CodeSweep& sweep,
 	                      const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-	                      u64                                            tsc_multiplier)
+	                      u64 tsc_multiplier, const std::set<uintptr_t>& indirect_targets)
 	    : m_module(module), m_function(function), m_start(function_start), m_end(function_end),
 	      m_sweep(sweep), m_rewrite_sites(rewrite_sites), m_tsc_multiplier(tsc_multiplier),
-	      m_gen(module->trampoline_gen) {}
+	      m_indirect_targets(indirect_targets), m_gen(module->trampoline_gen) {}
 
 	Outcome Write(GuestInstructionPatchResult& result) {
 		const auto entry_end = EntryPatchEnd();
@@ -1966,7 +1980,13 @@ public:
 		Xbyak::ClearError();
 		// Jump tables of the copy come first: their loads in the body need their addresses.
 		m_tables.clear();
+		m_table_branches.clear();
 		for (const auto& [branch, table]: m_function.jump_tables) {
+			if (!HoldsTableBase(table)) {
+				// The jump leaves the copy and dispatches through the original table.
+				continue;
+			}
+			m_table_branches.insert(branch);
 			m_gen.align(sizeof(s32));
 			m_tables.emplace(table.load, CopiedTable {&table, m_gen.getCurr()});
 			for (size_t index = 0; index < table.entries.size(); ++index) {
@@ -2030,6 +2050,10 @@ public:
 		}
 		EXIT_IF(Xbyak::GetError() != 0);
 		m_module->patched.insert(reinterpret_cast<u8*>(m_start));
+		m_module->copies.push_back({.start        = reinterpret_cast<uintptr_t>(copy),
+		                            .end          = reinterpret_cast<uintptr_t>(m_gen.getCurr()),
+		                            .function     = m_start,
+		                            .instructions = std::move(m_copy_instructions)});
 		result.rewritten_function_bytes += m_gen.getSize() - offset;
 		result.unprotected_instruction_count += m_unprotected;
 		result.partially_rewritten_function_count += m_leaves_early ? 1 : 0;
@@ -2067,11 +2091,102 @@ private:
 			address += decoded->second.instruction.length;
 		}
 		for (uintptr_t inside = m_start + 1; inside < address; ++inside) {
-			if (m_function.branch_targets.contains(inside) || m_sweep.IsBranchTarget(inside)) {
+			if (m_function.branch_targets.contains(inside) || m_sweep.IsBranchTarget(inside) ||
+			    m_indirect_targets.contains(inside)) {
 				return std::nullopt;
 			}
 		}
 		return address;
+	}
+
+	// Whether the base register of a jump table's load holds that table's address on every path
+	// through the copy. The resolver may take the base from an earlier LEA of the function (a
+	// guess); a copy that redirected such a load to its copy of the wrong table would jump into
+	// garbage. Forward must-analysis of the register's value over the copy's control flow: the copy
+	// is entered only at the function start, a call into guest code leaves it for good, a
+	// RIP-relative LEA defines the value and any other write (or a call to a host stub, for a
+	// caller-saved register) makes it unknown. A table that is not proven is dispatched through
+	// the original jump, which works whatever the register holds.
+	[[nodiscard]] bool HoldsTableBase(const JumpTable& table) const {
+		const auto& instructions = m_function.instructions;
+		const auto  load         = instructions.find(table.load);
+		if (load == instructions.end() ||
+		    load->second.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+			return false;
+		}
+		const ZydisRegister base         = load->second.operands[1].mem.base;
+		const auto          callee_saved = [base] {
+			const auto largest = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, base);
+			return largest == ZYDIS_REGISTER_RBX || largest == ZYDIS_REGISTER_RBP ||
+			       largest == ZYDIS_REGISTER_R12 || largest == ZYDIS_REGISTER_R13 ||
+			       largest == ZYDIS_REGISTER_R14 || largest == ZYDIS_REGISTER_R15;
+		}();
+		constexpr uintptr_t Unknown = 0;
+		// Value of the base register before each instruction (Unknown when not proven).
+		std::map<uintptr_t, uintptr_t> state;
+		std::vector<uintptr_t>         work;
+		const auto                     merge = [&](uintptr_t address, uintptr_t value) {
+			if (!instructions.contains(address)) {
+				return;
+			}
+			auto [entry, inserted] = state.try_emplace(address, value);
+			if (inserted) {
+				work.push_back(address);
+			} else if (entry->second != Unknown && entry->second != value) {
+				entry->second = Unknown;
+				work.push_back(address);
+			}
+		};
+		merge(m_start, Unknown);
+		while (!work.empty()) {
+			const uintptr_t address = work.back();
+			work.pop_back();
+			const auto& decoded  = instructions.at(address);
+			const auto  category = decoded.instruction.meta.category;
+			uintptr_t   value    = state.at(address);
+			if (category == ZYDIS_CATEGORY_CALL) {
+				const uintptr_t target = GetRelativeTarget(decoded);
+				if (target == 0 || (target >= reinterpret_cast<uintptr_t>(m_module->start) &&
+				                    target < reinterpret_cast<uintptr_t>(m_module->end))) {
+					continue; // runs from the original body and returns there
+				}
+				if (!callee_saved) {
+					value = Unknown;
+				}
+			} else if (WritesRegister(decoded, base)) {
+				value = Unknown;
+				ZyanU64 absolute {};
+				// The base of the load is a 64-bit register: the LEA must write all of it.
+				if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+				    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				    decoded.operands[0].reg.value == base &&
+				    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+				    decoded.operands[1].mem.base == ZYDIS_REGISTER_RIP &&
+				    decoded.operands[1].mem.index == ZYDIS_REGISTER_NONE &&
+				    ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(
+				        &decoded.instruction, &decoded.operands[1], address, &absolute))) {
+					value = absolute;
+				}
+			}
+			const uintptr_t next   = address + decoded.instruction.length;
+			const uintptr_t target = GetRelativeTarget(decoded);
+			if (category == ZYDIS_CATEGORY_COND_BR) {
+				merge(next, value);
+				merge(target, value);
+			} else if (category == ZYDIS_CATEGORY_UNCOND_BR) {
+				merge(target, value);
+				if (const auto jump = m_function.jump_tables.find(address);
+				    jump != m_function.jump_tables.end()) {
+					for (const uintptr_t entry: jump->second.entries) {
+						merge(entry, value);
+					}
+				}
+			} else if (!IsControlFlowTerminator(decoded.instruction)) {
+				merge(next, value);
+			}
+		}
+		const auto at_load = state.find(table.load);
+		return at_load != state.end() && at_load->second == table.address;
 	}
 
 	void Lower() {
@@ -2204,7 +2319,11 @@ private:
 		// Address the previous instruction continues at, while control can fall through.
 		std::optional<uintptr_t> fallthrough = m_start;
 
+		m_copy_instructions.clear();
 		for (const auto& [address, decoded]: m_function.instructions) {
+			if (!m_copy_instructions.empty()) {
+				m_copy_instructions.back().lowered = m_lowered;
+			}
 			if (fallthrough && *fallthrough != address) {
 				// The previous instruction continues in bytes that were not decoded.
 				if (!Exit(*fallthrough)) {
@@ -2223,6 +2342,8 @@ private:
 				m_lowered = true;
 			}
 			fallthrough.reset();
+			m_copy_instructions.push_back(
+			    {.copy = reinterpret_cast<uintptr_t>(m_gen.getCurr()), .original = address});
 
 			const auto&     instruction = decoded.instruction;
 			const auto      category    = instruction.meta.category;
@@ -2265,7 +2386,7 @@ private:
 					} else if (!Exit(target)) {
 						return false;
 					}
-				} else if (m_function.jump_tables.contains(address)) {
+				} else if (m_table_branches.contains(address)) {
 					// The copied table sends the jump to a label of the copy.
 					Lower();
 					if (!EmitInstruction(decoded, shape, false)) {
@@ -2349,6 +2470,9 @@ private:
 				fallthrough = next;
 			}
 		}
+		if (!m_copy_instructions.empty()) {
+			m_copy_instructions.back().lowered = m_lowered;
+		}
 		if (fallthrough && !Exit(*fallthrough)) {
 			return false;
 		}
@@ -2367,13 +2491,16 @@ private:
 	uintptr_t                                      m_start;
 	uintptr_t                                      m_end;
 	const CodeSweep&                               m_sweep;
+	const std::set<uintptr_t>&                     m_indirect_targets; // of the code before
 	const std::map<uintptr_t, InstructionRewrite>& m_rewrite_sites;
 	u64                                            m_tsc_multiplier;
 	Xbyak::CodeGenerator&                          m_gen;
 	bool                                           m_lowered      = false;
 	bool                                           m_leaves_early = false;
 	u64                                            m_unprotected  = 0;
-	std::map<uintptr_t, CopiedTable>               m_tables; // by load address
+	std::map<uintptr_t, CopiedTable>               m_tables;         // by load address
+	std::set<uintptr_t>                            m_table_branches; // jumps through m_tables
+	std::vector<GuestFunctionCopy::Instruction>    m_copy_instructions;
 };
 
 size_t AnalysisThreadCount() {
@@ -2579,9 +2706,21 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			continue;
 		}
 		++result.red_zone_copy_candidate_count;
+		// A start found by the sweep or a relocation can split a function whose jump table then
+		// has case labels in this one: decode the code before it through this function, so that
+		// such labels are known and no entry patch lands on them.
+		std::set<uintptr_t> indirect_targets;
+		if (item->index != 0) {
+			const auto before =
+			    DecodeFunction(starts[item->index - 1], function_end_of(item->index), segment_addr,
+			                   segment_end, data_ranges);
+			for (const auto& [branch, table]: before.jump_tables) {
+				indirect_targets.insert(table.entries.begin(), table.entries.end());
+			}
+		}
 		RedZoneFunctionWriter writer(module, item->function, starts[item->index],
 		                             function_end_of(item->index), *sweep, item->replacements,
-		                             tsc_multiplier);
+		                             tsc_multiplier, indirect_targets);
 		switch (writer.Write(result)) {
 			case RedZoneFunctionWriter::Outcome::Rewritten:
 				++result.rewritten_function_count;
@@ -2794,6 +2933,33 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
 	                                              static_cast<u8*>(trampoline_area_ptr),
 	                                              trampoline_area_size));
+}
+
+std::optional<GuestCopyLocation> FindGuestFunctionCopy(uintptr_t pc) {
+	for (auto& [address, module]: g_patch_modules) {
+		// The fault handler must not wait: a module that is being patched is skipped.
+		std::unique_lock lock {module.mutex, std::try_to_lock};
+		if (!lock.owns_lock()) {
+			continue;
+		}
+		const auto copy =
+		    std::ranges::upper_bound(module.copies, pc, {}, &GuestFunctionCopy::start);
+		if (copy == module.copies.begin() || pc >= std::prev(copy)->end) {
+			continue;
+		}
+		const auto& found       = *std::prev(copy);
+		const auto  instruction = std::ranges::upper_bound(found.instructions, pc, {},
+		                                                   &GuestFunctionCopy::Instruction::copy);
+		GuestCopyLocation location {.module   = reinterpret_cast<uintptr_t>(module.start),
+		                            .function = found.function,
+		                            .copy     = found.start};
+		if (instruction != found.instructions.begin()) {
+			location.instruction = std::prev(instruction)->original;
+			location.lowered     = std::prev(instruction)->lowered;
+		}
+		return location;
+	}
+	return std::nullopt;
 }
 
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {

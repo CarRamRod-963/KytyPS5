@@ -6,6 +6,7 @@
 
 #include "common/common.h"
 
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -66,6 +67,18 @@ struct GuestInstructionPatchResult {
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
+
+// Where a host address inside a red-zone function copy comes from, for fault reports: a fault in
+// a copy has the copy's address as pc, and RSP 128 bytes below the guest value where lowered.
+struct GuestCopyLocation {
+	uintptr_t module      = 0;     // start of the guest module
+	uintptr_t function    = 0;     // original start of the copied function
+	uintptr_t copy        = 0;     // start of the copy
+	uintptr_t instruction = 0;     // original address of the instruction at pc (0 if unknown)
+	bool      lowered     = false; // RSP is 128 bytes below the guest RSP there
+};
+// Does not wait for a lock: answers nothing for a module that is being patched.
+std::optional<GuestCopyLocation> FindGuestFunctionCopy(uintptr_t pc);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks. A nonzero
 // tsc_multiplier rewrites RDTSC/RDTSCP to return host TSC * tsc_multiplier >> 32.
