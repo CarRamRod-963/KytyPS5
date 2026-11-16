@@ -827,8 +827,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
 	// guest bytes, including tail padding, before retiring the incompatible backing.
-	if (cached.SafeToDownload()) {
-		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+	if (cached.HoldsCurrentContents()) {
+		if (merged && merged->HoldsCurrentContents() && !Publish(cache, *merged)) {
 			return;
 		}
 		if (!Publish(cache, cached)) {
@@ -1899,6 +1899,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.RefreshComplete();
 	image.MarkGpuModified();
 	image.buffer_written        = false;
+	image.buffer_written_range  = {};
 	image.native_write_sequence = ++m_event_sequence;
 }
 
@@ -2160,10 +2161,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	// A buffer write that overlapped the image since its last native write left newer bytes in
-	// its memory (TextureCache::PrepareGpuBufferWrite): copying the image over them would undo
-	// that write, so the buffer keeps what it holds.
-	if (!image.SafeToDownload() || image.buffer_written) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	// A range that starts at a stencil plane selects its depth image.
@@ -2176,8 +2174,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			    !buffer.IsInBounds(association.info.data.address, association.info.data.size)) {
 				continue;
 			}
-			m_texture_cache.DownloadStencil(association, buffer,
-			                                buffer.Offset(association.info.data.address));
+			// A stencil plane is memory of its own: its association records the buffer writes.
+			KeepBufferWrittenBytes(
+			    buffer, association.BufferWrittenRange(), association.info.data, [&] {
+				    m_texture_cache.DownloadStencil(association, buffer,
+				                                    buffer.Offset(association.info.data.address));
+			    });
 			return true;
 		}
 		return false;
@@ -2213,8 +2215,57 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
-	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	KeepBufferWrittenBytes(
+	    buffer, image.BufferWrittenRange(), {image.info.data.address, copy_size},
+	    [&] { m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels); });
 	return true;
+}
+
+template <typename Download>
+void BufferCache::KeepBufferWrittenBytes(Buffer& buffer, GuestRange written, GuestRange copied,
+                                         Download&& download) {
+	// Buffer writes since the image's last native write may have produced newer bytes than the
+	// image in `written` (Image::BufferWrittenRange; the Nanite culling queue state of Saros
+	// lives in transient memory a GPU-written image also covers). The image's texels land
+	// everywhere else, those bytes are put back over them.
+	const auto begin = std::max(written.address, copied.address);
+	const auto end   = std::min(written.End(), copied.End());
+	if (written.size == 0 || begin >= end) {
+		download();
+		return;
+	}
+	const auto size  = end - begin;
+	auto       saved = GetUtilityBuffer(MemoryUsage::Stream).MapDownload(size, 4);
+	m_scheduler.EndRendering();
+	auto&             command = m_scheduler.Current();
+	vk::MemoryBarrier to_transfer {};
+	to_transfer.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	to_transfer.dstAccessMask =
+	    vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                 vk::PipelineStageFlagBits::eTransfer, {}, 1, &to_transfer, 0,
+	                                 nullptr, 0, nullptr);
+	const vk::BufferCopy save {buffer.Offset(begin), saved.offset, size};
+	command.Handle().copyBuffer(buffer.Handle(), saved.buffer->Handle(), 1, &save);
+	download();
+	m_scheduler.EndRendering();
+	auto& restore_command = m_scheduler.Current();
+	restore_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                         vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                                         &to_transfer, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy restore {saved.offset, buffer.Offset(begin), size};
+	restore_command.Handle().copyBuffer(saved.buffer->Handle(), buffer.Handle(), 1, &restore);
+	vk::MemoryBarrier to_all {};
+	to_all.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_all.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	restore_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                         vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                                         &to_all, 0, nullptr, 0, nullptr);
+	if (saved.owner) {
+		// A range larger than the stream ring got a buffer of its own: it lives until the copies
+		// complete.
+		m_scheduler.DeferOperation([owner = std::move(saved.owner)] {});
+	}
 }
 
 bool TextureCache::CanDownloadStencil(const Image& association) const {
@@ -2283,10 +2334,27 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	// The bytes buffer writes produced since the image's last native write are newer than the
+	// image there (Image::buffer_written): only the rest of the image lands in guest memory.
+	const auto kept = image.BufferWrittenRange();
 	m_scheduler.DeferPriorityOperation(
-	    [this, download = std::move(download), range, trapped = m_readback_storage_images] {
+	    [this, download = std::move(download), range, kept, trapped = m_readback_storage_images] {
 		    download.buffer->Invalidate(download.offset, range.size);
-		    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    const auto kept_begin = std::clamp(kept.address, range.address, range.End());
+		    const auto kept_end   = std::clamp(kept.End(), kept_begin, range.End());
+		    if (kept.size == 0) {
+			    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    } else {
+			    if (kept_begin > range.address) {
+				    LibKernel::Memory::WriteBacking(range.address, download.mapped,
+				                                    kept_begin - range.address);
+			    }
+			    if (kept_end < range.End()) {
+				    LibKernel::Memory::WriteBacking(kept_end,
+				                                    download.mapped + (kept_end - range.address),
+				                                    range.End() - kept_end);
+			    }
+		    }
 		    if (trapped) {
 			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			    // Priority operations run in queue order, so this write-back is the oldest.
@@ -2337,7 +2405,8 @@ bool TextureCache::MemorySharedWithOtherContents(ImageId id) {
 	return shared;
 }
 
-void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
+void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size,
+                                         BufferWriteExtent extent) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -2349,13 +2418,21 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size) {
 		auto&      image = m_slot_images[id];
 		const bool covered =
 		    address <= image.info.data.address && address + size >= image.info.data.End();
-		if (covered || !image.IsGpuModified()) {
+		// A conservative range (the extent of a written storage V#) that covers an image says
+		// nothing about which of its bytes the shader writes: written V#s of Saros cover
+		// GPU-written images 7,000-10,000 times a second, and they do not refresh the image.
+		if (!image.IsGpuModified() || (covered && extent == BufferWriteExtent::Conservative)) {
 			continue;
 		}
 		// The image holds its rendered contents only while no buffer write overlaps them; one
-		// that does (conservative write ranges included) leaves the image behind its memory.
+		// that does (conservative write ranges included) leaves the image behind its memory
+		// there: Image::buffer_written_range bounds the bytes such writes may have produced.
 		const bool current   = !image.buffer_written;
 		image.buffer_written = true;
+		image.NoteBufferWrite(address, size);
+		if (covered) {
+			continue;
+		}
 		// A displaced image's contents are superseded by the image that displaced it, and memory
 		// another image shares may hold that image's bytes instead.
 		if (!current || image.depth_id || image.displaced || !image.SafeToDownload() ||
