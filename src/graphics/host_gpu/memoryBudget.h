@@ -100,33 +100,63 @@ namespace Detail {
 // memory and the OS change it (a 12 GB card's budget fell from 10.9 to 10.0 GiB during one
 // session), and marks read once at start then let the caches grow past it. Budget changes below
 // Hysteresis are ignored: the budget of a busy session moves by up to ~300 MiB from one second
-// to the next. O(1).
+// to the next. A drop is followed at once; a rise only once the budget stayed Hysteresis above
+// the marks' budget for RiseHoldMs, and then to the lowest budget seen while it held: a 16 GB
+// card's budget switched between 14,185 and ~13,300 MiB about every minute in one session, and
+// following both directions moved every mark by ~900 MiB each time. O(1).
 class LiveMarks {
 public:
 	static constexpr uint64_t Hysteresis = 512 * MiB;
+	static constexpr uint64_t RiseHoldMs = 30'000;
 
 	// Returns true when the marks changed.
-	bool Update(uint64_t cache_budget) {
-		if (m_valid && (cache_budget > m_budget ? cache_budget - m_budget
-		                                        : m_budget - cache_budget) < Hysteresis) {
+	bool Update(uint64_t cache_budget, uint64_t now_ms) {
+		if (!m_valid || cache_budget + Hysteresis <= m_budget) {
+			Set(cache_budget);
+			return true;
+		}
+		if (cache_budget < m_budget + Hysteresis) {
+			m_rising = false;
 			return false;
 		}
-		m_valid   = true;
-		m_budget  = cache_budget;
-		m_texture = TextureMarks(cache_budget);
-		m_buffer  = BufferMarks(cache_budget);
+		if (!m_rising) {
+			m_rising     = true;
+			m_rise_since = now_ms;
+			m_rise_low   = cache_budget;
+			return false;
+		}
+		m_rise_low = std::min(m_rise_low, cache_budget);
+		if (now_ms - m_rise_since < RiseHoldMs) {
+			return false;
+		}
+		Set(m_rise_low);
 		return true;
 	}
 
 	[[nodiscard]] uint64_t        Budget() const { return m_budget; }
 	[[nodiscard]] CollectionMarks Texture() const { return m_texture; }
 	[[nodiscard]] CollectionMarks Buffer() const { return m_buffer; }
+	// Changes with every update that moved the marks (0 before the first).
+	[[nodiscard]] uint64_t Generation() const { return m_generation; }
 
 private:
-	uint64_t        m_budget = 0;
+	void Set(uint64_t cache_budget) {
+		m_valid   = true;
+		m_rising  = false;
+		m_budget  = cache_budget;
+		m_texture = TextureMarks(cache_budget);
+		m_buffer  = BufferMarks(cache_budget);
+		m_generation++;
+	}
+
+	uint64_t        m_budget     = 0;
+	uint64_t        m_generation = 0;
+	uint64_t        m_rise_since = 0;
+	uint64_t        m_rise_low   = 0;
 	CollectionMarks m_texture;
 	CollectionMarks m_buffer;
-	bool            m_valid = false;
+	bool            m_valid  = false;
+	bool            m_rising = false;
 };
 
 // Accesses through the BDA page table to memory no buffer caches are lost for their dispatch (a

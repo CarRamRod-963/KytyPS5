@@ -318,6 +318,20 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+MemoryBudget::LiveMarks GraphicContext::UpdateCacheMarks() {
+	const auto budget = GetTotalMemoryBudget();
+	const auto now_ms =
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                              std::chrono::steady_clock::now().time_since_epoch())
+	                              .count());
+	std::scoped_lock lock(cache_marks_mutex);
+	// No budget before the allocator exists: the caches keep their initial marks.
+	if (budget != 0) {
+		(void)cache_marks.Update(budget, now_ms);
+	}
+	return cache_marks;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
                                  MemoryPriority::Class memory_class) {
 	KYTY_PROFILER_FUNCTION();

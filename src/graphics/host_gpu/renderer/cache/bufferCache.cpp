@@ -377,12 +377,16 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 void BufferCache::UpdateGcMarks() {
-	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage() ||
-	    !m_gc_marks.Update(m_graphics.GetTotalMemoryBudget())) {
+	if (m_gc_marks_pinned || !m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
-	m_trigger_gc_memory  = m_gc_marks.Buffer().trigger;
-	m_critical_gc_memory = m_gc_marks.Buffer().critical;
+	const auto live = m_graphics.UpdateCacheMarks();
+	if (live.Generation() == m_gc_marks_generation) {
+		return;
+	}
+	m_gc_marks_generation = live.Generation();
+	m_trigger_gc_memory   = live.Buffer().trigger;
+	m_critical_gc_memory  = live.Buffer().critical;
 }
 
 BufferCache::~BufferCache() {
