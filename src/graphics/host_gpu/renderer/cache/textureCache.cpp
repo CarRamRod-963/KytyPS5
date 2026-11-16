@@ -48,9 +48,6 @@ constexpr uint64_t NumFramesBeforePressureRemoval = 1;
 // images again: images unused for this many frames are deleted, oldest first, until usage is
 // back under the limit (the age-based passes above wait 80 to 160 frames for an image).
 constexpr uint64_t NumFramesBeforeOverLimitRemoval = 16;
-// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
-// each, landing when it completes); at most this many bytes per collection.
-constexpr uint64_t OverLimitWriteBackBytes = 256ull << 20u;
 // Submissions an image an overlapping image displaces must go unused before it is marked as
 // displaced (ResolveOverlap); titles submit hundreds of times per frame.
 constexpr uint64_t NumSubmissionsBeforeDisplacement = 32;
@@ -2766,17 +2763,21 @@ size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
 	}
 	uint64_t written = 0;
 	for (const auto id: written_back) {
-		if (m_total_used_memory <= limit || written >= OverLimitWriteBackBytes) {
+		if (m_total_used_memory <= limit || written >= m_over_limit_write_back_bytes) {
 			break;
 		}
 		auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered || !owner->SafeToDownload()) {
 			continue;
 		}
-		written += owner->AccountedSize();
+		// Only a completed write-back costs the quota: an image DownloadImageMemory refuses
+		// (displaced, multisampled, compressed metadata, ...) stays at the old end of the LRU and
+		// would otherwise use it up before any image that can be written back is reached.
+		const auto size = owner->AccountedSize();
 		if (!DownloadImageMemory(id)) {
 			continue;
 		}
+		written += size;
 		FreeImage(id);
 		evicted++;
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
