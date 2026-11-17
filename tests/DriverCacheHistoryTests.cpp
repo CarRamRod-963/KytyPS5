@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCacheHistory.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheRebuild.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -126,6 +127,34 @@ void TestCacheFilePayloadHash() {
         "the stored and the loaded payload hash agree");
 }
 
+void TestRebuildPolicy() {
+  using Libs::Graphics::DriverCacheRebuildPolicy;
+  using State = DriverCacheRebuildPolicy::State;
+  DriverCacheRebuildPolicy off;
+  Check(!off.ShouldStart(5, false) && off.GetState() == State::Off,
+        "a session without the rebuild never starts one");
+  DriverCacheRebuildPolicy policy;
+  policy.Enable();
+  Check(policy.GetState() == State::Watching && !policy.Running(),
+        "an enabled rebuild waits for a stale entry");
+  Check(!policy.ShouldStart(0, false), "nothing stale: no rebuild");
+  Check(!policy.ShouldStart(3, true),
+        "an open precompile run delays the rebuild");
+  Check(!policy.ShouldReplace(true), "nothing to replace before a start");
+  Check(policy.ShouldStart(3, false), "a stale entry on record starts it");
+  policy.Started();
+  Check(policy.Running() && !policy.ShouldStart(3, false),
+        "a running rebuild is not started again");
+  Check(!policy.ShouldReplace(false),
+        "the cache is replaced only once every build finished");
+  Check(policy.ShouldReplace(true), "a complete rebuild replaces the cache");
+  policy.Finished();
+  policy.Enable();
+  Check(policy.GetState() == State::Done && !policy.ShouldStart(9, false) &&
+            !policy.ShouldReplace(true),
+        "a session rebuilds once");
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +162,7 @@ int main() {
   TestSnapshotIsSorted();
   TestRoundTrip();
   TestCacheFilePayloadHash();
+  TestRebuildPolicy();
   std::printf("DriverCacheHistoryTests: ok\n");
   return 0;
 }

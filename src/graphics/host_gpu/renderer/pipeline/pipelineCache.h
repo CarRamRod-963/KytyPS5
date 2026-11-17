@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCacheHistory.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheRebuild.h"
 #include "graphics/host_gpu/renderer/pipeline/pendingDrawPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheWriter.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
@@ -75,6 +76,18 @@ enum class PipelineBuildMode : uint8_t {
 	// Built the way UnoptimizedFirst builds, so that a precompile of it fills the driver's own
 	// disk cache for that build.
 	Unoptimized,
+	// Like Precompile, but a pipeline the previous driver cache provides is not built (the
+	// caller reports PrecompileOutcome::Provided and builds it later): a background rebuild of
+	// the driver cache builds what the cache it replaces lacks first.
+	RebuildStale,
+};
+
+// A driver cache that a background rebuild replaces (PipelineCache::UpdateStaleRebuild), and the
+// pipelines it was given. While the rebuild runs, pipeline builds probe it before the cache they
+// build into; it is never written.
+struct PreviousDriverCache {
+	vk::PipelineCache                   cache = nullptr;
+	std::shared_ptr<DriverCacheHistory> history;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -121,6 +134,15 @@ public:
 	// `steady_thread_count` once the game renders or no recorded build is left (see
 	// UpdatePrecompileThreads); zero keeps `thread_count`.
 	void StartPrecompile(uint32_t thread_count, uint32_t steady_thread_count = 0);
+	// Rebuilds the driver cache in the background once a stale entry is on record (a pipeline the
+	// cache was given before and no longer provides, which then compiles in every session): at
+	// once when earlier sessions found one, else after this session's first. The recorded
+	// programs and pipelines (and, with --precompile-pipelines, the created compute shaders) are
+	// built into an empty cache on threads like StartPrecompile's, those the loaded cache does not
+	// provide first; the session keeps using the loaded cache meanwhile, and pipelines it lacks are
+	// built into the new one. Once every build has finished, the new cache replaces it and is
+	// written; a session that ends earlier keeps the old file. Call before StartPrecompile.
+	void EnableStaleRebuild(uint32_t thread_count, uint32_t steady_thread_count);
 	// Translates the programs the title's manifests recorded in earlier sessions, in the order
 	// they were first needed, on `thread_count` low-priority threads; the first use of such a
 	// program then takes its translation and module instead of translating it on the GPU thread.
@@ -273,6 +295,21 @@ private:
 	std::vector<uint64_t> m_history_file_built;
 	uint64_t              m_history_file_cache_hash = 0;
 	uint64_t              m_history_file_stale      = 0;
+	// The history whose pipelines the history file names: stale misses of another (a replaced
+	// cache's) are not written to it.
+	const DriverCacheHistory* m_history_file_owner = nullptr;
+	// The background rebuild of a stale driver cache (EnableStaleRebuild): the empty cache it
+	// fills and the pipelines given to that one. Set and cleared on the GPU thread, while no
+	// precompile build is queued or running.
+	DriverCacheRebuildPolicy              m_rebuild;
+	vk::PipelineCache                     m_rebuild_cache = nullptr;
+	std::shared_ptr<DriverCacheHistory>   m_rebuild_history;
+	std::chrono::steady_clock::time_point m_rebuild_start {};
+	uint32_t                              m_rebuild_threads        = 0;
+	uint32_t                              m_rebuild_steady_threads = 0;
+	std::chrono::steady_clock::time_point m_next_rebuild_check {};
+	// Driver caches the rebuild replaced; builds that captured them may still run.
+	std::vector<vk::PipelineCache> m_replaced_driver_caches;
 	// Writes the driver cache off the GPU thread; joined before the cache is destroyed.
 	PipelineCacheWriter m_driver_cache_writer;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
@@ -363,18 +400,37 @@ private:
 	// Graphics pipelines created this session: from the driver cache or compiled, and whether a
 	// record (local or imported) predicted them.
 	uint64_t m_graphics_from_cache = 0;
+	// Of those, provided by the cache a background rebuild replaces (EnableStaleRebuild).
+	uint64_t m_graphics_from_previous = 0;
 	uint64_t m_graphics_compiled   = 0;
 	uint64_t m_graphics_predicted  = 0;
 	uint64_t m_graphics_recorded   = 0;
 	// Live compute pipelines the driver cache provided or compiled.
 	uint64_t m_compute_from_cache = 0;
+	uint64_t m_compute_from_previous = 0;
 	uint64_t m_compute_compiled   = 0;
 
 	void InitializeDriverCache();
+	// Where pipeline builds go: the driver cache and its history, or while a background rebuild
+	// runs, the new cache with the loaded one as the cache to probe first.
+	struct BuildTarget {
+		vk::PipelineCache                   cache = nullptr;
+		std::shared_ptr<DriverCacheHistory> history;
+		PreviousDriverCache                 previous;
+	};
+	[[nodiscard]] BuildTarget CurrentBuildTarget() const;
+	// Starts a background rebuild when one is due, and replaces the driver cache with the
+	// rebuilt one once it is complete (GPU thread, a few times a minute).
+	void UpdateStaleRebuild();
+	bool StartStaleRebuild();
+	void ReplaceRebuiltDriverCache();
+	// Counts the windows of guest flips that tell whether the game renders steadily.
+	void TrackGameRendering(std::chrono::steady_clock::time_point now);
 	void CheckpointDriverCache();
 	void LogStaleDriverCache() const;
 	// Writes the history file for the cache file whose payload hash is `cache_hash`.
-	void WriteDriverHistory(std::vector<uint64_t> built, uint64_t cache_hash, uint64_t stale);
+	void WriteDriverHistory(const DriverCacheHistory& history, std::vector<uint64_t> built,
+	                        uint64_t cache_hash, uint64_t stale);
 	// Stale misses are kept even when the session ends without a save: the next
 	// --precompile-only must see them. Writes the history file when they changed.
 	void PersistStaleMisses();
@@ -392,9 +448,9 @@ private:
 	void SetPipelineManifest(std::unique_ptr<PipelineManifest> manifest);
 	// Records every compute shader the guest creates from now on in `created`.
 	void SetCreatedShaders(std::unique_ptr<ProgramManifest> created);
-	// Queues the manifest's programs and the created shaders without one, on a new queue unless
-	// one exists.
-	void QueuePrecompile(uint32_t thread_count);
+	// Queues the manifest's programs and, `with_created`, the created shaders without one, on a
+	// new queue unless one exists.
+	void QueuePrecompile(uint32_t thread_count, bool with_created = true);
 	// `position` is the record's FirstSeenPosition: recorded and listed builds run in that order,
 	// before the created shaders (code_only).
 	void EnqueuePrecompile(std::shared_ptr<const ComputeProgramRecord> record, bool code_only,
@@ -406,8 +462,9 @@ private:
 	// optimized build timed out is built unoptimized instead. Returns whether it was queued.
 	bool EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
 	                          uint64_t order);
+	// `requeue`: the key's job runs again (PrecompileOutcome::Provided).
 	void EnqueuePrecompileJob(uint64_t key, std::string label, PrecompileBuild build,
-	                          PipelineBuildMode mode, uint64_t order);
+	                          PipelineBuildMode mode, uint64_t order, bool requeue = false);
 	// Abandons the precompile builds that ran past the time budget.
 	void CheckPrecompileTimeouts();
 	// Boot threads while recorded or listed builds are left (or were queued less than a while
@@ -422,7 +479,8 @@ private:
 	PrecompileOutcome
 	PrecompileGraphicsPipeline(const GraphicsPipelineRecord&                               record,
 	                           std::span<const std::shared_ptr<const GraphicsStageRecord>> stages,
-	                           PipelineBuildMode mode, const std::atomic<bool>* cancel = nullptr);
+	                           PipelineBuildMode mode, const BuildTarget& target,
+	                           const std::atomic<bool>* cancel = nullptr);
 	void LogCoverage();
 	// Adds a pipeline the cache is about to create to the pipeline manifest.
 	void RecordGraphicsPipeline(const GraphicsPipelineKey& key, const DrawRenderState& state);
@@ -444,19 +502,24 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 // Creates the pipeline layout and the pipeline as `mode` says. Unless the build is Optimized,
 // the pipeline may be unoptimized or (Background) still null; the returned job then builds the
 // optimized one (see PipelineCache::DeferOptimization). `history` (optional) learns which
-// pipelines went through `driver_cache` and counts probes that missed one of them.
+// pipelines went through `driver_cache` and counts probes that missed one of them. Every mode but
+// Precompile and Unoptimized first probes `previous.cache` (if any), whose history counts its
+// stale misses; a pipeline it provides is not built into `driver_cache`, and `from_previous`
+// (optional) tells so.
 PipelineCompileQueue::Job CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const DrawRenderState& state, const PipelineStaticParameters& static_params,
     vk::PipelineCache driver_cache, PipelineBuildMode mode, bool* from_driver_cache = nullptr,
-    const std::atomic<bool>* cancel = nullptr, std::shared_ptr<DriverCacheHistory> history = {});
+    const std::atomic<bool>* cancel = nullptr, std::shared_ptr<DriverCacheHistory> history = {},
+    const PreviousDriverCache& previous = {}, bool* from_previous = nullptr);
 PipelineCompileQueue::Job
 CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                        const ShaderComputeInputInfo& input_info, vk::ShaderModule compute_module,
                        vk::PipelineCache driver_cache, PipelineBuildMode mode,
                        bool* from_driver_cache = nullptr, const std::atomic<bool>* cancel = nullptr,
-                       std::shared_ptr<DriverCacheHistory> history = {});
+                       std::shared_ptr<DriverCacheHistory> history = {},
+                       const PreviousDriverCache& previous = {}, bool* from_previous = nullptr);
 
 // Translates a recorded compute program as PipelineCache::GetComputeProgram would and builds
 // its pipeline through `driver_cache`, so that the pipeline cache finds it there on first use.
@@ -464,14 +527,16 @@ CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeli
 // With `code_only`, the record's specialization is ignored and the module is built for
 // ShaderRecompiler::IR::CodeOnlySpecialization of the translated program (a created shader that
 // no dispatch has specialized yet).
-// `mode` is Precompile, or Unoptimized for a program whose optimized build timed out. Once
-// `cancel` is set, the build stops before its next driver call (and reports TimedOut).
+// `mode` is Precompile, Unoptimized for a program whose optimized build timed out, or
+// RebuildStale (reports Provided when `previous` provides the pipeline). Once `cancel` is set,
+// the build stops before its next driver call (and reports TimedOut).
 PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::PipelineCache driver_cache,
                                            const ComputeProgramRecord& record,
                                            uint64_t* spirv_hash = nullptr, bool code_only = false,
                                            PipelineBuildMode mode = PipelineBuildMode::Precompile,
-                                           const std::atomic<bool>*            cancel  = nullptr,
-                                           std::shared_ptr<DriverCacheHistory> history = {});
+                                           const std::atomic<bool>*            cancel   = nullptr,
+                                           std::shared_ptr<DriverCacheHistory> history  = {},
+                                           const PreviousDriverCache&          previous = {});
 
 } // namespace Libs::Graphics
 

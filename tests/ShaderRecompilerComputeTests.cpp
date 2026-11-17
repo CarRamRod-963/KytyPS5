@@ -922,7 +922,42 @@ struct PipelineCacheTestAccess {
       PipelineCache &cache, const GraphicsPipelineRecord &record,
       const std::vector<std::shared_ptr<const GraphicsStageRecord>> &stages) {
     return cache.PrecompileGraphicsPipeline(record, stages,
-                                            PipelineBuildMode::Precompile);
+                                            PipelineBuildMode::Precompile,
+                                            cache.CurrentBuildTarget());
+  }
+
+  // EnableStaleRebuild for a cache without a title (no file to write).
+  static void EnableStaleRebuild(PipelineCache &cache, uint32_t threads) {
+    cache.m_rebuild_threads = threads;
+    cache.m_rebuild_steady_threads = threads;
+    cache.m_rebuild.Enable();
+    cache.UpdateStaleRebuild();
+  }
+
+  static bool RebuildRunning(const PipelineCache &cache) {
+    return cache.m_rebuild.Running();
+  }
+
+  // Waits for the rebuild's builds, then lets the cache replace its driver
+  // cache.
+  static void FinishStaleRebuild(PipelineCache &cache) {
+    if (cache.m_precompile_queue != nullptr) {
+      cache.m_precompile_queue->WaitIdle();
+    }
+    cache.UpdateStaleRebuild();
+  }
+
+  static vk::PipelineCache DriverCache(const PipelineCache &cache) {
+    return cache.m_driver_cache;
+  }
+
+  static std::shared_ptr<DriverCacheHistory>
+  History(const PipelineCache &cache) {
+    return cache.m_driver_history;
+  }
+
+  static uint64_t ComputeFromPrevious(const PipelineCache &cache) {
+    return cache.m_compute_from_previous;
   }
 };
 
@@ -58386,6 +58421,80 @@ void CheckComputePrecompile(VulkanHarness &vulkan) {
             counts.queued == 2 && counts.finished == 2 && counts.skipped == 1 &&
                 counts.cached + counts.compiled == 1,
             "precompiling every record did not account for each record once");
+  }
+
+  // A driver cache with stale entries on record is rebuilt in the background:
+  // the cache it replaces serves the session meanwhile, the rebuild builds what
+  // that cache provides after the rest, and the rebuilt cache then replaces it.
+  if (probes) {
+    {
+      PipelineCache quiet(graphics, nullptr);
+      auto manifest = std::make_unique<ProgramManifest>();
+      (void)manifest->Add(*record);
+      PipelineCacheTestAccess::AttachPersistence(quiet, std::move(manifest),
+                                                 new_driver_cache());
+      PipelineCacheTestAccess::AttachHistory(
+          quiet, std::make_shared<DriverCacheHistory>());
+      PipelineCacheTestAccess::EnableStaleRebuild(quiet, 1);
+      Require(name, "no stale entry",
+              !PipelineCacheTestAccess::RebuildRunning(quiet),
+              "a driver cache without stale entries was rebuilt");
+    }
+    PipelineCache cache(graphics, nullptr);
+    auto manifest = std::make_unique<ProgramManifest>();
+    (void)manifest->Add(*record);
+    const auto loaded = new_driver_cache();
+    Require(name, "rebuild seed",
+            PrecompileComputeProgram(graphics, loaded, *record) !=
+                PrecompileOutcome::Skipped,
+            "the record was not built into the loaded cache");
+    PipelineCacheTestAccess::AttachPersistence(cache, std::move(manifest),
+                                               loaded);
+    // A history file whose sessions found one stale entry.
+    const auto history_path =
+        std::filesystem::temp_directory_path() / "kyty-stale-rebuild.v1.built";
+    auto stale_history = std::make_shared<DriverCacheHistory>();
+    Require(name, "stale history",
+            DriverCacheHistory::Store(history_path, "stale-rebuild", {}, 1) &&
+                stale_history->Load(history_path, "stale-rebuild") &&
+                stale_history->StaleCount() == 1,
+            "a history with a stale miss could not be written and read");
+    std::error_code removed;
+    std::filesystem::remove(history_path, removed);
+    PipelineCacheTestAccess::AttachHistory(cache, stale_history);
+    PipelineCacheTestAccess::EnableStaleRebuild(cache, 1);
+    Require(name, "rebuild started",
+            PipelineCacheTestAccess::RebuildRunning(cache),
+            "a stale entry on record did not start a background rebuild");
+    ShaderComputeInputInfo input{};
+    (void)cache.GetComputeProgram(regs, input);
+    Require(name, "rebuild serves the loaded cache",
+            cache.GetComputePipeline(input).pipeline != nullptr &&
+                PipelineCacheTestAccess::ComputeFromPrevious(cache) == 1,
+            "a first use during the rebuild did not take the pipeline the "
+            "loaded cache provides");
+    PipelineCacheTestAccess::FinishStaleRebuild(cache);
+    const auto counts = PipelineCacheTestAccess::PrecompileCounts(cache);
+    Require(name, "rebuild replaces",
+            !PipelineCacheTestAccess::RebuildRunning(cache) &&
+                PipelineCacheTestAccess::DriverCache(cache) != loaded,
+            "the rebuilt cache did not replace the loaded one");
+    Require(name, "rebuild order",
+            counts.provided == 1 && counts.finished == 2 &&
+                counts.cached + counts.compiled == 1,
+            "the pipeline the loaded cache provides was not built into the new "
+            "cache after the others");
+    const auto rebuilt = PipelineCacheTestAccess::History(cache);
+    Require(name, "rebuild history",
+            rebuilt != stale_history && rebuilt->Size() == 1 &&
+                rebuilt->StaleCount() == 0,
+            "the rebuilt cache's history does not name its pipeline or kept "
+            "the stale misses");
+    Require(name, "rebuilt cache",
+            PrecompileComputeProgram(
+                graphics, PipelineCacheTestAccess::DriverCache(cache),
+                *record) == PrecompileOutcome::Cached,
+            "the rebuilt cache does not hold the pipeline");
   }
 
   // A queued precompile is expedited by the first use of its program.

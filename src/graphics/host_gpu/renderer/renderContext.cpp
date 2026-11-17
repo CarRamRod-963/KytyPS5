@@ -30,15 +30,18 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	if (graphics.ray_query_enabled) {
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
 	}
-	// After the bindless table: precompiled layouts reference its set layout.
+	// After the bindless table: precompiled layouts reference its set layout. While the session
+	// boots, about half the host threads (at low priority) build what earlier sessions or the list
+	// recorded, which the game is about to need; then as many as the background pipeline builds
+	// use: driver compilers are multithreaded themselves, and the guest needs the CPU.
+	const auto host           = std::thread::hardware_concurrency();
+	const auto boot_threads   = std::clamp(host / 2u, 2u, 8u);
+	const auto steady_threads = std::clamp(host / 8u, 1u, 2u);
+	if (Config::StalePipelineRebuildEnabled() && !Config::PrecompileOnlyEnabled()) {
+		m_pipeline_cache.EnableStaleRebuild(boot_threads, steady_threads);
+	}
 	if (Config::PrecompilePipelinesEnabled() && !Config::PrecompileOnlyEnabled()) {
-		// While the session boots, about half the host threads (at low priority) build what
-		// earlier sessions or the list recorded, which the game is about to need; then as many
-		// as the background pipeline builds use: driver compilers are multithreaded themselves,
-		// and the guest needs the CPU.
-		const auto host = std::thread::hardware_concurrency();
-		m_pipeline_cache.StartPrecompile(std::clamp(host / 2u, 2u, 8u),
-		                                 std::clamp(host / 8u, 1u, 2u));
+		m_pipeline_cache.StartPrecompile(boot_threads, steady_threads);
 	}
 	if (!Config::PrecompileOnlyEnabled()) {
 		m_pipeline_cache.StartProgramPreparation(std::min(Config::PrepareThreads(), 8u));

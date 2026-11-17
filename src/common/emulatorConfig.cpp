@@ -269,6 +269,10 @@ bool RebuildPipelineCacheEnabled() {
 	return g_config->rebuild_pipeline_cache;
 }
 
+bool StalePipelineRebuildEnabled() {
+	return g_config->stale_pipeline_rebuild;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

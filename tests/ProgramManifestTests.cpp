@@ -431,6 +431,89 @@ void TestPrecompileQueue() {
   }
   // The queue is gone; the abandoned job returns later on its own thread.
   stuck_gate->Release();
+
+  // A running job queues its key again behind later jobs; the new job is the
+  // one Expedite and Abandon act on, and both count.
+  {
+    ProgramPrecompileQueue requeued(1);
+    std::vector<int> ran;
+    std::mutex ran_mutex;
+    Gate first_gate;
+    std::atomic<bool> first_started{false};
+    const auto record = [&](int id) {
+      std::lock_guard lock(ran_mutex);
+      ran.push_back(id);
+    };
+    Gate second_gate;
+    std::atomic<bool> second_started{false};
+    std::thread::id requeued_thread;
+    Check(requeued.Enqueue(
+              20,
+              [&] {
+                first_started = true;
+                first_gate.Wait();
+                record(1);
+                Check(requeued.Requeue(
+                          20,
+                          [&] {
+                            requeued_thread = std::this_thread::get_id();
+                            record(3);
+                          },
+                          9),
+                      "a running job requeues its key");
+              },
+              1),
+          "queue the job to requeue");
+    while (!first_started) {
+      std::this_thread::yield();
+    }
+    (void)requeued.Enqueue(
+        21,
+        [&] {
+          second_started = true;
+          record(2);
+          second_gate.Wait();
+        },
+        5);
+    first_gate.Release();
+    while (!second_started) {
+      std::this_thread::yield();
+    }
+    // The first job of the key has finished; its completion must not end the
+    // requeued one, which is still queued behind the held worker.
+    Check(requeued.Remaining() == 2, "the requeued and the held job remain");
+    requeued.Expedite(20);
+    Check(requeued_thread == std::this_thread::get_id(),
+          "the requeued job is expedited after its first job finished");
+    second_gate.Release();
+    requeued.WaitIdle();
+    Check(ran == std::vector<int>{1, 2, 3},
+          "the requeued job runs after the jobs queued before its order");
+    Check(requeued.Remaining() == 0 && requeued.Queued() == 3,
+          "the requeued job counts as one more job");
+    Check(!requeued.Enqueue(20, [&] { record(4); }),
+          "a requeued key is still known");
+
+    // The requeued job of a key is the one a lookup expedites.
+    Gate hold_gate;
+    std::atomic<bool> hold_started{false};
+    (void)requeued.Enqueue(30, [&] {
+      hold_started = true;
+      hold_gate.Wait();
+    });
+    while (!hold_started) {
+      std::this_thread::yield();
+    }
+    Check(requeued.Requeue(
+              20, [&] { record(5); }, 0),
+          "a finished key is queued again");
+    requeued.Expedite(20);
+    Check(ran.back() == 5, "the requeued job is expedited");
+    hold_gate.Release();
+    requeued.WaitIdle();
+    requeued.Stop();
+    Check(!requeued.Requeue(20, [] {}), "a stopped queue takes no requeue");
+  }
 }
 
 void TestPrecompileProgress() {
