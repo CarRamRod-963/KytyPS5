@@ -301,8 +301,8 @@ private:
 	// Whether another image over the image's memory holds GPU-written contents or was written
 	// natively after it. Aliased images (a title's transient resources placed in one heap) share
 	// their bytes, and which of them the memory holds is unknown: a render target binding is not
-	// a write of all its texels.
-	[[nodiscard]] bool MemorySharedWithOtherContents(ImageId id);
+	// a write of all its texels. `except` is left out of the walk.
+	[[nodiscard]] bool MemorySharedWithOtherContents(ImageId id, ImageId except = {});
 
 	// FindImage; sole_owner, when given, tells whether the result is the only image overlapping
 	// the description's memory and matched it without an overlap resolution.
@@ -312,6 +312,10 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// Frees `cached` for a request at its address that cannot take it over; the request is
+	// inserted afresh and uploads from the buffer cache, where the cached image's GPU-written
+	// contents go first. Returns `merged`.
+	[[nodiscard]] ImageId       ReplaceOverlappedImage(ImageId cached, ImageId merged);
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
@@ -369,6 +373,10 @@ private:
 	LayoutChangeLog                                   m_layout_log;
 	uint64_t                                          m_deletion_epoch     = 0;
 	uint64_t                                          m_total_used_memory  = 0;
+	// Replaced images whose GPU-written contents were lost (ReplaceOverlappedImage); the first
+	// MaxReplaceReports are logged.
+	static constexpr uint32_t MaxReplaceReports = 16;
+	uint32_t                  m_replace_losses  = 0;
 	// GPU-written images deleted over the limit are written back to guest memory first (a GPU copy
 	// each, landing when it completes); at most this many bytes per collection.
 	uint64_t m_over_limit_write_back_bytes = 256ull << 20u;

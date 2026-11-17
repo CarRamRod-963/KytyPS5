@@ -847,7 +847,12 @@ bool Publish(TextureCache& cache, Image& image) {
 	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
 	auto [buffer, offset] =
 	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
-	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	// Bytes buffer writes produced since the image's last native write stay in the buffer.
+	cache.m_buffer_cache.KeepBufferWrittenBytes(
+	    *buffer, image.BufferWrittenRange(), image.info.data, [&] {
+		    cache.DownloadImage(image, *buffer, offset, image.info.data.size,
+		                        image.info.resources.levels);
+	    });
 	image.ClearGpuModified();
 	image.MarkBufferModified();
 	return true;
@@ -945,13 +950,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
-		// same block-slice layout while requiring a larger native image.
+		// same block-slice layout while requiring a larger native image. Equal resources mean an
+		// equal per-slice layout here, so a request at least as wide and deep contains every texel
+		// of the cached volume at the same address (widths may differ within the padded pitch).
+		// Bytes buffer writes produced since the cached image's last native write are not in it.
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
 		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
-		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.width >= cached.info.extent.width &&
 		      requested.extent.height == cached.info.extent.height &&
-		      requested.extent.depth > cached.info.extent.depth))) {
+		      requested.extent.depth >= cached.info.extent.depth &&
+		      cached.BufferWrittenRange().size == 0))) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -986,6 +995,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                                        requested.pixel_format)
 			            ? result_id
 			            : ImageId {}};
+		}
+		// A larger volume over a smaller one it does not contain: Saros reuses the slots of its
+		// volume pool for volumes of another width and a larger depth without unmapping them.
+		if (requested.IsVolume()) {
+			return {ReplaceOverlappedImage(cached_id, merged_id)};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
@@ -1087,6 +1101,36 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	FreeImage(source_id);
 	return expanded_id;
+}
+
+ImageId TextureCache::ReplaceOverlappedImage(ImageId cached_id, ImageId merged_id) {
+	// The memory holds the cached image's GPU-written contents unless they are superseded (a
+	// displaced image) or another image over the same memory may hold newer bytes there.
+	auto&      cached    = m_slot_images[cached_id];
+	const bool shared    = MemorySharedWithOtherContents(cached_id, merged_id);
+	const bool contents  = HoldsGpuContents(cached) && !cached.displaced;
+	const bool published = contents && !shared && BcAlias::Publish(*this, cached);
+	if (contents && !published && m_replace_losses++ < MaxReplaceReports) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "TextureCache: replaced image 0x%016" PRIx64 " (%ux%ux%u) without its GPU "
+		           "contents (%s)\n",
+		           cached.info.data.address, cached.info.extent.width, cached.info.extent.height,
+		           cached.info.extent.depth, shared ? "memory shared" : "not downloadable");
+	}
+	if (merged_id) {
+		// The request already resolved to an image: it keeps its own contents where both
+		// overlap and takes the published ones elsewhere.
+		auto& merged = m_slot_images[merged_id];
+		if (HoldsGpuContents(merged)) {
+			(void)BcAlias::Publish(*this, merged);
+		} else if (published) {
+			merged.MarkBufferModified();
+		}
+	}
+	auto& retired = m_slot_images[cached_id];
+	retired.binding.needs_rebind |= retired.binding.is_bound || retired.binding.is_target;
+	FreeImage(cached_id);
+	return merged_id;
 }
 
 bool TextureCache::CanDownload(const Image& image) const {
@@ -2419,16 +2463,17 @@ bool TextureCache::BufferWriteRefreshes(const Image& image, uint64_t address, ui
 	return image.info.data.address == address || inside;
 }
 
-bool TextureCache::MemorySharedWithOtherContents(ImageId id) {
+bool TextureCache::MemorySharedWithOtherContents(ImageId id, ImageId except) {
 	const auto& image  = m_slot_images[id];
 	bool        shared = false;
 	// The walk only reads images, as ForEachImageInRegion requires.
-	ForEachImageInRegion(
-	    image.info.data.address, image.info.data.size, [&](ImageId other_id, const Image& other) {
-		    shared = other_id != id && (other.IsGpuModified() ||
-		                                other.native_write_sequence > image.native_write_sequence);
-		    return shared;
-	    });
+	ForEachImageInRegion(image.info.data.address, image.info.data.size,
+	                     [&](ImageId other_id, const Image& other) {
+		                     shared = other_id != id && other_id != except &&
+		                              (other.IsGpuModified() ||
+		                               other.native_write_sequence > image.native_write_sequence);
+		                     return shared;
+	                     });
 	return shared;
 }
 
