@@ -34,7 +34,7 @@ OcclusionQueries::~OcclusionQueries() {
 
 int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
 	if (m_begun - m_read == QUERY_COUNT) {
-		m_uncounted++;
+		m_ledger.Credit();
 		return -1;
 	}
 	const auto query = static_cast<uint32_t>(m_begun++ % QUERY_COUNT);
@@ -43,17 +43,11 @@ int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
 }
 
 void OcclusionQueries::Dump(uint64_t address) {
-	// Begins dump to the results, ends 8 bytes into them.
-	if ((address & 8u) == 0) {
-		m_open++;
-	} else if (m_open != 0) {
-		m_open--;
-	}
-	m_dumps.push_back({address, m_scheduler.CurrentTick(), m_begun, m_uncounted});
+	m_dumps.push_back({m_ledger.Record(address, m_begun), m_scheduler.CurrentTick()});
 }
 
 void OcclusionQueries::PublishDumps() {
-	if (const auto last = m_dumps.back().queries; last != m_read) {
+	if (const auto last = m_dumps.back().dump.queries; last != m_read) {
 		m_scheduler.Wait(m_dumps.back().tick);
 		// The unread queries wrap around the pool at most once.
 		for (uint64_t read = m_read; read < last;) {
@@ -69,7 +63,7 @@ void OcclusionQueries::PublishDumps() {
 			read += count;
 		}
 	}
-	for (const auto& dump: m_dumps) {
+	for (const auto& [dump, tick]: m_dumps) {
 		for (; m_read < dump.queries; m_read++) {
 			m_samples += m_results[m_read % QUERY_COUNT];
 		}

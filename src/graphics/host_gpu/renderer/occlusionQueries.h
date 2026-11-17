@@ -27,6 +27,48 @@ inline void WriteZPassCounters(volatile uint64_t* results, uint64_t samples, boo
 	}
 }
 
+// The guest side of the z-pass dumps, without Vulkan: whether a guest query is open, and the
+// samples credited to draws that took no host query. A dump's counter is the samples of the host
+// queries before it plus those credits.
+class ZPassLedger {
+public:
+	struct Dump {
+		uint64_t address;
+		// Host queries begun before the dump.
+		uint64_t queries;
+		// Samples credited before the dump.
+		uint64_t uncounted;
+	};
+
+	// A guest query is open: draws count their samples.
+	[[nodiscard]] bool Counting() const { return m_open != 0; }
+	// One sample for a draw that took no host query (the pool had no free query).
+	void Credit() { m_uncounted++; }
+	// A draw the host does not issue while a guest query is open, because it cannot run it or
+	// replaces it with other work, counts one sample. Its object is then visible: a hidden result
+	// (no samples) would let the guest cull geometry its draw shows, while a visible one costs
+	// at most the work the guest would have done anyway.
+	void CountUnissuedDraw() {
+		if (m_open != 0) {
+			m_uncounted++;
+		}
+	}
+	// A PIXEL_PIPE_STAT_DUMP to address after `queries` host queries: begins dump to the
+	// results, ends 8 bytes into them.
+	Dump Record(uint64_t address, uint64_t queries) {
+		if ((address & 8u) == 0) {
+			m_open++;
+		} else if (m_open != 0) {
+			m_open--;
+		}
+		return {address, queries, m_uncounted};
+	}
+
+private:
+	uint32_t m_open      = 0;
+	uint64_t m_uncounted = 0;
+};
+
 // The guest's z-pass counters from host occlusion queries: a draw counts its samples while a guest
 // query is open, and the dumps' counters are written before the guest can see the GPU ran them.
 class OcclusionQueries {
@@ -39,8 +81,12 @@ public:
 
 	// In the draw's rendering: the query that counts its samples, or -1.
 	[[nodiscard]] int32_t Begin(vk::CommandBuffer command) {
-		return m_open == 0 ? -1 : BeginQuery(command);
+		return m_ledger.Counting() ? BeginQuery(command) : -1;
 	}
+	// Whether a draw recorded now counts its samples for a guest query.
+	[[nodiscard]] bool Counting() const { return m_ledger.Counting(); }
+	// See ZPassLedger::CountUnissuedDraw.
+	void CountUnissuedDraw() { m_ledger.CountUnissuedDraw(); }
 	void End(vk::CommandBuffer command, int32_t query) const {
 		if (query >= 0) {
 			command.endQuery(m_pool, static_cast<uint32_t>(query));
@@ -58,10 +104,8 @@ public:
 
 private:
 	struct PendingDump {
-		uint64_t address;
-		uint64_t tick;
-		uint64_t queries;
-		uint64_t uncounted;
+		ZPassLedger::Dump dump;
+		uint64_t          tick;
 	};
 
 	int32_t BeginQuery(vk::CommandBuffer command);
@@ -73,11 +117,10 @@ private:
 	vk::QueryControlFlags    m_control;
 	std::vector<PendingDump> m_dumps;
 	std::vector<uint64_t>    m_results;
-	uint32_t                 m_open      = 0;
-	uint64_t                 m_begun     = 0;
-	uint64_t                 m_read      = 0;
-	uint64_t                 m_samples   = 0;
-	uint64_t                 m_uncounted = 0;
+	ZPassLedger              m_ledger;
+	uint64_t                 m_begun   = 0;
+	uint64_t                 m_read    = 0;
+	uint64_t                 m_samples = 0;
 };
 
 } // namespace Libs::Graphics

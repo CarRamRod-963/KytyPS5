@@ -434,6 +434,9 @@ private:
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
+	// A draw the guest issued that the host leaves out or replaces: inside a guest occlusion
+	// query it counts as visible (ZPassLedger::CountUnissuedDraw).
+	void                      CountUnissuedDraw();
 	void ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
 	                         const DrawIndexBufferSource& index_source);
