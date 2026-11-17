@@ -123,37 +123,75 @@ void TestMarks() {
   Check(!marks.Update(9227 * MiB + 300 * MiB, 4 * s),
         "a fluctuation moves the marks");
 
-  // A rise is followed only once it held for RiseHoldMs, to the lowest
-  // budget seen meanwhile.
+  // A rise is followed once it held for RiseConfirmMs, to the lowest budget
+  // seen meanwhile: a 12 GB card's budget fell during a load and came back
+  // seconds later, and holding the rise for RiseHoldMs kept the collectors at
+  // the lower critical mark for the rest of the load.
+  constexpr uint64_t confirm = LiveMarks::RiseConfirmMs;
   constexpr uint64_t hold = LiveMarks::RiseHoldMs;
-  Check(!marks.Update(9227 * MiB + 900 * MiB, 10 * s),
-        "a budget rise is followed at once");
-  Check(!marks.Update(9227 * MiB + 600 * MiB, 10 * s + hold / 2),
+  constexpr uint64_t window = LiveMarks::RiseFlapWindowMs;
+  static_assert(confirm < hold);
+  // A reading that is high for a moment (another process held device memory)
+  // moves nothing.
+  Check(!marks.Update(14185 * MiB, 5 * s) &&
+            !marks.Update(14185 * MiB, 5 * s + confirm - 1),
+        "a budget rise is followed before it was confirmed");
+  Check(!marks.Update(9227 * MiB + 100 * MiB, 5 * s + confirm) &&
+            marks.Generation() == 2 && marks.Budget() == 9227 * MiB,
+        "a high reading that fell back moved the marks");
+  Check(!marks.Update(9227 * MiB + 1200 * MiB, 20 * s) &&
+            !marks.Update(9227 * MiB + 900 * MiB, 20 * s + confirm / 2),
+        "a budget rise is followed before it was confirmed");
+  Check(marks.Update(9227 * MiB + 1200 * MiB, 20 * s + confirm),
+        "a confirmed budget rise is not followed");
+  Check(marks.Budget() == 9227 * MiB + 900 * MiB && marks.Generation() == 3,
+        "the confirmed rise did not move the marks to its lowest budget");
+
+  // A rise that begins within RiseFlapWindowMs of the last one is followed
+  // only once it held for RiseHoldMs, to the lowest budget seen meanwhile.
+  Check(marks.Update(9227 * MiB, 30 * s),
+        "a drop after a rise is not followed");
+  constexpr uint64_t t0 = 31 * s;
+  Check(!marks.Update(9227 * MiB + 900 * MiB, t0) &&
+            !marks.Update(9227 * MiB + 900 * MiB, t0 + confirm),
+        "a rise inside the flap window is followed once confirmed");
+  Check(!marks.Update(9227 * MiB + 600 * MiB, t0 + hold / 2),
         "a budget rise is followed before it held");
-  Check(marks.Update(9227 * MiB + 900 * MiB, 10 * s + hold),
+  Check(marks.Update(9227 * MiB + 900 * MiB, t0 + hold),
         "a budget rise that held is not followed");
-  Check(marks.Budget() == 9227 * MiB + 600 * MiB && marks.Generation() == 3,
+  Check(marks.Budget() == 9227 * MiB + 600 * MiB && marks.Generation() == 5,
         "the held rise did not move the marks to its lowest budget");
+  // A rise that begins once the window passed since the last one is followed
+  // once confirmed.
+  constexpr uint64_t t1 = t0 + hold;
+  Check(marks.Update(9227 * MiB, t1 + 1), "a drop is not followed");
+  Check(!marks.Update(9227 * MiB + 900 * MiB, t1 + window) &&
+            marks.Update(9227 * MiB + 900 * MiB, t1 + window + confirm),
+        "a rise after the flap window is not followed once confirmed");
 
   // A budget that flaps (a 16 GB card: 14,185 <-> ~13,300 MiB about every
-  // minute) keeps the lower marks: a rise that falls back before it held
-  // restarts the hold.
+  // minute) moves the marks up once, then keeps the lower marks: a rise that
+  // falls back before it held restarts the hold.
   LiveMarks flap;
   Check(flap.Update(14185 * MiB, 0) && flap.Update(13287 * MiB, 60 * s),
         "the flapping budget's first drop is not followed");
-  for (uint64_t i = 0; i < 6; i++) {
-    const uint64_t t = 70 * s + i * 50 * s;
+  Check(!flap.Update(14185 * MiB, 70 * s) &&
+            flap.Update(14185 * MiB, 70 * s + confirm) &&
+            flap.Update(13287 * MiB, 100 * s),
+        "the flapping budget's first rise and drop are not followed");
+  for (uint64_t i = 0; i < 4; i++) {
+    const uint64_t t = 120 * s + i * 50 * s;
     Check(!flap.Update(14185 * MiB, t) &&
               !flap.Update(14185 * MiB, t + hold - 1),
           "a flapping budget's rise is followed before it held");
     Check(!flap.Update(13406 * MiB, t + hold),
           "a fall-back inside the hysteresis moves the marks");
   }
-  Check(flap.Budget() == 13287 * MiB && flap.Generation() == 2,
+  Check(flap.Budget() == 13287 * MiB && flap.Generation() == 4,
         "the flapping budget moved the marks");
   Check(!flap.Update(14185 * MiB, 1000 * s) &&
-            flap.Update(14185 * MiB, 1000 * s + hold),
-        "a rise that held after the flapping is not followed");
+            flap.Update(14185 * MiB, 1000 * s + confirm),
+        "a rise long after the flapping is not followed once confirmed");
   Check(flap.Texture() == TextureMarks(14185 * MiB), "the marks are not back");
 }
 

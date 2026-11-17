@@ -100,14 +100,22 @@ namespace Detail {
 // memory and the OS change it (a 12 GB card's budget fell from 10.9 to 10.0 GiB during one
 // session), and marks read once at start then let the caches grow past it. Budget changes below
 // Hysteresis are ignored: the budget of a busy session moves by up to ~300 MiB from one second
-// to the next. A drop is followed at once; a rise only once the budget stayed Hysteresis above
-// the marks' budget for RiseHoldMs, and then to the lowest budget seen while it held: a 16 GB
-// card's budget switched between 14,185 and ~13,300 MiB about every minute in one session, and
-// following both directions moved every mark by ~900 MiB each time. O(1).
+// to the next. A drop is followed at once. A rise is followed once the budget stayed Hysteresis
+// above the marks' budget for RiseConfirmMs, or for RiseHoldMs when the marks already rose within
+// RiseFlapWindowMs before the rise began, and then to the lowest budget seen while it held. A
+// 16 GB card's budget switched between 14,185 and ~13,300 MiB about every minute in one session,
+// and following both directions moved every mark by ~900 MiB each time; a 12 GB card's budget
+// fell by 1.2 GiB during a load and came back 0.7 GiB a few seconds later, and holding that rise
+// for RiseHoldMs kept the buffer collector at its critical mark for the rest of the load, where it
+// evicted GPU-written buffers shaders read again later (lost accesses). RiseConfirmMs keeps a
+// reading that is high for a moment (seen while another process held device memory) from moving
+// the marks and from starting a flap window. O(1).
 class LiveMarks {
 public:
-	static constexpr uint64_t Hysteresis = 512 * MiB;
-	static constexpr uint64_t RiseHoldMs = 30'000;
+	static constexpr uint64_t Hysteresis       = 512 * MiB;
+	static constexpr uint64_t RiseConfirmMs    = 5'000;
+	static constexpr uint64_t RiseHoldMs       = 30'000;
+	static constexpr uint64_t RiseFlapWindowMs = 10 * RiseHoldMs;
 
 	// Returns true when the marks changed.
 	bool Update(uint64_t cache_budget, uint64_t now_ms) {
@@ -123,13 +131,14 @@ public:
 			m_rising     = true;
 			m_rise_since = now_ms;
 			m_rise_low   = cache_budget;
-			return false;
+			m_rise_hold =
+			    m_rose && now_ms - m_rose_ms < RiseFlapWindowMs ? RiseHoldMs : RiseConfirmMs;
 		}
 		m_rise_low = std::min(m_rise_low, cache_budget);
-		if (now_ms - m_rise_since < RiseHoldMs) {
+		if (now_ms - m_rise_since < m_rise_hold) {
 			return false;
 		}
-		Set(m_rise_low);
+		Rise(m_rise_low, now_ms);
 		return true;
 	}
 
@@ -140,6 +149,12 @@ public:
 	[[nodiscard]] uint64_t Generation() const { return m_generation; }
 
 private:
+	void Rise(uint64_t cache_budget, uint64_t now_ms) {
+		Set(cache_budget);
+		m_rose    = true;
+		m_rose_ms = now_ms;
+	}
+
 	void Set(uint64_t cache_budget) {
 		m_valid   = true;
 		m_rising  = false;
@@ -153,10 +168,13 @@ private:
 	uint64_t        m_generation = 0;
 	uint64_t        m_rise_since = 0;
 	uint64_t        m_rise_low   = 0;
+	uint64_t        m_rise_hold  = 0; // How long the current rise must hold (m_rising).
+	uint64_t        m_rose_ms    = 0; // When the marks last rose (valid with m_rose).
 	CollectionMarks m_texture;
 	CollectionMarks m_buffer;
 	bool            m_valid  = false;
 	bool            m_rising = false;
+	bool            m_rose   = false;
 };
 
 // Accesses through the BDA page table to memory no buffer caches are lost for their dispatch (a
