@@ -16065,7 +16065,10 @@ public:
     constexpr uint64_t slice_size = 0x10000;
     constexpr uint64_t color_size = 0x200000;
     constexpr uint64_t metadata_size = 0x20000;
-    constexpr uint64_t allocation_size = 56 * slice_size;
+    constexpr uint64_t volume_size = 56 * slice_size;
+    // Volume-pool slots past the first volume (see "volume slot reuse" below).
+    constexpr uintptr_t slot_base = base + 64 * slice_size;
+    constexpr uint64_t allocation_size = 128 * slice_size;
     constexpr uint64_t allocation_alignment = 0x10000;
     EnsureRuntimeContext();
 
@@ -16340,7 +16343,7 @@ public:
           {vk::ImageAspectFlagBits::eColor, 0, 1, 31, 1}, painted);
       auto expanded = storage_desc;
       expanded.info.extent.depth = 56;
-      expanded.info.data.size = allocation_size;
+      expanded.info.data.size = volume_size;
       expanded.info.UpdateSize();
       const auto expanded_id = texture_cache.FindImage(expanded);
       Require(name, "3D storage depth expansion",
@@ -16355,6 +16358,124 @@ public:
                   ReadCachedTexel(name, context, expanded_id, {0, 0, 55}) ==
                       std::vector<u32>{0x5a5a5a5a},
               "volume expansion lost GPU writes or copied beyond the old depth");
+
+      // Volume slot reuse: Saros' volume pool reuses a slot for a volume of
+      // another width (inside the padded pitch) and a larger depth without
+      // unmapping it.
+      constexpr u32 guest_texel = 0x5a5a5a5au;
+      constexpr u32 painted_texel = 0x3fffffffu;
+      const auto slot_volume = [&](uint32_t width, uint32_t depth) {
+        auto desc = storage_desc;
+        desc.info.data = {slot_base, depth * slice_size};
+        desc.info.extent = {width, 32, depth};
+        desc.info.UpdateSize();
+        return desc;
+      };
+      const auto bind_volume = [&](ImageDesc &desc) {
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(id, desc);
+        return id;
+      };
+      const auto paint_slices = [&](ImageId id, uint32_t first,
+                                    uint32_t count) {
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, first, count}, painted);
+      };
+      const auto texel = [&](ImageId id, int32_t z) {
+        const auto value = ReadCachedTexel(name, context, id, {0, 0, z});
+        return value.empty() ? 0u : value[0];
+      };
+      auto slot0 = slot_volume(30, 16);
+      Require(name, "volume slot layout",
+              slot0.info.pitch == 128 &&
+                  slot0.info.mip_layout[0].size == slice_size &&
+                  slot0.info.data.size == 16 * slice_size,
+              "a narrower volume in the padded pitch changed the block-slice "
+              "layout");
+      const auto slot0_id = bind_volume(slot0);
+      paint_slices(slot0_id, 15, 1);
+      Require(name, "volume slot paint",
+              texture_cache.GetImage(slot0_id).IsGpuModified() &&
+                  texel(slot0_id, 15) == painted_texel,
+              "the slot volume did not take its GPU write");
+
+      // (a) A wider and deeper request contains the cached volume: it takes the
+      // native contents over by a copy, nothing goes through the buffer cache.
+      auto wider = slot_volume(32, 24);
+      const auto wider_id = bind_volume(wider);
+      const auto &wider_image = texture_cache.GetImage(wider_id);
+      Require(
+          name, "wider deeper volume takes the slot over",
+          wider_id != slot0_id &&
+              !TextureCacheTestAccess::Contains(texture_cache, slot0_id) &&
+              wider_image.backing.extent == vk::Extent3D{32, 32, 24} &&
+              wider_image.IsGpuModified() &&
+              !resources.GetBufferCache().HasGpuDirtyBytes(slot_base,
+                                                           24 * slice_size) &&
+              texel(wider_id, 15) == painted_texel &&
+              texel(wider_id, 23) == guest_texel,
+          "a request containing the cached volume did not copy its contents");
+
+      // (b) A narrower and deeper request does not contain it: the cached
+      // volume's GPU contents go to the buffer cache and the request uploads
+      // them (this was an EXIT).
+      paint_slices(wider_id, 20, 1);
+      auto narrower = slot_volume(28, 32);
+      const auto narrower_id = bind_volume(narrower);
+      Require(name, "narrower deeper volume replaces the slot",
+              narrower_id != wider_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, wider_id) &&
+                  texture_cache.GetImage(narrower_id).backing.extent ==
+                      vk::Extent3D{28, 32, 32} &&
+                  texel(narrower_id, 15) == painted_texel &&
+                  texel(narrower_id, 20) == painted_texel &&
+                  texel(narrower_id, 31) == guest_texel,
+              "a replaced volume lost its GPU contents or the request its "
+              "guest bytes");
+
+      // (c) Bytes a buffer write produced after the cached volume's last native
+      // write are newer than the volume there: even a containing request does
+      // not copy the volume over them. The write starts past the first block
+      // slice, which holds texel (0, 0, 0); the last Z slice lies inside it.
+      paint_slices(narrower_id, 0, 32);
+      const auto written = slot_base + slice_size;
+      const auto written_size = 31 * slice_size;
+      texture_cache.PrepareGpuBufferWrite(
+          written, written_size, TextureCache::BufferWriteExtent::Exact);
+      auto [written_buffer, written_offset] =
+          resources.GetBufferCache().ObtainBuffer(written, written_size, true);
+      written_buffer->Fill(written_offset, written_size, 0x11111111u);
+      Require(name, "buffer write after the native write",
+              texture_cache.GetImage(narrower_id).BufferWrittenRange().size ==
+                  written_size,
+              "the partial buffer write was not recorded on the volume");
+      auto written_over = slot_volume(32, 40);
+      const auto written_over_id = bind_volume(written_over);
+      Require(
+          name, "replaced volume keeps later buffer bytes",
+          written_over_id != narrower_id &&
+              !TextureCacheTestAccess::Contains(texture_cache, narrower_id) &&
+              texel(written_over_id, 0) == painted_texel &&
+              texel(written_over_id, 31) == 0x11111111u &&
+              texel(written_over_id, 39) == guest_texel,
+          "a volume replacement overwrote newer buffer bytes or lost GPU "
+          "contents");
+
+      // (d) Superseded (displaced) contents are not published; the request
+      // still replaces it.
+      paint_slices(written_over_id, 39, 1);
+      TextureCacheTestAccess::MarkDisplaced(texture_cache, written_over_id);
+      auto displaced_over = slot_volume(30, 48);
+      const auto displaced_over_id = bind_volume(displaced_over);
+      Require(name, "displaced volume is replaced without its contents",
+              displaced_over_id != written_over_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    written_over_id) &&
+                  texel(displaced_over_id, 39) == guest_texel &&
+                  texel(displaced_over_id, 0) == painted_texel &&
+                  texel(displaced_over_id, 47) == guest_texel,
+              "a displaced volume's superseded contents were published");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
