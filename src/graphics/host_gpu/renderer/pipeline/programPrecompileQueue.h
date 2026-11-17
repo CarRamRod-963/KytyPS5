@@ -26,6 +26,9 @@ enum class PrecompileOutcome : uint8_t {
 	// The build ran past the precompile time budget; it is abandoned (still running) and
 	// quarantined for later runs.
 	TimedOut,
+	// A background rebuild of the driver cache found the pipeline in the cache it replaces, which
+	// serves the session meanwhile: the pipeline is built after those the old cache lacks.
+	Provided,
 };
 
 // Counts the outcomes of a precompile run and tells exactly one caller that the run is complete:
@@ -41,6 +44,7 @@ public:
 		uint64_t compiled   = 0;
 		uint64_t skipped    = 0;
 		uint64_t timed_out  = 0;
+		uint64_t provided   = 0;
 		uint64_t compile_ms = 0;
 	};
 
@@ -83,6 +87,7 @@ public:
 				break;
 			case PrecompileOutcome::Skipped: m_counts.skipped++; break;
 			case PrecompileOutcome::TimedOut: m_counts.timed_out++; break;
+			case PrecompileOutcome::Provided: m_counts.provided++; break;
 		}
 		return --m_open == 0;
 	}
@@ -131,6 +136,26 @@ public:
 	bool Enqueue(uint64_t key, Job job, uint64_t order = 0) {
 		std::lock_guard lock(m_mutex);
 		if (m_stopped || !m_tickets.try_emplace(key, 0).second) {
+			return false;
+		}
+		const auto ticket = m_queue.Enqueue(
+		    [job = std::move(job)]() mutable -> uint64_t {
+			    job();
+			    return 0;
+		    },
+		    order);
+		m_tickets[key]        = ticket;
+		m_ticket_keys[ticket] = key;
+		m_queued++;
+		return true;
+	}
+
+	// Queues another job for a key that was queued before, also from that key's running job (a
+	// build that is to run again later). Expedite and Abandon then act on the new job. Returns
+	// whether the job was queued (not after Stop).
+	bool Requeue(uint64_t key, Job job, uint64_t order = 0) {
+		std::lock_guard lock(m_mutex);
+		if (m_stopped) {
 			return false;
 		}
 		const auto ticket = m_queue.Enqueue(
@@ -226,7 +251,11 @@ private:
 			if (key == m_ticket_keys.end()) {
 				continue;
 			}
-			m_tickets[key->second] = 0;
+			// A requeued key keeps the ticket of its newer job.
+			auto& ticket = m_tickets[key->second];
+			if (ticket == completion.ticket) {
+				ticket = 0;
+			}
 			m_ticket_keys.erase(key);
 			m_finished++;
 		}
