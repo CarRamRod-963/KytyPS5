@@ -136,6 +136,7 @@ void PutVertexInput(Writer& w, const ShaderVertexInputInfo& info, uint32_t layou
 	w.Put(mesh.host_subgroup_size);
 	w.Put(mesh.wave_size);
 	w.Put(mesh.input_primitive);
+	if (layout >= 4) w.Put(mesh.output_primitive_size);
 	w.Put(mesh.primitives_per_group);
 	w.Put(mesh.vertices_per_group);
 	w.Put(mesh.max_vertices);
@@ -198,12 +199,17 @@ bool GetVertexInput(Reader& r, ShaderVertexInputInfo& info, uint32_t layout) {
 	}
 	if (!r.Get(mesh.lds_size_dwords) || !r.Get(mesh.scratch_size_dwords) ||
 	    !r.Get(mesh.host_subgroup_size) || !r.Get(mesh.wave_size) || !r.Get(mesh.input_primitive) ||
-	    !r.Get(mesh.primitives_per_group) || !r.Get(mesh.vertices_per_group) ||
-	    !r.Get(mesh.max_vertices) || !r.Get(mesh.max_primitives) || !r.Get(mesh.provoking_vertex) ||
+	    (layout >= 4 && !r.Get(mesh.output_primitive_size)) || !r.Get(mesh.primitives_per_group) ||
+	    !r.Get(mesh.vertices_per_group) || !r.Get(mesh.max_vertices) ||
+	    !r.Get(mesh.max_primitives) || !r.Get(mesh.provoking_vertex) ||
 	    !r.GetBool(mesh.fast_launch)) {
 		return false;
 	}
 	if (info.logical_stage == ShaderType::Mesh && !ValidWaveSize(mesh.wave_size)) {
+		return false;
+	}
+	// Points, lines or triangles; records before layout 4 hold triangles (the default).
+	if (mesh.output_primitive_size == 0u || mesh.output_primitive_size > 3u) {
 		return false;
 	}
 	auto& tess = info.tess;
@@ -580,12 +586,12 @@ bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record
 
 std::filesystem::path PipelineManifest::PathFor(const std::filesystem::path& directory,
                                                 const std::string&           title_id) {
-	return directory / (title_id + ".v7.pipelines");
+	return directory / (title_id + ".v8.pipelines");
 }
 
 std::filesystem::path PipelineManifest::PreviousPathFor(const std::filesystem::path& directory,
                                                         const std::string&           title_id) {
-	return directory / (title_id + ".v6.pipelines");
+	return directory / (title_id + ".v7.pipelines");
 }
 
 PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::path previous)
@@ -599,10 +605,11 @@ PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::
 	    });
 	std::error_code error;
 	if (read.size == 0 && !previous.empty() && std::filesystem::exists(previous, error)) {
-		// The previous file (record layout 2) is read once and left as it is for older builds.
+		// The previous file (record layout 3) is read once and left as it is for older builds.
 		(void)ManifestFormat::ReadEntryFile(
 		    previous, ManifestMagic, [this](std::span<const uint8_t> payload, uint32_t version) {
-			    return version == FormatVersion && Parse(payload, 2);
+			    return version == FormatVersion &&
+			           Parse(payload, PipelineRecordFormat::PreviousLayoutVersion);
 		    });
 		m_legacy_stage_keys.clear();
 		m_loaded.imported = !m_stage_order.empty();
