@@ -26084,7 +26084,11 @@ public:
     constexpr uint64_t fetch_instance_address = fetch_vertex_address + 0x1000;
     constexpr uint64_t fetch_table_address = fetch_instance_address + 0x1000;
     EnsureRuntimeContext();
+    // This context counts guest occlusion queries with host ones where the
+    // device can (--occlusion-queries).
+    m_runtime_context.occlusion_queries_enabled = m_occlusion_queries;
     RenderContext context(m_runtime_context);
+    m_runtime_context.occlusion_queries_enabled = false;
     // Graphics stages and pipelines are recorded as a title's would be (in
     // memory), for the graphics precompile case below.
     auto *pipeline_manifest = PipelineCacheTestAccess::AttachPipelineManifest(
@@ -27245,9 +27249,9 @@ public:
       // passed, the draw waits for its pipeline.
       {
         static const auto skip_pixels = [] {
-          std::array<std::vector<u32>, 3> result;
-          constexpr std::array<u32, 3> colors{0x3e800000u, 0x3f000000u,
-                                              0x3f400000u};
+          std::array<std::vector<u32>, 4> result;
+          constexpr std::array<u32, 4> colors{0x3e800000u, 0x3f000000u,
+                                              0x3f400000u, 0x3e000000u};
           for (uint32_t index = 0; index < result.size(); index++) {
             auto &code = result[index];
             AppendVMovLiteral(&code, 0, colors[index]);
@@ -27329,6 +27333,46 @@ public:
                 drawn(draw_pixel(1), 0x3f000000u) &&
                     PipelineCacheTestAccess::PendingBuilds(pipelines) == 0,
                 "the background pipeline was not installed for the next draw");
+
+        // Inside a guest occlusion query a draw whose pipeline is still
+        // building waits for it: left out, it would count no samples and its
+        // object would read as hidden.
+        if (auto &queries = context.GetOcclusionQueries(); queries.Enabled()) {
+          // Counters in mapped guest memory.
+          constexpr uint64_t counters_size = 0x4000;
+          int64_t counters_offset = -1;
+          void *counters_memory = nullptr;
+          Require(name, "occlusion counter memory",
+                  Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                      0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                      counters_size, counters_size, 0, &counters_offset) == 0 &&
+                      Libs::LibKernel::Memory::KernelMapDirectMemory(
+                          &counters_memory, counters_size, 0x3, 0,
+                          counters_offset, counters_size) == 0,
+                  "the occlusion counter mapping failed");
+          const auto counters = reinterpret_cast<uint64_t>(counters_memory);
+          resources.MapMemory(counters, counters_size);
+          std::memset(counters_memory, 0, counters_size);
+          const std::span<uint64_t, OCCLUSION_QUERY_DBS * 2> results(
+              reinterpret_cast<uint64_t *>(counters), OCCLUSION_QUERY_DBS * 2);
+          queries.Dump(counters);
+          const auto pixels = draw_pixel(3);
+          queries.Dump(counters + 8u);
+          queries.Publish();
+          uint64_t passed = 0;
+          bool ready = true;
+          for (uint32_t db = 0; db < OCCLUSION_QUERY_DBS; db++) {
+            ready &= (results[db * 2] & results[db * 2 + 1] &
+                      OCCLUSION_QUERY_READY) != 0;
+            passed += results[db * 2 + 1] - results[db * 2];
+          }
+          Require(name, "pending draw inside a query",
+                  drawn(pixels, 0x3e000000u) &&
+                      PipelineCacheTestAccess::PendingBuilds(pipelines) == 0 &&
+                      ready && passed != 0,
+                  "a draw inside an occlusion query was skipped or counted no "
+                  "samples");
+        }
 
         (void)PipelineCacheTestAccess::SetSkipPendingDraws(pipelines, true, {});
         Require(name, "pending draw past the skip window",
@@ -30148,6 +30192,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  // Guest occlusion queries count host samples (--occlusion-queries).
+  bool m_occlusion_queries = false;
   bool m_pipeline_cache_control = false;
   bool m_calibrated_timestamps = false;
   u32   m_skipped_cases          = 0;
@@ -30466,6 +30512,8 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
     device_features12.samplerFilterMinmax = true;
+    m_occlusion_queries = available_features12.hostQueryReset == VK_TRUE;
+    device_features12.hostQueryReset = m_occlusion_queries;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
