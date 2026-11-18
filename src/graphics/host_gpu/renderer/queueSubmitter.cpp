@@ -97,6 +97,7 @@ void QueueSubmitter::SubmitBatches(const std::vector<Batch>& batches) {
 		    m_graphics.queue.submit(static_cast<uint32_t>(infos.size()), infos.data(), nullptr);
 	}
 	if (result != vk::Result::eSuccess) {
+		m_graphics.ReportLostDevice(result);
 		EXIT("vkQueueSubmit failed: %s, ticks=%" PRIu64 "..%" PRIu64 "\n",
 		     vk::to_string(result).c_str(), batches.front().tick, batches.back().tick);
 	}
