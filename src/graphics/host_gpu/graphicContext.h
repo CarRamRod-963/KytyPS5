@@ -47,6 +47,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;
+	// VK_EXT_device_fault: a lost device leaves a record of what the GPU reported.
+	bool                               device_fault_enabled                  = false;
 	bool                               ray_query_enabled                     = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
@@ -141,6 +143,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// After result = ErrorDeviceLost: writes the device fault record to the log and the console,
+	// once per process. Any other result does nothing.
+	void                   ReportLostDevice(vk::Result result) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
