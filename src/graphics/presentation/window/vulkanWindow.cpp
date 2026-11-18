@@ -431,13 +431,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR,
 	                   vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
 	                   vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
-	                   vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>
+	                   vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
+	                   vk::PhysicalDeviceFaultFeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8, uniform_control_flow,
-	       maximal_reconvergence, memory_priority, pageable_memory] = supported;
+	       maximal_reconvergence, memory_priority, pageable_memory, device_fault] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	// Optional: maps GPU timestamps onto the host clock for the submission latencies.
 	graphics.calibrated_timestamps_enabled = add(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
@@ -516,6 +517,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	} else if (!add(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
 	}
+	// A lost device leaves a record of what the GPU reported (GraphicContext::ReportLostDevice).
+	if (!add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
@@ -528,6 +533,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Vulkan memory priority: %s, pageable device-local memory: %s\n",
 	     graphics.memory_priority_enabled ? "true" : "false",
 	     graphics.pageable_memory_enabled ? "true" : "false");
+	graphics.device_fault_enabled = device_fault.deviceFault == VK_TRUE;
+	LOGF("Vulkan device fault reports: %s\n", graphics.device_fault_enabled ? "true" : "false");
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
@@ -762,6 +769,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR {.shaderMaximalReconvergence = VK_TRUE},
 	    vk::PhysicalDeviceMemoryPriorityFeaturesEXT {.memoryPriority = VK_TRUE},
 	    vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT {.pageableDeviceLocalMemory = VK_TRUE},
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -820,6 +828,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.pageable_memory_enabled) {
 		create.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
 	}
+	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),

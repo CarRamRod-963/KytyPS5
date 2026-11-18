@@ -424,6 +424,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::GpuTiming::Sync().AddSubmit(reason);
 
 	if (result != vk::Result::eSuccess) {
+		graphics.ReportLostDevice(result);
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 

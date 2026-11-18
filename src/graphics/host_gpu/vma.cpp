@@ -17,11 +17,16 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <span>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -175,6 +180,69 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+}
+
+void GraphicContext::ReportLostDevice(vk::Result result) const {
+	if (result != vk::Result::eErrorDeviceLost || device == nullptr) {
+		return;
+	}
+	// 0: not reported, 1: a thread is writing the report, 2: written.
+	static std::atomic<int> state {0};
+	int                     expected = 0;
+	if (!state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+		// Another thread found the loss first: let it finish before this one exits.
+		for (int i = 0; i < 200 && state.load(std::memory_order_acquire) != 2; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		return;
+	}
+	if (!device_fault_enabled) {
+		Log::WriteToConsoleAndLog("Device fault: no record (VK_EXT_device_fault unavailable)\n");
+		state.store(2, std::memory_order_release);
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	auto                     query = device.getFaultInfoEXT(&counts, nullptr);
+	if (query != vk::Result::eSuccess) {
+		Log::WriteToConsoleAndLog("Device fault: no record (" + vk::to_string(query) + ")\n");
+		state.store(2, std::memory_order_release);
+		return;
+	}
+	const uint32_t address_count = counts.addressInfoCount;
+	const uint32_t vendor_count  = counts.vendorInfoCount;
+	std::array<vk::DeviceFaultAddressInfoEXT, DeviceFault::MaxAddressInfos> addresses {};
+	std::array<vk::DeviceFaultVendorInfoEXT, DeviceFault::MaxVendorInfos>   vendors {};
+	counts.addressInfoCount = std::min(address_count, DeviceFault::MaxAddressInfos);
+	counts.vendorInfoCount  = std::min(vendor_count, DeviceFault::MaxVendorInfos);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	query              = device.getFaultInfoEXT(&counts, &info);
+	if (query != vk::Result::eSuccess && query != vk::Result::eIncomplete) {
+		Log::WriteToConsoleAndLog("Device fault: no record (" + vk::to_string(query) + ")\n");
+		state.store(2, std::memory_order_release);
+		return;
+	}
+	std::array<DeviceFault::AddressInfo, DeviceFault::MaxAddressInfos> address_infos {};
+	std::array<DeviceFault::VendorInfo, DeviceFault::MaxVendorInfos>   vendor_infos {};
+	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+		address_infos[i] = {.type      = static_cast<uint32_t>(addresses[i].addressType),
+		                    .address   = addresses[i].reportedAddress,
+		                    .precision = addresses[i].addressPrecision};
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+		vendor_infos[i] = {.description = {vendors[i].description.data(), VK_MAX_DESCRIPTION_SIZE},
+		                   .code        = vendors[i].vendorFaultCode,
+		                   .data        = vendors[i].vendorFaultData};
+	}
+	Log::WriteToConsoleAndLog(
+	    DeviceFault::Format({.description   = {info.description.data(), VK_MAX_DESCRIPTION_SIZE},
+	                         .address_count = address_count,
+	                         .vendor_count  = vendor_count,
+	                         .addresses = std::span(address_infos).first(counts.addressInfoCount),
+	                         .vendors   = std::span(vendor_infos).first(counts.vendorInfoCount)}));
+	state.store(2, std::memory_order_release);
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
