@@ -702,6 +702,54 @@ static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& i
 	return Select(state, TypeU32(state), pending, ConstantU32(state, 0u), raw);
 }
 
+// Selection feedback (IR::Bindings::selection_dword): an active lane stores the frame's stamp at
+// its root's region word of the selected ordinal, which the renderer reads after the frame to
+// learn which candidates the GPU used. The load before the store leaves the word's cache line
+// alone once one lane stored the stamp; nothing else in the program reads the region.
+static void EmitSelectionFeedback(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t root,
+                                  uint32_t selected) {
+	auto&       state    = ctx.state;
+	const auto& info     = state.program.info;
+	const auto& bindings = state.program.bindings;
+	if (bindings.selection_dword == IR::PushData::NoStart) return;
+	uint32_t ordinal = 0;
+	for (uint32_t i = 0; i < root; i++) {
+		ordinal += IR::IsSelectionFeedbackRoot(info.images[i], i) ? 1u : 0u;
+	}
+	const auto dword   = bindings.selection_dword;
+	const auto address = PackU64(state, EmitShaderDataDwordLoad(state, dword),
+	                             EmitShaderDataDwordLoad(state, dword + 1u));
+	const auto base =
+	    EmitShaderDataDwordLoad(state, dword + IR::SelectionFeedbackHeaderDwords + ordinal);
+	auto enabled =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           Binary(state, spv::OpINotEqual, TypeBool(state), address, ConstantU64(state, 0)),
+	           Binary(state, spv::OpINotEqual, TypeBool(state), base,
+	                  ConstantU32(state, IR::NoSelectionRegion)));
+	const auto& active = inst.Arg(inst.NumArgs() - 1u);
+	if (active.GetType() == IR::Type::U1) {
+		enabled = Binary(state, spv::OpLogicalAnd, TypeBool(state), enabled, ctx.Def(active));
+	}
+	EmitIfCondition(state, enabled, [&] {
+		const auto last = static_cast<uint32_t>(info.images[root].indirect_resources.size()) - 1u;
+		const auto word = Binary(state, spv::OpIAdd, TypeU32(state), base,
+		                         EmitUMin32(state, selected, ConstantU32(state, last)));
+		const auto offset =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
+		           Unary(state, spv::OpUConvert, TypeU64(state), word), ConstantU32(state, 2u));
+		const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+		                           Binary(state, spv::OpIAdd, TypeU64(state), address, offset));
+		const auto stamp   = EmitShaderDataDwordLoad(state, dword + 2u);
+		const auto seen    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), seen, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), seen, stamp), [&] {
+			state.builder.AddFunction(spv::OpStore, pointer, stamp, spv::MemoryAccessAlignedMask,
+			                          4u);
+		});
+	});
+}
+
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
                      const Emit& emit) {
@@ -751,6 +799,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	const auto selected = EmitIndirectResourceIndex(state, key, image.indirect_mapping_offset,
 	                                                image.indirect_mapping_header,
 	                                                image.indirect_search_iterations, 0u);
+	EmitSelectionFeedback(ctx, inst, mem.resource, selected);
 	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];

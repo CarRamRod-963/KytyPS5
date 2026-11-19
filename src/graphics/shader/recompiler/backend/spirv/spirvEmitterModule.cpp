@@ -271,6 +271,14 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
 	}
+	for (uint32_t i = 0; i < info.images.size(); i++) {
+		bindings.selection_roots += IR::IsSelectionFeedbackRoot(info.images[i], i) ? 1u : 0u;
+	}
+	if (bindings.selection_roots != 0) {
+		bindings.selection_dword = bindings.memory_offset_dword;
+		bindings.memory_offset_dword +=
+		    IR::SelectionFeedbackHeaderDwords + bindings.selection_roots;
+	}
 	bindings.memory_strides =
 	    std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
 		    return buffer.runtime_stride && buffer.descriptor_index != UINT32_MAX;
@@ -836,7 +844,8 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	    state.program.info.uses_device_address || state.program.info.ray_query;
+	    state.program.info.uses_device_address || state.program.info.ray_query ||
+	    state.program.bindings.selection_roots != 0;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
