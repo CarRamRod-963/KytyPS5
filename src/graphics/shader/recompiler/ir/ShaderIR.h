@@ -538,12 +538,28 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// A GPU-selected image root whose candidates the program enumerates in its own descriptor array
+// (not a resident image heap, not a bindless key); candidate 0 is the root itself.
+[[nodiscard]] inline bool IsSelectionFeedbackRoot(const ImageResource& image, uint32_t index) {
+	return image.indirect_root == index && !image.heap && !image.bindless &&
+	       image.indirect_resources.size() >= 2u;
+}
+
+inline constexpr uint32_t SelectionFeedbackHeaderDwords = 3;
+inline constexpr uint32_t NoSelectionRegion             = UINT32_MAX;
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
+	// Selection feedback of the program's enumerated image tables (IsSelectionFeedbackRoot): the
+	// feedback buffer's device address (two dwords), the frame's stamp, then one region base per
+	// root in image order. A selecting lane stores the stamp at feedback[base + ordinal]; an
+	// address of 0 or a base of NoSelectionRegion stores nothing.
+	uint32_t selection_dword     = PushData::NoStart;
+	uint32_t selection_roots     = 0;
 	uint32_t memory_offset_dword = 0;
 	// Shader data ends with one 16-bit stride word per buffer binding (two per dword) when a
 	// buffer takes its stride at run time.
