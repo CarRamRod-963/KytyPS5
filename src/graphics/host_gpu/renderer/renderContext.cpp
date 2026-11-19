@@ -23,6 +23,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_bindless_table(graphics, m_command_scheduler),
+      m_selection_feedback(graphics, m_command_scheduler),
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_command_scheduler.GetTimestamps().SetPrimary(true);
@@ -320,6 +321,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_graphics.MonitorMemoryBudget();
+	m_selection_feedback.EndFrame();
 	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
