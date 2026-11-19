@@ -17603,6 +17603,268 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A table of eight 1x1 textures selected per workgroup by a key the shader
+  // loads: candidates the shader stopped selecting bind as null descriptors
+  // once SelectionFeedback saw them unused for QuietFrames frames; a later
+  // selection of one is detected and the table binds all its candidates again;
+  // a table the shader writes never drops a candidate, so no store is lost.
+  void CheckSelectionFeedback() {
+    constexpr const char *name = "SelectionFeedback";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto keys = base, sampled_table = base + 0x1000,
+                   written_table = base + 0x1800;
+    constexpr auto output = base + 0x8000;
+    constexpr u32 rows = 8, groups = 4;
+    const auto texture = [](bool written, u32 row) {
+      return base + (written ? 0x4000u : 0x2000u) + row * 0x100u;
+    };
+    // s8 = workgroup ID; key = (keys[wg] ^ s2) & 7 (s2 = 0: the XOR keeps the key from being a
+    // selector the host reads); s[16:23] = table[key]; then a load
+    // (sampled) or a store of 2000 (written) at texel (0, 0); loads write
+    // output[wg].
+    const auto shader = [](bool written, u32 table_offset) {
+      std::vector<u32> code{EncodeSop2(0x1e, 9, 8, InlineU32(2)),
+                            EncodeSmem0(0x00, 10),
+                            EncodeSmem1(0, 9),
+                            EncodeSopp(0x0c, 0),
+                            EncodeSop2(0x12, 10, 10, 2),
+                            EncodeSop2(0x0e, 10, 10, InlineU32(7)),
+                            EncodeSop2(0x1e, 10, 10, InlineU32(5)),
+                            EncodeSop2(0x02, 10, 10, 255),
+                            table_offset,
+                            EncodeSmem0(0x03, 16),
+                            EncodeSmem1(0, 10),
+                            EncodeSopp(0x0c, 0),
+                            EncodeVop1(0x01, 20, InlineU32(0)),
+                            EncodeVop1(0x01, 21, InlineU32(0))};
+      if (written) {
+        AppendVMovLiteral(&code, 4, 2000u);
+        code.insert(code.end(), {EncodeMimg0(0x08, 1), EncodeMimg1(4, 20, 4)});
+      } else {
+        code.insert(code.end(), {EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 4),
+                                 0xbf8c3f70u, EncodeVop1(0x01, 30, 9),
+                                 EncodeMubuf0(0x1c), EncodeMubuf1(4, 1, 30)});
+      }
+      AppendEnd(&code);
+      return code;
+    };
+    const auto sampled_code = shader(false, 0x1000u);
+    const auto written_code = shader(true, 0x1800u);
+    for (const auto *code : {&sampled_code, &written_code})
+      ShaderMapUserData(
+          reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "selection feedback allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "selection feedback mapping failed");
+    std::memset(mapped, 0, size);
+    for (const bool written : {false, true}) {
+      for (u32 row = 0; row < rows; ++row) {
+        const auto address = texture(written, row);
+        const ShaderTextureResource sharp{
+            {static_cast<u32>(address >> 8u),
+             static_cast<u32>(Prospero::BufferFormat::k32UInt) << 20u, 0,
+             DstSel(4, 5, 6, 7) |
+                 (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                 (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+             0, 0x00700000u, 0, 0}};
+        std::memcpy(reinterpret_cast<void *>(
+                        (written ? written_table : sampled_table) + row * 32u),
+                    sharp.fields, sizeof(sharp.fields));
+        const u32 value = 100u + row;
+        std::memcpy(reinterpret_cast<void *>(address), &value, sizeof(value));
+      }
+    }
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      auto &executor = context.GetRenderExecutor();
+      auto &feedback = context.GetSelectionFeedback();
+      auto &scheduler = context.GetCommandScheduler();
+      for (u32 sgpr = 0; sgpr < 16; ++sgpr)
+        shaders.SetCsUserSgpr(sgpr, 0);
+      shaders.SetCsUserSgpr(0, static_cast<u32>(base));
+      shaders.SetCsUserSgpr(1, static_cast<u32>(base >> 32u));
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = groups * sizeof(u32);
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(4 + i, out.fields[i]);
+      const auto select = [&](u32 row) {
+        const std::array<u32, groups> words{row, row, row, row};
+        Require(name, "key refresh",
+                context.InvalidateMemory(keys, sizeof(words)),
+                "the key buffer escaped its mapped allocation");
+        std::memcpy(reinterpret_cast<void *>(keys), words.data(),
+                    sizeof(words));
+      };
+      // Dispatches one frame of the program and ends the frame; returns its
+      // stage bindings.
+      struct Bound {
+        ShaderComputeInputInfo input;
+        std::array<bool, rows> bound{};
+        std::array<u32, rows> resource{};
+        u32 root_row =
+            rows; // The row of the table's own descriptor (ordinal 0).
+      };
+      const auto frame = [&](bool written) {
+        shaders.SetCsShader(
+            {.data_addr = reinterpret_cast<uint64_t>(
+                 (written ? written_code : sampled_code).data()),
+             .num_thread_x = 64,
+             .num_thread_y = 1,
+             .num_thread_z = 1,
+             .wave_size = 64,
+             .user_sgpr = 8,
+             .tgid_x_en = true});
+        Bound result{};
+        (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(),
+                                                           result.input);
+        const auto &info = result.input.stage.program->info;
+        const auto &snapshot = *result.input.stage.resources;
+        PreparedBindings bindings;
+        executor.PrepareBindings(result.input.stage, bindings);
+        u32 roots = 0;
+        for (u32 index = 0; index < info.images.size(); ++index) {
+          if (!ShaderRecompiler::IR::IsSelectionFeedbackRoot(info.images[index],
+                                                             index))
+            continue;
+          ++roots;
+          for (const auto resource : info.images[index].indirect_resources) {
+            const auto address = uint64_t{snapshot.images[resource].dwords[0]}
+                                 << 8u;
+            for (u32 row = 0; row < rows; ++row) {
+              if (address != texture(written, row))
+                continue;
+              result.bound[row] = bool(bindings.images[resource].image_id);
+              result.resource[row] = resource;
+              if (resource == index)
+                result.root_row = row;
+            }
+          }
+        }
+        Require(name, "one enumerated table of every row",
+                roots == 1 &&
+                    result.input.stage.program->bindings.selection_dword !=
+                        ShaderRecompiler::IR::PushData::NoStart,
+                written ? "the written table is not enumerated"
+                        : "the sampled table is not enumerated");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+        feedback.EndFrame();
+        scheduler.Finish();
+        return result;
+      };
+      const auto outputs = [&] {
+        std::array<u32, groups> values{};
+        context.GetBufferCache().ReadMemory(output, sizeof(values));
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(output, values.data(),
+                                                  sizeof(values)),
+                "the sampled output could not be read back");
+        return values;
+      };
+      const auto quiet = CandidateSelection::QuietFrames + 4u;
+
+      // (a) Only row 1 is selected: after QuietFrames frames the other rows
+      // bind as null, except the table's own descriptor (ordinal 0), which
+      // always binds.
+      select(1);
+      Bound last{};
+      for (u32 i = 0; i < quiet; ++i) {
+        last = frame(false);
+        Require(name, "selected row served",
+                outputs() == std::array<u32, groups>{101, 101, 101, 101},
+                "the selected candidate did not sample its texture");
+      }
+      u32 dropped = 0;
+      for (u32 row = 0; row < rows; ++row)
+        dropped += last.bound[row] ? 0u : 1u;
+      Require(name, "unselected candidates bind as null",
+              last.bound[1] && last.root_row < rows &&
+                  last.bound[last.root_row] &&
+                  dropped == rows - (last.root_row == 1 ? 1u : 2u) &&
+                  feedback.Selection().EagerTables() == 0,
+              "quiet candidates stayed bound or the selected one was dropped");
+
+      // (b) Row 5 (bound as null) is selected: the frame reads zero, the
+      // feedback reports the miss within a few frames, and from then on every
+      // candidate binds and row 5 is served.
+      const u32 missed = last.root_row == 5 ? 4u : 5u;
+      const bool five_dropped = !last.bound[missed];
+      select(missed);
+      bool served = false;
+      for (u32 i = 0; i < 8 && !served; ++i) {
+        last = frame(false);
+        served =
+            outputs() == std::array<u32, groups>{100 + missed, 100 + missed,
+                                                 100 + missed, 100 + missed};
+      }
+      bool all_bound = true;
+      for (u32 row = 0; row < rows; ++row)
+        all_bound &= last.bound[row];
+      Require(name, "a selected null candidate is detected and served",
+              five_dropped && served && all_bound &&
+                  feedback.Selection().EagerTables() == 1 &&
+                  feedback.Selection().Misses() >= 1,
+              "the miss was not detected, the table did not bind all "
+              "candidates, or row 5 was not served");
+
+      // (c) A written table keeps every candidate: a store into a row
+      // unselected for QuietFrames frames lands in its texture in the first
+      // frame.
+      select(2);
+      for (u32 i = 0; i < quiet; ++i)
+        last = frame(true);
+      all_bound = true;
+      for (u32 row = 0; row < rows; ++row)
+        all_bound &= last.bound[row];
+      Require(name, "written candidates stay bound", all_bound,
+              "a candidate of a table the shader writes was bound as null");
+      select(6);
+      last = frame(true);
+      const auto &info = last.input.stage.program->info;
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, info.images[last.resource[6]],
+          last.input.stage.resources->images[last.resource[6]]);
+      const auto image = context.GetTextureCache().FindImage(binding.desc);
+      Require(name, "store into a long unselected written candidate",
+              ReadCachedTexel(name, context, image) == std::vector<u32>{2000u},
+              "a store through a written table candidate was lost");
+
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical,
+                                                                size) == 0,
+            "selection feedback release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckScalarLeafCall() {
     constexpr const char* name = "ScalarLeafCall";
     constexpr uintptr_t base = 0x0000000204800000ull;
@@ -66763,6 +67025,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--selection-feedback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSelectionFeedback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--bindless-slot-reuse-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBindlessSlotImageReuse();
@@ -67147,6 +67414,7 @@ int main(int argc, char **argv) {
   vulkan.CheckScatteredUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckSelectionFeedback();
   vulkan.CheckBindlessSlotImageReuse();
   vulkan.CheckSwappedDepthReadback();
   vulkan.CheckStencilPlaneStorage();

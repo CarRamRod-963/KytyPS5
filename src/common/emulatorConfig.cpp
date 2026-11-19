@@ -273,6 +273,10 @@ bool StalePipelineRebuildEnabled() {
 	return g_config->stale_pipeline_rebuild;
 }
 
+bool SelectionFeedbackEnabled() {
+	return g_config->selection_feedback;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

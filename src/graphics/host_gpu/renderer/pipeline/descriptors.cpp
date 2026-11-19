@@ -981,12 +981,24 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		seen_mask = capacity - 1;
 		++m_seen_stamp;
 	}
+	// Candidates of GPU-selected tables the shader has long stopped selecting bind as null
+	// descriptors; such a binding takes no part in the repeated-T# sharing below.
+	m_context.GetSelectionFeedback().PrepareStage(program, snapshot, m_selection_words,
+	                                              m_demoted_images);
 	for (uint32_t i = 0; i < image_count; i++) {
 		auto&       binding  = prepared.images[i];
 		const auto& resource = program.info.images[i];
 		const auto& value    = snapshot.images[i];
 		if (resource.heap) {
 			binding = {};
+			continue;
+		}
+		if (!m_demoted_images.empty() && m_demoted_images[i] != 0) {
+			// Keeps the memo fields: the binding resolves through them once it binds again.
+			binding.image_id   = {};
+			binding.image_view = nullptr;
+			binding.mip_views.clear();
+			binding.same_as = UINT32_MAX;
 			continue;
 		}
 		binding.same_as = UINT32_MAX;
@@ -1037,6 +1049,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	if (!m_selection_words.empty()) {
+		std::ranges::copy(m_selection_words,
+		                  prepared.shader_data.begin() + program.bindings.selection_dword);
+	}
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}

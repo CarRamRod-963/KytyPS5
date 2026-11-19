@@ -887,6 +887,11 @@ add_executable(memory_budget_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(memory_budget_tests PRIVATE ${inc_headers})
 
+add_executable(candidate_selection_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CandidateSelectionTests.cpp"
+)
+target_include_directories(candidate_selection_tests PRIVATE ${inc_headers})
+
 add_executable(subgroup_plan_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SubgroupPlanTests.cpp"
 )
@@ -1087,6 +1092,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME subgroup_plan COMMAND $<TARGET_FILE:subgroup_plan_tests>)
 	add_test(NAME device_fault COMMAND $<TARGET_FILE:device_fault_tests>)
+	add_test(NAME candidate_selection COMMAND $<TARGET_FILE:candidate_selection_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -1216,6 +1222,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
+	add_test(NAME selection_feedback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --selection-feedback-only)
 	add_test(NAME bindless_slot_image_reuse
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-slot-reuse-only)
 	add_test(NAME buffer_cache_ranges
@@ -1245,6 +1253,7 @@ if(BUILD_TESTING)
 		memory_priority_tests
 		subgroup_plan_tests
 		device_fault_tests
+		candidate_selection_tests
 		barrier_tracker_tests
 		memory_tracker_tests
 		page_manager_tests

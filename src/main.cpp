@@ -193,6 +193,10 @@ static void PrintUsage() {
 	    "                                       (pipelines it was given and no longer provides)\n"
 	    "                                       in the background while the game runs.\n");
 	::printf(
+	    "  --no-selection-feedback              Bind every candidate texture of GPU-selected\n"
+	    "                                       descriptor tables, also the ones the shaders\n"
+	    "                                       have not selected for a while.\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -339,6 +343,7 @@ static constexpr Flag FLAGS[] = {
     {"--precompile-only", &ConfigOptions::precompile_only},
     {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
     {"--no-stale-pipeline-rebuild", &ConfigOptions::stale_pipeline_rebuild, false},
+    {"--no-selection-feedback", &ConfigOptions::selection_feedback, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},

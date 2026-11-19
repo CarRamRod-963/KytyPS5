@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/selectionFeedback.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/eventQueue.h"
@@ -59,6 +60,7 @@ public:
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	ResolveCache&       GetResolveCache() { return m_resolve_cache; }
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
+	SelectionFeedback&  GetSelectionFeedback() { return m_selection_feedback; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
@@ -135,6 +137,7 @@ private:
 	ImageHeap                 m_image_heap;
 	PipelineCache             m_pipeline_cache; // Warm-up needs the image heap's descriptor layout.
 	BindlessTable             m_bindless_table;
+	SelectionFeedback         m_selection_feedback;
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

@@ -112,6 +112,8 @@ struct ConfigOptions {
 	bool                   rebuild_pipeline_cache          = false;
 	// A session rebuilds a driver cache with stale entries in the background.
 	bool                   stale_pipeline_rebuild          = true;
+	// GPU-selected texture tables bind long unselected candidates as null descriptors.
+	bool                   selection_feedback              = true;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -209,6 +211,7 @@ bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
 bool     RebuildPipelineCacheEnabled();
 bool     StalePipelineRebuildEnabled();
+bool     SelectionFeedbackEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();
