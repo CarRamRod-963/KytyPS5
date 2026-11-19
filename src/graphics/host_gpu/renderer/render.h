@@ -347,6 +347,9 @@ private:
 	};
 	std::vector<SeenTexture> m_seen_textures;
 	uint64_t                 m_seen_stamp = 0;
+	// Selection feedback of the stage being prepared (SelectionFeedback::PrepareStage).
+	std::vector<uint32_t> m_selection_words;
+	std::vector<uint8_t>  m_demoted_images;
 	struct TextureMemoKeyHash {
 		size_t operator()(const TextureMemoKey& key) const noexcept {
 			uint64_t hash = key.traits * 0x9E3779B97F4A7C15ull;
