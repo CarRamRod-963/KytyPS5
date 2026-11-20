@@ -105,6 +105,9 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// An upload source holding the guest bytes of the range, whatever buffers hold of it.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ReadGuestBytesForImage(uint64_t vaddr,
+	                                                                  uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);

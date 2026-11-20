@@ -1102,7 +1102,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (IsRegionGpuModified(vaddr, size)) {
 		return ObtainBuffer(vaddr, size, false, false);
 	}
+	return ReadGuestBytesForImage(vaddr, size);
+}
 
+std::pair<Buffer*, uint64_t> BufferCache::ReadGuestBytesForImage(uint64_t vaddr, uint64_t size) {
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
