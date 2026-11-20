@@ -437,6 +437,11 @@ struct TextureCacheTestAccess {
     return std::unique_lock(cache.m_lock);
   }
 
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    cache.FreeImage(id);
+  }
+
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
@@ -644,6 +649,12 @@ struct RenderExecutorTestAccess {
                                          const ShaderComputeInputInfo &input,
                                          const CommandBuffer &buffer) {
     return executor.TryConsumeComputeMetaClear(input, buffer);
+  }
+
+  static void
+  RebindReplacedImages(RenderExecutor &executor,
+                       std::span<PreparedBindings *const> bindings) {
+    executor.RebindReplacedImages(bindings);
   }
 
   static TextureBinding
@@ -23504,6 +23515,43 @@ public:
                         nullptr,
                 "a mip chain past the 1x1 level created host levels the image "
                 "cannot hold");
+      }
+      {
+        // A later binding of the same draw can create an image that replaces
+        // the image an earlier binding resolved; committing binds its
+        // replacement, never the image that went away.
+        constexpr uint64_t address = base + 0x2a0000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc1400000u,
+                             0x0007c07fu,
+                             0x90190facu,
+                             0,
+                             0x00700090u,
+                             0,
+                             0};
+        descriptor.dword_count = 8;
+        ShaderRecompiler::IR::CompiledShaderInfo program{};
+        program.info.images.push_back(sampled_overwide_resource);
+        ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+        snapshot.images = {descriptor};
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings prepared{};
+        prepared.runtime = &runtime;
+        prepared.images.push_back(RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor));
+        executor.RebindImages(prepared);
+        const auto replaced = prepared.images[0].image_id;
+        TextureCacheTestAccess::FreeImage(texture_cache, replaced);
+        PreparedBindings *const stages[] = {&prepared};
+        RenderExecutorTestAccess::RebindReplacedImages(executor, stages);
+        const auto &rebound = prepared.images[0];
+        Require(name, "replaced image rebound",
+                replaced && rebound.image_id && rebound.image_id != replaced &&
+                    texture_cache.GetImage(rebound.image_id).registered &&
+                    rebound.image_view != nullptr,
+                "a binding kept an image that went away before its bindings "
+                "were committed");
       }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,

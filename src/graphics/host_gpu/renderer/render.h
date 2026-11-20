@@ -298,6 +298,9 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// Resolves again the image bindings whose image went away after RebindImages (a later
+	// binding's image replaced it) until every bound image is current.
+	void RebindReplacedImages(std::span<PreparedBindings* const> bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
