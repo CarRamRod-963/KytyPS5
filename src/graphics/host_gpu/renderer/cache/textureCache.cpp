@@ -1229,8 +1229,19 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		// An image created over memory an image write-back stored starts from the stored bytes
+		// (once they landed), as it does when no buffer holds the range: a buffer that does keeps
+		// the bytes it had before the written-back image was rendered.
+		const auto written_back = TakeWrittenBack(image.info.data);
+		if (written_back) {
+			m_scheduler.Wait(*written_back);
+			m_scheduler.WaitPriorityOperations(*written_back);
+		}
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    written_back ? m_buffer_cache.ReadGuestBytesForImage(image.info.data.address,
+		                                                         image.info.data.size)
+		                 : m_buffer_cache.ObtainBufferForImage(image.info.data.address,
+		                                                       image.info.data.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1238,6 +1249,42 @@ void TextureCache::InitializeImage(ImageId id) {
 		image.ClearBufferModified();
 	}
 	image.RefreshComplete();
+}
+
+void TextureCache::NoteWrittenBack(const GuestRange& range, uint64_t tick) {
+	ForgetWrittenBack(range.address, range.size, false);
+	// Buffer writes test every record: the oldest go first (an image created over their memory
+	// then takes what a buffer holds of it, as before the record).
+	if (m_written_back.size() == MaxWrittenBack) {
+		m_written_back.erase(m_written_back.begin());
+	}
+	m_written_back.push_back({range, tick});
+}
+
+void TextureCache::ForgetWrittenBack(uint64_t address, uint64_t size, bool covered_ok) {
+	if (m_written_back.empty()) {
+		return;
+	}
+	// A write range that covers a record whole may be conservative (the extent of a written V#):
+	// as for images (PrepareGpuBufferWrite), it says nothing about the bytes it changed.
+	std::erase_if(m_written_back, [&](const WrittenBack& record) {
+		const auto& range  = record.range;
+		const bool  hits   = range.address < address + size && address < range.End();
+		const bool  covers = address <= range.address && address + size >= range.End();
+		return hits && !(covered_ok && covers);
+	});
+}
+
+std::optional<uint64_t> TextureCache::TakeWrittenBack(const GuestRange& range) {
+	const auto record = std::ranges::find_if(m_written_back, [&](const WrittenBack& entry) {
+		return entry.range.address <= range.address && range.End() <= entry.range.End();
+	});
+	if (record == m_written_back.end()) {
+		return std::nullopt;
+	}
+	const auto tick = record->tick;
+	m_written_back.erase(record);
+	return tick;
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -2408,6 +2455,18 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	// The bytes buffer writes produced since the image's last native write are newer than the
 	// image there (Image::buffer_written): only the rest of the image lands in guest memory.
 	const auto kept = image.BufferWrittenRange();
+	{
+		const auto kept_begin =
+		    kept.size == 0 ? range.End() : std::clamp(kept.address, range.address, range.End());
+		const auto kept_end =
+		    kept.size == 0 ? range.End() : std::clamp(kept.End(), kept_begin, range.End());
+		if (kept_begin > range.address) {
+			NoteWrittenBack({range.address, kept_begin - range.address}, m_scheduler.CurrentTick());
+		}
+		if (kept_end < range.End()) {
+			NoteWrittenBack({kept_end, range.End() - kept_end}, m_scheduler.CurrentTick());
+		}
+	}
 	m_scheduler.DeferPriorityOperation(
 	    [this, download = std::move(download), range, kept, trapped = m_readback_storage_images] {
 		    download.buffer->Invalidate(download.offset, range.size);
@@ -2483,6 +2542,7 @@ void TextureCache::PrepareGpuBufferWrite(uint64_t address, uint64_t size,
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	ForgetWrittenBack(address, size, extent == BufferWriteExtent::Conservative);
 	// Collected first: publishing reads other images of the region.
 	Common::SmallVector<ImageId, 8> ids;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { ids.push_back(id); });
@@ -2678,6 +2738,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
+	ForgetWrittenBack(address, size, false);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
 	Common::SmallVector<ImageId, 16> deleted_images;
