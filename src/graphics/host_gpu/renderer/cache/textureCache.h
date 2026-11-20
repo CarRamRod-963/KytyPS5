@@ -172,6 +172,13 @@ private:
 		GuestRange range;
 		uint64_t   tick;
 	};
+	// Guest memory an image write-back stored (it lands when its submission completes), with no
+	// buffer write recorded over it since: see TakeWrittenBack.
+	struct WrittenBack {
+		GuestRange range;
+		uint64_t   tick;
+	};
+	static constexpr size_t MaxWrittenBack = 256;
 
 	// PS5: guest addresses span 44 bits, so an entry keeps the whole image address.
 	struct BucketEntry {
@@ -329,6 +336,13 @@ private:
 	                                                uint32_t metadata_base_layer);
 	void ExpandDccConstantSlice(ImageId id, const ImageDesc& desc, uint64_t metadata_address,
 	                            uint64_t metadata_size, uint32_t layer);
+
+	// Write-back records (m_written_back): NoteWrittenBack adds one, ForgetWrittenBack drops those
+	// a buffer write or an unmap touches, TakeWrittenBack returns (and drops) the one that contains
+	// a range, if any.
+	void NoteWrittenBack(const GuestRange& range, uint64_t tick);
+	void ForgetWrittenBack(uint64_t address, uint64_t size, bool covered_ok);
+	[[nodiscard]] std::optional<uint64_t> TakeWrittenBack(const GuestRange& range);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
@@ -374,6 +388,7 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
+	std::vector<WrittenBack>                          m_written_back;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// Orders native image writes against guest metadata reads (see Image).
 	uint64_t                                          m_event_sequence = 0;

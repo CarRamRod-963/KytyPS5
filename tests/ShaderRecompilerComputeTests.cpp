@@ -14456,6 +14456,151 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A GPU-written image the collector writes back to guest memory while a
+  // cached buffer holds the same range with older bytes: the bytes it took
+  // from guest memory, or bytes the GPU wrote into it before the image was
+  // created from them. The write-back stores through the backing and takes no
+  // write fault, so the buffer has to be told. An image created again over the
+  // range (Saros re-creates its virtual-texture page table at the same address
+  // after a respawn) is uploaded from that buffer. A buffer write recorded over
+  // the range after the write-back is newer than the stored bytes.
+  void CheckWrittenBackBufferCopy() {
+    constexpr const char *name = "WrittenBackBufferCopy";
+    constexpr uintptr_t base = 0x000000020e800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stride = 0x40000;
+    constexpr uint32_t width = 128;
+    constexpr uint32_t height = 128;
+    constexpr uint64_t image_size = uint64_t{width} * height * 4u;
+    constexpr uint32_t buffer_written = 0x77777777u;
+    constexpr uint32_t written = 0x0badf00du;
+    constexpr uint32_t written_later = 0x13579bdfu;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "written-back direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "written-back fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &buffers = context.GetBufferCache();
+      const auto check = [&](const char *step, uint64_t address,
+                             bool gpu_written_buffer, bool written_after) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, 4, 1);
+        desc.type = BindingType::Storage;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+
+        // A buffer over the range takes the guest bytes, or the GPU writes it.
+        const auto [buffer, offset] = buffers.ObtainBuffer(
+            address, image_size, gpu_written_buffer, false);
+        Require(name, step, buffer != nullptr,
+                "no buffer was cached over the image range");
+        if (gpu_written_buffer) {
+          buffer->Fill(offset, image_size, buffer_written);
+        }
+
+        // The image is created from the buffer, the GPU renders it, and the
+        // collector writes it back and deletes it.
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindTexture(id, desc);
+        Require(name, step,
+                ReadCachedTexel(name, context, id) ==
+                    std::vector<u32>{gpu_written_buffer ? buffer_written
+                                                        : 0x5a5a5a5au},
+                "the image did not start from the buffer's bytes");
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = written;
+        TextureCacheTestAccess::ClearImage(
+            cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        cache.MarkGpuWritten(id);
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            cache, std::array{id}, 100, UINT64_MAX);
+        Require(name, step,
+                TextureCacheTestAccess::CollectOverLimit(cache, 64ull << 20u,
+                                                         0) == 1 &&
+                    !TextureCacheTestAccess::Contains(cache, id),
+                "the collection did not write back the GPU-written image");
+        const auto tick = scheduler.CurrentTick();
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(tick);
+
+        // A guest read of a page the GPU wrote through the buffer reads the
+        // buffer back first, so guest memory is checked only where it did not.
+        Require(name, step,
+                gpu_written_buffer ||
+                    (*reinterpret_cast<const uint32_t *>(address) == written &&
+                     *reinterpret_cast<const uint32_t *>(address + image_size -
+                                                         4) == written),
+                "the write-back did not land in guest memory");
+        if (written_after) {
+          cache.PrepareGpuBufferWrite(address, image_size,
+                                      TextureCache::BufferWriteExtent::Exact);
+          const auto [later, later_offset] =
+              buffers.ObtainBuffer(address, image_size, true, false);
+          later->Fill(later_offset, image_size, written_later);
+        }
+
+        // The same image again: it holds what the deleted one held, or what
+        // the buffer write stored after it.
+        const auto expected = written_after ? written_later : written;
+        const auto again_id = cache.FindImage(desc);
+        (void)cache.FindTexture(again_id, desc);
+        Require(name, step,
+                ReadCachedTexel(name, context, again_id) ==
+                        std::vector<u32>{expected} &&
+                    ReadCachedTexel(name, context, again_id,
+                                    {static_cast<int32_t>(width) - 1,
+                                     static_cast<int32_t>(height) - 1, 0}) ==
+                        std::vector<u32>{expected},
+                written_after ? "the image ignored a buffer write recorded "
+                                "after the write-back"
+                              : "the image was created from a buffer that "
+                                "kept its bytes from before the write-back");
+      };
+      check("buffer with guest bytes", base, false, false);
+      check("buffer written by the GPU before the image", base + stride, true,
+            false);
+      check("buffer written after the write-back", base + 2 * stride, false,
+            true);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "written-back fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "written-back direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // Over the device memory limit the collector deletes images unused for a few
   // frames, oldest first, until usage is back under the limit: those guest
   // memory holds first, then GPU-written ones after writing them back. Images
@@ -66489,6 +66634,7 @@ int main(int argc, char **argv) {
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
     vulkan.CheckOverLimitCollection();
+    vulkan.CheckWrittenBackBufferCopy();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--transient-alias-only") == 0) {
@@ -66496,6 +66642,7 @@ int main(int argc, char **argv) {
     vulkan.CheckTransientAliasReuse();
     vulkan.CheckPressureRetiredContents();
     vulkan.CheckOverLimitCollection();
+    vulkan.CheckWrittenBackBufferCopy();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
