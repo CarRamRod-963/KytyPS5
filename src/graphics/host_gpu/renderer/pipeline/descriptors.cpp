@@ -1549,11 +1549,51 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// Resolving a binding can create an image that replaces the image an earlier binding of the same
+// draw or dispatch resolved (an equal-address volume, a merged mip chain), and it can submit the
+// commands recorded so far: the replaced image is released when that submission completes, which
+// may be before the commands this draw records run. Bindings whose image went away resolve again
+// until no bound image is a replaced one; a binding still unsettled after that binds no image.
+void RenderExecutor::RebindReplacedImages(std::span<PreparedBindings* const> prepared_bindings) {
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto replaced      = [&](const TextureBinding& binding) {
+		if (!binding.image_id) return false;
+		const auto& image = texture_cache.m_slot_images[binding.image_id];
+		return !image.registered || image.binding.needs_rebind;
+	};
+	constexpr uint32_t MaxPasses = 4;
+	for (uint32_t pass = 0; pass < MaxPasses; pass++) {
+		bool rebound = false;
+		for (auto* prepared: prepared_bindings) {
+			if (std::ranges::any_of(prepared->images, replaced)) {
+				RebindImages(*prepared);
+				rebound = true;
+			}
+		}
+		if (!rebound) return;
+	}
+	for (auto* prepared: prepared_bindings) {
+		for (auto& binding: prepared->images) {
+			if (!replaced(binding)) continue;
+			static std::atomic_bool reported = false;
+			if (!reported.exchange(true)) {
+				LOGF("image bindings kept replacing each other's images; one binds no image\n");
+			}
+			binding.image_id   = {};
+			binding.image_view = nullptr;
+			binding.mip_views.clear();
+			binding.layout  = vk::ImageLayout::eGeneral;
+			binding.same_as = UINT32_MAX;
+		}
+	}
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	RebindReplacedImages(prepared_bindings);
 	// Binding commands access no memory. Image transitions order pending dispatches first.
 	auto                           vk_buffer              = buffer.StateHandle();
 	size_t                         image_descriptor_count = 0;
