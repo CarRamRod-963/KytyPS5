@@ -23029,6 +23029,44 @@ public:
                 "a view past MAX_MIP of a complete chain changed its stored "
                 "layout");
       }
+      {
+        // A block-compressed texture whose T# names its 4x4 blocks keeps the
+        // level count of its texel chain: 64x64 blocks with MAX_MIP 8 (a
+        // 256x256 BC texture). The host image holds the seven levels a 64x64
+        // image has; uploads of the other two would write past its memory.
+        constexpr uint64_t address = base + 0x280000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc1400000u,
+                             0x000fc00fu,
+                             0x90180facu,
+                             0,
+                             0x00700080u,
+                             0,
+                             0};
+        descriptor.dword_count = 8;
+        const auto chain = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        auto tail = descriptor;
+        tail.dwords[3] |= 8u << 12u;
+        const auto last = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, tail);
+        Require(name, "chain longer than the host image",
+                chain.image_id && last.image_id == chain.image_id &&
+                    chain.desc.info.resources.levels == 7 &&
+                    texture_cache.GetImage(chain.image_id).backing.mip_levels ==
+                        7 &&
+                    chain.desc.view_info.base_level == 0 &&
+                    chain.desc.view_info.level_count == 7 &&
+                    last.desc.view_info.base_level == 6 &&
+                    last.desc.view_info.level_count == 1 &&
+                    texture_cache.FindTexture(chain.image_id, chain.desc) !=
+                        nullptr &&
+                    texture_cache.FindTexture(last.image_id, last.desc) !=
+                        nullptr,
+                "a mip chain past the 1x1 level created host levels the image "
+                "cannot hold");
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);
