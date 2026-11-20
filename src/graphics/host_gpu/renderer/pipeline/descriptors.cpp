@@ -696,6 +696,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
+	// A chain longer than the host image holds (a block-compressed texture whose T# names its
+	// blocks keeps the level count of its texel chain, so levels past the 1x1 block remain)
+	// stores the host levels only; views of the missing levels address the last stored one. A
+	// host image created with them would be written past its memory by uploads of those levels.
+	// The data range stays the guest chain's, so writes to the missing levels still reach it.
+	if (const auto host_levels = desc.info.HostLevels(); desc.info.resources.levels > host_levels) {
+		view_base                  = std::min(view_base, host_levels - 1u);
+		view_levels                = std::min(view_levels, host_levels - view_base);
+		desc.info.resources.levels = host_levels;
+	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {

@@ -1003,6 +1003,10 @@ void Validate(const ImageInfo& info) {
 	    info.bytes_per_block == 0 || (info.data.address != 0 && info.pitch == 0)) {
 		EXIT("invalid image geometry or format\n");
 	}
+	// Uploads of levels past them would write past the host image's memory.
+	if (info.resources.levels > info.HostLevels()) {
+		EXIT("mip chain longer than a host image of its extent holds\n");
+	}
 
 	switch (info.type) {
 		case Prospero::ImageType::kColor3D:

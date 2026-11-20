@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -129,6 +130,11 @@ struct ImageInfo {
 	[[nodiscard]] bool IsTiled() const noexcept { return tile_mode != Prospero::TileMode::kLinear; }
 	[[nodiscard]] constexpr bool IsVolume() const noexcept {
 		return type == Prospero::ImageType::kColor3D;
+	}
+	// The levels a host image of this extent holds: a Vulkan mip chain ends at its 1x1 level.
+	[[nodiscard]] constexpr uint32_t HostLevels() const noexcept {
+		return static_cast<uint32_t>(std::bit_width(
+		    std::max({extent.width, extent.height, IsVolume() ? extent.depth : 1u, 1u})));
 	}
 	[[nodiscard]] constexpr uint32_t TransferLayers() const noexcept {
 		return IsVolume() ? extent.depth : resources.layers;
