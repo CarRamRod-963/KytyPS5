@@ -787,17 +787,20 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 			case Pm4::IT_SET_BASE:
 				(void)g_cp_op_func[opcode](*this, header & ~1u, packet + 1, remaining, total_dw);
 				break;
-			case Pm4::IT_NOP:
-				if (KYTY_PM4_R(header) == Pm4::R_DISPATCH_RESET) return Stop(packet);
-				break;
 			case Pm4::IT_SET_UCONFIG_REG:
 			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
-				// A flip block or a flip-done wait block is one unit for the parser
-				// (CpOpSetUconfigReg). Neither changes the commands after it: the flip's label
-				// tells the display a buffer is shown, and the wait in the other block only keeps
-				// rendering off a buffer the display still reads.
-				if (KYTY_PM4_R(header) != 1u || packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2) break;
-				const auto tag   = packet[2] & 0xff000000u;
+				// Driver user data, as for the parser (CpOpSetUconfigReg): R = 1 in a DCB, R = 0
+				// on a compute queue. A flip block or a flip-done wait block is one unit for the
+				// parser. Neither changes the commands after it: the flip's label tells the display
+				// a buffer is shown, and the wait in the other block only keeps rendering off a
+				// buffer the display still reads. A queue reset changes the state the commands
+				// after it run with.
+				if ((KYTY_PM4_R(header) != 1u && !IsAsyncComputeQueue()) ||
+				    packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+					break;
+				}
+				const auto tag = packet[2] & 0xff000000u;
+				if (tag == Pm4::USERDATA_TAG_RESET_QUEUE) return Stop(packet);
 				const auto block = tag == Pm4::USERDATA_TAG_FLIP ? Pm4::FLIP_PACKET_DW
 				                   : tag == Pm4::USERDATA_TAG_WAIT_FLIP_DONE
 				                       ? Pm4::WAIT_FLIP_DONE_PACKET_DW
@@ -852,8 +855,9 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 			}
 			case Pm4::IT_INDIRECT_BUFFER: {
 				if (size != 4u || depth >= MaxDepth) return Stop(packet);
+				// As CpOpIndirectBuffer: the two low bits of the target are not address bits.
 				const auto* buffer = reinterpret_cast<const uint32_t*>(
-				    packet[1] | (static_cast<uint64_t>(packet[2]) << 32u));
+				    (packet[1] & ~0x3u) | (static_cast<uint64_t>(packet[2]) << 32u));
 				const auto count = packet[3] & 0xfffffu;
 				if (count != 0 && buffer == nullptr) return Stop(packet);
 				// Recorded GPU work may still write the commands; the parser reads them back.
@@ -922,8 +926,9 @@ bool CommandProcessor::ScanLookahead(std::span<const uint32_t> commands, uint32_
 				const auto address = packet[2] | (static_cast<uint64_t>(packet[3]) << 32u);
 				const auto data    = std::span(packet + 4, size - 4u);
 				const bool one     = ((control >> 16u) & 0x1u) != 0;
-				// A long write is data, not a flag a wait could be on.
-				if (data.size() > 16u) break;
+				const auto dst_sel = ((control >> 30u) & 0x1u) | ((control >> 7u) & 0x1eu);
+				// A long write is data, not a flag a wait could be on; dst_sel 6 writes the GDS.
+				if (data.size() > 16u || dst_sel == 6u) break;
 				for (uint32_t i = one ? static_cast<uint32_t>(data.size()) - 1u : 0u;
 				     i < data.size(); ++i) {
 					m_lookahead_writes.push_back(

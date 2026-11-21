@@ -18446,6 +18446,12 @@ public:
         const std::array<u32, 5> write{0xc0033700u, 0x40100200u, lo, hi, 7u};
         Require(name, case_name, scan(write),
                 "the scan stopped at a wait a data write satisfies");
+        // WRITE_DATA to the GDS (dst_sel 6) stores nothing in memory, whatever
+        // its destination's low bits are.
+        const std::array<u32, 5> gds_write{0xc0033700u, 0x00100300u, lo, hi,
+                                           7u};
+        Require(name, case_name, !scan(gds_write),
+                "the scan took a GDS write for a memory write");
         Require(name, case_name, !scan({}),
                 "a scan kept the writes an earlier scan saw");
       }
@@ -18511,6 +18517,62 @@ public:
             CommandProcessorTestAccess::LookaheadStop(processor) ==
                 commands.data(),
             "the scan passed a flip block cut off by the end of the commands");
+
+        // On a compute queue driver user data has R = 0 (AgcAcb*), as for the
+        // parser: the scan passes such a wait block there, but not on the
+        // graphics queue, where R = 0 user data is a register write.
+        std::vector<u32> async_wait(wait, wait + Pm4::WAIT_FLIP_DONE_PACKET_DW);
+        async_wait[0] = KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 0u);
+        async_wait[12] = KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 0u);
+        CommandProcessor compute(context, 0x20);
+        compute.PlanLookahead(idle, async_wait);
+        Require(name, case_name,
+                CommandProcessorTestAccess::LookaheadStop(compute) == nullptr,
+                "the compute queue scan stopped in a flip-done wait block");
+        processor.PlanLookahead(idle, async_wait);
+        Require(name, case_name,
+                CommandProcessorTestAccess::LookaheadStop(processor) ==
+                    async_wait.data() + 3,
+                "the graphics queue scan took R = 0 user data for a block");
+        // A queue reset (AgcAcbResetQueue) changes the state the commands after
+        // it run with: the scan stops there.
+        const std::array<u32, 3> reset{KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 0u),
+                                       Pm4::SQ_THREAD_TRACE_USERDATA_2,
+                                       Pm4::USERDATA_TAG_RESET_QUEUE | 0x40u};
+        compute.PlanLookahead(idle, reset);
+        Require(name, case_name,
+                CommandProcessorTestAccess::LookaheadStop(compute) ==
+                    reset.data(),
+                "the scan passed a queue reset");
+      }
+      // An INDIRECT_BUFFER target's two low bits are not address bits; the scan
+      // reads the commands at the address the parser calls.
+      {
+        constexpr const char *case_name = "lookahead masks indirect targets";
+        constexpr auto label_address = base + 0xfc300;
+        const u32 zero = 0;
+        Require(name, case_name,
+                LibKernel::Memory::TryWriteBacking(label_address, &zero,
+                                                   sizeof(zero)),
+                "the label could not be cleared");
+        // WAIT_REG_MEM: memory space, function 3 (equal) on 7, unsatisfied.
+        const std::array<u32, 7> inner{KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0),
+                                       0x13u,
+                                       static_cast<u32>(label_address),
+                                       static_cast<u32>(label_address >> 32u),
+                                       7u,
+                                       0xffffffffu,
+                                       4u};
+        const auto target = reinterpret_cast<uint64_t>(inner.data()) | 1u;
+        const std::array<u32, 4> call{
+            KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0), static_cast<u32>(target),
+            static_cast<u32>(target >> 32u), static_cast<u32>(inner.size())};
+        const Pm4Execution idle;
+        processor.PlanLookahead(idle, call);
+        Require(name, case_name,
+                CommandProcessorTestAccess::LookaheadStop(processor) ==
+                    inner.data(),
+                "the scan did not stop at the called buffer's wait");
       }
       // A scan that reaches the end of the running submission continues into
       // the ones queued behind it on the same queue, whose first commands run
