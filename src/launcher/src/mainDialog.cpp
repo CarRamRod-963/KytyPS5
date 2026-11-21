@@ -293,6 +293,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--maximal-reconvergence" << EnumToText(info.maximal_reconvergence);
 	AddFlag(args, info.no_shader_simplification, "--no-shader-simplification");
 	AddFlag(args, info.no_selection_feedback, "--no-selection-feedback");
+	AddFlag(args, info.lazy_bda_sync, "--lazy-bda-sync");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
