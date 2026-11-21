@@ -822,6 +822,10 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	                         data, size);
 }
 
+bool IsBacked(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsBacked(vaddr, size);
+}
+
 BackingCompare CompareBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	if (g_guest_address_space == nullptr) {
 		return BackingCompare::Unmapped;

@@ -21551,6 +21551,119 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A T# can outlive the metadata it names: the guest unmaps the heap that held
+  // the DCC keys while the texture data stays mapped. Binding it again keeps
+  // the image as it was.
+  void CheckUnmappedColorMetadata() {
+    constexpr const char *name = "UnmappedColorMetadata";
+    constexpr uintptr_t base = 0x0000000206c00000ull;
+    constexpr uint64_t page = 0x10000;
+    constexpr uint64_t dcc_address = base + page;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                2 * page, page, 0, &direct_offset) == 0,
+            "texture and metadata allocation failed");
+    // The texture data and its metadata are separate mappings, as in two heaps.
+    for (uint64_t index = 0; index < 2; ++index) {
+      void *mapped = reinterpret_cast<void *>(base + index * page);
+      Require(name, "direct mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &mapped, page, 0x3, 0x10,
+                  direct_offset + static_cast<int64_t>(index * page),
+                  page) == 0 &&
+                  mapped == reinterpret_cast<void *>(base + index * page),
+              "texture or metadata mapping failed");
+    }
+    std::memset(reinterpret_cast<void *>(base), 0x5a, page);
+    std::memset(reinterpret_cast<void *>(dcc_address), 0xff, page);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, 2 * page);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      // A 64x64 R32 float surface with DCC keys one mapping further.
+      const ShaderTextureResource descriptor{
+          {static_cast<uint32_t>(base >> 8u), 0xc1600000u, 0x000fc00fu,
+           0x91b00204u, 0, 0x00700000u,
+           0x002b0000u | (static_cast<uint32_t>(dcc_address >> 8u) << 24u),
+           static_cast<uint32_t>(dcc_address >> 16u)}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+
+      // While mapped, a clear key is honoured, then uncompressed keys are read
+      // again.
+      WriteMetadata(context, dcc_address, 0x1000, 0);
+      const auto cleared =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(
+          name, "mapped metadata clear",
+          cleared.image_id &&
+              cleared.desc.info.metadata.range ==
+                  GuestRange{dcc_address, 0x1000} &&
+              cache.FindTexture(cleared.image_id, cleared.desc) != nullptr &&
+              ReadCachedTexel(name, context, cleared.image_id, {63, 63, 0}) ==
+                  std::vector<u32>{0u},
+          "the mapped DCC clear key was not applied");
+      WriteMetadata(context, dcc_address, 0x1000, UINT32_MAX);
+      TextureBinding memo{};
+      RenderExecutorTestAccess::ResolveTextureMemo(executor, resource, value,
+                                                   memo);
+      Require(name, "mapped uncompressed keys",
+              memo.image_id == cleared.image_id &&
+                  cache.FindTexture(memo.image_id, memo.desc) != nullptr,
+              "re-reading uncompressed keys replaced the image");
+
+      // The heap holding the keys goes; the texture data stays mapped.
+      Require(name, "metadata unmap",
+              Libs::LibKernel::Memory::KernelMunmap(dcc_address, page) == 0 &&
+                  !LibKernel::Memory::IsBacked(dcc_address, 1),
+              "the metadata mapping release failed");
+      RenderExecutorTestAccess::ResolveTextureMemo(executor, resource, value,
+                                                   memo);
+      const auto rebound =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(
+          name, "unmapped metadata",
+          memo.image_id == cleared.image_id &&
+              rebound.image_id == cleared.image_id &&
+              cache.FindTexture(rebound.image_id, rebound.desc) != nullptr &&
+              ReadCachedTexel(name, context, rebound.image_id, {63, 63, 0}) ==
+                  std::vector<u32>{0u},
+          "binding a T# whose metadata was unmapped lost the image or its "
+          "contents");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, page);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, page) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               2 * page) == 0,
+            "texture and metadata allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckPackedTextureComponents() {
     constexpr const char *name = "PackedTextureComponents";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -66689,6 +66802,7 @@ int main(int argc, char **argv) {
     vulkan.CheckColorClearCheck();
     vulkan.CheckConsumedCpuStores();
     vulkan.CheckWatchedRangeWrites();
+    vulkan.CheckUnmappedColorMetadata();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
@@ -66975,6 +67089,7 @@ int main(int argc, char **argv) {
     vulkan.CheckWatchedRangeWrites();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckUnmappedColorMetadata();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -67052,6 +67167,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckUnmappedColorMetadata();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -67434,6 +67550,7 @@ int main(int argc, char **argv) {
     vulkan.CheckWatchedRangeWrites();
     vulkan.CheckDccConstantBlocks();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckUnmappedColorMetadata();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckSampledSrgbViews();
     vulkan.CheckMsaaStorageClear();

@@ -1377,6 +1377,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
 	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
+	// A descriptor can still name metadata in memory the guest has unmapped (a T# left in a table
+	// after its heap was released, with the texture data elsewhere). Such metadata holds no
+	// fast-clear state: the texture unit would fault on it, so nothing on PS5 samples it. The
+	// image keeps its contents.
+	if (!LibKernel::Memory::IsBacked(viewed.address, viewed.size)) {
+		return;
+	}
 	// Another reader may already have downloaded the metadata and consumed its GPU-modified
 	// state, so the watched write sequence is what tells a re-applied clear from a stale one.
 	const auto write_sequence   = m_buffer_cache.WatchedWriteSequence(range.address, range.size);

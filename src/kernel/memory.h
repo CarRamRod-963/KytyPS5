@@ -141,6 +141,8 @@ int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int 
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether every page of the range has backing, which TryReadBacking needs to read it.
+[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size);
 enum class BackingCompare : uint8_t { Unmapped, Equal, Different };
 // Compares what TryReadBacking would read (elided labels included) with `data`, without copying
 // the backing out when no elided label can overlay it.
