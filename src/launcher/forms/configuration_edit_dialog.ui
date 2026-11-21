@@ -243,6 +243,12 @@
               <property name="text"><string>Keep every listed texture loaded (uses more video memory)</string></property>
              </widget>
             </item>
+            <item row="18" column="1">
+             <widget class="QCheckBox" name="checkBox_lazy_bda_sync">
+              <property name="toolTip"><string>Upload the game's memory writes at command ordering points only into the GPU buffers shaders read by address; the others take them when they are bound. Faster; experimental.</string></property>
+              <property name="text"><string>Lazy BDA synchronization (experimental)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

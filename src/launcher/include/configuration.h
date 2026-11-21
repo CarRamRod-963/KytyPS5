@@ -138,6 +138,7 @@ public:
 	MaximalReconvergence   maximal_reconvergence       = MaximalReconvergence::Auto;
 	bool                   no_shader_simplification    = false;
 	bool                   no_selection_feedback       = false;
+	bool                   lazy_bda_sync               = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -194,6 +195,7 @@ public:
 		maximal_reconvergence       = other.maximal_reconvergence;
 		no_shader_simplification    = other.no_shader_simplification;
 		no_selection_feedback       = other.no_selection_feedback;
+		lazy_bda_sync               = other.lazy_bda_sync;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
