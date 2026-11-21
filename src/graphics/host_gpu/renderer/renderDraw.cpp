@@ -1119,8 +1119,8 @@ static PendingDrawDescription DescribePendingDraw(const DrawRenderState&        
 	    std::ranges::any_of(stages,
 	                        [](const auto& stage) { return StageWritesMemory(stage.stage); }) ||
 	    (state.ps_active && StageWritesMemory(state.ps_input_info.stage));
-	// Inside a guest query a skipped draw would count no samples and read as hidden. (Without
-	// --occlusion-queries the dumps publish always-visible results, which it cannot change.)
+	// Inside a guest query a skipped draw would count no samples and read as hidden. (With
+	// --no-occlusion-queries the dumps publish always-visible results, which it cannot change.)
 	draw.query_active = queries.Counting();
 	draw.linear_color_target =
 	    std::ranges::any_of(std::span {state.color_info, state.color_count},

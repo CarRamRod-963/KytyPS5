@@ -128,7 +128,10 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
-	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf(
+	    "  --no-occlusion-queries               Treat guest occlusion queries as always visible\n"
+	    "                                       instead of counting their samples on the GPU.\n"
+	    "                                       Default: counted (--occlusion-queries).\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
 	::printf(
 	    "  --emulate-wave64                     Run wave64 compute shaders 32 lanes wide, two\n"
@@ -327,6 +330,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--emulate-wave64", &ConfigOptions::emulate_wave64},
     {"--no-shader-simplification", &ConfigOptions::no_shader_simplification},

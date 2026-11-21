@@ -285,7 +285,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
-	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
+	AddFlag(args, !info.occlusion_queries, "--no-occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	AddFlag(args, info.native_rt, "--native-rt");
 	AddFlag(args, info.emulate_wave64, "--emulate-wave64");
