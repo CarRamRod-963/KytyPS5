@@ -434,7 +434,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan                  plan;
 		std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> lookahead_plan;
 		std::vector<Permutation>                            permutations;
-		std::vector<uint32_t>                               push_data_cursors;
+		std::vector<ShaderRecompiler::IR::PushData::Window> push_data_windows;
 	};
 
 	// The records of one program key, in the order they were first added (one of the two lists).
@@ -583,8 +583,8 @@ struct PipelineCache::ProgramCache {
 					        ShaderRecompiler::IR::SrtWalkerCompilation::Deferred));
 				}
 			}
-			result = ShaderRecompiler::CompileProgram(
-			    std::move(translated), options, record.specialization, record.push_data_cursor);
+			result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                          record.specialization, record.push_data);
 		} catch (const Common::RecoverableFatal& fatal) {
 			PipelineCacheLog("Program preparation: {:016x} cannot be translated: {}", key.hash,
 			                 fatal.message);
@@ -609,7 +609,7 @@ struct PipelineCache::ProgramCache {
 		    .handle         = {.module = module, .spirv_hash = spirv_hash},
 		    .spirv_hash     = spirv_hash,
 		});
-		prepared.push_data_cursors.push_back(record.push_data_cursor);
+		prepared.push_data_windows.push_back(record.push_data);
 		return true;
 	}
 
@@ -770,16 +770,16 @@ struct PipelineCache::ProgramCache {
 			auto& permutation =
 			    entry->second.permutations.emplace_back(std::move(prepared->permutations[i]));
 			permutation.handle.id = ++next_shader_id;
-			const auto cursor     = prepared->push_data_cursors[i];
+			const auto window     = prepared->push_data_windows[i];
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				if (manifest != nullptr) {
 					permutation.handle.record_key =
-					    RecordComputeProgram(params, input_info, cursor, permutation);
+					    RecordComputeProgram(params, input_info, window, permutation);
 				}
 			} else {
 				if (pipeline_manifest != nullptr) {
 					permutation.handle.record_key =
-					    RecordGraphicsStage(stage, params, input_info, cursor, permutation);
+					    RecordGraphicsStage(stage, params, input_info, window, permutation);
 				}
 			}
 		}
@@ -911,14 +911,15 @@ struct PipelineCache::ProgramCache {
 	// Adds a compiled compute permutation to the title's manifest and returns its key. Shaders
 	// with calls read guest code at run time and are not recorded.
 	uint64_t RecordComputeProgram(const ShaderParams& params, const ShaderComputeInputInfo& input,
-	                              uint32_t push_data_cursor, const Permutation& permutation) {
+	                              ShaderRecompiler::IR::PushData::Window push_data,
+	                              const Permutation&                     permutation) {
 		ComputeProgramRecord record;
 		record.shader_hash = params.hash;
 		record.code =
 		    std::make_shared<const std::vector<uint32_t>>(params.code.begin(), params.code.end());
 		record.user_data_count  = params.user_data_count;
 		record.input            = ComputeProgramRecord::StaticInput(input);
-		record.push_data_cursor = push_data_cursor;
+		record.push_data        = push_data;
 		record.specialization   = permutation.specialization;
 		record.spirv_hash       = permutation.spirv_hash;
 		const auto key          = record.Key();
@@ -933,13 +934,14 @@ struct PipelineCache::ProgramCache {
 	// its key. Shaders with calls are not recorded.
 	template <typename InputInfo>
 	uint64_t RecordGraphicsStage(ShaderType stage, const ShaderParams& params,
-	                             const InputInfo& input, uint32_t push_data_cursor,
-	                             const Permutation& permutation) {
+	                             const InputInfo&                       input,
+	                             ShaderRecompiler::IR::PushData::Window push_data,
+	                             const Permutation&                     permutation) {
 		GraphicsStageRecord record;
 		record.stage            = stage;
 		record.shader_hash      = params.hash;
 		record.user_data_count  = params.user_data_count;
-		record.push_data_cursor = push_data_cursor;
+		record.push_data        = push_data;
 		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			record.pixel = GraphicsStageRecord::StaticInput(input);
 		} else {
@@ -1167,7 +1169,7 @@ struct PipelineCache::ProgramCache {
 					    if (record->shader_hash != params.hash ||
 					        record->user_data_count != params.user_data_count ||
 					        record->code == nullptr || record->code->size() != params.code.size() ||
-					        record->push_data_cursor != push_data_cursor)
+					        record->push_data != push_data)
 						    return true;
 					    auto input               = record->input;
 					    input.host_subgroup_size = input_info.host_subgroup_size;
@@ -1215,13 +1217,13 @@ struct PipelineCache::ProgramCache {
 			if (manifest != nullptr && !entry->second.call_source) {
 				auto& added = entry->second.permutations.back();
 				added.handle.record_key =
-				    RecordComputeProgram(params, input_info, push_data_cursor, added);
+				    RecordComputeProgram(params, input_info, push_data, added);
 			}
 		} else {
 			if (pipeline_manifest != nullptr && !entry->second.call_source) {
 				auto& added = entry->second.permutations.back();
 				added.handle.record_key =
-				    RecordGraphicsStage(stage, params, input_info, push_data_cursor, added);
+				    RecordGraphicsStage(stage, params, input_info, push_data, added);
 			}
 		}
 
@@ -1450,7 +1452,7 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 			return std::nullopt;
 		}
 		return ShaderRecompiler::CompileProgram(std::move(translated), options, *specialization,
-		                                        record.push_data_cursor);
+		                                        record.push_data);
 	};
 	std::optional<ShaderRecompiler::CompileResult> result;
 	// No dispatch has used a created shader, and a recorded program may meet a recompiler that
@@ -1578,7 +1580,7 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 			return false;
 		}
 		result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                          record.specialization, record.push_data_cursor);
+		                                          record.specialization, record.push_data);
 	} catch (const Common::RecoverableFatal& fatal) {
 		PipelineCacheLog("Precompile: recorded stage {:016x} cannot be translated: {}",
 		                 record.shader_hash, fatal.message);
@@ -2023,7 +2025,11 @@ void PipelineCache::InitializeDriverCache() {
 	PipelineCacheLog("Pipeline manifest: {} graphics pipelines, {} stages in {}{}{}",
 	                 pipelines.pipelines, pipelines.stages,
 	                 Common::PathToString(m_pipeline_manifest->Path()),
-	                 pipelines.imported ? " (imported from the v6 file)" : "",
+	                 pipelines.imported
+	                     ? fmt::format(" (imported from the v8 file, {} vertex-side stages without "
+	                                   "a pipeline not converted)",
+	                                   pipelines.unconverted_stages)
+	                     : std::string {},
 	                 pipelines.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
 	                                                   pipelines.dropped_bytes)
 	                                     : std::string {});

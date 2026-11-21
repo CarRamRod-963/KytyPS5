@@ -30,8 +30,10 @@ struct ComputeProgramRecord {
 	uint32_t                                     user_data_count = 0;
 	// The static fields BuildStageStaticKey reads. Host fields (host_subgroup_size,
 	// lds_storage) are derived from the device when the record is translated.
-	ShaderComputeInputInfo                       input;
-	uint32_t                                     push_data_cursor = 0;
+	ShaderComputeInputInfo input;
+	// The push constants the program may take. A compute program has them all to itself, so only
+	// `begin` is stored; `end` is always PushData::DwordCount.
+	ShaderRecompiler::IR::PushData::Window       push_data;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	// Hash of the SPIR-V the recording build emitted. Not part of the key: a recompiler change
 	// gives the same program another module.

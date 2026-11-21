@@ -425,6 +425,8 @@ struct PushData {
 			if (size == 0 || size > end - begin) return NoStart;
 			return stage == ShaderType::Pixel ? end - size : begin;
 		}
+
+		constexpr bool operator==(const Window&) const = default;
 	};
 
 	[[nodiscard]] static constexpr Window GraphicsWindow(bool mesh, bool object_id,
