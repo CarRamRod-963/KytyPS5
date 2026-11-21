@@ -336,7 +336,7 @@ private:
 	std::unique_ptr<ProgramManifest> m_created;
 	// Precompile builds that never finished; null without a driver cache file.
 	std::unique_ptr<PrecompileAttempts>     m_precompile_attempts;
-	// Graphics pipelines of this title and their stages (_PipelineCache/<title>.v5.pipelines),
+	// Graphics pipelines of this title and their stages (_PipelineCache/<title>.v9.pipelines),
 	// and the code of every shader the guest created (<title>.v5.created); null without a driver
 	// cache file.
 	std::unique_ptr<PipelineManifest> m_pipeline_manifest;

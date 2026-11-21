@@ -59,7 +59,7 @@ GraphicsStageRecord VertexStage(uint32_t seed, ShaderCode code) {
   record.stage = ShaderType::Vertex;
   record.shader_hash = 0x5000u + seed;
   record.user_data_count = 16;
-  record.push_data_cursor = 4;
+  record.push_data.begin = 4;
   auto &vertex = record.vertex;
   vertex.logical_stage = ShaderType::Vertex;
   vertex.resources_num = 2;
@@ -239,22 +239,37 @@ void TestManifestDamage() {
   Check(manifest.Loaded().stages == 1, "the replaced file is appended to");
 }
 
-// A layout-3 file (<title>.v7.pipelines) is imported once into the current
-// file: its stages keep their fields (the mesh output primitive size, which
-// layout 3 lacks, reads as triangles), its pipelines name the stages by
-// their new keys, and the old file stays.
+// A layout-4 file (<title>.v8.pipelines) is imported once into the current
+// file: its stages keep their fields, each pipeline gives its stages the
+// push-data windows of their cursors, the pipelines name the stages by their
+// new keys, and the old file stays. Layout 4 records the cursor the stages of
+// a draw advanced in turn, from the draw's own dwords, pixel stage first; the
+// window gives the pixel stage the end of the push constants instead.
 void TestManifestImport() {
   namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
   using Libs::Graphics::ManifestFormat::Writer;
-  const auto previous = TempPath("import.v7.pipelines");
-  const auto path = TempPath("import.v8.pipelines");
+  using Window = Libs::Graphics::ShaderRecompiler::IR::PushData::Window;
+  constexpr uint32_t dwords =
+      Libs::Graphics::ShaderRecompiler::IR::PushData::DwordCount;
+  const auto previous = TempPath("import.v8.pipelines");
+  const auto path = TempPath("import.v9.pipelines");
+  // A draw with the object ID (1 dword) and a pixel stage taking 6 dwords:
+  // the pixel stage's cursor is 1, the vertex stage's 7.
   auto vs = VertexStage(4, Code(4, 80));
   vs.vertex.has_dynamic_vertex_fetch = true;
   vs.vertex.indirect_draw = true;
   vs.vertex.indirect_offsets = {3, ShaderIndirectOffsets::None};
-  // Layout 3 stores the sRGB fields of each specialized image.
-  vs.specialization.images.emplace_back();
-  const auto ps = PixelStage(5, Code(5, 30));
+  vs.vertex.mesh.output_primitive_size = 2;
+  vs.push_data = {.begin = 7};
+  auto ps = PixelStage(5, Code(5, 30));
+  ps.push_data = {.begin = 1};
+  // A pixel stage and a vertex stage no pipeline names.
+  auto lone_ps = PixelStage(8, Code(8, 24));
+  lone_ps.push_data = {.begin = 5};
+  auto lone_vs = VertexStage(9, Code(9, 24));
+  // A pipeline without a pixel stage: its vertex stage keeps its cursor.
+  auto bare_vs = VertexStage(10, Code(10, 24));
+  bare_vs.push_data = {.begin = 0};
   const auto code_entry = [](const ShaderCode &code) {
     std::vector<uint8_t> out;
     Writer w(out);
@@ -265,9 +280,11 @@ void TestManifestImport() {
     w.PutWords(*code);
     return out;
   };
-  std::vector<std::vector<uint8_t>> payloads{code_entry(vs.code), code_entry(ps.code)};
+  std::vector<std::vector<uint8_t>> payloads;
   std::vector<uint64_t> old_keys;
-  for (const GraphicsStageRecord *stage : {static_cast<const GraphicsStageRecord *>(&vs), &ps}) {
+  for (const GraphicsStageRecord *stage :
+       {&vs, &ps, &lone_ps, &lone_vs, &bare_vs}) {
+    payloads.push_back(code_entry(stage->code));
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{2});
@@ -279,58 +296,73 @@ void TestManifestImport() {
   auto pipeline = Pipeline(vs, &ps, 1);
   pipeline.vertex_stages[0] = old_keys[0];
   pipeline.pixel_stage = old_keys[1];
-  {
+  auto bare = Pipeline(bare_vs, nullptr, 2);
+  bare.vertex_stages[0] = old_keys[4];
+  for (const auto *record : {&pipeline, &bare}) {
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{3});
-    RecordFormat::PutPipeline(w, pipeline, RecordFormat::PreviousLayoutVersion);
+    RecordFormat::PutPipeline(w, *record, RecordFormat::PreviousLayoutVersion);
     payloads.push_back(std::move(body));
   }
   Check(old_keys[0] != vs.Key(), "the layouts encode a stage differently");
   Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
             previous, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
             PipelineManifest::FormatVersion, payloads),
-        "the layout-3 file is written");
+        "the layout-4 file is written");
   const auto previous_size = std::filesystem::file_size(previous);
+  auto new_vs = vs;
+  new_vs.push_data = Window{.begin = 1, .end = dwords - 6};
+  auto new_ps = ps;
+  new_ps.push_data = Window{.begin = 1, .end = dwords};
+  auto new_lone_ps = lone_ps;
+  new_lone_ps.push_data = Window{.begin = 5, .end = dwords};
+  auto new_bare_vs = bare_vs;
+  new_bare_vs.push_data = Window{.begin = 0, .end = dwords};
   const auto ps2 = [] {
     auto stage = PixelStage(6, Code(6, 20));
     stage.pixel.target_uint_mask = 2;
     stage.pixel.target_sint_mask = 4;
     return stage;
   }();
-  auto lines = VertexStage(7, Code(7, 40));
-  lines.vertex.mesh.output_primitive_size = 2;
   {
     PipelineManifest manifest(path, previous);
     const auto loaded = manifest.Loaded();
-    Check(loaded.imported && loaded.stages == 2 && loaded.pipelines == 1,
-          "the layout-3 records are imported");
-    const auto imported = manifest.FindStage(vs.Key());
-    Check(imported != nullptr && imported->vertex.indirect_draw &&
-              imported->vertex.indirect_offsets == vs.vertex.indirect_offsets &&
-              imported->vertex.has_dynamic_vertex_fetch &&
-              imported->vertex.mesh.output_primitive_size == 3u,
-          "a layout-3 stage keeps its indirect draw and fetch fields");
+    Check(loaded.imported && loaded.stages == 4 && loaded.pipelines == 2 &&
+              loaded.unconverted_stages == 1,
+          "the layout-4 records are imported, but for the lone vertex stage");
+    const auto imported = manifest.FindStage(new_vs.Key());
+    Check(
+        imported != nullptr && imported->vertex.indirect_draw &&
+            imported->vertex.indirect_offsets == vs.vertex.indirect_offsets &&
+            imported->vertex.has_dynamic_vertex_fetch &&
+            imported->vertex.mesh.output_primitive_size == 2u &&
+            imported->push_data == new_vs.push_data,
+        "a layout-4 vertex stage keeps its fields and starts after the draw's "
+        "dwords");
+    const auto pixel = manifest.FindStage(new_ps.Key());
+    Check(pixel != nullptr && pixel->push_data == new_ps.push_data,
+          "a layout-4 pixel stage takes the end of the push constants");
+    Check(manifest.FindStage(new_lone_ps.Key()) != nullptr,
+          "a pixel stage no pipeline names converts on its own");
     const auto pipelines = manifest.Pipelines();
-    Check(pipelines[0]->vertex_stages[0] == vs.Key() &&
-              pipelines[0]->pixel_stage == ps.Key() &&
-              pipelines[0]->Key() == Pipeline(vs, &ps, 1).Key(),
+    Check(pipelines[0]->vertex_stages[0] == new_vs.Key() &&
+              pipelines[0]->pixel_stage == new_ps.Key() &&
+              pipelines[0]->Key() == Pipeline(new_vs, &new_ps, 1).Key() &&
+              pipelines[1]->vertex_stages[0] == new_bare_vs.Key(),
           "an imported pipeline names its stages by their current keys");
-    Check(manifest.AddStage(ps2) && manifest.AddStage(lines),
-          "the imported manifest is appended to");
+    Check(manifest.AddStage(ps2), "the imported manifest is appended to");
   }
   Check(std::filesystem::file_size(previous) == previous_size,
-        "the layout-3 file is left as it is");
+        "the layout-4 file is left as it is");
   PipelineManifest manifest(path, previous);
   const auto loaded = manifest.Loaded();
-  Check(!loaded.imported && !loaded.rewritten && loaded.stages == 4 &&
-            loaded.pipelines == 1,
+  Check(!loaded.imported && !loaded.rewritten && loaded.stages == 5 &&
+            loaded.pipelines == 2,
         "the current file is read without importing again");
-  const auto mesh = manifest.FindStage(lines.Key());
-  Check(
-      mesh != nullptr && mesh->vertex.mesh.output_primitive_size == 2u &&
-          lines.Key() != VertexStage(7, Code(7, 40)).Key(),
-      "a mesh stage's output primitive size reads back and is part of its key");
+  const auto vertex = manifest.FindStage(new_vs.Key());
+  Check(vertex != nullptr && vertex->push_data == new_vs.push_data,
+        "a stage's window reads back");
   const auto masks = manifest.FindStage(ps2.Key());
   Check(masks != nullptr && masks->pixel.target_uint_mask == 2 &&
             masks->pixel.target_sint_mask == 4,
@@ -421,7 +453,7 @@ ComputeProgramRecord Compute(uint32_t seed, ShaderCode code) {
   record.input.threads_num[0] = 64;
   record.input.threads_num[1] = 1;
   record.input.threads_num[2] = 1;
-  record.push_data_cursor = seed;
+  record.push_data.begin = seed;
   return record;
 }
 
@@ -483,7 +515,7 @@ void TestListRoundTrip() {
             read.pipelines.size() == 3,
         "every entry reads back");
   Check(read.compute[0].code == ShaderCodeId::Of(*fixture.cs_code) &&
-            read.compute[0].record.push_data_cursor == 1 &&
+            read.compute[0].record.push_data.begin == 1 &&
             !read.compute[0].code_only && read.compute[1].code_only,
         "compute entries read back");
   Check(read.stages[0].Key() == fixture.vs.Key() &&

@@ -67,7 +67,7 @@ MakeRecord(uint32_t seed, std::shared_ptr<const std::vector<uint32_t>> code) {
   record.input.thread_ids_num = 3;
   record.input.workgroup_register = 12;
   record.input.tg_size_en = true;
-  record.push_data_cursor = seed;
+  record.push_data.begin = seed;
   Specialization::Buffer buffer;
   buffer.packed_stride = 1;
   buffer.descriptor_swizzle = 516;

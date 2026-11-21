@@ -429,7 +429,10 @@ void PipelineRecordFormat::PutStage(Writer& w, const GraphicsStageRecord& record
 	PutCodeId(w, record.code_id);
 	PutCodeId(w, record.back_code_id);
 	w.Put(record.user_data_count);
-	w.Put(record.push_data_cursor);
+	w.Put(record.push_data.begin);
+	if (layout >= 5) {
+		w.Put(record.push_data.end);
+	}
 	if (record.stage == ShaderType::Pixel) {
 		PutPixelInput(w, record.pixel, layout);
 	} else {
@@ -443,7 +446,14 @@ bool PipelineRecordFormat::GetStage(Reader& r, GraphicsStageRecord& record, uint
 	    !GraphicsStageRecord::IsGraphicsStage(record.stage) || !r.Get(record.shader_hash) ||
 	    !GetCodeId(r, record.code_id) || !record.code_id || !GetCodeId(r, record.back_code_id) ||
 	    !r.Get(record.user_data_count) || record.user_data_count > MaxUserData ||
-	    !r.Get(record.push_data_cursor)) {
+	    !r.Get(record.push_data.begin)) {
+		return false;
+	}
+	// Layouts before 5 store the cursor (see LayoutVersion).
+	record.push_data.end = ShaderRecompiler::IR::PushData::DwordCount;
+	if ((layout >= 5 && !r.Get(record.push_data.end)) ||
+	    record.push_data.end > ShaderRecompiler::IR::PushData::DwordCount ||
+	    record.push_data.begin > record.push_data.end) {
 		return false;
 	}
 	if (record.stage == ShaderType::Pixel) {
@@ -586,12 +596,12 @@ bool PipelineRecordFormat::GetPipeline(Reader& r, GraphicsPipelineRecord& record
 
 std::filesystem::path PipelineManifest::PathFor(const std::filesystem::path& directory,
                                                 const std::string&           title_id) {
-	return directory / (title_id + ".v8.pipelines");
+	return directory / (title_id + ".v9.pipelines");
 }
 
 std::filesystem::path PipelineManifest::PreviousPathFor(const std::filesystem::path& directory,
                                                         const std::string&           title_id) {
-	return directory / (title_id + ".v7.pipelines");
+	return directory / (title_id + ".v8.pipelines");
 }
 
 PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::path previous)
@@ -605,13 +615,24 @@ PipelineManifest::PipelineManifest(std::filesystem::path path, std::filesystem::
 	    });
 	std::error_code error;
 	if (read.size == 0 && !previous.empty() && std::filesystem::exists(previous, error)) {
-		// The previous file (record layout 3) is read once and left as it is for older builds.
+		// The previous file (record layout 4) is read once and left as it is for older builds.
 		(void)ManifestFormat::ReadEntryFile(
 		    previous, ManifestMagic, [this](std::span<const uint8_t> payload, uint32_t version) {
 			    return version == FormatVersion &&
 			           Parse(payload, PipelineRecordFormat::PreviousLayoutVersion);
 		    });
-		m_legacy_stage_keys.clear();
+		// A pixel stage no pipeline named converts on its own: its cursor is where the draw's
+		// own dwords end, the beginning of its window.
+		for (auto& [key, stage]: m_legacy_stages) {
+			if (m_legacy_converted.contains(key)) continue;
+			if (stage->stage != ShaderType::Pixel) {
+				m_loaded.unconverted_stages++;
+				continue;
+			}
+			AddLoadedStage(std::make_shared<GraphicsStageRecord>(*stage));
+		}
+		m_legacy_stages.clear();
+		m_legacy_converted.clear();
 		m_loaded.imported = !m_stage_order.empty();
 	}
 	m_loaded.stages       = m_stage_order.size();
@@ -651,12 +672,6 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload, uint32_t layout) 
 		    !r.AtEnd()) {
 			return false;
 		}
-		if (layout != PipelineRecordFormat::LayoutVersion) {
-			// Pipelines of another layout name their stages by the key of that layout's body:
-			// the payload without its SPIR-V hash.
-			const auto body = payload.first(payload.size() - sizeof(record->spirv_hash));
-			m_legacy_stage_keys.emplace(XXH3_64bits(body.data(), body.size()), record->Key());
-		}
 		const auto front = m_code.find(record->code_id);
 		const auto back  = record->back_code_id ? m_code.find(record->back_code_id) : m_code.end();
 		// A stage whose code entry was lost cannot be translated; the entry itself is intact.
@@ -665,10 +680,14 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload, uint32_t layout) 
 		}
 		record->code      = front->second;
 		record->back_code = record->back_code_id ? back->second : nullptr;
-		const auto key    = record->Key();
-		if (m_stages.try_emplace(key, record).second) {
-			m_stage_order.push_back(std::move(record));
+		if (layout != PipelineRecordFormat::LayoutVersion) {
+			// Pipelines of another layout name their stages by the key of that layout's body:
+			// the payload without its SPIR-V hash. The stage is converted with its pipelines.
+			const auto body = payload.first(payload.size() - sizeof(record->spirv_hash));
+			m_legacy_stages.emplace(XXH3_64bits(body.data(), body.size()), std::move(record));
+			return true;
 		}
+		AddLoadedStage(std::move(record));
 		return true;
 	}
 	if (kind != KindPipeline) {
@@ -678,15 +697,8 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload, uint32_t layout) 
 	if (!PipelineRecordFormat::GetPipeline(r, *record, layout) || !r.AtEnd()) {
 		return false;
 	}
-	if (layout != PipelineRecordFormat::LayoutVersion) {
-		const auto current = [this](uint64_t& key) {
-			if (key == 0) return;
-			const auto found = m_legacy_stage_keys.find(key);
-			key              = found != m_legacy_stage_keys.end() ? found->second : 1u;
-		};
-		for (uint32_t i = 0; i < record->vertex_stage_count; i++)
-			current(record->vertex_stages[i]);
-		current(record->pixel_stage);
+	if (layout != PipelineRecordFormat::LayoutVersion && !ConvertLegacyPipeline(*record)) {
+		return true;
 	}
 	const auto known = [this](uint64_t key) { return m_stages.contains(key); };
 	if (!std::ranges::all_of(record->VertexStages(), known) ||
@@ -695,6 +707,59 @@ bool PipelineManifest::Parse(std::span<const uint8_t> payload, uint32_t layout) 
 	}
 	if (m_pipeline_keys.insert(record->Key()).second) {
 		m_pipelines.push_back(std::move(record));
+	}
+	return true;
+}
+
+void PipelineManifest::AddLoadedStage(std::shared_ptr<GraphicsStageRecord> record) {
+	const auto key = record->Key();
+	if (m_stages.try_emplace(key, record).second) {
+		m_stage_order.push_back(std::move(record));
+	}
+}
+
+bool PipelineManifest::ConvertLegacyPipeline(GraphicsPipelineRecord& record) {
+	using ShaderRecompiler::IR::PushData;
+	const auto find = [this](uint64_t key) -> const GraphicsStageRecord* {
+		const auto found = m_legacy_stages.find(key);
+		return found != m_legacy_stages.end() ? found->second.get() : nullptr;
+	};
+	const auto* pixel = record.pixel_stage != 0 ? find(record.pixel_stage) : nullptr;
+	std::array<const GraphicsStageRecord*, 3> vertex {};
+	for (uint32_t i = 0; i < record.vertex_stage_count; i++) {
+		vertex[i] = find(record.vertex_stages[i]);
+		if (vertex[i] == nullptr) return false;
+	}
+	if (record.pixel_stage != 0 && pixel == nullptr) return false;
+	// The cursor started after the draw's own dwords, with the pixel stage, so that stage's
+	// cursor is where the draw's dwords end and the first vertex-side stage's cursor is past the
+	// pixel stage's data. In the window, the pixel stage takes the end instead and the
+	// vertex-side stages start where the draw's dwords end; each of them reads at the same
+	// distance from the start as before.
+	const uint32_t draw_end =
+	    pixel != nullptr ? pixel->push_data.begin : vertex[0]->push_data.begin;
+	if (vertex[0]->push_data.begin < draw_end) return false;
+	const uint32_t pixel_size = vertex[0]->push_data.begin - draw_end;
+	if (pixel_size > PushData::DwordCount - draw_end) return false;
+	// The vertex-side stages advanced the cursor in turn.
+	for (uint32_t i = 1; i < record.vertex_stage_count; i++) {
+		if (vertex[i]->push_data.begin < vertex[i - 1]->push_data.begin) return false;
+	}
+	const auto convert = [&](uint64_t& key, const GraphicsStageRecord& legacy,
+	                         PushData::Window window) {
+		m_legacy_converted.insert(key);
+		auto stage       = std::make_shared<GraphicsStageRecord>(legacy);
+		stage->push_data = window;
+		key              = stage->Key();
+		AddLoadedStage(std::move(stage));
+	};
+	for (uint32_t i = 0; i < record.vertex_stage_count; i++) {
+		convert(record.vertex_stages[i], *vertex[i],
+		        {.begin = vertex[i]->push_data.begin - pixel_size,
+		         .end   = PushData::DwordCount - pixel_size});
+	}
+	if (pixel != nullptr) {
+		convert(record.pixel_stage, *pixel, {.begin = draw_end, .end = PushData::DwordCount});
 	}
 	return true;
 }

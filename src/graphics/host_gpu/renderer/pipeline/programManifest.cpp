@@ -135,7 +135,7 @@ std::vector<uint8_t> ProgramManifest::EncodeComputeBody(const ComputeProgramReco
 	w.Put(static_cast<uint32_t>(record.code != nullptr ? record.code->size() : 0u));
 	w.Put(record.user_data_count);
 	PutInput(w, record.input);
-	w.Put(record.push_data_cursor);
+	w.Put(record.push_data.begin);
 	ManifestFormat::PutSpecialization(w, record.specialization);
 	return out;
 }
@@ -148,7 +148,7 @@ bool ProgramManifest::DecodeComputeBody(std::span<const uint8_t> body, ComputePr
 	return r.Get(kind) && kind == KindComputeProgram && r.Get(record.shader_hash) &&
 	       r.Get(code_words) && r.Get(record.user_data_count) &&
 	       record.user_data_count <= MaxUserData && GetInput(r, record.input) &&
-	       r.Get(record.push_data_cursor) &&
+	       r.Get(record.push_data.begin) &&
 	       ManifestFormat::GetSpecialization(r, record.specialization) && r.AtEnd();
 }
 
@@ -211,7 +211,7 @@ bool ProgramManifest::ParseEntry(std::span<const uint8_t> payload, uint32_t vers
 	uint32_t code_words = 0;
 	if (!r.Get(record->shader_hash) || !r.Get(code_words) || !r.Get(record->user_data_count) ||
 	    record->user_data_count > MaxUserData || !GetInput(r, record->input) ||
-	    !r.Get(record->push_data_cursor) ||
+	    !r.Get(record->push_data.begin) ||
 	    !ManifestFormat::GetSpecialization(r, record->specialization,
 	                                       {.mapping_header = version >= FirstHeaderVersion,
 	                                        .image_heap     = version >= FirstHeapVersion,
@@ -367,7 +367,8 @@ void ProgramManifest::AppendEntry(std::span<const uint8_t> payload) {
 }
 
 bool ProgramManifest::Add(const ComputeProgramRecord& record) {
-	if (record.code == nullptr || record.code->empty() || record.user_data_count > MaxUserData) {
+	if (record.code == nullptr || record.code->empty() || record.user_data_count > MaxUserData ||
+	    record.push_data.end != ShaderRecompiler::IR::PushData::DwordCount) {
 		return false;
 	}
 	auto            body = EncodeComputeBody(record);
