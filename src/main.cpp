@@ -189,7 +189,10 @@ static void PrintUsage() {
 	    "                                       (pipelines it was given and no longer provides)\n"
 	    "                                       in the background while the game runs.\n");
 	::printf(
-	    "  --no-selection-feedback              Bind every candidate texture of GPU-selected\n"
+	    "  --no-gpu-core-reservation            Do not reserve a CPU core for the GPU command\n"
+	    "                                       processor thread.\n");
+	::printf(
+	    "  --no-selection-feedback             Bind every candidate texture of GPU-selected\n"
 	    "                                       descriptor tables, also the ones the shaders\n"
 	    "                                       have not selected for a while.\n");
 	::printf(
@@ -338,6 +341,7 @@ static constexpr Flag FLAGS[] = {
     {"--precompile-only", &ConfigOptions::precompile_only},
     {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
     {"--no-stale-pipeline-rebuild", &ConfigOptions::stale_pipeline_rebuild, false},
+    {"--no-gpu-core-reservation", &ConfigOptions::gpu_core_reservation, false},
     {"--no-selection-feedback", &ConfigOptions::selection_feedback, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},

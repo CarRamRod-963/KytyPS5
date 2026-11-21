@@ -107,6 +107,8 @@ struct ConfigOptions {
 	bool                   rebuild_pipeline_cache          = false;
 	// A session rebuilds a driver cache with stale entries in the background.
 	bool                   stale_pipeline_rebuild          = true;
+	// The GPU command processor thread reserves a CPU core (Common::Thread::ReserveCore...).
+	bool                   gpu_core_reservation            = true;
 	// GPU-selected texture tables bind long unselected candidates as null descriptors.
 	bool                   selection_feedback              = true;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
@@ -204,6 +206,7 @@ bool     PrecompilePipelinesEnabled();
 bool     PrecompileOnlyEnabled();
 bool     RebuildPipelineCacheEnabled();
 bool     StalePipelineRebuildEnabled();
+bool     GpuCoreReservationEnabled();
 bool     SelectionFeedbackEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
