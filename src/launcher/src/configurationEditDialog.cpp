@@ -307,7 +307,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->spinBox_flush_draws->setValue(info.flush_draws);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
-	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
+	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries);
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
 	m_ui->checkBox_native_rt->setChecked(info.native_rt);
 	m_ui->checkBox_emulate_wave64->setChecked(info.emulate_wave64);
@@ -563,7 +563,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.flush_draws               = ui.spinBox_flush_draws->value();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
-	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
+	info.occlusion_queries         = ui.checkBox_occlusion_queries->isChecked();
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
 	info.native_rt                 = ui.checkBox_native_rt->isChecked();
 	info.emulate_wave64            = ui.checkBox_emulate_wave64->isChecked();

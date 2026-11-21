@@ -117,7 +117,8 @@ struct ConfigOptions {
 	uint32_t               lookahead_threads               = 2;
 	uint32_t               prepare_threads                 = 2;
 	bool                   tessellation_enabled        = false;
-	bool                   occlusion_queries_enabled   = false;
+	// Guest occlusion queries count samples on the GPU (--no-occlusion-queries: always visible).
+	bool                   occlusion_queries_enabled       = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   emulate_wave64                  = false;
 	MaximalReconvergence   maximal_reconvergence           = MaximalReconvergence::Auto;

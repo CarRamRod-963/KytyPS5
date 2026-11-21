@@ -130,7 +130,7 @@ public:
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
-	bool                   occlusion_queries_enabled   = false;
+	bool                   occlusion_queries           = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
 	bool                   emulate_wave64              = false;
@@ -185,7 +185,7 @@ public:
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		flush_draws                 = other.flush_draws;
 		tessellation_enabled        = other.tessellation_enabled;
-		occlusion_queries_enabled   = other.occlusion_queries_enabled;
+		occlusion_queries           = other.occlusion_queries;
 		relaxed_shader_float        = other.relaxed_shader_float;
 		native_rt                   = other.native_rt;
 		emulate_wave64              = other.emulate_wave64;

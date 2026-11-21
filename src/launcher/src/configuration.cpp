@@ -2,6 +2,8 @@
 
 #include <QRegularExpression>
 
+static constexpr QLatin1StringView LEGACY_OCCLUSION_QUERIES_KEY("occlusion_queries_enabled");
+
 QString Configuration::NormalizeResolution(const QString& text) {
 	// Older settings stored the enum key, e.g. "R1920X1080".
 	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
@@ -37,7 +39,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(sync_raw_image_buffers);
 	KYTY_CFG_SET(flush_draws);
 	KYTY_CFG_SET(tessellation_enabled);
-	KYTY_CFG_SET(occlusion_queries_enabled);
+	KYTY_CFG_SET(occlusion_queries);
 	KYTY_CFG_SET(relaxed_shader_float);
 	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(emulate_wave64);
@@ -103,7 +105,10 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
-	KYTY_CFG_GET(occlusion_queries_enabled);
+	// Occlusion queries became the default. The checkbox that launchers before that stored as
+	// occlusion_queries_enabled held the old default (off) for everyone who never touched it, so
+	// that key is not read; only a choice stored under the new key turns them off.
+	occlusion_queries = s.value(QStringLiteral("occlusion_queries"), true).toBool();
 	KYTY_CFG_GET(relaxed_shader_float);
 	KYTY_CFG_GET(native_rt);
 	KYTY_CFG_GET(emulate_wave64);
@@ -183,6 +188,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	};
 	auto values = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+		if (it.key() == LEGACY_OCCLUSION_QUERIES_KEY) {
+			continue; // Exported before occlusion queries became the default; see above.
+		}
 		if (!values.contains(it.key())) {
 			return fail(tr("Unknown game setting: %1").arg(it.key()));
 		}
@@ -197,7 +205,8 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	ReadGameSettingsValues(values);
 	const auto canonical = GameSettings();
 	for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
-		if (canonical.value(it.key()) != values.value(it.key())) {
+		if (it.key() != LEGACY_OCCLUSION_QUERIES_KEY &&
+		    canonical.value(it.key()) != values.value(it.key())) {
 			return fail(tr("Invalid value for game setting: %1").arg(it.key()));
 		}
 	}

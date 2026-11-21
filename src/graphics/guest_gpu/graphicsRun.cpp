@@ -1743,8 +1743,8 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are treated as always "
-				            "visible without --occlusion-queries; GPU usage may be higher and FPS "
-				            "may be lower.\n");
+				            "visible with --no-occlusion-queries or without host query support; "
+				            "GPU usage may be higher and FPS may be lower.\n");
 			});
 
 			// Without host occlusion queries, publish an always-visible result. The PS5 layout
