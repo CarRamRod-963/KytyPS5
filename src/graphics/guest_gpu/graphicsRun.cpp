@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -461,7 +462,10 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
-	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
+	if (const auto processor = Config::GpuCoreReservationEnabled()
+	                               ? Common::Thread::ReserveCoreForCurrentThread()
+	                               : -1;
+	    processor >= 0) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GPU: command processor assigned to the core of logical processor {}.\n", processor));
 	}

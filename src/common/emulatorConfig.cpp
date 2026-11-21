@@ -273,6 +273,10 @@ bool StalePipelineRebuildEnabled() {
 	return g_config->stale_pipeline_rebuild;
 }
 
+bool GpuCoreReservationEnabled() {
+	return g_config->gpu_core_reservation;
+}
+
 bool SelectionFeedbackEnabled() {
 	return g_config->selection_feedback;
 }
