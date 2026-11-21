@@ -677,26 +677,24 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
-    DrawTargets targets{};
+    RenderDepthInfo depth{};
     executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, targets);
+        std::span{stages.data(), pixel_active ? 2u : 1u}, {}, depth);
     return result;
   }
 
   static void PrepareGraphicsBindings(RenderExecutor &executor,
                                       std::span<PreparedBindings *const> stages,
-                                      DrawTargets &targets) {
-    executor.PrepareGraphicsBindings(stages, targets);
+                                      std::span<RenderColorInfo> colors,
+                                      RenderDepthInfo &depth) {
+    executor.PrepareGraphicsBindings(stages, colors, depth);
   }
 
   static void PrepareGraphicsBindings(RenderExecutor &executor,
                                       std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
-    DrawTargets targets{};
-    std::ranges::copy(colors, targets.colors);
-    targets.color_count = static_cast<uint32_t>(colors.size());
-    executor.PrepareGraphicsBindings(stages, targets);
-    std::ranges::copy(std::span{targets.colors, colors.size()}, colors.begin());
+    RenderDepthInfo depth{};
+    executor.PrepareGraphicsBindings(stages, colors, depth);
   }
 
   static PipelineCache::Pipeline
@@ -10036,8 +10034,7 @@ public:
           0x1111u, 0x1112u, 0x2221u, 0x2222u, 0x3331u, 0x3332u, 0x4441u, 0x4442u};
       std::memcpy(memory + grow_depth_offset, grow_depth_values.data(),
                   sizeof(grow_depth_values));
-      DrawTargets grow_targets{};
-      auto &grow_depth = grow_targets.depth;
+      RenderDepthInfo grow_depth{};
       grow_depth.desc = MakeLinearDesc(
           base + grow_depth_offset, sizeof(grow_depth_values) / 2, vk::Format::eD16Unorm,
           Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
@@ -10076,9 +10073,13 @@ public:
                   texture_cache.FindTexture(grown, grow_sampled) != nullptr,
               "a sampled view of more layers moved the depth target to a color copy");
       RenderExecutorTestAccess::PrepareGraphicsBindings(
-          context.GetRenderExecutor(), std::span<PreparedBindings *const>{}, grow_targets);
-      const auto grow_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-          context.GetRenderExecutor(), scheduler.Current(), grow_targets.colors, 0, grow_depth);
+          context.GetRenderExecutor(), std::span<PreparedBindings *const>{},
+          std::span<RenderColorInfo>{}, grow_depth);
+      std::array<RenderColorInfo, 1> grow_colors{};
+      const auto grow_rendering =
+          RenderExecutorTestAccess::AcquireRenderTargets(
+              context.GetRenderExecutor(), scheduler.Current(),
+              grow_colors.data(), 0, grow_depth);
       Require(name, "grown depth target rediscovery",
               grow_depth.image_id == grown &&
                   grow_rendering.depth_stencil_attachment.image_view != nullptr,

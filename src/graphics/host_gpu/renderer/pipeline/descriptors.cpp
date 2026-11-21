@@ -1509,7 +1509,8 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             DrawTargets&                       targets) {
+                                             std::span<RenderColorInfo>         colors,
+                                             RenderDepthInfo&                   depth) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
@@ -1527,7 +1528,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: std::span {targets.colors, targets.color_count}) {
+	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		auto& old_image = cache.m_slot_images[target.image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
@@ -1539,7 +1540,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		}
 	}
 	// A sampled view can grow the depth image into a larger one at the same address.
-	if (auto& depth = targets.depth; depth.image_id) {
+	if (depth.image_id) {
 		auto& old_image = cache.m_slot_images[depth.image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
 			old_image.binding = {};
