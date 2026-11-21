@@ -430,7 +430,8 @@ private:
 	};
 	std::array<TargetLookupSource, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_sources;
 	TargetLookupSource                                           m_depth_target_source;
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages, DrawTargets& targets);
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+	                             std::span<RenderColorInfo> colors, RenderDepthInfo& depth);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slot, bool ignore_target_mask = false,
 	                              bool exact_format = false);
