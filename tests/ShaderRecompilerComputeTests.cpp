@@ -58734,6 +58734,40 @@ std::vector<u32> TessellationStageKey(ShaderType stage, const ShaderTessellation
   return key;
 }
 
+// The program cache keys a compute program on the same static key for the
+// graphics and the async compute queues (one module serves both; a module that
+// reads HW_ID2 is refused for async dispatches instead), and a vertex program
+// on the guest format of each fetched attribute: the pipelines take their host
+// vertex formats from the vertex module, so draws whose formats differ only
+// within a channel class must not share it.
+void CheckProgramStaticKeys() {
+  constexpr const char *name = "ProgramStaticKeys";
+  ShaderComputeInputInfo compute;
+  compute.threads_num[0] = 64;
+  std::vector<u32> graphics_queue;
+  std::vector<u32> async_queue;
+  BuildStageStaticKey(compute, graphics_queue);
+  compute.async_compute = true;
+  BuildStageStaticKey(compute, async_queue);
+  Require(name, "compute queue", graphics_queue == async_queue,
+          "the async compute queue gives a compute program another key");
+  const auto vertex_key = [](Prospero::BufferFormat format) {
+    ShaderVertexInputInfo vertex;
+    vertex.logical_stage = ShaderType::Vertex;
+    vertex.resources_num = 1;
+    vertex.resources[0].fields[3] = 0xfacu | static_cast<u32>(format) << 12u;
+    vertex.resources_dst[0].registers_num = 2;
+    std::vector<u32> key;
+    BuildStageStaticKey(vertex, key);
+    return key;
+  };
+  Require(name, "vertex formats",
+          vertex_key(Prospero::BufferFormat::k16_16UNorm) !=
+              vertex_key(Prospero::BufferFormat::k16_16Float),
+          "two vertex formats of one channel class share a vertex program key");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
 bool HasPatchInterface(const std::string &assembly, const std::string &storage, u32 vectors,
                        u32 location) {
@@ -65240,6 +65274,7 @@ int main(int argc, char **argv) {
   ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckProgramStaticKeys();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));
