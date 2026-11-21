@@ -77,7 +77,9 @@ public:
 	// a submission of `epoch` starts or resumes, or (every epoch) the command processor waits for
 	// a memory value.
 	void               NoteCommandOrderingPoint(uint64_t epoch = BdaSyncQueue::AllEpochs);
-	void               PrepareBda();
+	// A command ordering point of work that reads memory by address (uploads the guest stores
+	// the work may see); `address_writes`: the work may also store through the page table.
+	void               PrepareBda(bool address_writes = false);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

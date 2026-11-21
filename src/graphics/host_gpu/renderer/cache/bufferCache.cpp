@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -126,10 +127,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 		buffer.lru_id         = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.bda_watch_tick = 0;
 		buffer.registered_tick = m_scheduler.CurrentTick();
-		WriteBdaEntries(buffer, false);
+		buffer.registered_watched = IsBdaWatched(buffer);
+		WriteBdaEntries(buffer);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
+		if (m_bda_lazy) {
+			// A buffer created over the range later takes all of it first (Buffer::bda_new).
+			m_bda_passed.Subtract(buffer.CpuAddress(), buffer.Size());
+		}
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
@@ -147,14 +153,16 @@ void BufferCache::TouchBuffer(Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	if (buffer.bda_watch_tick != 0) {
 		buffer.bda_watch_tick = 0;
-		WriteBdaEntries(buffer, false);
+		if (!IsBdaWatched(buffer)) {
+			WriteBdaEntries(buffer);
+		}
 	}
 }
 
-void BufferCache::WriteBdaEntries(const Buffer& buffer, bool watched) {
+void BufferCache::WriteBdaEntries(const Buffer& buffer) {
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
-	const auto                     flags = watched ? BdaWatchBit : vk::DeviceAddress {0};
+	const auto flags = IsBdaWatched(buffer) ? BdaWatchBit : vk::DeviceAddress {0};
 	std::vector<vk::DeviceAddress> addresses;
 	addresses.reserve(pages.last_exclusive - pages.first);
 	for (uint64_t i = 0; i < pages.last_exclusive - pages.first; ++i) {
@@ -172,15 +180,86 @@ bool BufferCache::NoteBdaAccess(uint64_t address, uint64_t window_start) {
 	if (owner == nullptr || !*owner) {
 		return false;
 	}
+	// A shader read the buffer through the page table, whether or not the access was made.
+	auto& buffer = m_slot_buffers[*owner];
+	if (m_bda_lazy) {
+		MarkBdaRead(buffer);
+	}
 	// A resident page reports only through a watched entry (or a cleared one). A buffer that is
 	// no longer watched but was registered before the reporting dispatches ran was watched when
-	// they accessed it: a report processed earlier unwatched it, and the access was made.
-	const auto& buffer = m_slot_buffers[*owner];
-	if (buffer.bda_watch_tick == 0 && buffer.registered_tick >= window_start) {
+	// they accessed it: a report processed earlier unwatched it, and the access was made. So was
+	// it when the buffer's entries were watched from its registration on (an unread buffer of
+	// lazy synchronization), unless the report came from an access before the registration,
+	// which no report tells apart. A buffer registered since then without watched entries was
+	// not there when the access was made.
+	if (buffer.bda_watch_tick == 0 && !buffer.registered_watched &&
+	    buffer.registered_tick >= window_start) {
 		return false;
 	}
 	m_bda_accessed.push_back(address);
 	return true;
+}
+
+void BufferCache::MarkBdaRead(Buffer& buffer) {
+	if (buffer.is_deleted) {
+		return;
+	}
+	const auto previous = std::exchange(buffer.bda_use, BdaUse::Read);
+	buffer.bda_use_tick = m_gc_tick;
+	if (previous == BdaUse::Read) {
+		return;
+	}
+	if (previous == BdaUse::Unread) {
+		// The stores synchronizations passed over (SynchronizeBda) are still CPU-modified pages
+		// of the buffer: the next synchronization takes them with the new ones.
+		m_bda_passed.Subtract(buffer.CpuAddress(), buffer.Size());
+		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+	}
+	if (!IsBdaWatched(buffer)) {
+		WriteBdaEntries(buffer);
+	}
+}
+
+void BufferCache::SetLazyBdaSync(bool lazy) {
+	if (lazy == m_bda_lazy) {
+		return;
+	}
+	m_bda_lazy = lazy;
+	// The entries of the buffers not known to be read gain or lose their watch; with every
+	// buffer synchronized again, the unread ones take the stores passed over so far.
+	for (const auto& [vaddr, id]: m_buffers) {
+		(void)vaddr;
+		const auto& buffer = m_slot_buffers[id];
+		if (buffer.bda_use != BdaUse::Read && buffer.bda_watch_tick == 0) {
+			WriteBdaEntries(buffer);
+		}
+		if (!lazy && buffer.bda_use == BdaUse::Unread) {
+			QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+		}
+	}
+	m_bda_passed.Clear();
+}
+
+void BufferCache::ProbeBdaReaders() {
+	if (!m_bda_lazy || !m_bda_in_use || m_gc_tick % BdaProbeStride != 0) {
+		return;
+	}
+	for (const auto& [vaddr, id]: m_buffers) {
+		(void)vaddr;
+		auto&      buffer = m_slot_buffers[id];
+		const auto age    = m_gc_tick - buffer.bda_use_tick;
+		if (buffer.bda_use == BdaUse::Read && age >= BdaProbeInterval) {
+			const bool watched  = IsBdaWatched(buffer);
+			buffer.bda_use      = BdaUse::Probed;
+			buffer.bda_use_tick = m_gc_tick;
+			if (!watched) {
+				WriteBdaEntries(buffer);
+			}
+		} else if (buffer.bda_use == BdaUse::Probed && age >= BdaProbationTicks) {
+			// Its entries stay watched: the next access through them is reported.
+			buffer.bda_use = BdaUse::Unread;
+		}
+	}
 }
 
 void BufferCache::KeepAccessedBdaBuffers() {
@@ -374,6 +453,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// Bindings of empty buffers read this one, so it must hold zeros, not leftover memory.
 	GetBuffer(null_id).Fill(0, 16, 0);
 	UpdateGcMarks();
+	m_bda_lazy = Config::LazyBdaSyncEnabled();
+	LOGF("GPU: lazy BDA synchronization: %s\n", m_bda_lazy ? "on" : "off");
 }
 
 void BufferCache::UpdateGcMarks() {
@@ -875,7 +956,7 @@ void BufferCache::RecordAsyncDownloads() {
 	    GuestWrites {written_begin, written_end - written_begin});
 }
 
-BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size, bool by_address) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -886,10 +967,13 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			if (by_address && m_bda_lazy) {
+				MarkBdaRead(buffer);
+			}
 			return *owner;
 		}
 	}
-	return CreateBuffer(vaddr, size);
+	return CreateBuffer(vaddr, size, by_address);
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
@@ -956,7 +1040,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool by_address) {
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -970,10 +1054,15 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	// Shaders read the new buffer through the page table when they read a buffer it replaces.
+	bool read = by_address;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
+		read              = read || m_slot_buffers[old_id].bda_use != BdaUse::Unread;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	buffer.bda_use      = read ? BdaUse::Read : BdaUse::Unread;
+	buffer.bda_use_tick = m_gc_tick;
 	if (overlap.first != overlap.last) {
 		// The joined contents arrive by GPU copies recorded now.
 		NoteOpenWrite(buffer, id);
@@ -1371,6 +1460,7 @@ bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	ProbeBdaReaders();
 	KeepAccessedBdaBuffers();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -1406,8 +1496,11 @@ void BufferCache::RunGarbageCollector() {
 			// Shaders may still use the buffer through the page table: they report it while it
 			// is watched, and only a buffer nobody reported is evicted.
 			if (buffer.bda_watch_tick == 0) {
+				const bool watched    = IsBdaWatched(buffer);
 				buffer.bda_watch_tick = tick + 1;
-				WriteBdaEntries(buffer, true);
+				if (!watched) {
+					WriteBdaEntries(buffer);
+				}
 				m_bda_watched.push_back(id);
 				return ++retire_count == limit;
 			}
@@ -1532,26 +1625,57 @@ void BufferCache::ForEachBufferPart(uint64_t start, uint64_t finish, Func&& func
 	}
 }
 
-void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+void BufferCache::SynchronizeBda(const RangeSet& mapped, bool address_writes) {
 	m_bda_in_use = true;
 	// Take before walking: writes queued during synchronization remain pending.
 	auto& due = m_bda_due;
 	TakeBdaSync(due);
-	auto& ranges = m_bda_ranges;
-	auto& owners = m_bda_owners;
+	auto& ranges  = m_bda_ranges;
+	auto& owners  = m_bda_owners;
+	auto& created = m_bda_created;
 	ranges.clear();
 	owners.clear();
+	created.clear();
+	// Lazy synchronization passes over the stores into buffers no shader is known to read through
+	// the page table: they stay CPU-modified pages, which a binding uploads where it covers them,
+	// and the buffer's first reported access queues (MarkBdaRead). A new buffer takes its guest
+	// memory first (registration queued all of it), so an access nothing reported reads the
+	// guest's bytes of that time at worst, never memory the buffer was allocated with. Work that
+	// stores through the page table takes all of them first: a store passed over and uploaded
+	// after the work would land over the work's stores, which no tracking records.
+	const bool all  = !m_bda_lazy || address_writes;
+	const auto part = [&](BufferId id, uint64_t first, uint64_t last) {
+		auto& buffer = m_slot_buffers[id];
+		if (!all && buffer.bda_use == BdaUse::Unread && !buffer.bda_new) {
+			m_bda_passed.Add(first, last - first);
+			return;
+		}
+		if (buffer.bda_new) {
+			created.push_back(id);
+		}
+		ranges.push_back({first, last - first});
+		owners.push_back(id);
+	};
 	// The due ranges come in address order, so a mapping usually holds several in a row.
 	RangeSet::Cursor mapping;
 	due.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, mapping, [&](uint64_t start, uint64_t finish) {
-			ForEachBufferPart(start, finish, [&](BufferId id, uint64_t first, uint64_t last) {
-				ranges.push_back({first, last - first});
-				owners.push_back(id);
-			});
+			ForEachBufferPart(start, finish, part);
 		});
 	});
 	due.Clear();
+	if (address_writes && !m_bda_passed.Empty()) {
+		RangeSet::Cursor passed_mapping;
+		m_bda_passed.ForEach([&](uint64_t begin, uint64_t end) {
+			mapped.ForEachInRange(
+			    begin, end - begin, passed_mapping,
+			    [&](uint64_t start, uint64_t finish) { ForEachBufferPart(start, finish, part); });
+		});
+		m_bda_passed.Clear();
+	}
+	for (const auto id: created) {
+		m_slot_buffers[id].bda_new = false;
+	}
 	if (ranges.empty()) {
 		return;
 	}

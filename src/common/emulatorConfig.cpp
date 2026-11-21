@@ -285,6 +285,10 @@ bool GpuCheckpointsEnabled() {
 	return g_config->gpu_checkpoints;
 }
 
+bool LazyBdaSyncEnabled() {
+	return g_config->lazy_bda_sync;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

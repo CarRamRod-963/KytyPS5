@@ -8354,6 +8354,219 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Lazy BDA synchronization (BufferCache::SetLazyBdaSync): a buffer only
+  // bindings use is left to them. A synchronization passes over the guest's
+  // stores into it (they stay modified pages until a binding covers them) and
+  // its page table entries are watched. A reported access makes it a buffer
+  // shaders read, synchronized at ordering points from then on, until a
+  // probation passes without a report. Work that stores through the page
+  // table takes every passed-over store first, and so does a buffer when the
+  // mode is switched off. A report of a page whose buffer appeared after the
+  // access ran counts as lost unless the buffer's entries were watched from
+  // its registration on.
+  void CheckLazyBdaSync() {
+    constexpr const char *name = "LazyBdaSync";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t pages = 8;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), pages * page,
+                page, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(
+                    &mapped, pages * page, 0x3, 0, direct, page) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    std::fill_n(static_cast<u32 *>(mapped), pages * page / sizeof(u32),
+                0x0b1ec0deu);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, pages * page);
+    cache.SetLazyBdaSync(true);
+    constexpr auto never = std::numeric_limits<uint64_t>::max();
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+    const auto id = cache.FindBuffer(base, 2 * page);
+    const auto device_address = cache.GetBuffer(id).BufferDeviceAddress();
+
+    auto entries = CreateHostBuffer(name, sizeof(vk::DeviceAddress),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    // The page table entry of `address`, which must map `expected`; whether it
+    // is watched.
+    const auto watched_at = [&](uint64_t address, vk::DeviceAddress expected) {
+      auto command = scheduler.Current().Handle();
+      const vk::MemoryBarrier before{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1,
+                              &before, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy copy{BufferCache::PageIndex(address) *
+                                    sizeof(vk::DeviceAddress),
+                                0, entries.size};
+      command.copyBuffer(cache.GetBdaPageTableBuffer()->Handle(),
+                         entries.buffer, 1, &copy);
+      const vk::MemoryBarrier after{
+          .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+          .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &after,
+                              0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, entries, 2);
+      const auto entry = words[0] | (uint64_t{words[1]} << 32u);
+      Require(name, "entry",
+              (entry & ~uint64_t{BufferCache::BdaWatchBit}) == expected,
+              "the page table does not map the buffer");
+      return (entry & BufferCache::BdaWatchBit) != 0;
+    };
+    const auto watched = [&] { return watched_at(base, device_address); };
+    // A guest store into the first tracker page, and whether the next
+    // synchronization uploaded it.
+    const auto store_is_synchronized = [&] {
+      cache.InvalidateMemory(base + 8, 1);
+      context.PrepareBda();
+      return !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE);
+    };
+    const auto report_access = [&](uint64_t address) {
+      const auto reported_page = BufferCache::PageIndex(address);
+      cache.GetFaultBuffer()->Fill((reported_page >> 5u) * sizeof(u32),
+                                   sizeof(u32), 1u << (reported_page & 31u));
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+    };
+    // Collections with the buffer in use by a binding, which keeps it cached.
+    const auto collect = [&](uint64_t times) {
+      for (uint64_t i = 0; i < times; i++) {
+        (void)cache.ObtainBuffer(base, page + 4, false, false);
+        cache.RunGarbageCollector();
+      }
+    };
+
+    // A new buffer takes the guest memory it was created over once.
+    context.PrepareBda();
+    Require(name, "new buffer",
+            !cache.IsRegionCpuModified(base, 2 * page) && watched(),
+            "a new buffer did not take its guest memory, or is not watched");
+    // Guest stores into it stay modified pages at ordering points, and a
+    // binding uploads those it covers.
+    const auto far_store = base + page + TRACKER_PAGE_SIZE;
+    cache.InvalidateMemory(base + 8, 1);
+    cache.InvalidateMemory(far_store + 8, 1);
+    context.PrepareBda();
+    Require(name, "stores left to bindings",
+            cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE) &&
+                cache.IsRegionCpuModified(far_store, TRACKER_PAGE_SIZE),
+            "a guest store into a buffer no shader reads through the page "
+            "table was uploaded at an ordering point");
+    (void)cache.ObtainBuffer(base, page + 4, false, false);
+    Require(name, "binding upload",
+            !cache.IsRegionCpuModified(base, page) &&
+                cache.IsRegionCpuModified(far_store, TRACKER_PAGE_SIZE),
+            "a binding did not upload exactly the modified pages it covers");
+    // Work that stores through the page table takes the passed-over stores
+    // first: uploaded after it, they would land over its stores.
+    context.PrepareBda(true);
+    Require(name, "address writes",
+            !cache.IsRegionCpuModified(base, 2 * page) && watched(),
+            "work storing through the page table ran before the passed-over "
+            "guest stores were uploaded, or the buffer counts as read");
+    cache.InvalidateMemory(far_store + 8, 1);
+    context.PrepareBda();
+    Require(name, "unread after address writes",
+            cache.IsRegionCpuModified(far_store, TRACKER_PAGE_SIZE),
+            "work storing through the page table made the buffer read");
+
+    report_access(base + page);
+    context.PrepareBda();
+    Require(name, "reported access",
+            !cache.IsRegionCpuModified(base, 2 * page) && !watched(),
+            "a reported access did not synchronize the buffer and end its "
+            "watch");
+    Require(name, "read buffer", store_is_synchronized(),
+            "a guest store into a buffer shaders read was not uploaded");
+
+    collect(BufferCache::BdaProbeInterval + BufferCache::BdaProbeStride);
+    Require(name, "probed", watched() && store_is_synchronized(),
+            "a buffer read for the probe interval is not watched, or lost its "
+            "synchronization during the probation");
+    report_access(base + page);
+    Require(name, "probation report", !watched() && store_is_synchronized(),
+            "a report during the probation did not end the watch");
+
+    collect(BufferCache::BdaProbeInterval + BufferCache::BdaProbeStride);
+    Require(name, "probed again", watched() && store_is_synchronized(),
+            "the buffer was not probed again");
+    collect(BufferCache::BdaProbationTicks + BufferCache::BdaProbeStride);
+    Require(name, "unread again", watched() && !store_is_synchronized(),
+            "a probation without a report did not leave the buffer to its "
+            "bindings");
+
+    // Switched off, every buffer takes the stores passed over so far, and
+    // none is watched for lazy synchronization any more.
+    cache.SetLazyBdaSync(false);
+    context.PrepareBda();
+    Require(name, "switched off",
+            !cache.IsRegionCpuModified(base, 2 * page) && !watched() &&
+                store_is_synchronized(),
+            "the stores passed over were not uploaded when lazy "
+            "synchronization was switched off");
+    cache.SetLazyBdaSync(true);
+    Require(name, "switched on", watched(),
+            "an unread buffer is not watched when lazy synchronization is "
+            "switched on");
+
+    // A report processed after a buffer appeared at the page: through entries
+    // watched from the buffer's registration on the access was made (the
+    // buffer counts as read now); a buffer created read by address had no
+    // watched entries, so the access ran before it existed and was lost.
+    {
+      report_access(base); // Starts the next report window.
+      const auto unread_page = base + 4 * page;
+      const auto unread = cache.FindBuffer(unread_page, page);
+      const auto unread_address = cache.GetBuffer(unread).BufferDeviceAddress();
+      context.PrepareBda();
+      Require(name, "new unread buffer",
+              watched_at(unread_page, unread_address),
+              "a new unread buffer is not watched");
+      const auto lost_before = cache.LostBdaAccesses();
+      report_access(unread_page);
+      Require(name, "made through watched entries",
+              cache.LostBdaAccesses() == lost_before &&
+                  !watched_at(unread_page, unread_address),
+              "a report through the watched entries of a new buffer counted "
+              "as lost, or did not make it read");
+      const auto read_page = base + 6 * page;
+      const auto read = cache.FindBuffer(read_page, page, true);
+      Require(
+          name, "new read buffer",
+          !watched_at(read_page, cache.GetBuffer(read).BufferDeviceAddress()),
+          "a buffer created for an access by address is watched");
+      report_access(read_page);
+      Require(name, "lost before the buffer",
+              cache.LostBdaAccesses() == lost_before + 1,
+              "a report of a page whose buffer was created after the access "
+              "(without watched entries) counted as made");
+    }
+
+    context.UnmapMemory(base, pages * page);
+    scheduler.Finish();
+    DestroyBuffer(&entries);
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, pages * page) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct,
+                                                             pages * page) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A GPU write or a host write advances the sequence of every watched range it
   // overlaps, also one that starts well before the write, and of no other.
   void CheckWatchedRangeWrites() {
@@ -67404,6 +67617,7 @@ int main(int argc, char **argv) {
     vulkan.CheckFaultRecordsOverflow();
     vulkan.CheckBdaWatchedEviction();
     vulkan.CheckBdaAgeCollection();
+    vulkan.CheckLazyBdaSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
@@ -67422,6 +67636,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBdaWatchedEviction();
     vulkan.CheckBdaAgeCollection();
+    vulkan.CheckLazyBdaSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -67692,6 +67907,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckBdaWatchedEviction();
   vulkan.CheckBdaAgeCollection();
+  vulkan.CheckLazyBdaSync();
   vulkan.CheckBatchedUploads();
   vulkan.CheckScatteredUploads();
   vulkan.CheckLargeSparseImageUpload();

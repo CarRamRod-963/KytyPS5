@@ -208,6 +208,11 @@ static void PrintUsage() {
 	    "                                       the GPU reached (NVIDIA). --no-gpu-checkpoints\n"
 	    "                                       turns it off.\n");
 	::printf(
+	    "  --lazy-bda-sync                      Upload the guest's stores at command ordering\n"
+	    "                                       points only into buffers shaders read by\n"
+	    "                                       address; the others take them when they are\n"
+	    "                                       bound. Experimental. Default: off.\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -359,6 +364,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-selection-feedback", &ConfigOptions::selection_feedback, false},
     {"--gpu-checkpoints", &ConfigOptions::gpu_checkpoints},
     {"--no-gpu-checkpoints", &ConfigOptions::gpu_checkpoints, false},
+    {"--lazy-bda-sync", &ConfigOptions::lazy_bda_sync},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
