@@ -7566,8 +7566,9 @@ public:
   // The fault scan reports each set page once and leaves the pages past its records set.
   void CheckFaultBufferScan() {
     constexpr const char *name = "FaultBufferScan";
-    constexpr u32 words = 2048;
-    constexpr u32 records = 1024; // Record 0 holds the count.
+    // Record 0 holds the count.
+    constexpr u32 records = FaultManager::MaxPageFaults;
+    constexpr u32 words = 2 * records;
     const vk::DescriptorSetLayoutBinding bindings[]{
         {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
         {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
@@ -7645,11 +7646,12 @@ public:
               "the scan lost, repeated or kept a reported page");
     };
     // Bits in each word of a block, several in one word, and in the last word.
-    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17, 2047 * 32 + 31});
-    // 1200 pages, two per word, overflow the 1023 records; an odd record count leaves a word
-    // partly reported.
+    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17,
+                    (words - 1) * 32 + 31});
+    // 1.2 pages per record, two per word, overflow the records; an odd record
+    // count leaves a word partly reported.
     std::vector<u32> overflow;
-    for (u32 i = 0; i < 600; i++) {
+    for (u32 i = 0; i < records * 6 / 10; i++) {
       overflow.push_back((3 * i + 1) * 32 + i % 31);
       overflow.push_back((3 * i + 1) * 32 + 31);
     }
@@ -7666,7 +7668,7 @@ public:
   void CheckFaultRecordsOverflow() {
     constexpr const char *name = "FaultRecordsOverflow";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
-    constexpr u32 pages = 1216;
+    constexpr u32 pages = FaultManager::MaxPageFaults + 192;
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;

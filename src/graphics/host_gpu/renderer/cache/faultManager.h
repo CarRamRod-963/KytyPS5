@@ -16,6 +16,12 @@ class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
 
 public:
+	// Page records a fault-bitmap scan reports (one slot holds the count). The pages past them
+	// stay set in the bitmap for the next scan, so with more reported pages a buffer that counts
+	// as unread through the page table (lazy BDA synchronization) waits a frame longer for its
+	// stores. Must match MAX_PAGE_FAULTS of fault_buffer_process.comp (CMakeLists.txt).
+	static constexpr size_t MaxPageFaults = 8192;
+
 	FaultManager(GraphicContext& graphics, CommandScheduler& scheduler, BufferCache& buffer_cache);
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);

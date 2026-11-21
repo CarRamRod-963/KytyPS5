@@ -22,8 +22,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
-constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t PageFaultAreaSize = FaultManager::MaxPageFaults * sizeof(uint64_t);
 
 } // namespace
 
@@ -130,7 +129,7 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds;
-		// the reports past them were dropped.
+		// the pages past them stay set in the bitmap and are reported by the next scan.
 		const auto reported = faults[0];
 		const auto count    = std::min<uint64_t>(reported, MaxPageFaults - 1);
 		if (reported != count) {
