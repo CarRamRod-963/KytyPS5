@@ -303,7 +303,7 @@ void RenderContext::NoteCommandOrderingPoint(uint64_t epoch) {
 	m_buffer_cache.NoteBdaOrderingPoint(epoch);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool address_writes) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
@@ -311,7 +311,7 @@ void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// The uploads of every written range share their barriers.
 	const auto batch = m_command_scheduler.Current().BatchCopies();
-	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	m_buffer_cache.SynchronizeBda(m_mapped_ranges, address_writes);
 	m_fault_process_pending = true;
 }
 

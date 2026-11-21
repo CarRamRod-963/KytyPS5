@@ -1512,14 +1512,16 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
                                              std::span<RenderColorInfo>         colors,
                                              RenderDepthInfo&                   depth) {
 	bool uses_dma        = false;
+	bool address_writes  = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.ReadsMemoryByAddress();
+		address_writes |= stage->runtime->program->has_address_writes;
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(address_writes);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
