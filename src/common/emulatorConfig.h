@@ -119,8 +119,9 @@ struct ConfigOptions {
 	// VK_NV_device_diagnostic_checkpoints markers before each draw and dispatch, so that a lost
 	// device names the last commands the GPU reached.
 	bool                   gpu_checkpoints                 = false;
-	// BDA synchronizations upload guest stores only into buffers shaders read by address.
-	bool                   lazy_bda_sync                   = false;
+	// BDA synchronizations upload guest stores only into buffers shaders read by address
+	// (--no-lazy-bda-sync: into every buffer, as before).
+	bool                   lazy_bda_sync                   = true;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;

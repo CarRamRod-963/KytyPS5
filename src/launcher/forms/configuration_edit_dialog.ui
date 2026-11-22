@@ -265,8 +265,8 @@
             </item>
             <item row="18" column="1">
              <widget class="QCheckBox" name="checkBox_lazy_bda_sync">
-              <property name="toolTip"><string>Upload the game's memory writes at command ordering points only into the GPU buffers shaders read by address; the others take them when they are bound. Faster; experimental.</string></property>
-              <property name="text"><string>Lazy BDA synchronization (experimental)</string></property>
+              <property name="toolTip"><string>Copy the game's memory writes to the GPU only for the buffers its shaders read by address; the others get them when they are bound. Faster in fights and busy scenes. Untick it if textures or geometry look wrong or the game crashes.</string></property>
+              <property name="text"><string>Lazy GPU memory synchronization (faster)</string></property>
              </widget>
             </item>
            </layout>

@@ -1378,6 +1378,20 @@ const GraphicContext &NativeRenderTargetHost() {
   return graphics;
 }
 
+// The cases are written for BDA synchronizations into every buffer; the
+// emulator synchronizes lazily by default. KYTY_TEST_LAZY_BDA_SYNC=1 runs every
+// case lazily (LazyBdaSync sets both modes itself). Every configuration a case
+// loads keeps that mode.
+bool TestLazyBdaSync() {
+  const char *lazy_bda_sync = std::getenv("KYTY_TEST_LAZY_BDA_SYNC");
+  return lazy_bda_sync != nullptr && std::strcmp(lazy_bda_sync, "1") == 0;
+}
+
+void LoadTestConfig(Config::ConfigOptions options) {
+  options.lazy_bda_sync = TestLazyBdaSync();
+  Config::Load(options);
+}
+
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
   if (!config_initialized) {
@@ -1386,7 +1400,7 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
-    Config::Load(options);
+    LoadTestConfig(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
     ShaderInit();
@@ -26100,7 +26114,7 @@ public:
               "raw image synchronization should be disabled by default");
       for (const auto [sync_raw, formatted] :
            {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
-        Config::Load({.sync_raw_image_buffers = sync_raw});
+        LoadTestConfig({.sync_raw_image_buffers = sync_raw});
         const bool sync_image = sync_raw || formatted;
         const uint32_t before = 0x13579bd0u | (uint32_t(sync_raw) << 1u) | uint32_t(formatted);
         constexpr uint32_t guard = 0x2468ace0u;
@@ -26195,7 +26209,7 @@ public:
                 "attachment rendering lost its new color or changed the untouched array layer");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
-      Config::Load({});
+      LoadTestConfig({});
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
@@ -65336,7 +65350,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
 // limits the GPU gives.
 void CheckDeviceCreation() {
   constexpr const char *name = "DeviceCreation";
-  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  LoadTestConfig({.printf_direction = Config::LogDirection::Silent});
   Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
   WindowContext window;
   window.graphic_ctx.screen_width = 64;
@@ -65422,8 +65436,8 @@ void CheckDeviceCreation() {
 // does, passes validation on the emulator's device; a validation error exits.
 void CheckComputeDerivativesDevice() {
   constexpr const char *name = "ComputeDerivativesDevice";
-  Config::Load({.vulkan_validation_enabled = true,
-                .printf_direction = Config::LogDirection::Silent});
+  LoadTestConfig({.vulkan_validation_enabled = true,
+                  .printf_direction = Config::LogDirection::Silent});
   Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
   WindowContext window;
   window.graphic_ctx.screen_width = 64;
@@ -65467,8 +65481,8 @@ void CheckComputeDerivativesDevice() {
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
   constexpr const char *name = "Pm4Flip";
-  Config::Load({.printf_direction = Config::LogDirection::Silent,
-                .occlusion_queries_enabled = true});
+  LoadTestConfig({.printf_direction = Config::LogDirection::Silent,
+                  .occlusion_queries_enabled = true});
   Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
           "SDL video init failed");
   WindowContext window;
@@ -65779,7 +65793,7 @@ void CheckHmd2() {
       reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, int32_t)>(
           func("Al4qjNREVQQ"));
   const auto vibration_checked = [&](bool connected) {
-    Config::Load({.vr_enabled = connected});
+    LoadTestConfig({.vr_enabled = connected});
     const int out_of_range = connected ? -1972240375 : 0; // 0x8a720009
     return set_vibration(0x0f000002, 26) == -1972240381 && // 0x8a720003
            set_vibration(0x0f000001, 0) == 0 &&
@@ -65811,8 +65825,8 @@ void CheckFlipRate() {
   using Common::DebugCounters::Counter;
   constexpr const char *name = "FlipRate";
   constexpr std::chrono::duration<double> period{1.0 / 30};
-  Config::Load({.vblank_frequency = 30,
-                .printf_direction = Config::LogDirection::Silent});
+  LoadTestConfig({.vblank_frequency = 30,
+                  .printf_direction = Config::LogDirection::Silent});
   Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
           "SDL video init failed");
   WindowContext window;
@@ -65988,7 +66002,8 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
   constexpr const char *name = "Pm4LodStatsBoundTextures";
   constexpr uintptr_t base = 0x0000000205100000ull;
   constexpr uint64_t allocation_size = 0x10000;
-  Config::Load({.printf_direction = Config::LogDirection::Silent, .lod_stats_enabled = enabled});
+  LoadTestConfig({.printf_direction = Config::LogDirection::Silent,
+                  .lod_stats_enabled = enabled});
   int64_t direct_offset = -1;
   Require(name, "direct allocation",
           Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -66094,7 +66109,7 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
   Require(name, "release",
           Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
           "texture allocation release failed");
-  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  LoadTestConfig({.printf_direction = Config::LogDirection::Silent});
   std::printf("[gpu]     %-32s ok (--lod-stats %s)\n", name, enabled ? "on" : "off");
 }
 

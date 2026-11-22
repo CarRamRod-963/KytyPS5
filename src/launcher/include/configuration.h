@@ -143,7 +143,7 @@ public:
 	MaximalReconvergence   maximal_reconvergence       = MaximalReconvergence::Auto;
 	bool                   no_shader_simplification    = false;
 	bool                   no_selection_feedback       = false;
-	bool                   lazy_bda_sync               = false;
+	bool                   lazy_bda_sync               = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
