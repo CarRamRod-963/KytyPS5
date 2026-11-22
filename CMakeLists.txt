@@ -1015,6 +1015,10 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_maximal_reconvergence_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME emulator_occlusion_queries_off
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-occlusion-queries)
+	add_test(NAME emulator_lazy_bda_sync_off
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-lazy-bda-sync)
+	add_test(NAME emulator_lazy_bda_sync_on
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --lazy-bda-sync)
 	add_test(NAME emulator_occlusion_queries_on
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --occlusion-queries)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)

@@ -128,7 +128,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	}
 	KYTY_CFG_GET(no_shader_simplification);
 	KYTY_CFG_GET(no_selection_feedback);
-	KYTY_CFG_GET(lazy_bda_sync);
+	lazy_bda_sync    = s.value(QStringLiteral("lazy_bda_sync"), true).toBool();
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
