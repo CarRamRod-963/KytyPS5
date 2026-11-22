@@ -902,6 +902,11 @@ add_executable(device_fault_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(device_fault_tests PRIVATE ${inc_headers})
 
+add_executable(command_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CommandLogTests.cpp"
+)
+target_include_directories(command_log_tests PRIVATE ${inc_headers})
+
 add_executable(memory_priority_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryPriorityTests.cpp"
 )
@@ -1096,6 +1101,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME subgroup_plan COMMAND $<TARGET_FILE:subgroup_plan_tests>)
 	add_test(NAME device_fault COMMAND $<TARGET_FILE:device_fault_tests>)
+	add_test(NAME command_log COMMAND $<TARGET_FILE:command_log_tests>)
 	add_test(NAME candidate_selection COMMAND $<TARGET_FILE:candidate_selection_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
@@ -1257,6 +1263,7 @@ if(BUILD_TESTING)
 		memory_priority_tests
 		subgroup_plan_tests
 		device_fault_tests
+		command_log_tests
 		candidate_selection_tests
 		barrier_tracker_tests
 		memory_tracker_tests

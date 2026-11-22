@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
@@ -78,13 +79,42 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_timestamps(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+// Commands noted per scheduler: a lost submission of a frame of a busy scene holds a few
+// hundred, and the GPU runs at most a few frames behind.
+static constexpr uint32_t CommandLogCapacity = 8192;
+
+static uint32_t NextCommandLogId() {
+	static std::atomic<uint32_t> next {1};
+	return next.fetch_add(1, std::memory_order_relaxed) & 0xffu;
+}
+
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   const char* name)
+    : m_master(graphics), m_name(name), m_command_log(NextCommandLogId(), CommandLogCapacity),
+      m_context(context), m_graphics(graphics), m_command_pool(graphics, m_master),
+      m_timestamps(graphics, m_master), m_command(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	m_graphics.RegisterLostWorkReport(&CommandScheduler::ReportLostSubmission, this);
+}
 
 CommandScheduler::~CommandScheduler() {
+	m_graphics.UnregisterLostWorkReport(this);
 	Shutdown();
+}
+
+void CommandScheduler::ReportLostSubmission(const void*                             object,
+                                            std::span<const CommandLog::Checkpoint> checkpoints) {
+	const auto& scheduler = *static_cast<const CommandScheduler*>(object);
+	// The semaphore value the GPU reached; on failure (as after a lost device on some drivers)
+	// the last value this process read.
+	uint64_t completed = 0;
+	if (scheduler.m_graphics.device.getSemaphoreCounterValue(scheduler.m_master.Handle(),
+	                                                         &completed) != vk::Result::eSuccess) {
+		completed = scheduler.m_master.KnownGpuTick();
+	}
+	Log::WriteToConsoleAndLog(CommandLog::Format(scheduler.m_command_log, scheduler.m_name,
+	                                             completed, scheduler.m_master.CurrentTick() - 1u,
+	                                             checkpoints));
 }
 
 void CommandScheduler::Shutdown() {

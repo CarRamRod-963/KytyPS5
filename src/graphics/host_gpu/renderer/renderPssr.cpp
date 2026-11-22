@@ -188,7 +188,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 
 	buffer.EndRendering();
 	// Binds its own pipeline: the next guest dispatch or draw must bind its pipeline again.
-	const auto command = buffer.PipelineHandle();
+	const auto command = buffer.PipelineHandle("PSSR upscale");
 	const auto range   = [](const ImageViewInfo& view) {
 		return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
 	};

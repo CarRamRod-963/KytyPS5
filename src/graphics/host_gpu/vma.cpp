@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -182,30 +183,17 @@ void GraphicContext::LogMemoryBudget() const {
 	}
 }
 
-void GraphicContext::ReportLostDevice(vk::Result result) const {
-	if (result != vk::Result::eErrorDeviceLost || device == nullptr) {
-		return;
-	}
-	// 0: not reported, 1: a thread is writing the report, 2: written.
-	static std::atomic<int> state {0};
-	int                     expected = 0;
-	if (!state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
-		// Another thread found the loss first: let it finish before this one exits.
-		for (int i = 0; i < 200 && state.load(std::memory_order_acquire) != 2; i++) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		return;
-	}
-	if (!device_fault_enabled) {
+// The device fault record (VK_EXT_device_fault) as log lines.
+static void WriteDeviceFaultRecord(const GraphicContext& graphics) {
+	if (!graphics.device_fault_enabled) {
 		Log::WriteToConsoleAndLog("Device fault: no record (VK_EXT_device_fault unavailable)\n");
-		state.store(2, std::memory_order_release);
 		return;
 	}
+	const auto&              device = graphics.device;
 	vk::DeviceFaultCountsEXT counts {};
 	auto                     query = device.getFaultInfoEXT(&counts, nullptr);
 	if (query != vk::Result::eSuccess) {
 		Log::WriteToConsoleAndLog("Device fault: no record (" + vk::to_string(query) + ")\n");
-		state.store(2, std::memory_order_release);
 		return;
 	}
 	const uint32_t address_count = counts.addressInfoCount;
@@ -221,7 +209,6 @@ void GraphicContext::ReportLostDevice(vk::Result result) const {
 	query              = device.getFaultInfoEXT(&counts, &info);
 	if (query != vk::Result::eSuccess && query != vk::Result::eIncomplete) {
 		Log::WriteToConsoleAndLog("Device fault: no record (" + vk::to_string(query) + ")\n");
-		state.store(2, std::memory_order_release);
 		return;
 	}
 	std::array<DeviceFault::AddressInfo, DeviceFault::MaxAddressInfos> address_infos {};
@@ -242,6 +229,69 @@ void GraphicContext::ReportLostDevice(vk::Result result) const {
 	                         .vendor_count  = vendor_count,
 	                         .addresses = std::span(address_infos).first(counts.addressInfoCount),
 	                         .vendors   = std::span(vendor_infos).first(counts.vendorInfoCount)}));
+}
+
+void GraphicContext::RegisterLostWorkReport(LostWorkReport report, const void* object) const {
+	std::scoped_lock lock(lost_work_mutex);
+	for (auto& reporter: lost_work_reporters) {
+		if (reporter.object == nullptr) {
+			reporter = {report, object};
+			return;
+		}
+	}
+}
+
+void GraphicContext::UnregisterLostWorkReport(const void* object) const {
+	std::scoped_lock lock(lost_work_mutex);
+	for (auto& reporter: lost_work_reporters) {
+		if (reporter.object == object) {
+			reporter = {};
+		}
+	}
+}
+
+void GraphicContext::ReportLostDevice(vk::Result result) const {
+	if (result != vk::Result::eErrorDeviceLost || device == nullptr) {
+		return;
+	}
+	// 0: not reported, 1: a thread is writing the report, 2: written.
+	static std::atomic<int> state {0};
+	int                     expected = 0;
+	if (!state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+		// Another thread found the loss first: let it finish before this one exits.
+		for (int i = 0; i < 200 && state.load(std::memory_order_acquire) != 2; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		return;
+	}
+	WriteDeviceFaultRecord(*this);
+	// The last checkpoint each pipeline stage passed on the queue (at most one per stage).
+	constexpr uint32_t                                 MaxCheckpoints = 32;
+	std::array<vk::CheckpointDataNV, MaxCheckpoints>   checkpoint_data {};
+	std::array<std::string, MaxCheckpoints>            stage_names;
+	std::array<CommandLog::Checkpoint, MaxCheckpoints> checkpoints {};
+	uint32_t                                           checkpoint_count = 0;
+	if (diagnostic_checkpoints_enabled && queue != nullptr) {
+		checkpoint_count = MaxCheckpoints;
+		queue.getCheckpointDataNV(&checkpoint_count, checkpoint_data.data());
+		checkpoint_count = std::min(checkpoint_count, MaxCheckpoints);
+		for (uint32_t i = 0; i < checkpoint_count; i++) {
+			stage_names[i] = vk::to_string(checkpoint_data[i].stage);
+			checkpoints[i] = {
+			    .stage  = stage_names[i],
+			    .marker = reinterpret_cast<uintptr_t>(checkpoint_data[i].pCheckpointMarker)};
+		}
+	}
+	std::array<LostWorkReporter, LostWorkReporterLimit> reporters {};
+	{
+		std::scoped_lock lock(lost_work_mutex);
+		reporters = lost_work_reporters;
+	}
+	for (const auto& reporter: reporters) {
+		if (reporter.object != nullptr) {
+			reporter.report(reporter.object, std::span(checkpoints).first(checkpoint_count));
+		}
+	}
 	state.store(2, std::memory_order_release);
 }
 

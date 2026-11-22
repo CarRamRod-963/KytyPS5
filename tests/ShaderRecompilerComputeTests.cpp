@@ -7683,6 +7683,68 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Draws, dispatches and emulator passes are noted with the tick their
+  // command buffer is submitted with, so that a lost device can name the work
+  // of the submission the GPU did not finish.
+  void CheckCommandLog() {
+    constexpr const char *name = "CommandLog";
+    namespace CmdLog = Libs::Graphics::CommandLog;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &log = scheduler.GetCommandLog();
+    scheduler.Finish();
+    const uint64_t before = log.Count();
+    const uint64_t tick = scheduler.CurrentTick();
+    auto &buffer = scheduler.Current();
+    (void)buffer.PipelineHandle("test pass");
+    buffer.Note(buffer.StateHandle(), {.kind = CmdLog::Kind::Dispatch,
+                                       .shader0 = 0x0123456789abcdefull,
+                                       .x = 2,
+                                       .y = 3,
+                                       .z = 4});
+    scheduler.Flush();
+    buffer.Note(
+        buffer.StateHandle(),
+        {.kind = CmdLog::Kind::Draw, .shader0 = 1, .shader1 = 2, .x = 3});
+    const uint64_t next = scheduler.CurrentTick();
+    CmdLog::Entry pass{};
+    CmdLog::Entry dispatch{};
+    CmdLog::Entry draw{};
+    Require(name, "noted commands",
+            log.Count() == before + 3 && log.Read(before + 1, pass) &&
+                log.Read(before + 2, dispatch) && log.Read(before + 3, draw),
+            "the pass, dispatch and draw were not all noted");
+    Require(name, "submission ticks",
+            next == tick + 1 && pass.tick == tick && dispatch.tick == tick &&
+                draw.tick == next,
+            "a command was noted with another tick than its submission's");
+    Require(name, "noted fields",
+            pass.command.kind == CmdLog::Kind::Internal &&
+                std::string_view(pass.command.name) == "test pass" &&
+                dispatch.command.shader0 == 0x0123456789abcdefull &&
+                dispatch.command.x == 2 && dispatch.command.y == 3 &&
+                dispatch.command.z == 4,
+            "the noted fields differ from the recorded ones");
+    const auto report = CmdLog::Format(log, "main", tick - 1, tick);
+    Require(name, "report",
+            report.find("tick " + std::to_string(tick) + ", GPU at " +
+                        std::to_string(tick - 1) + ", submitted up to " +
+                        std::to_string(tick) + ", 2 command(s) noted\n") !=
+                    std::string::npos &&
+                report.find("command 0: internal test pass\n") !=
+                    std::string::npos &&
+                report.find("command 1: dispatch CS 0123456789abcdef groups "
+                            "2x3x4\n") != std::string::npos,
+            "the report does not list the submission's commands");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -67254,12 +67316,18 @@ int main(int argc, char **argv) {
     vulkan.CheckDccConstantBlocks();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--command-log-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckCommandLog();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
     CheckDynamicRenderingState();
     CheckPs5GameExampleImageClearRuntimeShape();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
     vulkan.CheckComputeDispatchLimits();
+    vulkan.CheckCommandLog();
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();

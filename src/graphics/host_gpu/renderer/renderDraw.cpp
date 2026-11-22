@@ -1352,6 +1352,35 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	buffer.BindGraphicsPipeline(pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	{
+		CommandLog::Command noted {};
+		noted.shader0 = vertex_stages.back().stage.program != nullptr
+		                    ? vertex_stages.back().stage.program->shader_hash
+		                    : 0;
+		noted.shader1 = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                    ? state.ps_input_info.stage.program->shader_hash
+		                    : 0;
+		if (mesh_task) {
+			noted.kind = CommandLog::Kind::DrawMeshIndirect;
+			noted.x    = emit.indirect.count;
+		} else if (mesh_active) {
+			noted.kind = CommandLog::Kind::DrawMesh;
+			noted.x    = mesh_groups;
+			noted.y    = draw.instance_count;
+			noted.z    = 1;
+		} else if (emit.indirect_source != nullptr) {
+			noted.kind = CommandLog::Kind::DrawIndirect;
+			noted.x    = emit.indirect_source->max_draw_count;
+		} else if (args_buffer.first != nullptr) {
+			noted.kind = CommandLog::Kind::DrawIndirect;
+			noted.x    = emit.indirect.count;
+		} else {
+			noted.kind = draw.indexed ? CommandLog::Kind::DrawIndexed : CommandLog::Kind::Draw;
+			noted.x    = draw.index_count;
+			noted.y    = draw.instance_count;
+		}
+		buffer.Note(vk_buffer, noted);
+	}
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/commandLog.h"
 #include "graphics/host_gpu/memoryBudget.h"
 #include "graphics/host_gpu/memoryPriority.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
@@ -49,6 +50,9 @@ struct GraphicContext {
 	bool                               robust_buffer_access_enabled          = false;
 	// VK_EXT_device_fault: a lost device leaves a record of what the GPU reported.
 	bool                               device_fault_enabled                  = false;
+	// VK_NV_device_diagnostic_checkpoints: a marker before each noted command
+	// (CommandLog) names the last commands the GPU reached when the device is lost.
+	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               ray_query_enabled                     = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
@@ -143,9 +147,17 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	// After result = ErrorDeviceLost: writes the device fault record to the log and the console,
-	// once per process. Any other result does nothing.
+	// After result = ErrorDeviceLost: writes the device fault record and the reports of the
+	// registered lost-work reporters (the commands of the submissions the GPU did not finish) to
+	// the log and the console, once per process. Any other result does nothing.
 	void                   ReportLostDevice(vk::Result result) const;
+	// A reporter writes what it knows about lost work; `checkpoints` are the queue's diagnostic
+	// checkpoints (empty without VK_NV_device_diagnostic_checkpoints). Registered objects must
+	// unregister before they are destroyed.
+	using LostWorkReport = void (*)(const void*                             object,
+	                                std::span<const CommandLog::Checkpoint> checkpoints);
+	void                   RegisterLostWorkReport(LostWorkReport report, const void* object) const;
+	void                   UnregisterLostWorkReport(const void* object) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
@@ -215,6 +227,13 @@ struct GraphicContext {
 	std::atomic<uint64_t> image_fallback_count = 0;
 	uint32_t              memory_budget_frame  = 0;
 	MemoryBudget::Monitor memory_budget_monitor;
+	struct LostWorkReporter {
+		LostWorkReport report = nullptr;
+		const void*    object = nullptr;
+	};
+	static constexpr size_t                                     LostWorkReporterLimit = 4;
+	mutable std::mutex                                          lost_work_mutex;
+	mutable std::array<LostWorkReporter, LostWorkReporterLimit> lost_work_reporters {};
 	std::mutex                               cache_marks_mutex;
 	MemoryBudget::LiveMarks                  cache_marks;
 	MemoryPriority::Tracker                  memory_priority;

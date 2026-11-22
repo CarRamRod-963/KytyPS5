@@ -578,6 +578,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
+	buffer.Note(vk_buffer, {.kind    = CommandLog::Kind::Dispatch,
+	                        .flags   = async_compute ? CommandLog::FlagAsyncCompute : uint8_t {0},
+	                        .shader0 = program.shader_hash,
+	                        .x       = thread_group_x,
+	                        .y       = thread_group_y,
+	                        .z       = thread_group_z});
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
 		// A single guest wave per group can run in launch order without a device-wide
@@ -664,6 +670,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                                             DispatchUsesSharedMemory(program, bindings));
 	buffer.OrderIndirectDispatchReads();
 	buffer.BindComputePipeline(pipeline.pipeline);
+	buffer.Note(vk_buffer, {.kind    = CommandLog::Kind::DispatchIndirect,
+	                        .flags   = async_compute ? CommandLog::FlagAsyncCompute : uint8_t {0},
+	                        .shader0 = program.shader_hash});
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	// The guest clears color metadata with compute; the texture cache reads the clear code

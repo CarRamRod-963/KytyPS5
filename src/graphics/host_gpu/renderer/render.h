@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/commandLog.h"
 #include "graphics/host_gpu/renderer/barrierTracker.h"
 #include "graphics/host_gpu/renderer/cache/uploadScatter.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
@@ -17,7 +18,6 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
-#include <unordered_map>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -38,6 +38,7 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
+class MasterSemaphore;
 struct RenderExecutorTestAccess;
 
 enum class DrawOffsetSource : uint8_t {
@@ -148,6 +149,8 @@ public:
 	// Handle() for a helper pass that binds a pipeline of its own: BindComputePipeline and
 	// BindGraphicsPipeline bind theirs again afterwards.
 	[[nodiscard]] vk::CommandBuffer PipelineHandle() const;
+	// PipelineHandle() for the pass `pass` (a string literal), noted in the command log.
+	[[nodiscard]] vk::CommandBuffer PipelineHandle(const char* pass) const;
 	// For a pipeline barrier only. A barrier orders earlier submissions against the commands
 	// recorded after it, so it keeps its meaning when the buffer is submitted later, and a buffer
 	// holding nothing else is not worth a submission. Pending guest dispatches are ordered
@@ -166,6 +169,15 @@ public:
 	// write memory through any path. `shared`: it uses emulator memory shared between dispatches
 	// (the LDS backing, GDS). Records the barrier it needs against earlier commands.
 	[[nodiscard]] vk::CommandBuffer DispatchHandle(bool writes, bool shared) const;
+	// Notes a draw or dispatch recorded next through `handle` (the handle Handle() and the like
+	// returned) in the scheduler's command log, which names the work of a submission the GPU did
+	// not finish when the device is lost. With diagnostic checkpoints, also records a checkpoint
+	// marker before it. O(1): a few stores.
+	void Note(vk::CommandBuffer handle, const CommandLog::Command& command) const;
+	// Notes an emulator pass recorded next; `name` must have static storage duration.
+	void NoteInternal(vk::CommandBuffer handle, const char* name) const {
+		Note(handle, {.kind = CommandLog::Kind::Internal, .name = name});
+	}
 	// A guest request to finish all earlier work before later work starts (a partial flush,
 	// a cache writeback or invalidation).
 	void GuestFlush() const;
@@ -239,6 +251,9 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	CommandLog::Ring&      m_command_log;
+	const MasterSemaphore& m_master;
+	bool                   m_checkpoints;
 	vk::CommandBuffer   m_buffer = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;

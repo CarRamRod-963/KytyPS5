@@ -34,7 +34,8 @@ struct GuestWrites {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	// `name` (a string literal) names the scheduler in lost-device reports.
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, const char* name = "main");
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -82,6 +83,8 @@ public:
 	[[nodiscard]] GpuTimestamps&   GetTimestamps() noexcept { return m_timestamps; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// The draws and dispatches noted into this scheduler's submissions (CommandBuffer::Note).
+	[[nodiscard]] CommandLog::Ring& GetCommandLog() noexcept { return m_command_log; }
 
 private:
 	class CommandPool {
@@ -119,8 +122,13 @@ private:
 	                        bool after_recorded = false, GuestWrites writes = {});
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
+	// GraphicContext::LostWorkReport: the noted commands of the first unfinished submission.
+	static void ReportLostSubmission(const void*                             scheduler,
+	                                 std::span<const CommandLog::Checkpoint> checkpoints);
 
 	MasterSemaphore              m_master;
+	const char*                  m_name;
+	CommandLog::Ring             m_command_log;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

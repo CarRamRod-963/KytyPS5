@@ -203,6 +203,11 @@ static void PrintUsage() {
 	    "                                       descriptor tables, also the ones the shaders\n"
 	    "                                       have not selected for a while.\n");
 	::printf(
+	    "  --gpu-checkpoints                    Record a GPU checkpoint before each draw and\n"
+	    "                                       dispatch: a lost device names the last commands\n"
+	    "                                       the GPU reached (NVIDIA). --no-gpu-checkpoints\n"
+	    "                                       turns it off.\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -352,6 +357,8 @@ static constexpr Flag FLAGS[] = {
     {"--no-stale-pipeline-rebuild", &ConfigOptions::stale_pipeline_rebuild, false},
     {"--no-gpu-core-reservation", &ConfigOptions::gpu_core_reservation, false},
     {"--no-selection-feedback", &ConfigOptions::selection_feedback, false},
+    {"--gpu-checkpoints", &ConfigOptions::gpu_checkpoints},
+    {"--no-gpu-checkpoints", &ConfigOptions::gpu_checkpoints, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
