@@ -137,6 +137,7 @@ public:
 	bool                   no_async_pipelines          = false;
 	MaximalReconvergence   maximal_reconvergence       = MaximalReconvergence::Auto;
 	bool                   no_shader_simplification    = false;
+	bool                   no_selection_feedback       = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -192,6 +193,7 @@ public:
 		no_async_pipelines          = other.no_async_pipelines;
 		maximal_reconvergence       = other.maximal_reconvergence;
 		no_shader_simplification    = other.no_shader_simplification;
+		no_selection_feedback       = other.no_selection_feedback;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;

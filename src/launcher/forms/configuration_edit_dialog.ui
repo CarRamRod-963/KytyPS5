@@ -237,6 +237,12 @@
               <property name="text"><string>Skip shader simplification for the driver</string></property>
              </widget>
             </item>
+            <item row="17" column="1">
+             <widget class="QCheckBox" name="checkBox_no_selection_feedback">
+              <property name="toolTip"><string>Turn selection feedback off: every texture a shader's table lists stays loaded and bound, as in v0.1.9, instead of only the ones the GPU has used recently. Uses more video memory; meant for checking missing or flickering textures and fog glitches.</string></property>
+              <property name="text"><string>Keep every listed texture loaded (uses more video memory)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

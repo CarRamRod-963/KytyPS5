@@ -314,6 +314,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_no_async_pipelines->setChecked(info.no_async_pipelines);
 	ListInit(m_ui->comboBox_maximal_reconvergence, info.maximal_reconvergence);
 	m_ui->checkBox_no_shader_simplification->setChecked(info.no_shader_simplification);
+	m_ui->checkBox_no_selection_feedback->setChecked(info.no_selection_feedback);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
@@ -571,6 +572,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.maximal_reconvergence     = TextToEnum<Configuration::MaximalReconvergence>(
 	    ui.comboBox_maximal_reconvergence->currentText());
 	info.no_shader_simplification  = ui.checkBox_no_shader_simplification->isChecked();
+	info.no_selection_feedback     = ui.checkBox_no_selection_feedback->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
