@@ -111,6 +111,9 @@ struct ConfigOptions {
 	bool                   gpu_core_reservation            = true;
 	// GPU-selected texture tables bind long unselected candidates as null descriptors.
 	bool                   selection_feedback              = true;
+	// VK_NV_device_diagnostic_checkpoints markers before each draw and dispatch, so that a lost
+	// device names the last commands the GPU reached.
+	bool                   gpu_checkpoints                 = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -209,6 +212,7 @@ bool     RebuildPipelineCacheEnabled();
 bool     StalePipelineRebuildEnabled();
 bool     GpuCoreReservationEnabled();
 bool     SelectionFeedbackEnabled();
+bool     GpuCheckpointsEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();

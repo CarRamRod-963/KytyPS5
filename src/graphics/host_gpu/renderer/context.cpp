@@ -19,8 +19,19 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_command_log(scheduler.GetCommandLog()), m_master(scheduler.GetMasterSemaphore()),
+      m_checkpoints(scheduler.Graphics().diagnostic_checkpoints_enabled) {
 	m_barriers.SetSerializeDispatches(Config::SerializeDispatchesEnabled());
+}
+
+void CommandBuffer::Note(vk::CommandBuffer handle, const CommandLog::Command& command) const {
+	// The buffer is submitted with the tick the scheduler hands out next.
+	const uint64_t sequence = m_command_log.Note(m_master.CurrentTick(), command);
+	if (m_checkpoints) {
+		handle.setCheckpointNV(reinterpret_cast<const void*>(
+		    static_cast<uintptr_t>(CommandLog::MakeMarker(m_command_log.LogId(), sequence))));
+	}
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
@@ -36,6 +47,12 @@ vk::CommandBuffer CommandBuffer::PipelineHandle() const {
 	const auto handle   = Handle();
 	m_compute_pipeline  = nullptr;
 	m_graphics_pipeline = nullptr;
+	return handle;
+}
+
+vk::CommandBuffer CommandBuffer::PipelineHandle(const char* pass) const {
+	const auto handle = PipelineHandle();
+	NoteInternal(handle, pass);
 	return handle;
 }
 
@@ -221,6 +238,7 @@ void CommandBuffer::RecordScatter() const {
 	if (m_scatter_pieces.empty()) {
 		return;
 	}
+	NoteInternal(m_buffer, "upload scatter");
 	if (!m_context.GetUploadScatter().Record(m_buffer, m_scatter_source_address,
 	                                         m_scatter_pieces)) {
 		// The ring is full: a copy command per destination buffer.

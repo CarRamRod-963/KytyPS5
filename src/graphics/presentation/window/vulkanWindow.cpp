@@ -521,6 +521,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 	}
+	// A checkpoint marker before each noted command names the last commands the GPU reached when
+	// the device is lost (CommandLog). No features to enable.
+	graphics.diagnostic_checkpoints_enabled =
+	    Config::GpuCheckpointsEnabled() && add(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
@@ -535,6 +539,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.pageable_memory_enabled ? "true" : "false");
 	graphics.device_fault_enabled = device_fault.deviceFault == VK_TRUE;
 	LOGF("Vulkan device fault reports: %s\n", graphics.device_fault_enabled ? "true" : "false");
+	LOGF("Vulkan diagnostic checkpoints: %s\n",
+	     graphics.diagnostic_checkpoints_enabled ? "true" : "false");
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "

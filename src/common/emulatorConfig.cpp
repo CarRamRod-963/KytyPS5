@@ -273,6 +273,10 @@ bool SelectionFeedbackEnabled() {
 	return g_config->selection_feedback;
 }
 
+bool GpuCheckpointsEnabled() {
+	return g_config->gpu_checkpoints;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }
