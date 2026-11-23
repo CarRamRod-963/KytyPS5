@@ -121,6 +121,9 @@ struct ConfigOptions {
 	// BDA synchronizations upload guest stores only into buffers shaders read by address
 	// (--no-lazy-bda-sync: into every buffer, as before).
 	bool                   lazy_bda_sync                   = true;
+	// Readbacks for stores and resource walks take only the tracker pages they ask for
+	// (--narrow-readbacks; off: the 512 KiB window guest read faults take).
+	bool narrow_readbacks = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -222,6 +225,7 @@ bool     GpuCoreReservationEnabled();
 bool     SelectionFeedbackEnabled();
 bool     GpuCheckpointsEnabled();
 bool     LazyBdaSyncEnabled();
+bool                  NarrowReadbacksEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();

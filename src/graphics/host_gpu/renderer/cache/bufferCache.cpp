@@ -696,16 +696,36 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		auto& buffer = m_slot_buffers[FindBuffer(result.base, result.size)];
 		if (IsRegionGpuModified(result.base, result.size)) {
 			// GPU-modified ranges come as many small scattered islands, so a readback widens to
-			// a window of its buffer (a fault read: the window around the faulting byte).
+			// a window of its buffer (a fault read: the window around the faulting byte), which
+			// pays for a guest that reads on. A store (a label of the command processor, a guest
+			// write) needs its own pages, and a resource walk asks for all its ranges in one
+			// batch: with NarrowReadbacksEnabled they take only the tracker pages of the request
+			// (a 4-byte label must not read back the 512 KiB the GPU wrote around it). Other
+			// invalidations keep the window: an unmap of part of a buffer publishes the
+			// GPU-written pages beside it.
 			const auto wanted_end = request.kind == GuestReadback::Kind::Around
 			                            ? request.vaddr + 1u
 			                            : request.vaddr + request.size;
-			const auto start = std::max(Common::AlignDown(request.vaddr, DownloadWindowSize),
-			                            buffer.CpuAddress());
-			const auto end        = std::min(std::max(start + DownloadWindowSize, wanted_end),
-			                                 buffer.CpuAddress() + buffer.Size());
-			result.base = start;
-			result.size = end - start;
+			const bool narrow     = Config::NarrowReadbacksEnabled() &&
+			                        ((request.kind == GuestReadback::Kind::Write &&
+			                          request.reason == Common::GpuTiming::SyncReason::CpuWrite) ||
+			                         (request.kind == GuestReadback::Kind::Read &&
+			                          request.reason == Common::GpuTiming::SyncReason::WalkRead));
+			if (narrow) {
+				const auto start = std::max(Common::AlignDown(request.vaddr, TRACKER_PAGE_SIZE),
+				                            buffer.CpuAddress());
+				const auto end   = std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE),
+				                            buffer.CpuAddress() + buffer.Size());
+				result.base      = start;
+				result.size      = end - start;
+			} else {
+				const auto start = std::max(Common::AlignDown(request.vaddr, DownloadWindowSize),
+				                            buffer.CpuAddress());
+				const auto end   = std::min(std::max(start + DownloadWindowSize, wanted_end),
+				                            buffer.CpuAddress() + buffer.Size());
+				result.base      = start;
+				result.size      = end - start;
+			}
 		}
 		AwaitSubmittedDownloads(result.base, result.size);
 		if (ReadBackInPlace(buffer, result.base, result.size)) {

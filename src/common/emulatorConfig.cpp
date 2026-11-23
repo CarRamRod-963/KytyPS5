@@ -281,6 +281,10 @@ bool LazyBdaSyncEnabled() {
 	return g_config->lazy_bda_sync;
 }
 
+bool NarrowReadbacksEnabled() {
+	return g_config->narrow_readbacks;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

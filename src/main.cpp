@@ -369,6 +369,8 @@ static constexpr Flag FLAGS[] = {
     {"--no-gpu-checkpoints", &ConfigOptions::gpu_checkpoints, false},
     {"--lazy-bda-sync", &ConfigOptions::lazy_bda_sync},
     {"--no-lazy-bda-sync", &ConfigOptions::lazy_bda_sync, false},
+    {"--narrow-readbacks", &ConfigOptions::narrow_readbacks},
+    {"--no-narrow-readbacks", &ConfigOptions::narrow_readbacks, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
