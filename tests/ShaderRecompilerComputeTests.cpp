@@ -19902,8 +19902,9 @@ public:
       const auto before_in_place = Common::GpuTiming::Sync().Snapshot();
       std::thread in_place_reader([&] { cache.ReadMemory(finished, bytes); });
       in_place_reader.join();
-      const auto in_place =
-          Common::GpuTiming::Sync().Snapshot().Since(before_in_place).in_place;
+      const auto in_place_counts =
+          Common::GpuTiming::Sync().Snapshot().Since(before_in_place);
+      const auto in_place = in_place_counts.in_place;
       uint64_t tick_in_place = 0;
       bool finished_clean = false;
       gpu.SendCommandSync([&] {
@@ -19914,12 +19915,14 @@ public:
       });
       if (host_readable) {
         Require(name, "in-place readback",
-                in_place == 1 && tick_in_place == queued_tick &&
+                in_place == 1 && in_place_counts.in_place_bytes == 0x10000 &&
+                    tick_in_place == queued_tick &&
                     value_at(finished) == 0x81818181u && finished_clean,
                 "a finished write of a host-readable buffer was not read from "
                 "its mapping (" +
-                    std::to_string(in_place) + " in place, ticks " +
-                    std::to_string(queued_tick) + " -> " +
+                    std::to_string(in_place) + " in place, " +
+                    std::to_string(in_place_counts.in_place_bytes) +
+                    " bytes, ticks " + std::to_string(queued_tick) + " -> " +
                     std::to_string(tick_in_place) + ")");
       } else {
         std::printf("[gpu]     %-32s no host-readable device memory, in-place "

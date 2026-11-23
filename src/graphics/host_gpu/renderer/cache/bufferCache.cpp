@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <functional>
@@ -406,13 +407,20 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	m_scheduler.WaitPriorityOperations(write_tick);
 	const auto buffer_address = buffer.CpuAddress();
 	bool       copied         = false;
+	uint64_t   read_bytes     = 0;
+	int64_t    read_ns        = 0;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
 		                                           "in-place readback");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    m_in_place_scratch.resize(static_cast<size_t>(end - start));
+			    const auto read_start = std::chrono::steady_clock::now();
 			    buffer.ReadMapped(start - buffer_address, end - start, m_in_place_scratch.data());
+			    read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                   std::chrono::steady_clock::now() - read_start)
+			                   .count();
+			    read_bytes += end - start;
 			    Libs::LibKernel::Memory::WriteBacking(start, m_in_place_scratch.data(),
 			                                          end - start);
 			    copied = true;
@@ -422,6 +430,7 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	    });
 	if (copied) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, dirty);
+		Common::GpuTiming::Sync().AddInPlaceReadback(read_bytes, read_ns);
 	}
 	return copied;
 }
@@ -597,7 +606,6 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		if (ReadBackInPlace(buffer, result.base, result.size)) {
 			// Published already: only the tracker state below remains.
 			result.copied = true;
-			Common::GpuTiming::Sync().AddInPlaceReadback();
 			continue;
 		}
 		result.copied =
