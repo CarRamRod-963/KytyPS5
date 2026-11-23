@@ -57675,6 +57675,49 @@ TestCase DispatcherIrreducibleControlFlow() {
 
 #include "ShaderRayTracingGpuTests.inc"
 
+// Loads of a BVH traversal shader whose node pages are watched: a watched page
+// is resident and reads its data (it is only reported), while a page no buffer
+// backs reads as the absent link, all ones. A DWORD load reads two DWORDs, a
+// byte load one (the single-DWORD path). Taking the watched page for absent
+// ended every traversal of a watched BVH for the frames the watch lasted (a
+// short flash of unshadowed lighting in Saros).
+TestCase BvhWatchedPageLoads() {
+  constexpr uint64_t NodePage = 0x10000, Unmapped = 0x20000;
+  constexpr u32 NodeStart = 1024, DwordStart = 768, DwordAbsentStart = 800,
+                ByteStart = 832, ByteAbsentStart = 864;
+  auto test = BvhIntersections(true, true);
+  test.name = "BvhPageLoads";
+  auto &code = test.code;
+  code.pop_back(); // S_ENDPGM
+  const auto load = [&](u32 opcode, uint64_t address, u32 dst) {
+    AppendVMovLiteral(&code, 40, static_cast<u32>(address));
+    AppendVMovLiteral(&code, 41, static_cast<u32>(address >> 32u));
+    code.insert(code.end(),
+                {EncodeFlat0(opcode, 2), EncodeFlat1(dst, 0x7d, 0, 40)});
+  };
+  // GLOBAL_LOAD_DWORD of the node's flag DWORD and GLOBAL_LOAD_UBYTE of its
+  // first child link, both on the first (watched) node page.
+  load(0x0c, NodePage + 15u * sizeof(u32), 42);
+  load(0x0c, Unmapped, 43);
+  load(0x08, NodePage + 16u * sizeof(u32), 44);
+  load(0x08, Unmapped, 45);
+  AppendStoreVgprAtLaneDwordOffset(&code, 42, 0, DwordStart);
+  AppendStoreVgprAtLaneDwordOffset(&code, 43, 0, DwordAbsentStart);
+  AppendStoreVgprAtLaneDwordOffset(&code, 44, 0, ByteStart);
+  AppendStoreVgprAtLaneDwordOffset(&code, 45, 0, ByteAbsentStart);
+  AppendEnd(&code);
+  for (u32 lane = 0; lane < 32u; ++lane) {
+    test.expected[DwordStart + lane] = test.initial[NodeStart + 15u];
+    test.expected[DwordAbsentStart + lane] = UINT32_MAX;
+    test.expected[ByteStart + lane] = test.initial[NodeStart + 16u] & 0xffu;
+    test.expected[ByteAbsentStart + lane] = 0xffu;
+  }
+  test.max_spirv_words += 1600u;
+  return WatchedBdaMappings(
+      std::move(test),
+      {NodePage, NodePage + BufferCache::CACHING_PAGESIZE, Unmapped});
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -58162,6 +58205,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BvhIntersections(true, true, 0, true));
   cases.push_back(
       WatchedBdaMappings(BvhIntersections(true, true), {0x10000, 0x14000}));
+  cases.push_back(BvhWatchedPageLoads());
   for (bool barycentrics : {false, true}) {
     for (bool sorted : {false, true}) {
       cases.push_back(BvhIntersections(barycentrics, sorted));
@@ -66045,6 +66089,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BvhIntersections(true, true, 0, true));
     RunCase(&vulkan, WatchedBdaMappings(BvhIntersections(true, true),
                                         {0x10000, 0x14000}));
+    RunCase(&vulkan, BvhWatchedPageLoads());
     for (bool barycentrics : {false, true}) {
       for (bool sorted : {false, true}) {
         RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
@@ -66837,6 +66882,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaWatchedEviction();
     vulkan.CheckBdaAgeCollection();
     vulkan.CheckLazyBdaSync();
+    RunCase(&vulkan, BvhWatchedPageLoads());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--batched-uploads-only") == 0) {
