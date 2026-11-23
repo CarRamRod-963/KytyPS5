@@ -104,6 +104,8 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 	}
 	async_pages += other.async_pages;
 	in_place += other.in_place;
+	in_place_bytes += other.in_place_bytes;
+	in_place_ns += other.in_place_ns;
 	async_deferred += other.async_deferred;
 	labels_direct += other.labels_direct;
 	labels_gpu_thread += other.labels_gpu_thread;
@@ -133,6 +135,8 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 	}
 	delta.async_pages    = async_pages - earlier.async_pages;
 	delta.in_place          = in_place - earlier.in_place;
+	delta.in_place_bytes    = in_place_bytes - earlier.in_place_bytes;
+	delta.in_place_ns       = in_place_ns - earlier.in_place_ns;
 	delta.async_deferred    = async_deferred - earlier.async_deferred;
 	delta.labels_direct     = labels_direct - earlier.labels_direct;
 	delta.labels_gpu_thread = labels_gpu_thread - earlier.labels_gpu_thread;
@@ -188,6 +192,8 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 	}
 	counts.async_pages    = m_async_pages.load(std::memory_order_relaxed);
 	counts.in_place          = m_in_place.load(std::memory_order_relaxed);
+	counts.in_place_bytes    = m_in_place_bytes.load(std::memory_order_relaxed);
+	counts.in_place_ns       = m_in_place_ns.load(std::memory_order_relaxed);
 	counts.async_deferred    = m_async_deferred.load(std::memory_order_relaxed);
 	counts.labels_direct     = m_labels_direct.load(std::memory_order_relaxed);
 	counts.labels_gpu_thread = m_labels_gpu_thread.load(std::memory_order_relaxed);
@@ -365,15 +371,17 @@ namespace {
 
 std::string SyncSuffix(const Summary& summary) {
 	const double scale = summary.seconds > 0.0 ? 1.0 / summary.seconds : 0.0;
-	char         tail[460];
+	char         tail[520];
 	std::snprintf(tail, sizeof(tail),
 	              ", empty flushes skipped %.0f/s, readbacks served by submitted downloads %.0f/s, "
-	              "read in place %.0f/s, "
+	              "read in place %.0f/s (%.0f KiB/s, %.1f ms/s), "
 	              "readbacks joined to another's submission %.0f/s, async download pages %.0f/s, "
 	              "skipped over cap %.0f/s, labels on completion %.0f/s, via the GPU thread %.0f/s",
 	              static_cast<double>(summary.sync.TotalSkipped()) * scale,
 	              static_cast<double>(summary.sync.TotalServed()) * scale,
 	              static_cast<double>(summary.sync.in_place) * scale,
+	              static_cast<double>(summary.sync.in_place_bytes) / 1024.0 * scale,
+	              static_cast<double>(summary.sync.in_place_ns) / 1e6 * scale,
 	              static_cast<double>(summary.sync.TotalJoined()) * scale,
 	              static_cast<double>(summary.sync.async_pages) * scale,
 	              static_cast<double>(summary.sync.async_deferred) * scale,
