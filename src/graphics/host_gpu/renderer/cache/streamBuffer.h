@@ -115,6 +115,10 @@ public:
 	uint64_t gpu_write_tick = 0;
 	bool     gpu_write_open = false;
 
+private:
+	// Copies the `size` bytes of one 16-byte word of the mapping for ReadMapped.
+	void ReadMappedEdge(const uint8_t* source, uint64_t size, uint8_t* target) const;
+
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }

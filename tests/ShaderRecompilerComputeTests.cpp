@@ -19934,6 +19934,49 @@ public:
       Require(name, "open write read back", value_at(pending) == 0x83838383u,
               "a write in the open command buffer was read from the mapping "
               "before it ran");
+
+      // Reads of a host-readable buffer's mapping return the right bytes for
+      // every offset and size, also for the ends that do not fill a 16-byte
+      // word.
+      if (host_readable) {
+        constexpr uint64_t edges = base + 0xa0000;
+        constexpr uint64_t edge_bytes = 1024;
+        const auto expected_byte = [](uint64_t index) {
+          return static_cast<uint8_t>((index / 16) * 7 + (index % 4) + 1);
+        };
+        std::string mismatch;
+        gpu.SendCommandSync([&] {
+          CommandProcessor processor(context, 0);
+          processor.BufferInit();
+          auto [buffer, offset] = cache.ObtainBuffer(edges, edge_bytes, true);
+          for (uint64_t chunk = 0; chunk < edge_bytes / 16; chunk++) {
+            uint32_t value = 0;
+            for (uint32_t i = 0; i < 4; i++) {
+              value |= uint32_t{expected_byte(chunk * 16 + i)} << (8 * i);
+            }
+            buffer->Fill(offset + chunk * 16, 16, value);
+          }
+          scheduler.Finish();
+          std::vector<uint8_t> read(64);
+          for (uint64_t start = 0; start < 40 && mismatch.empty(); start++) {
+            for (uint64_t size = 1; size <= 40 && mismatch.empty(); size++) {
+              std::fill(read.begin(), read.end(), uint8_t{0});
+              buffer->ReadMapped(offset + start, size, read.data());
+              for (uint64_t i = 0; i < size; i++) {
+                if (read[i] != expected_byte(start + i)) {
+                  mismatch = "offset " + std::to_string(start) + " size " +
+                             std::to_string(size) + " byte " +
+                             std::to_string(i);
+                  break;
+                }
+              }
+            }
+          }
+        });
+        Require(name, "in-place edge bytes", mismatch.empty(),
+                "a read of the mapping returned wrong bytes (" + mismatch +
+                    ")");
+      }
       gpu.SendCommandSync([&] {
         CommandProcessor processor(context, 0);
         processor.BufferInit();

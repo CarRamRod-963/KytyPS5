@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <algorithm>
 #include <cstring>
 #include <immintrin.h>
 #include <numeric>
@@ -183,14 +184,39 @@ void Buffer::ReadMapped(uint64_t offset, uint64_t size, void* destination) const
 	_mm_mfence();
 	const auto lead =
 	    std::min<uint64_t>(size, (16u - reinterpret_cast<uintptr_t>(source) % 16u) % 16u);
-	std::memcpy(target, source, static_cast<size_t>(lead));
+	ReadMappedEdge(source, lead, target);
 	uint64_t done = lead;
 	for (; done + 16 <= size; done += 16) {
 		const auto value =
 		    _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(source + done)));
 		_mm_storeu_si128(reinterpret_cast<__m128i*>(target + done), value);
 	}
-	std::memcpy(target + done, source + done, static_cast<size_t>(size - done));
+	ReadMappedEdge(source + done, size - done, target + done);
+}
+
+void Buffer::ReadMappedEdge(const uint8_t* source, uint64_t size, uint8_t* target) const {
+	if (size == 0) {
+		return;
+	}
+	// A plain load of write-combined memory is a bus read of its own, far slower than a streaming
+	// load, and readbacks often take islands shorter than a word: read the 16-byte words that hold
+	// the bytes with streaming loads where those words lie inside the mapping.
+	const auto first = reinterpret_cast<uintptr_t>(source) & ~uintptr_t {15};
+	const auto last  = (reinterpret_cast<uintptr_t>(source + size - 1) & ~uintptr_t {15}) + 16;
+	if (first < reinterpret_cast<uintptr_t>(m_mapped.data()) ||
+	    last > reinterpret_cast<uintptr_t>(m_mapped.data() + m_mapped.size())) {
+		std::memcpy(target, source, static_cast<size_t>(size));
+		return;
+	}
+	for (auto word = first; word < last; word += 16) {
+		alignas(16) uint8_t scratch[16];
+		_mm_store_si128(reinterpret_cast<__m128i*>(scratch),
+		                _mm_stream_load_si128(reinterpret_cast<__m128i*>(word)));
+		const auto begin = std::max(word, reinterpret_cast<uintptr_t>(source));
+		const auto end   = std::min(word + 16, reinterpret_cast<uintptr_t>(source + size));
+		std::memcpy(target + (begin - reinterpret_cast<uintptr_t>(source)),
+		            scratch + (begin - word), static_cast<size_t>(end - begin));
+	}
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
