@@ -322,6 +322,23 @@ void TestSpansAndStalls() {
             "timeouts/s), stalls per s: wait-reg-mem 2, rewind 0, "
             "predication 1") != std::string::npos,
         "summary line carries the GPU thread idle time");
+  const auto before_cpu = counters.Snapshot();
+  counters.NoteGpuThreadCpu(5, 0, 1);
+  counters.NoteGpuThreadCpu(5, 0, 1);
+  counters.NoteGpuThreadCpu(14, 1, 1);
+  const auto cpu = counters.Snapshot().Since(before_cpu);
+  Check(cpu.gpu_thread_cpu == 14 && cpu.gpu_thread_cpu_class == 1 &&
+            cpu.gpu_thread_top_class == 1 && cpu.gpu_thread_cpu_samples == 3 &&
+            cpu.gpu_thread_cpu_lower == 2,
+        "GPU thread CPU place");
+  Summary placed;
+  placed.seconds = 1.0;
+  placed.sync = cpu;
+  Check(Common::GpuTiming::FormatSummary(placed).find(
+            "GPU thread on CPU 14 (efficiency class 1, top 1; below the top "
+            "class 67% "
+            "of flips)") != std::string::npos,
+        "summary line carries the GPU thread's CPU");
   Summary merged;
   merged.Merge(summary);
   merged.Merge(window);

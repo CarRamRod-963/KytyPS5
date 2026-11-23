@@ -469,6 +469,16 @@ void GuestGpu::ThreadRun(void* data) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "GPU: command processor assigned to the core of logical processor {}.\n", processor));
 	}
+	if (Config::GpuThreadPriorityEnabled()) {
+		LOGF("GPU: command processor thread priority raised: %s\n",
+		     Common::Thread::RaiseCurrentThreadPriority() ? "yes" : "refused");
+	}
+	if (Config::PowerThrottlingOptOutEnabled()) {
+		LOGF("Host: power throttling opt-out: %s\n",
+		     Common::Thread::DisablePowerThrottling() ? "on" : "not available");
+	} else {
+		LOGF("Host: power throttling opt-out: off\n");
+	}
 
 	for (;;) {
 		Submission                   submission;
@@ -1768,6 +1778,13 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 }
 
+// Once per flip: where the GPU thread runs, for the GpuTiming line (a few dozen ns).
+static void NoteGpuThreadCpu() {
+	const auto place = Common::Thread::CurrentCpuPlace();
+	Common::GpuTiming::Sync().NoteGpuThreadCpu(place.processor, place.efficiency_class,
+	                                           place.top_class);
+}
+
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
@@ -1781,6 +1798,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	    GuestWrites::None());
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
+	NoteGpuThreadCpu();
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -1791,6 +1809,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	    GuestWrites::None());
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
+	NoteGpuThreadCpu();
 }
 
 void CommandProcessor::SynchronizeGpu() {

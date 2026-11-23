@@ -1086,6 +1086,12 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --lazy-bda-sync)
 	add_test(NAME emulator_occlusion_queries_on
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --occlusion-queries)
+	add_test(NAME emulator_gpu_thread_priority_on
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --gpu-thread-priority)
+	add_test(NAME emulator_gpu_thread_priority_off
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-gpu-thread-priority)
+	add_test(NAME emulator_allow_power_throttling
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --allow-power-throttling)
 	add_test(NAME emulator_narrow_readbacks_off
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-narrow-readbacks)
 	add_test(NAME emulator_narrow_readbacks_on

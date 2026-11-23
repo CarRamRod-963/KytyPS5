@@ -140,6 +140,14 @@ struct SyncCounts {
 	uint64_t gpu_thread_blocked    = 0;
 	uint64_t gpu_thread_timeouts   = 0;
 	uint64_t gpu_thread_blocked_ns = 0;
+	// Where the guest GPU thread ran at its latest flip (logical processor, -1 unknown; its
+	// efficiency class and the system's top class), and of how many flips it ran on a core below
+	// the top class.
+	int64_t  gpu_thread_cpu         = -1;
+	uint32_t gpu_thread_cpu_class   = 0;
+	uint32_t gpu_thread_top_class   = 0;
+	uint64_t gpu_thread_cpu_samples = 0;
+	uint64_t gpu_thread_cpu_lower   = 0;
 	// Command stream suspensions by kind (StallKind).
 	std::array<uint64_t, STALL_KIND_COUNT> stalls {};
 
@@ -213,6 +221,15 @@ public:
 		m_gpu_thread_blocked_ns.fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
 		                                  std::memory_order_relaxed);
 	}
+	void NoteGpuThreadCpu(int processor, uint32_t efficiency_class, uint32_t top_class) noexcept {
+		m_gpu_thread_cpu.store(processor, std::memory_order_relaxed);
+		m_gpu_thread_cpu_class.store(efficiency_class | (top_class << 8u),
+		                             std::memory_order_relaxed);
+		m_gpu_thread_cpu_samples.fetch_add(1, std::memory_order_relaxed);
+		if (efficiency_class < top_class) {
+			m_gpu_thread_cpu_lower.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	void AddStall(StallKind kind) noexcept {
 		const auto index = static_cast<size_t>(kind);
 		m_stalls[index < STALL_KIND_COUNT ? index : 0].fetch_add(1, std::memory_order_relaxed);
@@ -250,6 +267,10 @@ private:
 	std::atomic<uint64_t>                                 m_gpu_thread_timeouts {};
 	std::atomic<uint64_t>                                 m_gpu_thread_blocked_ns {};
 	std::array<std::atomic<uint64_t>, STALL_KIND_COUNT>   m_stalls {};
+	std::atomic<int64_t>                                  m_gpu_thread_cpu {-1};
+	std::atomic<uint32_t>                                 m_gpu_thread_cpu_class {};
+	std::atomic<uint64_t>                                 m_gpu_thread_cpu_samples {};
+	std::atomic<uint64_t>                                 m_gpu_thread_cpu_lower {};
 };
 
 // Process-wide counters: every scheduler's submits and semaphore waits.

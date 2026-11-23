@@ -118,6 +118,11 @@ struct ConfigOptions {
 	bool                   stale_pipeline_rebuild          = true;
 	// The GPU command processor thread reserves a CPU core (Common::Thread::ReserveCore...).
 	bool                   gpu_core_reservation            = true;
+	// The GPU command processor thread runs above normal priority (--gpu-thread-priority).
+	bool gpu_thread_priority = false;
+	// The process asks Windows not to throttle it in the background (--allow-power-throttling:
+	// the system's default).
+	bool power_throttling_opt_out = true;
 	// GPU-selected texture tables bind long unselected candidates as null descriptors.
 	bool                   selection_feedback              = true;
 	// VK_NV_device_diagnostic_checkpoints markers before each draw and dispatch, so that a lost
@@ -233,6 +238,8 @@ bool     PrecompileOnlyEnabled();
 bool     RebuildPipelineCacheEnabled();
 bool     StalePipelineRebuildEnabled();
 bool     GpuCoreReservationEnabled();
+bool                  GpuThreadPriorityEnabled();
+bool                  PowerThrottlingOptOutEnabled();
 bool     SelectionFeedbackEnabled();
 bool     GpuCheckpointsEnabled();
 bool     LazyBdaSyncEnabled();

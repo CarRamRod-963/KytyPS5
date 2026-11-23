@@ -260,6 +260,99 @@ void Thread::LowerCurrentThreadPriority() {
 #endif
 }
 
+bool Thread::RaiseCurrentThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// A negative nice value needs CAP_SYS_NICE or a raised RLIMIT_NICE.
+	return setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), -5) == 0;
+#else
+	return false;
+#endif
+}
+
+bool Thread::DisablePowerThrottling() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PROCESS_POWER_THROTTLING_STATE state {};
+	state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+	state.StateMask   = 0;
+	if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state)) ==
+	    0) {
+		return false;
+	}
+#ifdef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+	// Windows 11 only; older systems refuse the flag, which leaves the first request in force.
+	state.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+	(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+#endif
+	return true;
+#else
+	return false;
+#endif
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+namespace {
+
+// Efficiency class per logical processor (64 per processor group), read once.
+struct CpuClasses {
+	std::vector<uint8_t> by_processor;
+	uint8_t              top = 0;
+};
+
+const CpuClasses& GetCpuClasses() {
+	static const CpuClasses classes = [] {
+		CpuClasses result;
+		ULONG      size = 0;
+		GetSystemCpuSetInformation(nullptr, 0, &size, GetCurrentProcess(), 0);
+		std::vector<uint8_t> buffer(size);
+		if (size == 0 ||
+		    GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),
+		                               size, &size, GetCurrentProcess(), 0) == 0) {
+			return result;
+		}
+		for (ULONG offset = 0; offset < size;) {
+			const auto& entry =
+			    *reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(&buffer[offset]);
+			offset += entry.Size;
+			if (entry.Type != CpuSetInformation) {
+				continue;
+			}
+			const auto index =
+			    size_t {entry.CpuSet.Group} * 64 + entry.CpuSet.LogicalProcessorIndex;
+			if (result.by_processor.size() <= index) {
+				result.by_processor.resize(index + 1, 0);
+			}
+			result.by_processor[index] = entry.CpuSet.EfficiencyClass;
+			result.top                 = std::max(result.top, entry.CpuSet.EfficiencyClass);
+		}
+		return result;
+	}();
+	return classes;
+}
+
+} // namespace
+#endif
+
+Thread::CpuPlace Thread::CurrentCpuPlace() {
+	CpuPlace place;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PROCESSOR_NUMBER number {};
+	GetCurrentProcessorNumberEx(&number);
+	const auto& classes = GetCpuClasses();
+	const auto  index   = size_t {number.Group} * 64 + number.Number;
+	place.processor     = static_cast<int>(index);
+	place.top_class     = classes.top;
+	if (index < classes.by_processor.size()) {
+		place.efficiency_class = classes.by_processor[index];
+	}
+#elif defined(__linux__)
+	place.processor = sched_getcpu();
+#endif
+	return place;
+}
+
 int Thread::GetThreadIdUnique() {
 	static std::atomic<int> counter = 0;
 	static thread_local int tid     = ++counter;

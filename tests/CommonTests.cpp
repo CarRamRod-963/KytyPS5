@@ -382,6 +382,14 @@ TEST(Thread, SleepsAtLeastTheRequestedTimeAndIdsAreUniquePerThread) {
 	EXPECT_FALSE(other_main);
 }
 
+TEST(Thread, CurrentCpuPlaceNamesTheProcessorAndItsClass) {
+  const auto place = Common::Thread::CurrentCpuPlace();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || defined(__linux__)
+  EXPECT_GE(place.processor, 0);
+#endif
+  EXPECT_LE(place.efficiency_class, place.top_class);
+}
+
 #ifdef __linux__
 unsigned ReadCpuValue(int cpu, const char* file) {
 	unsigned value = 0;
