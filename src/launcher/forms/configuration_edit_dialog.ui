@@ -249,6 +249,16 @@
               <property name="text"><string>Lazy GPU memory synchronization (faster)</string></property>
              </widget>
             </item>
+            <item row="19" column="0">
+             <widget class="QLabel" name="label_in_place_readbacks">
+              <property name="text"><string>Read GPU results in place:</string></property>
+             </widget>
+            </item>
+            <item row="19" column="1">
+             <widget class="QComboBox" name="comboBox_in_place_readbacks">
+              <property name="toolTip"><string>How the emulator reads data the GPU wrote: straight from the GPU's memory (On) or through a copy the GPU makes into system memory (Off). Some PCs read GPU memory very slowly. Auto measures both at start and picks the faster one; On and Off override Auto.</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

@@ -45,6 +45,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(emulate_wave64);
 	KYTY_CFG_SET(no_async_pipelines);
 	KYTY_CFG_SET(maximal_reconvergence);
+	KYTY_CFG_SET(in_place_readbacks);
 	KYTY_CFG_SET(no_shader_simplification);
 	KYTY_CFG_SET(no_selection_feedback);
 	KYTY_CFG_SET(lazy_bda_sync);
@@ -129,6 +130,14 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(no_shader_simplification);
 	KYTY_CFG_GET(no_selection_feedback);
 	lazy_bda_sync    = s.value(QStringLiteral("lazy_bda_sync"), true).toBool();
+	if (s.contains(QStringLiteral("in_place_readbacks"))) {
+		KYTY_CFG_GET(in_place_readbacks);
+		if (EnumToText(in_place_readbacks).isEmpty()) {
+			in_place_readbacks = InPlaceReadbacks::Auto;
+		}
+	} else {
+		in_place_readbacks = InPlaceReadbacks::Auto;
+	}
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);

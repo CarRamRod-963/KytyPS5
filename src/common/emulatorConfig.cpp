@@ -309,6 +309,10 @@ MaximalReconvergence GetMaximalReconvergence() {
 	return g_config->maximal_reconvergence;
 }
 
+InPlaceReadbacks GetInPlaceReadbacks() {
+	return g_config->in_place_readbacks;
+}
+
 bool ShaderSimplificationDisabled() {
 	return g_config->no_shader_simplification;
 }

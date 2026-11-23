@@ -397,7 +397,7 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	uint64_t dirty = 0;
 	m_gpu_modified_ranges.ForEachInRange(
 	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty += end - begin; });
-	if (dirty == 0 || dirty > MaxInPlaceReadback) {
+	if (dirty == 0 || dirty > m_in_place_limit) {
 		return false;
 	}
 	if (!m_scheduler.IsFree(write_tick)) {
@@ -464,6 +464,108 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	UpdateGcMarks();
 	m_bda_lazy = Config::LazyBdaSyncEnabled();
 	LOGF("GPU: lazy BDA synchronization: %s\n", m_bda_lazy ? "on" : "off");
+}
+
+void BufferCache::ProbeInPlaceReadbacks() {
+	const auto                            mode = Config::GetInPlaceReadbacks();
+	std::vector<InPlaceReadbacks::Sample> samples;
+	if (mode == Config::InPlaceReadbacks::Auto) {
+		samples = MeasureReadbacks();
+	}
+	const auto decision = InPlaceReadbacks::Decide(mode, samples, MaxInPlaceReadback);
+	m_in_place_limit    = decision.max_bytes;
+	m_in_place_probes_left--;
+	m_in_place_probe_wait = InPlaceProbeSpacing;
+	if (mode != Config::InPlaceReadbacks::Auto || !samples.empty()) {
+		m_in_place_probes_left = 0;
+	} else if (m_in_place_probes_left + 1 != InPlaceProbeAttempts && m_in_place_probes_left != 0) {
+		return; // Logged by the first attempt; the last one logs the final state.
+	}
+	std::string line    = "In-place readbacks:";
+	for (const auto& sample: samples) {
+		const auto mbps = [&](int64_t ns) {
+			return ns > 0 ? static_cast<double>(sample.bytes) * 1e3 / static_cast<double>(ns) : 0.0;
+		};
+		line += fmt::format(" {} KiB {:.0f} MB/s in place, {:.0f} us copy ({:.0f} MB/s);",
+		                    sample.bytes >> 10u, mbps(sample.in_place_ns),
+		                    static_cast<double>(sample.copy_ns) / 1e3, mbps(sample.copy_ns));
+	}
+	if (decision.max_bytes == 0) {
+		line += fmt::format(" -> off ({}{})\n", decision.reason,
+		                    m_in_place_probes_left != 0 ? "; probing again later" : "");
+	} else {
+		line +=
+		    fmt::format(" -> on up to {} KiB ({})\n", decision.max_bytes >> 10u, decision.reason);
+	}
+	Log::WriteToConsoleAndLog(line);
+}
+
+std::vector<InPlaceReadbacks::Sample> BufferCache::MeasureReadbacks() {
+	// A buffer of the kind game buffers are (device-local, host-readable where the device has
+	// such memory), written by the GPU, then read both ways at sizes readbacks take.
+	Buffer probe(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, MaxInPlaceReadback,
+	             true);
+	if (!probe.IsHostReadable()) {
+		return {};
+	}
+	probe.Fill(0, MaxInPlaceReadback, 0x5a5a5a5au);
+	m_scheduler.Finish();
+	std::vector<uint8_t> scratch(static_cast<size_t>(MaxInPlaceReadback));
+	// Touch the mapping once: page-table misses are not the cost of a readback.
+	probe.ReadMapped(0, MaxInPlaceReadback, scratch.data());
+	const auto           now = [] { return std::chrono::steady_clock::now(); };
+	const auto           ns  = [](auto duration) {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+	};
+	std::vector<InPlaceReadbacks::Sample> samples;
+	for (const uint64_t bytes: {uint64_t {4} << 10u, uint64_t {16} << 10u, uint64_t {64} << 10u,
+	                            uint64_t {256} << 10u, MaxInPlaceReadback}) {
+		auto& sample = samples.emplace_back();
+		sample.bytes = bytes;
+		// The best of eight: the probe runs while the session boots, and other threads and other
+		// bus traffic only ever make a single read or copy slower. A noisy probe errs toward GPU
+		// copies, which are correct everywhere.
+		sample.in_place_ns = INT64_MAX;
+		sample.copy_ns     = INT64_MAX;
+		for (int repeat = 0; repeat < 8; repeat++) {
+			const auto read_start = now();
+			probe.ReadMapped(0, sample.bytes, scratch.data());
+			sample.in_place_ns = std::min(sample.in_place_ns, ns(now() - read_start));
+
+			// As DownloadBufferMemory records a readback, then the wait ServeGuestReadbacks makes.
+			const auto copy_start = now();
+			auto       download   = m_download_buffer.MapDownload(sample.bytes, 64);
+			auto&      command    = m_scheduler.Current();
+			command.EndRendering();
+			const auto              native = command.Handle();
+			vk::BufferMemoryBarrier before {};
+			before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+			before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+			before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.buffer              = probe.Handle();
+			before.offset              = 0;
+			before.size                = sample.bytes;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before,
+			                       0, nullptr);
+			const vk::BufferCopy copy {0, download.offset, sample.bytes};
+			native.copyBuffer(probe.Handle(), download.buffer->Handle(), 1, &copy);
+			auto after          = before;
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+			after.buffer        = download.buffer->Handle();
+			after.offset        = download.offset;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                       vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+			                       nullptr);
+			m_scheduler.Wait(m_scheduler.CurrentTick());
+			download.buffer->Invalidate(download.offset, sample.bytes);
+			std::memcpy(scratch.data(), download.mapped, static_cast<size_t>(sample.bytes));
+			sample.copy_ns = std::min(sample.copy_ns, ns(now() - copy_start));
+		}
+	}
+	return samples;
 }
 
 void BufferCache::UpdateGcMarks() {
@@ -552,6 +654,9 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 }
 
 void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
+	if (m_in_place_probes_left != 0 && m_in_place_probe_wait-- == 0) {
+		ProbeInPlaceReadbacks();
+	}
 	struct Served {
 		uint64_t base   = 0;
 		uint64_t size   = 0;
