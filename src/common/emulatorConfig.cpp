@@ -269,6 +269,14 @@ bool GpuCoreReservationEnabled() {
 	return g_config->gpu_core_reservation;
 }
 
+bool GpuThreadPriorityEnabled() {
+	return g_config->gpu_thread_priority;
+}
+
+bool PowerThrottlingOptOutEnabled() {
+	return g_config->power_throttling_opt_out;
+}
+
 bool SelectionFeedbackEnabled() {
 	return g_config->selection_feedback;
 }

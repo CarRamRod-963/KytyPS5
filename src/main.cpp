@@ -201,6 +201,11 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-gpu-core-reservation            Do not reserve a CPU core for the GPU command\n"
 	    "                                       processor thread.\n");
+	::printf("  --gpu-thread-priority                Run the GPU command processor thread above\n"
+	         "                                       normal priority. Default: off.\n"
+	         "  --allow-power-throttling             Let Windows throttle the emulator while its\n"
+	         "                                       window is in the background (the system's\n"
+	         "                                       default). Default: the emulator opts out.\n");
 	::printf(
 	    "  --no-selection-feedback             Bind every candidate texture of GPU-selected\n"
 	    "                                       descriptor tables, also the ones the shaders\n"
@@ -364,6 +369,9 @@ static constexpr Flag FLAGS[] = {
     {"--rebuild-pipeline-cache", &ConfigOptions::rebuild_pipeline_cache},
     {"--no-stale-pipeline-rebuild", &ConfigOptions::stale_pipeline_rebuild, false},
     {"--no-gpu-core-reservation", &ConfigOptions::gpu_core_reservation, false},
+    {"--gpu-thread-priority", &ConfigOptions::gpu_thread_priority},
+    {"--no-gpu-thread-priority", &ConfigOptions::gpu_thread_priority, false},
+    {"--allow-power-throttling", &ConfigOptions::power_throttling_opt_out, false},
     {"--no-selection-feedback", &ConfigOptions::selection_feedback, false},
     {"--gpu-checkpoints", &ConfigOptions::gpu_checkpoints},
     {"--no-gpu-checkpoints", &ConfigOptions::gpu_checkpoints, false},

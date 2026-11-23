@@ -122,6 +122,13 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 	gpu_thread_blocked += other.gpu_thread_blocked;
 	gpu_thread_timeouts += other.gpu_thread_timeouts;
 	gpu_thread_blocked_ns += other.gpu_thread_blocked_ns;
+	if (other.gpu_thread_cpu >= 0) {
+		gpu_thread_cpu       = other.gpu_thread_cpu;
+		gpu_thread_cpu_class = other.gpu_thread_cpu_class;
+		gpu_thread_top_class = other.gpu_thread_top_class;
+	}
+	gpu_thread_cpu_samples += other.gpu_thread_cpu_samples;
+	gpu_thread_cpu_lower += other.gpu_thread_cpu_lower;
 	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
 		stalls[i] += other.stalls[i];
 	}
@@ -157,6 +164,11 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 	delta.gpu_thread_blocked    = gpu_thread_blocked - earlier.gpu_thread_blocked;
 	delta.gpu_thread_timeouts   = gpu_thread_timeouts - earlier.gpu_thread_timeouts;
 	delta.gpu_thread_blocked_ns = gpu_thread_blocked_ns - earlier.gpu_thread_blocked_ns;
+	delta.gpu_thread_cpu         = gpu_thread_cpu;
+	delta.gpu_thread_cpu_class   = gpu_thread_cpu_class;
+	delta.gpu_thread_top_class   = gpu_thread_top_class;
+	delta.gpu_thread_cpu_samples = gpu_thread_cpu_samples - earlier.gpu_thread_cpu_samples;
+	delta.gpu_thread_cpu_lower   = gpu_thread_cpu_lower - earlier.gpu_thread_cpu_lower;
 	for (size_t i = 0; i < STALL_KIND_COUNT; i++) {
 		delta.stalls[i] = stalls[i] - earlier.stalls[i];
 	}
@@ -200,6 +212,12 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 	}
 	counts.async_pages    = m_async_pages.load(std::memory_order_relaxed);
 	counts.in_place          = m_in_place.load(std::memory_order_relaxed);
+	counts.gpu_thread_cpu         = m_gpu_thread_cpu.load(std::memory_order_relaxed);
+	const auto cpu_classes        = m_gpu_thread_cpu_class.load(std::memory_order_relaxed);
+	counts.gpu_thread_cpu_class   = cpu_classes & 0xffu;
+	counts.gpu_thread_top_class   = cpu_classes >> 8u;
+	counts.gpu_thread_cpu_samples = m_gpu_thread_cpu_samples.load(std::memory_order_relaxed);
+	counts.gpu_thread_cpu_lower   = m_gpu_thread_cpu_lower.load(std::memory_order_relaxed);
 	counts.in_place_bytes    = m_in_place_bytes.load(std::memory_order_relaxed);
 	counts.in_place_ns       = m_in_place_ns.load(std::memory_order_relaxed);
 	counts.guest_copies      = m_guest_copies.load(std::memory_order_relaxed);
@@ -432,6 +450,17 @@ std::string SyncSuffix(const Summary& summary) {
 		              static_cast<double>(sync.stalls[i]) * scale);
 		line += item;
 	}
+	char cpu[160];
+	std::snprintf(cpu, sizeof(cpu),
+	              ", GPU thread on CPU %lld (efficiency class %u, top %u; below the top class "
+	              "%.0f%% of flips)",
+	              static_cast<long long>(sync.gpu_thread_cpu), sync.gpu_thread_cpu_class,
+	              sync.gpu_thread_top_class,
+	              sync.gpu_thread_cpu_samples != 0
+	                  ? 100.0 * static_cast<double>(sync.gpu_thread_cpu_lower) /
+	                        static_cast<double>(sync.gpu_thread_cpu_samples)
+	                  : 0.0);
+	line += cpu;
 	line += ", GPU span ms/s by submit reason:";
 	bool any = false;
 	for (const auto reason: BusiestReasons(sync)) {

@@ -30,6 +30,22 @@ void RestoreProcessAffinity();
 // Lets the calling thread yield the CPU to normal-priority threads (background work such as
 // pipeline builds). Best effort: does nothing where the platform refuses.
 void LowerCurrentThreadPriority();
+// Runs the calling thread above normal-priority threads (THREAD_PRIORITY_HIGHEST on Windows,
+// nice -5 on Linux where allowed). Returns whether the platform accepted it.
+bool RaiseCurrentThreadPriority();
+// Asks Windows not to throttle the process when its window is not in the foreground (no
+// placement on efficiency cores for that reason, timer resolution kept). Returns whether the
+// system accepted it; false on other platforms.
+bool DisablePowerThrottling();
+// The logical processor the calling thread runs on, its efficiency class (a higher class is a
+// faster core; every core has class 0 on CPUs with one kind of core) and the highest class of
+// the system. processor is -1 where the platform cannot tell.
+struct CpuPlace {
+	int     processor        = -1;
+	uint8_t efficiency_class = 0;
+	uint8_t top_class        = 0;
+};
+[[nodiscard]] CpuPlace CurrentCpuPlace();
 
 } // namespace Thread
 
