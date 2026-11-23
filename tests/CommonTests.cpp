@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
+#include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 
@@ -436,6 +437,49 @@ TEST(Thread, ReservesTheFastestCoreAndRestoresTheProcessAffinity) {
 	EXPECT_TRUE(CPU_EQUAL(&restored, &reserved));
 }
 #endif
+
+TEST(SystemInfo, CpuLineNamesTheStateThatSizesExceptionFrames) {
+  Common::SystemInfo info;
+  info.ProcessorName = "Test CPU";
+  info.Features.physical_cores = 8;
+  info.Features.logical_processors = 16;
+  info.Features.xsave_size = 2696;
+  info.Features.xcr0 = 0x207;
+  EXPECT_EQ(Common::FormatCpuLine(info),
+            "Test CPU (8 cores, 16 threads), AVX-512: no, XSAVE area 2696 "
+            "bytes, XCR0 0x207");
+
+  info.Features.avx512_cpu = true;
+  info.Features.avx512_os = true;
+  info.Features.xcr0 = 0x2e7;
+  info.Features.xsave_size = 2704;
+  EXPECT_EQ(Common::FormatCpuLine(info),
+            "Test CPU (8 cores, 16 threads), AVX-512: yes, XSAVE area 2704 "
+            "bytes, XCR0 0x2e7");
+
+  info.Features.avx512_os = false;
+  EXPECT_NE(
+      Common::FormatCpuLine(info).find("AVX-512: yes, not enabled by the OS"),
+      std::string::npos);
+
+  // Unknown counts and no XSAVE leave those parts out.
+  info.Features = {};
+  EXPECT_EQ(Common::FormatCpuLine(info), "Test CPU, AVX-512: no");
+}
+
+TEST(SystemInfo, HostCpuFeaturesAreConsistent) {
+  const auto info = Common::GetSystemInfo();
+  EXPECT_FALSE(info.ProcessorName.empty());
+  EXPECT_GE(info.Features.logical_processors, info.Features.physical_cores);
+  // The OS cannot enable AVX-512 state on a CPU without AVX-512.
+  EXPECT_TRUE(info.Features.avx512_cpu || !info.Features.avx512_os);
+  if (info.Features.xcr0 != 0) {
+    // x87 and SSE state are always enabled; the area holds at least the legacy
+    // region and the XSAVE header.
+    EXPECT_EQ(info.Features.xcr0 & 3u, 3u);
+    EXPECT_GE(info.Features.xsave_size, 576u);
+  }
+}
 
 } // namespace
 

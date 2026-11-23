@@ -51,7 +51,7 @@ static void PrintSystemInfo() {
 	     "  os:      %s\n"
 	     "  cpu:     %s\n"
 	     "  threads: %u\n\n",
-	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
+	     KYTY_BUILD_LABEL, platform_name, Common::FormatCpuLine(info).c_str(),
 	     std::thread::hardware_concurrency());
 }
 
