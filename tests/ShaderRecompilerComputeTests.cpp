@@ -232,6 +232,8 @@ struct BufferCacheTestAccess {
     return cache.m_lru_cache.IsConsistent();
   }
 
+  static void DrainPublished(BufferCache &cache) { cache.DrainPublished(); }
+
   static uint64_t &InPlaceLimit(BufferCache &cache) {
     return cache.m_in_place_limit;
   }
@@ -1386,8 +1388,18 @@ bool TestLazyBdaSync() {
   return lazy_bda_sync != nullptr && std::strcmp(lazy_bda_sync, "1") == 0;
 }
 
+// KYTY_TEST_GUEST_COPIES=1 runs the suite with guest-thread readbacks
+// (--guest-thread-readbacks); without it the GPU thread serves every readback,
+// which the cases' counts expect. SubmittedDownloadReadback checks both.
+bool TestGuestCopies() {
+  const char *guest_copies = std::getenv("KYTY_TEST_GUEST_COPIES");
+  return guest_copies != nullptr && std::strcmp(guest_copies, "1") == 0;
+}
+
 void LoadTestConfig(Config::ConfigOptions options) {
   options.lazy_bda_sync = TestLazyBdaSync();
+  options.guest_thread_readbacks =
+      options.guest_thread_readbacks || TestGuestCopies();
   // No startup probe of the readback paths: a test's ticks start at its own
   // commands (CheckSubmittedDownloadReadback runs the probe itself).
   options.in_place_readbacks = Config::InPlaceReadbacks::On;
@@ -4946,10 +4958,20 @@ public:
       return label == label_value;
     };
     LibKernel::Memory::InstallGpuResources(&resources);
+    // No readback is made for the label beside them: none from the buffer's
+    // mapping, none submitted or waited for as a CPU write. (The bytes may be
+    // published all the same, by their page's own asynchronous download, and
+    // HasGpuDirtyBytes takes what was published.)
+    const auto before_beside = Common::GpuTiming::Sync().Snapshot();
+    const bool label_beside_landed = release_label(label_beside_address);
+    const auto beside =
+        Common::GpuTiming::Sync().Snapshot().Since(before_beside);
+    constexpr auto cpu_write =
+        static_cast<size_t>(Common::GpuTiming::SyncReason::CpuWrite);
     const bool label_beside_stored =
-        release_label(label_beside_address) &&
-        buffer_cache.HasGpuDirtyBytes(label_gpu_address,
-                                      sizeof(label_gpu_value));
+        label_beside_landed && beside.in_place == 0 &&
+        beside.guest_copies == 0 && beside.submits[cpu_write] == 0 &&
+        beside.served[cpu_write] == 0 && beside.joined[cpu_write] == 0;
     const bool label_over_stored =
         release_label(label_gpu_address) &&
         !buffer_cache.HasGpuDirtyBytes(label_gpu_address, sizeof(label_value));
@@ -19921,13 +19943,18 @@ public:
       bool finished_clean = false;
       gpu.SendCommandSync([&] {
         tick_in_place = scheduler.CurrentTick();
-        // The readback takes the download window around the read, which holds the
-        // whole finished write.
+        // The readback takes the download window around the read, which holds
+        // the whole finished write. (A guest thread's copy is published at the
+        // GPU thread's next readback.)
+        BufferCacheTestAccess::DrainPublished(cache);
         finished_clean = !cache.HasGpuDirtyBytes(finished, 0x10000);
       });
       if (host_readable) {
         Require(name, "in-place readback",
-                in_place == 1 && in_place_counts.in_place_bytes == 0x10000 &&
+                in_place + in_place_counts.guest_copies == 1 &&
+                    in_place_counts.in_place_bytes +
+                            in_place_counts.guest_copy_bytes ==
+                        0x10000 &&
                     tick_in_place == queued_tick &&
                     value_at(finished) == 0x81818181u && finished_clean,
                 "a finished write of a host-readable buffer was not read from "
@@ -20025,6 +20052,7 @@ public:
             Common::GpuTiming::Sync().Snapshot().Since(before_store);
         bool stored_clean = false;
         gpu.SendCommandSync([&] {
+          BufferCacheTestAccess::DrainPublished(cache); // a guest thread's copy
           stored_clean = !cache.HasGpuDirtyBytes(region + 0x4000, 0x1000);
         });
         uint32_t stored = 0;
@@ -20035,10 +20063,11 @@ public:
                 "a store did not read back the GPU's bytes of its page");
         if (host_readable) {
           // Read in place: the counter has the bytes the store's readback took.
-          const auto read = store_counts.in_place_bytes;
+          const auto read =
+              store_counts.in_place_bytes + store_counts.guest_copy_bytes;
           Require(
               name, narrow ? "narrow store readback" : "store readback window",
-              store_counts.in_place == 1 &&
+              store_counts.in_place + store_counts.guest_copies == 1 &&
                   (narrow ? read == 0x1000 : read > 0x1000),
               (narrow
                    ? "a store read back GPU-written pages beside its own ("
@@ -20047,6 +20076,71 @@ public:
         }
         std::thread rest([&] { cache.ReadMemory(region, 0x10000); });
         rest.join();
+      }
+      if (host_readable) {
+        // A guest thread that waits for a readback copies the bytes from the
+        // mapping itself when their write is submitted: a read and a store.
+        Config::ConfigOptions guest_options;
+        guest_options.printf_direction = Config::LogDirection::Silent;
+        guest_options.lazy_bda_sync = TestLazyBdaSync();
+        guest_options.in_place_readbacks = Config::InPlaceReadbacks::On;
+        guest_options.guest_thread_readbacks = true;
+        Config::Load(guest_options);
+        for (const bool store : {false, true}) {
+          const uint32_t value = store ? 0x88888888u : 0x87878787u;
+          // Pages no readback touched before (hot pages download on their own).
+          const uint64_t copied = base + (store ? 0x90000 : 0x80000);
+          gpu.SendCommandSync([&] {
+            CommandProcessor processor(context, 0);
+            processor.BufferInit();
+            auto [buffer, offset] = cache.ObtainBuffer(copied, 0x10000, true);
+            buffer->Fill(offset, 0x10000, value);
+            scheduler.Flush();
+          });
+          gpu.SendCommandSync([&] {
+            // Later work: the fill's write tick is submitted once this begins.
+            CommandProcessor processor(context, 0);
+            processor.BufferInit();
+            auto [buffer, offset] =
+                cache.ObtainBuffer(base + 0xf8000, bytes, true);
+            buffer->Fill(offset, bytes, value);
+            scheduler.Flush();
+          });
+          const auto before_guest = Common::GpuTiming::Sync().Snapshot();
+          std::thread guest([&] {
+            if (store) {
+              cache.InvalidateMemory(copied + 0x4000, 4, true);
+            } else {
+              cache.ReadMemory(copied, bytes);
+            }
+          });
+          guest.join();
+          const auto guest_counts =
+              Common::GpuTiming::Sync().Snapshot().Since(before_guest);
+          bool clean = false;
+          gpu.SendCommandSync([&] {
+            // The GPU thread takes the copy's publications at its next
+            // readback.
+            BufferCacheTestAccess::DrainPublished(cache);
+            clean = !cache.HasGpuDirtyBytes(store ? copied + 0x4000 : copied,
+                                            store ? 0x1000 : bytes);
+          });
+          uint32_t read = 0;
+          Require(
+              name,
+              store ? "guest-thread store copy" : "guest-thread read copy",
+              guest_counts.guest_copies == 1 && guest_counts.in_place == 0 &&
+                  guest_counts.guest_copy_bytes != 0 &&
+                  LibKernel::Memory::TryReadBacking(
+                      (store ? copied + 0x4000 : copied) + 4, &read,
+                      sizeof(read)) &&
+                  read == value && clean,
+              "a waiting guest thread did not copy the GPU's bytes itself (" +
+                  std::to_string(guest_counts.guest_copies) + " copies, " +
+                  std::to_string(guest_counts.in_place) + " in place)");
+          std::thread rest([&] { cache.ReadMemory(copied, 0x10000); });
+          rest.join();
+        }
       }
       LoadTestConfig({});
       std::thread open_reader([&] { cache.ReadMemory(pending, bytes); });

@@ -124,6 +124,10 @@ struct ConfigOptions {
 	// Readbacks for stores and resource walks take only the tracker pages they ask for
 	// (--narrow-readbacks; off: the 512 KiB window guest read faults take).
 	bool narrow_readbacks = false;
+	// A guest thread waiting for a readback copies the bytes from the buffer's mapping itself
+	// when the GPU thread has nothing to record for it (--guest-thread-readbacks; off: the GPU
+	// thread serves every request).
+	bool guest_thread_readbacks = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -226,6 +230,7 @@ bool     SelectionFeedbackEnabled();
 bool     GpuCheckpointsEnabled();
 bool     LazyBdaSyncEnabled();
 bool                  NarrowReadbacksEnabled();
+bool                  GuestThreadReadbacksEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();

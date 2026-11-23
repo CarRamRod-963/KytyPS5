@@ -307,6 +307,32 @@ private:
 	void                  NoteOpenWrite(Buffer& buffer, BufferId id);
 	std::vector<BufferId> m_open_writes;
 
+	// The part of a guest thread's readback that the thread makes itself (RunGuestCopy): it is
+	// waiting for the bytes anyway, and the GPU thread, which every draw goes through, only says
+	// what to copy. The bytes go from the buffer's mapping into guest memory the way an
+	// asynchronous download is published (MemoryTracker::PublishGpuModified, then m_published):
+	// under the tracking region's lock, and only while `current` holds.
+	struct GuestCopy {
+		struct Interval {
+			uint64_t address;
+			uint64_t size;
+		};
+		// Cleared by the GPU thread before it records a GPU write over the window (NoteGpuWrite):
+		// pages not published by then stay GPU-dirty and the requester asks again.
+		std::atomic<bool> current {true};
+		std::atomic<bool> finished {false};
+		// The buffer whose mapping holds the bytes (its deletion waits for the copy); null when
+		// the requester only waits for submitted downloads to publish the bytes.
+		Buffer*  buffer = nullptr;
+		BufferId buffer_id {};
+		uint64_t buffer_address = 0;
+		uint64_t base           = 0;
+		uint64_t size           = 0;
+		// A submitted tick: the buffer's latest GPU write, or the downloads. The wait cannot
+		// depend on the GPU thread, which may be blocked on the guest.
+		uint64_t              wait_tick = 0;
+		std::vector<Interval> intervals; // The window's GPU-dirty bytes, ascending.
+	};
 	// A synchronous readback a guest thread waits for. Requests that arrive together (guest
 	// threads faulting at once) share one submission and one wait on the GPU thread.
 	struct GuestReadback {
@@ -316,11 +342,26 @@ private:
 		uint64_t                      size; // The window for Around.
 		Common::GpuTiming::SyncReason reason;
 		std::binary_semaphore*        done;
+		// Where the GPU thread may leave the rest of the request to the requester; null: it
+		// serves all of it.
+		std::shared_ptr<GuestCopy>* handoff = nullptr;
 	};
-	void                       RequestGuestReadback(const GuestReadback& request);
-	void                       ServeGuestReadbacks(std::span<const GuestReadback> requests);
-	std::mutex                 m_guest_readbacks_mutex;
-	std::vector<GuestReadback> m_guest_readbacks;
+	void RequestGuestReadback(const GuestReadback& request);
+	// A guest thread: queues the request and returns once the GPU thread served or handed it.
+	void QueueGuestReadback(const GuestReadback& request, std::shared_ptr<GuestCopy>* handoff);
+	void ServeGuestReadbacks(std::span<const GuestReadback> requests);
+	// GPU thread: leaves the request's window [base, base + size) of the buffer to its requester
+	// when that needs no GPU work recorded here (the bytes are in the mapping and their last
+	// write is submitted, or downloads of them are). False, nothing done, otherwise.
+	[[nodiscard]] bool HandOffGuestCopy(const GuestReadback& request, Buffer& buffer, BufferId id,
+	                                    uint64_t base, uint64_t size);
+	// The requester's part.
+	void RunGuestCopy(GuestCopy& copy);
+	// GPU thread: returns once no handed-over copy reads the buffer any more.
+	void                                    WaitGuestCopies(BufferId id);
+	std::mutex                              m_guest_readbacks_mutex;
+	std::vector<GuestReadback>              m_guest_readbacks;
+	std::vector<std::shared_ptr<GuestCopy>> m_guest_copies; // Handed over, maybe unfinished.
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -360,6 +401,8 @@ private:
 	// submitted, still valid asynchronous download waits for those downloads to publish
 	// instead of submitting a copy of its own and waiting for the whole GPU tail.
 	void                        AwaitSubmittedDownloads(uint64_t vaddr, uint64_t size);
+	// The submission those downloads complete with; 0 when the range is not covered by them.
+	[[nodiscard]] uint64_t      SubmittedDownloadTick(uint64_t vaddr, uint64_t size);
 	std::vector<uint64_t>       m_keep_readable;
 	std::vector<uint64_t>       m_make_unreadable;
 	// SynchronizeBda's scratch: the taken ranges, the buffer parts to synchronize, their buffers,
@@ -388,6 +431,8 @@ private:
 	};
 	std::mutex             m_published_mutex;
 	std::vector<Published> m_published;
+	// Whether m_published holds anything: DrainPublished asks this before it takes the lock.
+	std::atomic<bool> m_published_pending {false};
 	struct WatchedRange {
 		uint64_t address;
 		uint64_t size;
