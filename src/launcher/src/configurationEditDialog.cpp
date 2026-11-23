@@ -316,6 +316,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_emulate_wave64->setChecked(info.emulate_wave64);
 	m_ui->checkBox_no_async_pipelines->setChecked(info.no_async_pipelines);
 	ListInit(m_ui->comboBox_maximal_reconvergence, info.maximal_reconvergence);
+	ListInit(m_ui->comboBox_in_place_readbacks, info.in_place_readbacks);
 	m_ui->checkBox_no_shader_simplification->setChecked(info.no_shader_simplification);
 	m_ui->checkBox_no_selection_feedback->setChecked(info.no_selection_feedback);
 	m_ui->checkBox_lazy_bda_sync->setChecked(info.lazy_bda_sync);
@@ -578,6 +579,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.no_async_pipelines        = ui.checkBox_no_async_pipelines->isChecked();
 	info.maximal_reconvergence     = TextToEnum<Configuration::MaximalReconvergence>(
 	    ui.comboBox_maximal_reconvergence->currentText());
+	info.in_place_readbacks =
+	    TextToEnum<Configuration::InPlaceReadbacks>(ui.comboBox_in_place_readbacks->currentText());
 	info.no_shader_simplification  = ui.checkBox_no_shader_simplification->isChecked();
 	info.no_selection_feedback     = ui.checkBox_no_selection_feedback->isChecked();
 	info.lazy_bda_sync             = ui.checkBox_lazy_bda_sync->isChecked();

@@ -93,6 +93,9 @@ public:
 	enum class MaximalReconvergence { Auto, On, Off };
 	Q_ENUM(MaximalReconvergence)
 
+	enum class InPlaceReadbacks { Auto, On, Off };
+	Q_ENUM(InPlaceReadbacks)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -141,6 +144,7 @@ public:
 	bool                   emulate_wave64              = false;
 	bool                   no_async_pipelines          = false;
 	MaximalReconvergence   maximal_reconvergence       = MaximalReconvergence::Auto;
+	InPlaceReadbacks       in_place_readbacks          = InPlaceReadbacks::Auto;
 	bool                   no_shader_simplification    = false;
 	bool                   no_selection_feedback       = false;
 	bool                   lazy_bda_sync               = true;
@@ -200,6 +204,7 @@ public:
 		emulate_wave64              = other.emulate_wave64;
 		no_async_pipelines          = other.no_async_pipelines;
 		maximal_reconvergence       = other.maximal_reconvergence;
+		in_place_readbacks          = other.in_place_readbacks;
 		no_shader_simplification    = other.no_shader_simplification;
 		no_selection_feedback       = other.no_selection_feedback;
 		lazy_bda_sync               = other.lazy_bda_sync;

@@ -34,6 +34,10 @@ enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
 // --maximal-reconvergence: Auto requests it except on drivers whose compiler mishandles it.
 enum class MaximalReconvergence { Auto, On, Off };
 
+// --in-place-readbacks: Auto reads GPU-written bytes through host-readable device memory only up
+// to the size where that is faster than a GPU copy on this host (measured at startup).
+enum class InPlaceReadbacks { Auto, On, Off };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -133,6 +137,7 @@ struct ConfigOptions {
 	bool                   relaxed_shader_float        = false;
 	bool                   emulate_wave64                  = false;
 	MaximalReconvergence   maximal_reconvergence           = MaximalReconvergence::Auto;
+	InPlaceReadbacks       in_place_readbacks              = InPlaceReadbacks::Auto;
 	bool                   no_shader_simplification        = false;
 	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;
@@ -233,6 +238,7 @@ bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 bool                  EmulateWave64Enabled();
 MaximalReconvergence  GetMaximalReconvergence();
+InPlaceReadbacks      GetInPlaceReadbacks();
 bool                  ShaderSimplificationDisabled();
 bool NativeRtEnabled();
 bool LodStatsEnabled();

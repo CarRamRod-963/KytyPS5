@@ -897,6 +897,11 @@ add_executable(subgroup_plan_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(subgroup_plan_tests PRIVATE ${inc_headers})
 
+add_executable(in_place_readbacks_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/InPlaceReadbacksTests.cpp"
+)
+target_include_directories(in_place_readbacks_tests PRIVATE ${inc_headers})
+
 add_executable(device_fault_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DeviceFaultTests.cpp"
 )
@@ -1081,6 +1086,13 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --lazy-bda-sync)
 	add_test(NAME emulator_occlusion_queries_on
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --occlusion-queries)
+	add_test(NAME emulator_in_place_readbacks_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --in-place-readbacks off)
+	add_test(NAME emulator_in_place_readbacks_alias
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-in-place-readbacks)
+	add_test(NAME emulator_in_place_readbacks_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --in-place-readbacks sometimes)
+	set_tests_properties(emulator_in_place_readbacks_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -1104,6 +1116,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME subgroup_plan COMMAND $<TARGET_FILE:subgroup_plan_tests>)
+	add_test(NAME in_place_readbacks COMMAND $<TARGET_FILE:in_place_readbacks_tests>)
 	add_test(NAME device_fault COMMAND $<TARGET_FILE:device_fault_tests>)
 	add_test(NAME command_log COMMAND $<TARGET_FILE:command_log_tests>)
 	add_test(NAME candidate_selection COMMAND $<TARGET_FILE:candidate_selection_tests>)
@@ -1266,6 +1279,7 @@ if(BUILD_TESTING)
 		pending_draw_policy_tests
 		memory_priority_tests
 		subgroup_plan_tests
+		in_place_readbacks_tests
 		device_fault_tests
 		command_log_tests
 		candidate_selection_tests

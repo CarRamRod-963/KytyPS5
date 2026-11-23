@@ -233,6 +233,15 @@ struct BufferCacheTestAccess {
     return cache.m_lru_cache.IsConsistent();
   }
 
+  static uint64_t &InPlaceLimit(BufferCache &cache) {
+    return cache.m_in_place_limit;
+  }
+
+  static std::vector<Libs::Graphics::InPlaceReadbacks::Sample>
+  MeasureReadbacks(BufferCache &cache) {
+    return cache.MeasureReadbacks();
+  }
+
   // Serves a readback on the calling thread, as the GPU thread would.
   static void ReadBack(BufferCache &cache, uint64_t address, uint64_t size) {
     const BufferCache::GuestReadback request{
@@ -1389,6 +1398,9 @@ bool TestLazyBdaSync() {
 
 void LoadTestConfig(Config::ConfigOptions options) {
   options.lazy_bda_sync = TestLazyBdaSync();
+  // No startup probe of the readback paths: a test's ticks start at its own
+  // commands (CheckSubmittedDownloadReadback runs the probe itself).
+  options.in_place_readbacks = Config::InPlaceReadbacks::On;
   Config::Load(options);
 }
 
@@ -20287,6 +20299,54 @@ public:
         std::printf("[gpu]     %-32s no host-readable device memory, in-place "
                     "readback not checked\n",
                     name);
+      }
+      if (host_readable) {
+        // The startup probe times both readback paths on a GPU-written
+        // host-readable buffer.
+        std::vector<Libs::Graphics::InPlaceReadbacks::Sample> samples;
+        gpu.SendCommandSync(
+            [&] { samples = BufferCacheTestAccess::MeasureReadbacks(cache); });
+        bool timed = samples.size() == 5 && samples.back().bytes == 512 * 1024;
+        for (const auto &sample : samples) {
+          timed = timed && sample.in_place_ns > 0 && sample.copy_ns > 0;
+        }
+        Require(name, "in-place readback probe", timed,
+                "the probe did not time both paths at every size (" +
+                    std::to_string(samples.size()) + " sizes)");
+
+        // With in-place readbacks off (a limit of 0) the same read is a GPU
+        // copy and still delivers the bytes.
+        // Pages no readback touched before (hot pages download on their own).
+        constexpr uint64_t off_region = base + 0xb0000;
+        gpu.SendCommandSync([&] {
+          CommandProcessor processor(context, 0);
+          processor.BufferInit();
+          auto [buffer, offset] = cache.ObtainBuffer(off_region, 0x10000, true);
+          buffer->Fill(offset, 0x10000, 0x84848484u);
+          scheduler.Flush();
+          BufferCacheTestAccess::InPlaceLimit(cache) = 0;
+        });
+        gpu.SendCommandSync([&] {
+          // Later work: the fill's write tick is submitted once this begins.
+          CommandProcessor processor(context, 0);
+          processor.BufferInit();
+          auto [buffer, offset] =
+              cache.ObtainBuffer(base + 0xf8000, bytes, true);
+          buffer->Fill(offset, bytes, 0x84848484u);
+          scheduler.Flush();
+        });
+        const auto before_off = Common::GpuTiming::Sync().Snapshot();
+        std::thread off_reader([&] { cache.ReadMemory(off_region, bytes); });
+        off_reader.join();
+        const auto off_counts =
+            Common::GpuTiming::Sync().Snapshot().Since(before_off);
+        gpu.SendCommandSync(
+            [&] { BufferCacheTestAccess::InPlaceLimit(cache) = 512 * 1024; });
+        Require(name, "in-place readbacks off",
+                off_counts.in_place == 0 && value_at(off_region) == 0x84848484u,
+                "with in-place readbacks off a readback read the mapping or "
+                "lost the GPU's bytes (" +
+                    std::to_string(off_counts.in_place) + " in place)");
       }
       std::thread open_reader([&] { cache.ReadMemory(pending, bytes); });
       open_reader.join();

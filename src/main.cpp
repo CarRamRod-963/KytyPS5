@@ -143,6 +143,13 @@ static void PrintUsage() {
 	    "                                       for it except on AMD's LLPC drivers. Default: "
 	    "Auto.\n"
 	    "  --no-maximal-reconvergence           Same as --maximal-reconvergence Off.\n");
+	::printf(
+	    "  --in-place-readbacks <value>         Auto, On, or Off: read GPU-written bytes back\n"
+	    "                                       through the GPU's host-visible memory instead of\n"
+	    "                                       a GPU copy. Auto measures both at startup and\n"
+	    "                                       reads in place up to the size where that is\n"
+	    "                                       faster. Default: Auto.\n"
+	    "  --no-in-place-readbacks              Same as --in-place-readbacks Off.\n");
 	::printf("  --no-shader-simplification           Give the GPU driver shaders without the\n"
 	         "                                       driver simplification pass. Default: off.\n");
 	::printf("  --native-rt                         Use native RT on the GPU.\n");
@@ -399,6 +406,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--no-in-place-readbacks") {
+			options.config.in_place_readbacks = Config::InPlaceReadbacks::Off;
+			continue;
+		}
+
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
 			return false;
@@ -544,6 +556,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--maximal-reconvergence") {
 			if (!ParseEnum(value, options.config.maximal_reconvergence)) {
 				::printf("invalid maximal reconvergence: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--in-place-readbacks") {
+			if (!ParseEnum(value, options.config.in_place_readbacks)) {
+				::printf("invalid in-place readbacks: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--pssr-upscaler") {

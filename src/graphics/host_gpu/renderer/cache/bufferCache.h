@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/inPlaceReadbacks.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -208,6 +209,16 @@ public:
 	void               RunGarbageCollector();
 	// Derives the collection marks from the current device memory budget.
 	void UpdateGcMarks();
+	// Times reads of host-readable device memory against GPU copies (--in-place-readbacks Auto),
+	// sets the largest readback read in place and logs both. ServeGuestReadbacks runs it before
+	// the session's first readback (it needs the scheduler a command processor began) and, while
+	// the probe finds no host-readable memory for its buffer, again every InPlaceProbeSpacing
+	// readbacks, at most InPlaceProbeAttempts times; until then nothing is read in place.
+	void                      ProbeInPlaceReadbacks();
+	static constexpr uint32_t InPlaceProbeAttempts   = 8;
+	static constexpr uint32_t InPlaceProbeSpacing    = 256;
+	uint32_t                  m_in_place_probes_left = InPlaceProbeAttempts;
+	uint32_t                  m_in_place_probe_wait  = 0;
 	// Called before every submission on the GPU thread: records downloads of the hot read-back
 	// pages the GPU wrote since the last submission, published into guest memory when the
 	// submission completes, so the guest finds them clean instead of faulting into a
@@ -299,9 +310,12 @@ private:
 	// mapping into guest memory, after waiting only for the submission that holds the buffer's
 	// latest GPU write (not for the work queued behind it). Returns false, doing nothing, when
 	// the buffer is not host-readable, the write may still be recorded into an open command
-	// buffer, or the dirty bytes exceed MaxInPlaceReadback.
+	// buffer, or the dirty bytes exceed m_in_place_limit.
 	[[nodiscard]] bool        ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	static constexpr uint64_t MaxInPlaceReadback = uint64_t {512} << 10u;
+	// The largest readback read in place (ProbeInPlaceReadbacks); 0 = none.
+	uint64_t                                            m_in_place_limit = MaxInPlaceReadback;
+	[[nodiscard]] std::vector<InPlaceReadbacks::Sample> MeasureReadbacks();
 	std::vector<uint8_t>      m_in_place_scratch;
 	// A GPU write of the buffer is being prepared; NoteCommandBoundary assigns it its tick.
 	void                  NoteOpenWrite(Buffer& buffer, BufferId id);
