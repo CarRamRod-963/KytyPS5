@@ -106,6 +106,10 @@ void SyncCounts::Merge(const SyncCounts& other) noexcept {
 	in_place += other.in_place;
 	in_place_bytes += other.in_place_bytes;
 	in_place_ns += other.in_place_ns;
+	guest_copies += other.guest_copies;
+	guest_copy_bytes += other.guest_copy_bytes;
+	guest_copy_ns += other.guest_copy_ns;
+	guest_copy_again += other.guest_copy_again;
 	async_deferred += other.async_deferred;
 	labels_direct += other.labels_direct;
 	labels_gpu_thread += other.labels_gpu_thread;
@@ -137,6 +141,10 @@ SyncCounts SyncCounts::Since(const SyncCounts& earlier) const noexcept {
 	delta.in_place          = in_place - earlier.in_place;
 	delta.in_place_bytes    = in_place_bytes - earlier.in_place_bytes;
 	delta.in_place_ns       = in_place_ns - earlier.in_place_ns;
+	delta.guest_copies      = guest_copies - earlier.guest_copies;
+	delta.guest_copy_bytes  = guest_copy_bytes - earlier.guest_copy_bytes;
+	delta.guest_copy_ns     = guest_copy_ns - earlier.guest_copy_ns;
+	delta.guest_copy_again  = guest_copy_again - earlier.guest_copy_again;
 	delta.async_deferred    = async_deferred - earlier.async_deferred;
 	delta.labels_direct     = labels_direct - earlier.labels_direct;
 	delta.labels_gpu_thread = labels_gpu_thread - earlier.labels_gpu_thread;
@@ -194,6 +202,10 @@ SyncCounts SyncCounters::Snapshot() const noexcept {
 	counts.in_place          = m_in_place.load(std::memory_order_relaxed);
 	counts.in_place_bytes    = m_in_place_bytes.load(std::memory_order_relaxed);
 	counts.in_place_ns       = m_in_place_ns.load(std::memory_order_relaxed);
+	counts.guest_copies      = m_guest_copies.load(std::memory_order_relaxed);
+	counts.guest_copy_bytes  = m_guest_copy_bytes.load(std::memory_order_relaxed);
+	counts.guest_copy_ns     = m_guest_copy_ns.load(std::memory_order_relaxed);
+	counts.guest_copy_again  = m_guest_copy_again.load(std::memory_order_relaxed);
 	counts.async_deferred    = m_async_deferred.load(std::memory_order_relaxed);
 	counts.labels_direct     = m_labels_direct.load(std::memory_order_relaxed);
 	counts.labels_gpu_thread = m_labels_gpu_thread.load(std::memory_order_relaxed);
@@ -371,10 +383,11 @@ namespace {
 
 std::string SyncSuffix(const Summary& summary) {
 	const double scale = summary.seconds > 0.0 ? 1.0 / summary.seconds : 0.0;
-	char         tail[520];
+	char         tail[640];
 	std::snprintf(tail, sizeof(tail),
 	              ", empty flushes skipped %.0f/s, readbacks served by submitted downloads %.0f/s, "
-	              "read in place %.0f/s (%.0f KiB/s, %.1f ms/s), "
+	              "read in place %.0f/s (%.0f KiB/s, %.1f ms/s), copied by guest threads %.0f/s "
+	              "(%.0f KiB/s, %.1f ms/s, %.0f/s asked again), "
 	              "readbacks joined to another's submission %.0f/s, async download pages %.0f/s, "
 	              "skipped over cap %.0f/s, labels on completion %.0f/s, via the GPU thread %.0f/s",
 	              static_cast<double>(summary.sync.TotalSkipped()) * scale,
@@ -382,6 +395,10 @@ std::string SyncSuffix(const Summary& summary) {
 	              static_cast<double>(summary.sync.in_place) * scale,
 	              static_cast<double>(summary.sync.in_place_bytes) / 1024.0 * scale,
 	              static_cast<double>(summary.sync.in_place_ns) / 1e6 * scale,
+	              static_cast<double>(summary.sync.guest_copies) * scale,
+	              static_cast<double>(summary.sync.guest_copy_bytes) / 1024.0 * scale,
+	              static_cast<double>(summary.sync.guest_copy_ns) / 1e6 * scale,
+	              static_cast<double>(summary.sync.guest_copy_again) * scale,
 	              static_cast<double>(summary.sync.TotalJoined()) * scale,
 	              static_cast<double>(summary.sync.async_pages) * scale,
 	              static_cast<double>(summary.sync.async_deferred) * scale,

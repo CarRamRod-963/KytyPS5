@@ -1090,6 +1090,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-narrow-readbacks)
 	add_test(NAME emulator_narrow_readbacks_on
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --narrow-readbacks)
+	add_test(NAME emulator_guest_thread_readbacks_off
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-guest-thread-readbacks)
+	add_test(NAME emulator_guest_thread_readbacks_on
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --guest-thread-readbacks)
 	add_test(NAME emulator_in_place_readbacks_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --in-place-readbacks off)
 	add_test(NAME emulator_in_place_readbacks_alias

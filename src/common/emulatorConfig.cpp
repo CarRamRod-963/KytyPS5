@@ -293,6 +293,10 @@ bool NarrowReadbacksEnabled() {
 	return g_config->narrow_readbacks;
 }
 
+bool GuestThreadReadbacksEnabled() {
+	return g_config->guest_thread_readbacks;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

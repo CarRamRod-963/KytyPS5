@@ -118,6 +118,12 @@ struct SyncCounts {
 	uint64_t in_place       = 0;
 	uint64_t in_place_bytes = 0;
 	uint64_t in_place_ns    = 0;
+	// Readbacks a waiting guest thread copied itself from a mapping (BufferCache::GuestCopy),
+	// their bytes and copy time, and the ones asked again because a GPU write came between.
+	uint64_t guest_copies     = 0;
+	uint64_t guest_copy_bytes = 0;
+	uint64_t guest_copy_ns    = 0;
+	uint64_t guest_copy_again = 0;
 	// End-of-pipe labels written by the completion thread, and labels it handed to the GPU
 	// thread (watched pages, or behind such a label).
 	uint64_t labels_direct     = 0;
@@ -167,6 +173,15 @@ public:
 		m_in_place.fetch_add(1, std::memory_order_relaxed);
 		m_in_place_bytes.fetch_add(bytes, std::memory_order_relaxed);
 		m_in_place_ns.fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0), std::memory_order_relaxed);
+	}
+	void AddGuestCopy(uint64_t bytes, int64_t ns) noexcept {
+		m_guest_copies.fetch_add(1, std::memory_order_relaxed);
+		m_guest_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		m_guest_copy_ns.fetch_add(static_cast<uint64_t>(ns > 0 ? ns : 0),
+		                          std::memory_order_relaxed);
+	}
+	void AddGuestCopyAgain() noexcept {
+		m_guest_copy_again.fetch_add(1, std::memory_order_relaxed);
 	}
 	void AddJoinedReadback(SyncReason reason) noexcept {
 		m_joined[Index(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -221,6 +236,10 @@ private:
 	std::atomic<uint64_t>                                 m_in_place_bytes {};
 	std::atomic<uint64_t>                                 m_in_place_ns {};
 	std::atomic<uint64_t>                                m_async_deferred {};
+	std::atomic<uint64_t>                                 m_guest_copies {};
+	std::atomic<uint64_t>                                 m_guest_copy_bytes {};
+	std::atomic<uint64_t>                                 m_guest_copy_ns {};
+	std::atomic<uint64_t>                                 m_guest_copy_again {};
 	std::atomic<uint64_t>                                m_labels_direct {};
 	std::atomic<uint64_t>                                m_labels_gpu_thread {};
 	std::array<std::atomic<uint64_t>, BARRIER_KIND_COUNT> m_barriers {};
