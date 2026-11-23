@@ -615,6 +615,248 @@ void TestWindowsGuestRedZoneFunctionCopy() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Switches whose bound check the jump-table resolver must see through: the index reaches the table
+// load through a zero-extending move, the bounds branch does not follow the comparison directly, or
+// an AND bounds it. A resolved table keeps the cases in the copy; an unresolved one leaves it for
+// the original code, where a fault destroys the red zone. Index moves that may carry bits the
+// comparison did not check must not count as bounded.
+void TestWindowsGuestRedZoneJumpTableBounds() {
+	const char*        test            = "WindowsGuestRedZoneJumpTableBounds";
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	constexpr size_t   CASES           = 4;
+	enum : uint64_t {
+		ZeroExtend = 0x000, // cmp ecx, 3; ja; mov ecx, ecx
+		Narrow     = 0x100, // cmp al, 3; mov rdx, rdi; ja; movzx eax, al; load and add apart
+		Mask       = 0x200, // and eax, 3
+		WideMove   = 0x300, // cmp cl, 3; ja; movzx ecx, cx: bits 8-15 are not bounded
+		WideCopy   = 0x400, // cmp ecx, 3; ja; mov rax, rcx: bits 32-63 are not bounded
+		Flags      = 0x500, // cmp ecx, 3; test ecx, ecx; ja: the branch tests other flags
+		ByteMask   = 0x600, // and al, 3: bits 8-31 are not bounded
+		HighByte   = 0x700, // cmp al, 3; ja; movzx eax, ah: another byte than the compared one
+		CodeEnd    = 0x800,
+		Tables     = 0xd00, // one table of CASES entries per function, in that order
+	};
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x000000090a000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_jump_table_test");
+	Check(test, mapping != 0, "failed to allocate test code");
+	std::memset(reinterpret_cast<void*>(mapping), 0xcc, CODE_SIZE);
+	const auto at = [&](uint64_t offset) { return reinterpret_cast<uint8_t*>(mapping + offset); };
+
+	g_red_zone_clobber_page =
+	    VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_clobber_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneClobberHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	using Xbyak::CodeGenerator;
+	const std::array<uint64_t, 8> functions = {ZeroExtend, Narrow, Mask,     WideMove,
+	                                            WideCopy,   Flags,  ByteMask, HighByte};
+	// Each function keeps its argument at [rsp - 16], dispatches on an index derived from it and
+	// returns the kept argument plus the case number after a faulting load.
+	const auto make = [&](size_t number, auto&& dispatch) {
+		const uint64_t table = Tables + number * CASES * sizeof(int32_t);
+		CodeGenerator  c(0x100, at(functions[number]));
+		std::array<Xbyak::Label, CASES> cases;
+		Xbyak::Label                    other;
+		c.mov(c.qword[c.rsp - 16], c.rsi);
+		const auto lea_table = [&] {
+			// lea r9, [rip + table]
+			const auto lea_end = reinterpret_cast<intptr_t>(c.getCurr()) + 7;
+			c.db(0x4c);
+			c.db(0x8d);
+			c.db(0x0d);
+			c.dd(static_cast<uint32_t>(
+			    static_cast<int32_t>(static_cast<intptr_t>(mapping + table) - lea_end)));
+		};
+		dispatch(c, other, lea_table);
+		for (size_t index = 0; index < CASES; ++index) {
+			c.L(cases[index]);
+			c.mov(c.rcx, c.ptr[c.rdi]); // faults
+			c.mov(c.rax, c.qword[c.rsp - 16]);
+			c.add(c.rax, static_cast<uint32_t>(index));
+			c.ret();
+		}
+		c.L(other);
+		c.xor_(c.eax, c.eax);
+		c.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate jump-table fixture");
+		for (size_t index = 0; index < CASES; ++index) {
+			const auto offset = static_cast<int32_t>(
+			    reinterpret_cast<intptr_t>(cases[index].getAddress()) -
+			    static_cast<intptr_t>(mapping + table));
+			std::memcpy(at(table) + index * sizeof(offset), &offset, sizeof(offset));
+		}
+	};
+	make(0, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.movzx(c.ecx, c.sil);
+		c.sub(c.ecx, 0x41);
+		c.cmp(c.ecx, 3);
+		c.ja(other, CodeGenerator::T_NEAR);
+		c.mov(c.ecx, c.ecx);
+		lea_table();
+		c.movsxd(c.rcx, c.dword[c.r9 + c.rcx * 4]);
+		c.add(c.rcx, c.r9);
+		c.jmp(c.rcx);
+	});
+	make(1, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.mov(c.eax, c.esi);
+		c.sub(c.al, 0x41);
+		c.cmp(c.al, 3);
+		c.mov(c.rdx, c.rdi); // keeps the flags
+		c.ja(other, CodeGenerator::T_NEAR);
+		c.movzx(c.eax, c.al);
+		lea_table();
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.mov(c.rdi, c.rdx);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+	});
+	make(2, [](CodeGenerator& c, Xbyak::Label&, auto&& lea_table) {
+		c.mov(c.eax, c.esi);
+		c.and_(c.eax, 3);
+		lea_table();
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+	});
+	make(3, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.mov(c.ecx, c.esi);
+		c.sub(c.cl, 0x41);
+		c.cmp(c.cl, 3);
+		c.ja(other, CodeGenerator::T_NEAR);
+		c.movzx(c.ecx, c.cx);
+		lea_table();
+		c.movsxd(c.rcx, c.dword[c.r9 + c.rcx * 4]);
+		c.add(c.rcx, c.r9);
+		c.jmp(c.rcx);
+	});
+	make(4, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.mov(c.ecx, c.esi);
+		c.sub(c.ecx, 0x41);
+		c.cmp(c.ecx, 3);
+		c.ja(other, CodeGenerator::T_NEAR);
+		c.mov(c.rax, c.rcx);
+		lea_table();
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+	});
+	make(5, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.mov(c.ecx, c.esi);
+		c.sub(c.ecx, 0x41);
+		c.cmp(c.ecx, 3);
+		c.test(c.ecx, c.ecx);
+		c.ja(other, CodeGenerator::T_NEAR);
+		lea_table();
+		c.movsxd(c.rcx, c.dword[c.r9 + c.rcx * 4]);
+		c.add(c.rcx, c.r9);
+		c.jmp(c.rcx);
+	});
+	make(6, [](CodeGenerator& c, Xbyak::Label&, auto&& lea_table) {
+		c.mov(c.eax, c.esi);
+		c.and_(c.al, 3);
+		lea_table();
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+	});
+	make(7, [](CodeGenerator& c, Xbyak::Label& other, auto&& lea_table) {
+		c.mov(c.eax, c.esi);
+		c.sub(c.al, 0x41);
+		c.cmp(c.al, 3);
+		c.ja(other, CodeGenerator::T_NEAR);
+		c.movzx(c.eax, c.ah);
+		lea_table();
+		c.movsxd(c.rax, c.dword[c.r9 + c.rax * 4]);
+		c.add(c.rax, c.r9);
+		c.jmp(c.rax);
+	});
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush generated test code");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(void*, uint64_t);
+	const auto call     = [&](uint64_t offset, uint64_t argument, bool fault) {
+		DWORD old_protection = 0;
+		Check(test,
+		      VirtualProtect(g_red_zone_clobber_page, 0x1000, fault ? PAGE_NOACCESS : PAGE_READWRITE,
+		                     &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return reinterpret_cast<GuestFunction>(mapping + offset)(g_red_zone_clobber_page, argument);
+	};
+	struct Case {
+		const char* name;
+		uint64_t    offset;
+		uint64_t    argument;
+		uint64_t    expected;
+		bool        bounded;
+	};
+	const std::array<Case, 8> cases = {{
+	    {"zero-extending move", ZeroExtend, 0x43, 0x45, true},
+	    {"narrow compare", Narrow, 0x42, 0x43, true},
+	    {"and mask", Mask, 0x41, 0x42, true},
+	    {"wider movzx", WideMove, 0x43, 0x45, false},
+	    {"wider copy", WideCopy, 0x43, 0x45, false},
+	    {"flags written", Flags, 0x41, 0x41, false},
+	    {"byte mask", ByteMask, 0x41, 0x42, false},
+	    {"high byte", HighByte, 0x42, 0x42, false},
+	}};
+	bool reproduced = true;
+	for (const auto& entry: cases) {
+		const uint64_t value = call(entry.offset, entry.argument, true);
+		std::printf("[host]    jump table %-22s unpatched=%llx\n", entry.name,
+		            static_cast<unsigned long long>(value));
+		reproduced &= value != entry.expected;
+	}
+
+	std::array<uintptr_t, functions.size()> function_starts {};
+	for (size_t index = 0; index < functions.size(); ++index) {
+		function_starts[index] = mapping + functions[index];
+	}
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
+	                                            reinterpret_cast<void*>(mapping + CODE_SIZE),
+	                                            TRAMPOLINE_SIZE);
+	const std::array<std::pair<uint64_t, uint64_t>, 1> data_ranges = {
+	    {{mapping + Tables, functions.size() * CASES * sizeof(int32_t)}}};
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, CodeEnd, function_starts, false, false, Loader::GetGuestInstructionHostFeatures(), 0,
+	    true, data_ranges);
+	std::printf("[host]    jump table copies candidates=%llu rewritten=%llu early=%llu\n",
+	            static_cast<unsigned long long>(result.red_zone_copy_candidate_count),
+	            static_cast<unsigned long long>(result.rewritten_function_count),
+	            static_cast<unsigned long long>(result.partially_rewritten_function_count));
+
+	bool preserved = true;
+	for (const auto& entry: cases) {
+		const uint64_t faulted   = call(entry.offset, entry.argument, true);
+		const uint64_t unfaulted = call(entry.offset, entry.argument, false);
+		const uint64_t outside   = call(entry.offset, 0x47, false);
+		std::printf("[host]    jump table %-22s patched=%llx without fault=%llx\n", entry.name,
+		            static_cast<unsigned long long>(faulted),
+		            static_cast<unsigned long long>(unfaulted));
+		preserved &= unfaulted == entry.expected &&
+		             outside == (entry.offset == Mask || entry.offset == ByteMask ? 0x47 + 3 : 0) &&
+		             (!entry.bounded || faulted == entry.expected);
+	}
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_clobber_page, 0, MEM_RELEASE);
+	g_red_zone_clobber_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, reproduced, "test handler did not reproduce red-zone corruption");
+	// All are copied; the five whose index is not bounded leave the copy at their jump.
+	Check(test,
+	      result.red_zone_copy_candidate_count == 8 && result.rewritten_function_count == 8 &&
+	          result.partially_rewritten_function_count == 5,
+	      "unexpected jump-table copy counts");
+	Check(test, preserved, "a switch lost its red zone or changed its result");
+	Check(test, freed, "failed to free test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 // Single-instruction red-zone patches (--redzone) of functions that cannot be copied must not
 // take the trampoline room of the function copies that follow them in the segment.
 void TestWindowsGuestRedZoneCopySpace() {
@@ -715,6 +957,10 @@ void TestWindowsGuestRedZoneCopySpace() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 #else
+void TestWindowsGuestRedZoneJumpTableBounds() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneJumpTableBounds");
+}
+
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
 }
@@ -6689,6 +6935,7 @@ int main(int argc, char** argv) {
 	}
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
+		RunTest(TestWindowsGuestRedZoneJumpTableBounds);
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		RunTest(TestWindowsGuestRedZoneFunctionCopy);
 		RunTest(TestWindowsGuestRedZoneCopySpace);
@@ -6707,6 +6954,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionPatches);
 	RunTest(TestTimeStampCounterPatches);
 #endif
+	RunTest(TestWindowsGuestRedZoneJumpTableBounds);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestWindowsGuestRedZoneFunctionCopy);
 	RunTest(TestWindowsGuestRedZoneCopySpace);

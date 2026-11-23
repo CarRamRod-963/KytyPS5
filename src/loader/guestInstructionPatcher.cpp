@@ -380,7 +380,18 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	}
 	const ZydisRegister table_reg = add->second.operands[1].reg.value;
 
-	const auto load = previous_contiguous(add);
+	// The compiler may schedule unrelated instructions between the load and the add.
+	auto load = previous_contiguous(add);
+	for (size_t count = 0;
+	     count < MaxInterveningInstructions && load != function.instructions.end() &&
+	     load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD;
+	     ++count) {
+		if (WritesRegister(load->second, target_reg) || WritesRegister(load->second, table_reg) ||
+		    IsControlFlowTerminator(load->second.instruction)) {
+			return std::nullopt;
+		}
+		load = previous_contiguous(load);
+	}
 	if (load == function.instructions.end() ||
 	    load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
 	    load->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
@@ -391,15 +402,44 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	    load->second.operands[1].mem.scale != sizeof(s32)) {
 		return std::nullopt;
 	}
-	const ZydisRegister index_reg = load->second.operands[1].mem.index;
+	// The bound is found by walking back from the load. The index may reach the load through
+	// moves that keep its value (MOV to a 32- or 64-bit register, MOVZX of a register): the walk
+	// then follows the source register. A copy keeps the bound only when it reads no bits above
+	// the compared ones, so the widest source must not exceed the comparison (and no high-byte
+	// register takes part).
+	const auto is_high_byte = [](ZydisRegister reg) {
+		return reg == ZYDIS_REGISTER_AH || reg == ZYDIS_REGISTER_BH || reg == ZYDIS_REGISTER_CH ||
+		       reg == ZYDIS_REGISTER_DH;
+	};
+	ZydisRegister index_reg          = load->second.operands[1].mem.index;
+	u16           widest_move_source = 0;
+	const auto    value_source =
+	    [&index_reg, &is_high_byte](
+	        const DecodedCodeInstruction& decoded) -> std::optional<std::pair<ZydisRegister, u16>> {
+		const auto& destination = decoded.operands[0];
+		const auto& source      = decoded.operands[1];
+		const auto  mnemonic    = decoded.instruction.mnemonic;
+		if ((mnemonic != ZYDIS_MNEMONIC_MOV && mnemonic != ZYDIS_MNEMONIC_MOVZX) ||
+		    decoded.instruction.operand_count_visible != 2 ||
+		    destination.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    !IsSameRegister(destination.reg.value, index_reg) || destination.size < 32 ||
+		    source.type != ZYDIS_OPERAND_TYPE_REGISTER || is_high_byte(source.reg.value)) {
+			return std::nullopt;
+		}
+		return std::pair {source.reg.value, source.size};
+	};
 
 	constexpr size_t         MaxPatternInstructions = 64;
+	constexpr size_t         MaxBoundBranchDistance = 4;
 	std::optional<size_t>    table_size;
 	std::optional<uintptr_t> guarded_path_start;
 	auto                     cursor = load;
 	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
 		cursor = previous_contiguous(cursor);
-		if (cursor == function.instructions.end()) {
+		// Code after a jump, return or trap is entered only by a branch: the bound must lie in
+		// the code that runs into the load.
+		if (cursor == function.instructions.end() ||
+		    IsControlFlowTerminator(cursor->second.instruction)) {
 			break;
 		}
 		const auto& decoded = cursor->second;
@@ -407,8 +447,28 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 		    IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+			if (widest_move_source > decoded.operands[0].size ||
+			    (widest_move_source != 0 && is_high_byte(decoded.operands[0].reg.value))) {
+				return std::nullopt;
+			}
+			// The branch that leaves for indices past the bound. Instructions that keep the
+			// flags may sit between it and the comparison.
 			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
-			const auto      bounds_branch = function.instructions.find(next_address);
+			auto            bounds_branch = function.instructions.find(next_address);
+			for (size_t distance = 0;
+			     bounds_branch != function.instructions.end() &&
+			     bounds_branch->second.instruction.meta.category != ZYDIS_CATEGORY_COND_BR;
+			     ++distance) {
+				const auto* flags = bounds_branch->second.instruction.cpu_flags;
+				if (distance == MaxBoundBranchDistance || flags == nullptr ||
+				    (flags->modified | flags->set_0 | flags->set_1 | flags->undefined) != 0 ||
+				    IsControlFlowTerminator(bounds_branch->second.instruction)) {
+					return std::nullopt;
+				}
+				const uintptr_t after =
+				    bounds_branch->first + bounds_branch->second.instruction.length;
+				bounds_branch = function.instructions.find(after);
+			}
 			if (bounds_branch == function.instructions.end()) {
 				return std::nullopt;
 			}
@@ -425,11 +485,33 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			} else {
 				return std::nullopt;
 			}
-			guarded_path_start = next_address + bounds_branch->second.instruction.length;
+			// A jump to an instruction after the comparison would bypass it.
+			guarded_path_start = next_address;
+			break;
+		}
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_AND &&
+		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
+		    decoded.operands[0].size >= 32 &&
+		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+			// A 32- or 64-bit AND with a non-negative mask bounds the whole register.
+			const s64 mask = decoded.operands[1].imm.is_signed
+			                     ? decoded.operands[1].imm.value.s
+			                     : static_cast<s64>(decoded.operands[1].imm.value.u);
+			if (mask < 0) {
+				return std::nullopt;
+			}
+			table_size         = static_cast<size_t>(mask) + 1;
+			guarded_path_start = decoded.address + decoded.instruction.length;
 			break;
 		}
 		if (WritesRegister(decoded, index_reg)) {
-			return std::nullopt;
+			const auto source = value_source(decoded);
+			if (!source) {
+				return std::nullopt;
+			}
+			index_reg          = source->first;
+			widest_move_source = std::max(widest_move_source, source->second);
 		}
 	}
 	if (!table_size) {
