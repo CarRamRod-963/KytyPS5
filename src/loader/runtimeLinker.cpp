@@ -682,12 +682,323 @@ static void AppendHostBacktrace(const Common::HostException::ExceptionInfo& info
 [[noreturn]] static void
 ReportUnhandledHostException(const Common::HostException::ExceptionInfo& exception_info);
 
+// Loaded guest modules for fault reports, which cannot take the linker's mutex.
+static GuestModuleMap g_guest_modules;
+// Guest threads, for the report of where the others were at a fatal fault.
+static GuestThreadRegistry g_guest_threads;
+// The faults this thread had resolved, for the report of a fatal fault that follows.
+static thread_local HandledFaultRing g_handled_faults;
+
+GuestThreadRegistry& GuestThreads() {
+	return g_guest_threads;
+}
+
+static uint64_t MonotonicNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+static void RecordHandledFault(const Common::HostException::ExceptionInfo& info,
+                               HandledFaultKind kind, uint64_t address) {
+	g_handled_faults.Record({.address = address,
+	                         .pc      = info.exception_address,
+	                         .rsp     = info.rsp,
+	                         .time_ns = MonotonicNs(),
+	                         .kind    = kind});
+}
+
+// Copies the 16-byte rows of [start, start + rows * 16) that can be read, without faulting even
+// when another thread changes a page's protection meanwhile, and returns the mask of rows read.
+static uint64_t CopyReadableRows(uint64_t start, uint8_t* out, size_t rows) {
+	uint64_t readable = 0;
+	for (size_t row = 0; row < rows && row < 64; row++) {
+		const uint64_t address = start + row * 16;
+		if (address < start || !IsReadableRange(address, 16)) {
+			continue;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		SIZE_T copied = 0;
+		if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+		                      out + row * 16, 16, &copied) == 0 ||
+		    copied != 16) {
+			continue;
+		}
+#else
+		std::memcpy(out + row * 16, reinterpret_cast<const void*>(address), 16);
+#endif
+		readable |= uint64_t {1} << row;
+	}
+	return readable;
+}
+
+static bool MayBePointer(uint64_t value) {
+	// Small integers and non-canonical values are no pointers.
+	return value >= 0x10000 && value <= 0x00007fffffffffffull;
+}
+
+// The window of `before` bytes below and `after` bytes from `value`, when any of it is readable.
+static GuestFaultMemory DumpAround(std::string_view name, uint64_t value, uint64_t before,
+                                   uint64_t after, uint8_t* buffer) {
+	GuestFaultMemory window;
+	window.name  = name;
+	window.value = value;
+	if (!MayBePointer(value) || value < before) {
+		return window;
+	}
+	window.start         = value - before;
+	const size_t rows    = static_cast<size_t>((before + after) / 16);
+	window.readable_rows = CopyReadableRows(window.start, buffer, rows);
+	window.bytes         = {buffer, rows * 16};
+	return window;
+}
+
+static bool WindowCovers(const GuestFaultMemory& window, uint64_t address) {
+	return window.readable_rows != 0 && address >= window.start &&
+	       address - window.start < window.bytes.size();
+}
+
+// The qword at `address` when a dump holds it.
+static bool ReadDumped(const GuestFaultMemory& window, uint64_t address, uint64_t* value) {
+	if (!WindowCovers(window, address) || address + 8 > window.start + window.bytes.size()) {
+		return false;
+	}
+	const uint64_t offset = address - window.start;
+	if (((window.readable_rows >> (offset / 16)) & 1u) == 0 ||
+	    ((window.readable_rows >> ((offset + 7) / 16)) & 1u) == 0) {
+		return false;
+	}
+	std::memcpy(value, window.bytes.data() + offset, sizeof(*value));
+	return true;
+}
+
+// Storage of the second part of a fatal report: static, so that a report from a thread near the
+// end of its stack does not need tens of KiB of it. One report at a time.
+struct GuestFaultMemoryStorage {
+	static constexpr size_t Registers    = 16;
+	static constexpr size_t WindowBytes  = GuestFaultPointerBefore + GuestFaultPointerAfter;
+	static constexpr size_t ThreadsMax   = GuestThreadRegistry::Capacity;
+	static constexpr size_t HostNameSize = 64;
+
+	uint8_t              register_bytes[Registers][WindowBytes];
+	uint8_t              stack_bytes[GuestFaultStackBefore + GuestFaultStackAfter];
+	uint8_t              frame_bytes[GuestFaultFrameBefore + GuestFaultFrameAfter];
+	uint8_t              indirect_bytes[GuestFaultIndirectMax][GuestFaultIndirectAfter];
+	char                 indirect_names[GuestFaultIndirectMax][24];
+	GuestFaultMemory     registers[Registers];
+	GuestFaultMemory     stack[2];
+	GuestFaultMemory     indirect[GuestFaultIndirectMax];
+	GuestThreadState     threads[ThreadsMax];
+	char                 thread_names[ThreadsMax][GuestThreadRegistry::NameSize];
+	char                 host_modules[ThreadsMax][HostNameSize];
+	GuestFaultMemoryText text;
+};
+static GuestFaultMemoryStorage g_fault_memory;
+static std::atomic_flag        g_fault_memory_busy;
+
+// Pointers found in the first GuestFaultPointerScan bytes of the register dumps (first qword of
+// each register, then the second, ...) and in the frame below rbp (nearest first), dumped once
+// more when they point to readable memory no dump holds yet, off this thread's stack and outside
+// the guest modules.
+static size_t DumpIndirect(GuestFaultMemoryStorage* s, uint64_t rsp) {
+	size_t count = 0;
+	auto   add   = [&](uint64_t target, std::string_view base, char sign, uint64_t offset) {
+		if (count >= GuestFaultIndirectMax || !MayBePointer(target) ||
+		    (target + 0x1000 >= rsp && target < rsp + 0x100000) ||
+		    !g_guest_modules.Find(target).module.empty()) {
+			return;
+		}
+		for (const auto& w: s->registers) {
+			if (WindowCovers(w, target)) {
+				return;
+			}
+		}
+		for (const auto& w: s->stack) {
+			if (WindowCovers(w, target)) {
+				return;
+			}
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (WindowCovers(s->indirect[i], target)) {
+				return;
+			}
+		}
+		auto*      name    = s->indirect_names[count];
+		const auto written = fmt::format_to_n(name, sizeof(s->indirect_names[0]) - 1,
+		                                      "[{}{}0x{:x}]", base, sign, offset);
+		name[written.size < sizeof(s->indirect_names[0]) - 1 ? written.size
+		                                                     : sizeof(s->indirect_names[0]) - 1] =
+		    '\0';
+		auto window =
+		    DumpAround(name, target, 0, GuestFaultIndirectAfter, s->indirect_bytes[count]);
+		if (window.readable_rows != 0) {
+			s->indirect[count++] = window;
+		}
+	};
+	for (uint64_t offset = 0; offset < GuestFaultPointerScan; offset += 8) {
+		for (size_t r = 0; r < GuestFaultMemoryStorage::Registers; r++) {
+			const auto& window = s->registers[r];
+			uint64_t    value  = 0;
+			bool        same   = false;
+			for (size_t j = 0; j < r && !same; j++) {
+				same = s->registers[j].readable_rows != 0 && s->registers[j].value == window.value;
+			}
+			if (!same && ReadDumped(window, window.value + offset, &value)) {
+				add(value, window.name, '+', offset);
+			}
+		}
+	}
+	const auto& frame = s->stack[1];
+	for (uint64_t offset = 8; offset <= GuestFaultFrameBefore; offset += 8) {
+		uint64_t value = 0;
+		if (ReadDumped(frame, frame.value - offset, &value)) {
+			add(value, "rbp", '-', offset);
+		}
+	}
+	return count;
+}
+
+// Suspends the other registered guest threads together, reads where they are and resumes them
+// before anything else happens (no lock is taken while they are suspended).
+static size_t SnapshotGuestThreads(GuestFaultMemoryStorage* s, size_t* total) {
+	size_t count = 0;
+	*total       = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const uint64_t self = GetCurrentThreadId();
+	g_guest_threads.ForEach([&](uint64_t id, std::string_view name) {
+		if (id == self) {
+			return;
+		}
+		(*total)++;
+		if (count >= GuestFaultMemoryStorage::ThreadsMax) {
+			return;
+		}
+		auto& state = s->threads[count];
+		state       = {};
+		const auto length =
+		    std::min(name.size(), static_cast<size_t>(GuestThreadRegistry::NameSize - 1));
+		std::memcpy(s->thread_names[count], name.data(), length);
+		s->thread_names[count][length] = '\0';
+		state.name                     = {s->thread_names[count], length};
+		state.host_thread_id           = id;
+		count++;
+	});
+	static HANDLE handles[GuestFaultMemoryStorage::ThreadsMax];
+	static bool   suspended[GuestFaultMemoryStorage::ThreadsMax];
+	for (size_t i = 0; i < count; i++) {
+		handles[i]   = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
+		                          static_cast<DWORD>(s->threads[i].host_thread_id));
+		suspended[i] = handles[i] != nullptr && SuspendThread(handles[i]) != static_cast<DWORD>(-1);
+	}
+	for (size_t i = 0; i < count; i++) {
+		CONTEXT context {};
+		context.ContextFlags = CONTEXT_CONTROL;
+		if (suspended[i] && GetThreadContext(handles[i], &context) != 0) {
+			s->threads[i].rip  = context.Rip;
+			s->threads[i].rsp  = context.Rsp;
+			s->threads[i].read = true;
+		}
+	}
+	for (size_t i = 0; i < count; i++) {
+		if (suspended[i]) {
+			ResumeThread(handles[i]);
+		}
+		if (handles[i] != nullptr) {
+			CloseHandle(handles[i]);
+		}
+	}
+	// Host code (an HLE function, the emulator, a system DLL) is named by its module.
+	for (size_t i = 0; i < count; i++) {
+		auto& state = s->threads[i];
+		void* base  = nullptr;
+		if (!state.read || !g_guest_modules.Find(state.rip).module.empty() ||
+		    RtlPcToFileHeader(reinterpret_cast<void*>(state.rip), &base) == nullptr) {
+			continue;
+		}
+		char path[MAX_PATH] = "";
+		GetModuleFileNameA(static_cast<HMODULE>(base), path, sizeof(path));
+		const char* file  = std::strrchr(path, '\\');
+		file              = file != nullptr ? file + 1 : path;
+		const auto length = std::min(
+		    std::strlen(file), static_cast<size_t>(GuestFaultMemoryStorage::HostNameSize - 1));
+		std::memcpy(s->host_modules[i], file, length);
+		s->host_modules[i][length] = '\0';
+		state.host_module          = {s->host_modules[i], length};
+		state.host_offset          = state.rip - reinterpret_cast<uint64_t>(base);
+	}
+#else
+	(void)s;
+#endif
+	return count;
+}
+
+// Second part of a fatal report: the memory the registers point to, the faults this thread had
+// resolved before and where the other guest threads were. Together they tell a red zone or a
+// saved value an exception frame overwrote from data the program got wrong, and show a thread
+// that was working on the same data at the same moment.
+static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& info) {
+	if (g_fault_memory_busy.test_and_set(std::memory_order_acquire)) {
+		Log::WriteToConsoleAndLog("--- Guest memory at the registers: left out (another thread is "
+		                          "reporting a fault) ---\n");
+		return;
+	}
+	const uint64_t                         now_ns = MonotonicNs();
+	auto*                                  s      = &g_fault_memory;
+	const std::pair<const char*, uint64_t> registers[GuestFaultMemoryStorage::Registers] = {
+	    {"fault address", info.access_violation_vaddr},
+	    {"rax", info.rax},
+	    {"rbx", info.rbx},
+	    {"rcx", info.rcx},
+	    {"rdx", info.rdx},
+	    {"rsi", info.rsi},
+	    {"rdi", info.rdi},
+	    {"rbp", info.rbp},
+	    {"r8", info.r8},
+	    {"r9", info.r9},
+	    {"r10", info.r10},
+	    {"r11", info.r11},
+	    {"r12", info.r12},
+	    {"r13", info.r13},
+	    {"r14", info.r14},
+	    {"r15", info.r15},
+	};
+	for (size_t i = 0; i < GuestFaultMemoryStorage::Registers; i++) {
+		s->registers[i] =
+		    DumpAround(registers[i].first, registers[i].second, GuestFaultPointerBefore,
+		               GuestFaultPointerAfter, s->register_bytes[i]);
+	}
+	s->stack[0] =
+	    DumpAround("rsp", info.rsp, GuestFaultStackBefore, GuestFaultStackAfter, s->stack_bytes);
+	s->stack[0].prefix   = "rsp";
+	s->stack[0].red_zone = true;
+	s->stack[1] =
+	    DumpAround("rbp", info.rbp, GuestFaultFrameBefore, GuestFaultFrameAfter, s->frame_bytes);
+	s->stack[1].prefix         = "rbp";
+	const size_t indirect      = DumpIndirect(s, info.rsp);
+	size_t       threads_total = 0;
+	const size_t threads       = SnapshotGuestThreads(s, &threads_total);
+
+	GuestFaultMemoryReport report;
+	report.info          = &info;
+	report.registers     = s->registers;
+	report.stack         = s->stack;
+	report.indirect      = {s->indirect, indirect};
+	report.handled       = &g_handled_faults;
+	report.modules       = &g_guest_modules;
+	report.now_ns        = now_ns;
+	report.threads       = {s->threads, threads};
+	report.threads_total = threads_total;
+	FormatGuestFaultMemory(report, &s->text);
+	Log::WriteToConsoleAndLog(s->text.View());
+}
+
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
+		RecordHandledFault(*info, HandledFaultKind::EmulatedInstruction, 0);
 		return true;
 	}
 
@@ -701,6 +1012,9 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		const auto access_kind = access == GpuAccess::Read    ? HandledFaultKind::Read
+		                         : access == GpuAccess::Write ? HandledFaultKind::Write
+		                                                      : HandledFaultKind::Execute;
 		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
 		        info->exception_address)) {
 			// The backing serves an SRT walker load, so false sharing with GPU-written bytes
@@ -710,13 +1024,16 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
 			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				RecordHandledFault(*info, access_kind, info->access_violation_vaddr);
 				return true;
 			}
 			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+			RecordHandledFault(*info, HandledFaultKind::SkippedLoad, info->access_violation_vaddr);
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			RecordHandledFault(*info, access_kind, info->access_violation_vaddr);
 			return true;
 		}
 	}
@@ -769,6 +1086,7 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 		AppendHostBacktrace(*info, &text);
 		Log::WriteToConsoleAndLog(text.View());
 	}
+	ReportGuestFaultMemory(*info);
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
@@ -1411,6 +1729,8 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	auto it = std::find(m_programs.begin(), m_programs.end(), program);
 	EXIT_IF(it == m_programs.end());
 	m_programs.erase(it);
+	g_guest_modules.Remove(program->base_vaddr);
+	g_guest_modules.Remove(program->base_vaddr + program->base_size_aligned);
 
 	for (auto* importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
@@ -1602,6 +1922,7 @@ void RuntimeLinker::Clear() {
 		DeleteProgram(p);
 	}
 	m_programs.clear();
+	g_guest_modules.Clear();
 	for (const auto page: g_unresolved_stub_thunk_pages) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(page, UNRESOLVED_STUB_PAGE_SIZE));
 	}
@@ -1904,6 +2225,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(program->base_vaddr == 0);
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
 	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
+
+	const auto module_name = Common::PathToString(program->file_name.filename());
+	g_guest_modules.Add(program->base_vaddr, program->base_size_aligned, module_name);
+	if (program->mapped_size > program->base_size_aligned) {
+		// Red-zone function copies and instruction patches run from here.
+		g_guest_modules.Add(program->base_vaddr + program->base_size_aligned,
+		                    program->mapped_size - program->base_size_aligned,
+		                    module_name + " patch area");
+	}
 
 	if (patch_options.Any()) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
