@@ -1086,6 +1086,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --lazy-bda-sync)
 	add_test(NAME emulator_occlusion_queries_on
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --occlusion-queries)
+	add_test(NAME emulator_narrow_readbacks_off
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-narrow-readbacks)
+	add_test(NAME emulator_narrow_readbacks_on
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --narrow-readbacks)
 	add_test(NAME emulator_in_place_readbacks_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --in-place-readbacks off)
 	add_test(NAME emulator_in_place_readbacks_alias

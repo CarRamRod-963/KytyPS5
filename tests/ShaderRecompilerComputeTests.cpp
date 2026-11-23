@@ -20348,6 +20348,66 @@ public:
                 "lost the GPU's bytes (" +
                     std::to_string(off_counts.in_place) + " in place)");
       }
+      // A guest store into GPU-written memory reads back the tracker page it
+      // writes, not the window around it; with --no-narrow-readbacks the
+      // window.
+      for (const bool narrow : {true, false}) {
+        LoadTestConfig({.narrow_readbacks = narrow});
+        // Pages no readback touched yet: hot pages would be downloaded on
+        // their own at the next submission.
+        const uint64_t region = base + (narrow ? 0x20000 : 0x30000);
+        const uint32_t value = narrow ? 0x85858585u : 0x86868686u;
+        gpu.SendCommandSync([&] {
+          CommandProcessor processor(context, 0);
+          processor.BufferInit();
+          auto [buffer, offset] = cache.ObtainBuffer(region, 0x10000, true);
+          buffer->Fill(offset, 0x10000, value);
+          scheduler.Flush();
+        });
+        gpu.SendCommandSync([&] {
+          // Later work: the fill's write tick is submitted once this begins.
+          CommandProcessor processor(context, 0);
+          processor.BufferInit();
+          auto [buffer, offset] =
+              cache.ObtainBuffer(base + 0xf8000, bytes, true);
+          buffer->Fill(offset, bytes, value);
+          scheduler.Flush();
+        });
+        const auto before_store = Common::GpuTiming::Sync().Snapshot();
+        std::thread store([&] {
+          const Common::GpuTiming::SyncScope reason(
+              Common::GpuTiming::SyncReason::CpuWrite);
+          cache.InvalidateMemory(region + 0x4000, 4, true);
+        });
+        store.join();
+        const auto store_counts =
+            Common::GpuTiming::Sync().Snapshot().Since(before_store);
+        bool stored_clean = false;
+        gpu.SendCommandSync([&] {
+          stored_clean = !cache.HasGpuDirtyBytes(region + 0x4000, 0x1000);
+        });
+        uint32_t stored = 0;
+        Require(name, "store readback data",
+                LibKernel::Memory::TryReadBacking(region + 0x4000, &stored,
+                                                  sizeof(stored)) &&
+                    stored == value && stored_clean,
+                "a store did not read back the GPU's bytes of its page");
+        if (host_readable) {
+          // Read in place: the counter has the bytes the store's readback took.
+          const auto read = store_counts.in_place_bytes;
+          Require(
+              name, narrow ? "narrow store readback" : "store readback window",
+              store_counts.in_place == 1 &&
+                  (narrow ? read == 0x1000 : read > 0x1000),
+              (narrow
+                   ? "a store read back GPU-written pages beside its own ("
+                   : "a store without narrow readbacks read only its page (") +
+                  std::to_string(read) + " bytes)");
+        }
+        std::thread rest([&] { cache.ReadMemory(region, 0x10000); });
+        rest.join();
+      }
+      LoadTestConfig({});
       std::thread open_reader([&] { cache.ReadMemory(pending, bytes); });
       open_reader.join();
       Require(name, "open write read back", value_at(pending) == 0x83838383u,
