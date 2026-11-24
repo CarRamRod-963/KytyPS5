@@ -2530,7 +2530,7 @@ void TextureCache::DownloadStencil(Image& association, Buffer& destination,
 	              association.info.resources.levels);
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool held) {
 	auto& image = m_slot_images[id];
 	if (image.displaced || !image.SafeToDownload() ||
 	    (image.depth_id ? !CanDownloadStencil(image) : !CanDownload(image))) {
@@ -2539,7 +2539,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.depth_id) {
 		// A depth image's stencil plane is guest memory of its own.
 		for (const auto association: image.stencil_ids) {
-			(void)DownloadImageMemory(association);
+			(void)DownloadImageMemory(association, held);
 		}
 	}
 	const auto range = image.info.data;
@@ -2570,11 +2570,15 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	// With storage readback, guest accesses to its pages wait until the stored data lands.
-	if (m_readback_storage_images) {
+	// With storage readback, guest accesses to its pages wait until the stored data lands, and so
+	// do accesses to the memory of an image that is freed right after this: no cache watches it
+	// then, and a guest store into it before the copy lands would be overwritten with older bytes.
+	const bool trapped = m_readback_storage_images || held;
+	if (trapped) {
 		{
 			std::scoped_lock write_back_lock {m_write_back_mutex};
 			m_write_backs.push_back({range, m_scheduler.CurrentTick()});
+			m_write_backs_pending.store(m_write_backs.size(), std::memory_order_release);
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
@@ -2596,7 +2600,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 	}
 	m_scheduler.DeferPriorityOperation(
-	    [this, download = std::move(download), range, kept, trapped = m_readback_storage_images] {
+	    [this, download = std::move(download), range, kept, trapped] {
 		    download.buffer->Invalidate(download.offset, range.size);
 		    const auto kept_begin = std::clamp(kept.address, range.address, range.End());
 		    const auto kept_end   = std::clamp(kept.End(), kept_begin, range.End());
@@ -2618,6 +2622,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 			    // Priority operations run in queue order, so this write-back is the oldest.
 			    std::scoped_lock write_back_lock {m_write_back_mutex};
 			    m_write_backs.erase(m_write_backs.begin());
+			    m_write_backs_pending.store(m_write_backs.size(), std::memory_order_release);
 		    }
 	    },
 	    GuestWrites {range.address, range.size});
@@ -2625,7 +2630,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 }
 
 uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
-	if (!m_readback_storage_images) {
+	if (m_write_backs_pending.load(std::memory_order_acquire) == 0) {
 		return 0;
 	}
 	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
@@ -2954,7 +2959,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || !owner->SafeToDownload() ||
-			    !DownloadImageMemory(id)) {
+			    !DownloadImageMemory(id, true)) {
 				continue;
 			}
 			evict(id);
@@ -3044,7 +3049,7 @@ size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
 		// (displaced, multisampled, compressed metadata, ...) stays at the old end of the LRU and
 		// would otherwise use it up before any image that can be written back is reached.
 		const auto size = owner->AccountedSize();
-		if (!DownloadImageMemory(id)) {
+		if (!DownloadImageMemory(id, true)) {
 			continue;
 		}
 		written += size;
