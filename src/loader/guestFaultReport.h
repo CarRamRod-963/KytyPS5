@@ -1,6 +1,7 @@
 #ifndef KYTY_LOADER_GUEST_FAULT_REPORT_H_
 #define KYTY_LOADER_GUEST_FAULT_REPORT_H_
 
+#include "common/guestStoreRing.h"
 #include "common/hostException.h"
 #include "loader/guestFaultHistory.h"
 #include "loader/guestInstructionPatcher.h"
@@ -126,15 +127,18 @@ struct GuestFaultMemory {
 
 // Window sizes. A pointer register shows 16 bytes before and 0x110 from its address (a structure
 // header and the fields after it); a pointer found in the first 0x40 bytes of such a dump, or in
-// the frame below rbp, shows 0x110 bytes once more (one level of indirection, at most
-// GuestFaultIndirectMax dumps). The stack pointer shows 256 bytes either side, so the 128 bytes
-// below it (the SysV red zone, which every exception frame of the thread overwrites on Windows)
-// can be told from the frame above; rbp shows the locals below it.
+// the frame below rbp, shows 0x110 bytes once more, and so does a pointer in the first 0x40 bytes
+// of those (two levels of indirection, at most GuestFaultIndirectLevel1 dumps on the first level
+// and GuestFaultIndirectMax in all). The stack pointer shows 256 bytes either side, so the 128
+// bytes below it (the SysV red zone, which every exception frame of the thread overwrites on
+// Windows) can be told from the frame above; rbp shows the locals below it.
 inline constexpr uint64_t GuestFaultPointerBefore = 16;
 inline constexpr uint64_t GuestFaultPointerAfter  = 0x110;
 inline constexpr uint64_t GuestFaultPointerScan   = 0x40;
 inline constexpr uint64_t GuestFaultIndirectAfter = 0x110;
-inline constexpr size_t   GuestFaultIndirectMax   = 32;
+inline constexpr size_t   GuestFaultIndirectLevel1 = 32;
+inline constexpr size_t   GuestFaultIndirectMax    = 64;
+inline constexpr size_t   GuestFaultIndirectName   = 48;
 inline constexpr uint64_t GuestFaultStackBefore   = 256;
 inline constexpr uint64_t GuestFaultStackAfter    = 256;
 inline constexpr uint64_t GuestFaultFrameBefore   = 0x100;
@@ -150,7 +154,185 @@ struct GuestThreadState {
 	bool             read           = false; // false: the thread could not be suspended or read
 	std::string_view host_module;            // module of a rip outside the guest modules
 	uint64_t         host_offset = 0;
+	// For a thread in host code: the first return address into a guest module found on its stack
+	// above rsp (the guest code that called into the emulator, best effort), or 0.
+	uint64_t guest_caller = 0;
 };
+
+// A range whose stores the report lists: around the faulting address, the registers' pointers and
+// the dumped memory.
+struct GuestFaultInterest {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+};
+
+// Granule around an address whose emulator stores are listed.
+inline constexpr uint64_t GuestFaultStoreGranule = 0x10000;
+// Stores listed: near the fault (the newest), and the last ones overall.
+inline constexpr size_t GuestFaultStoresNear = 96;
+inline constexpr size_t GuestFaultStoresLast = 32;
+
+// Calls f(value, window, offset) for the qwords of the first `scan` bytes of each window: the first
+// qword of every window first, then the second, ...; a window whose value an earlier one has is
+// skipped.
+template <typename F>
+inline void ForEachDumpedPointer(std::span<const GuestFaultMemory> windows, uint64_t scan, F&& f) {
+	for (uint64_t offset = 0; offset < scan; offset += 8) {
+		for (size_t i = 0; i < windows.size(); i++) {
+			const auto& window = windows[i];
+			if (window.readable_rows == 0) {
+				continue;
+			}
+			bool same = false;
+			for (size_t j = 0; j < i && !same; j++) {
+				same = windows[j].readable_rows != 0 && windows[j].value == window.value;
+			}
+			const uint64_t address = window.value + offset;
+			if (same || address < window.start ||
+			    address + 8 > window.start + window.bytes.size()) {
+				continue;
+			}
+			const uint64_t at = address - window.start;
+			if (((window.readable_rows >> (at / 16)) & 1u) == 0 ||
+			    ((window.readable_rows >> ((at + 7) / 16)) & 1u) == 0) {
+				continue;
+			}
+			uint64_t value = 0;
+			std::memcpy(&value, window.bytes.data() + at, sizeof(value));
+			f(value, window, offset);
+		}
+	}
+}
+
+// The qword at `address` when a dump holds all of it.
+inline bool ReadDumpedWord(const GuestFaultMemory& window, uint64_t address, uint64_t* value) {
+	if (window.readable_rows == 0 || address < window.start ||
+	    address + 8 > window.start + window.bytes.size()) {
+		return false;
+	}
+	const uint64_t at = address - window.start;
+	if (((window.readable_rows >> (at / 16)) & 1u) == 0 ||
+	    ((window.readable_rows >> ((at + 7) / 16)) & 1u) == 0) {
+		return false;
+	}
+	std::memcpy(value, window.bytes.data() + at, sizeof(*value));
+	return true;
+}
+
+inline bool GuestFaultWindowCovers(const GuestFaultMemory& window, uint64_t address) {
+	return window.readable_rows != 0 && address >= window.start &&
+	       address - window.start < window.bytes.size();
+}
+
+// The memory pointers in the dumps point to: those in the first GuestFaultPointerScan bytes of the
+// register dumps (ForEachDumpedPointer order) and in the frame below rbp (stack[1], nearest first),
+// at most GuestFaultIndirectLevel1, then those in the first GuestFaultPointerScan bytes of these
+// dumps, up to out.size() in all. A target some dump already holds is not dumped again, so a cycle
+// ends. accept(target) leaves targets out (not a pointer, on the stack, in a module);
+// dump(name, target, i) returns the window of a target (readable_rows 0 when nothing is readable).
+// Names ("[rax+0x8]", "[[rax+0x8]+0x10]") go to names[i] of the i-th dump.
+template <typename Accept, typename Dump>
+inline size_t CollectGuestFaultIndirect(std::span<const GuestFaultMemory> registers,
+                                        std::span<const GuestFaultMemory> stack,
+                                        std::span<GuestFaultMemory>       out,
+                                        std::span<std::array<char, GuestFaultIndirectName>> names,
+                                        Accept&& accept, Dump&& dump) {
+	size_t count = 0;
+	size_t limit = std::min(out.size(), GuestFaultIndirectLevel1);
+	auto   add   = [&](uint64_t target, std::string_view base, char sign, uint64_t offset) {
+		if (count >= limit || count >= names.size() || !accept(target)) {
+			return;
+		}
+		for (const auto& w: registers) {
+			if (GuestFaultWindowCovers(w, target)) {
+				return;
+			}
+		}
+		for (const auto& w: stack) {
+			if (GuestFaultWindowCovers(w, target)) {
+				return;
+			}
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (GuestFaultWindowCovers(out[i], target)) {
+				return;
+			}
+		}
+		auto&      name = names[count];
+		const auto written =
+		    fmt::format_to_n(name.data(), name.size() - 1, "[{}{}0x{:x}]", base, sign, offset);
+		name[std::min(written.size, name.size() - 1)] = '\0';
+		auto window = dump(std::string_view(name.data()), target, count);
+		if (window.readable_rows != 0) {
+			out[count++] = window;
+		}
+	};
+	ForEachDumpedPointer(registers, GuestFaultPointerScan,
+	                     [&](uint64_t value, const GuestFaultMemory& window, uint64_t offset) {
+		                     add(value, window.name, '+', offset);
+	                     });
+	if (stack.size() > 1) {
+		const auto& frame = stack[1];
+		for (uint64_t offset = 8; offset <= GuestFaultFrameBefore; offset += 8) {
+			uint64_t value = 0;
+			if (frame.value >= offset && ReadDumpedWord(frame, frame.value - offset, &value)) {
+				add(value, "rbp", '-', offset);
+			}
+		}
+	}
+	const size_t level1 = count;
+	limit               = out.size();
+	ForEachDumpedPointer(std::span<const GuestFaultMemory>(out.data(), level1),
+	                     GuestFaultPointerScan,
+	                     [&](uint64_t value, const GuestFaultMemory& window, uint64_t offset) {
+		                     add(value, window.name, '+', offset);
+	                     });
+	return count;
+}
+
+// The interest ranges of a report: the 64 KiB granule around the fault address and around each
+// register value and dump address that may be a pointer, and every dumped range. Returns how many
+// it wrote (at most out.size()).
+inline size_t CollectGuestFaultInterest(uint64_t                          fault_address,
+                                        std::span<const GuestFaultMemory> registers,
+                                        std::span<const GuestFaultMemory> indirect,
+                                        std::span<GuestFaultInterest>     out) {
+	size_t count = 0;
+	auto   add   = [&](uint64_t begin, uint64_t end) {
+		if (end <= begin) {
+			return;
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (out[i].begin == begin && out[i].end == end) {
+				return;
+			}
+		}
+		if (count < out.size()) {
+			out[count++] = {begin, end};
+		}
+	};
+	auto granule = [&](uint64_t value) {
+		if (value < 0x10000 || value > 0x00007fffffffffffull) {
+			return;
+		}
+		const auto begin = value & ~(GuestFaultStoreGranule - 1);
+		add(begin, begin + GuestFaultStoreGranule);
+	};
+	granule(fault_address);
+	for (const auto& window: registers) {
+		granule(window.value);
+		if (window.readable_rows != 0) {
+			add(window.start, window.start + window.bytes.size());
+		}
+	}
+	for (const auto& window: indirect) {
+		if (window.readable_rows != 0) {
+			granule(window.value);
+			add(window.start, window.start + window.bytes.size());
+		}
+	}
+	return count;
+}
 
 // The second part of a fatal report: memory at the registers, the faults the thread had resolved
 // before it and where the other guest threads were. It is written after the first part, from a
@@ -165,9 +347,17 @@ struct GuestFaultMemoryReport {
 	uint64_t                                    now_ns = 0; // monotonic, when the fault is reported
 	std::span<const GuestThreadState>           threads;
 	size_t                                      threads_total = 0; // other guest threads registered
+	// The emulator's own stores into guest memory the ring kept (oldest first), how many it
+	// recorded in all, the time stamp counter when the fault is reported and its rate, and the
+	// ranges whose stores are listed in full.
+	std::span<const Common::GuestStore> stores;
+	uint64_t                            stores_total       = 0;
+	uint64_t                            store_tsc_now      = 0;
+	uint64_t                            store_ticks_per_us = 0;
+	std::span<const GuestFaultInterest> interest;
 };
 
-using GuestFaultMemoryText = BasicGuestFaultText<192 * 1024>;
+using GuestFaultMemoryText = BasicGuestFaultText<256 * 1024>;
 
 template <typename Text>
 inline void AppendModuleLocation(const GuestModuleMap* modules, uint64_t address, Text* out) {
@@ -220,6 +410,61 @@ inline const char* HandledFaultKindName(HandledFaultKind kind) {
 		case HandledFaultKind::SkippedLoad: return "skipped load";
 	}
 	return "?";
+}
+
+template <typename Text>
+inline void AppendGuestStore(const GuestFaultMemoryReport& report, const Common::GuestStore& store,
+                             Text* out) {
+	const uint64_t ticks = report.store_tsc_now >= store.tsc ? report.store_tsc_now - store.tsc : 0;
+	out->Append("  #{} ", store.sequence);
+	if (report.store_ticks_per_us != 0) {
+		out->Append("{} us before", ticks / report.store_ticks_per_us);
+	} else {
+		out->Append("{} ticks before", ticks);
+	}
+	out->Append(": {} 0x{:016x} size 0x{:x} first {:016x} thread {}\n",
+	            Common::GuestStorePathName(store.path), store.address, store.size, store.first,
+	            store.thread);
+}
+
+// The emulator's own stores into guest memory: those over the report's interest ranges (the newest
+// GuestFaultStoresNear of them), then the last GuestFaultStoresLast of all.
+template <typename Text>
+inline void AppendGuestStores(const GuestFaultMemoryReport& report, Text* out) {
+	if (report.stores_total == 0) {
+		return;
+	}
+	const auto near = [&](const Common::GuestStore& store) {
+		for (const auto& range: report.interest) {
+			if (Common::GuestStoreOverlaps(store, range.begin, range.end)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	size_t matched = 0;
+	for (const auto& store: report.stores) {
+		matched += near(store) ? 1 : 0;
+	}
+	out->Append("--- The emulator's own stores into guest memory near this fault ({} of the last "
+	            "{}; {} recorded) ---\n",
+	            matched, report.stores.size(), report.stores_total);
+	size_t skip = matched > GuestFaultStoresNear ? matched - GuestFaultStoresNear : 0;
+	for (const auto& store: report.stores) {
+		if (!near(store)) {
+			continue;
+		}
+		if (skip != 0) {
+			skip--;
+			continue;
+		}
+		AppendGuestStore(report, store, out);
+	}
+	const auto last = std::min(report.stores.size(), GuestFaultStoresLast);
+	out->Append("--- The emulator's last {} stores into guest memory ---\n", last);
+	for (size_t i = report.stores.size() - last; i < report.stores.size(); i++) {
+		AppendGuestStore(report, report.stores[i], out);
+	}
 }
 
 template <typename Text>
@@ -289,6 +534,9 @@ inline void FormatGuestFaultMemory(const GuestFaultMemoryReport& report, Text* o
 				const uint64_t delta = below ? info->rsp - fault.rsp : fault.rsp - info->rsp;
 				out->Append(" (fault rsp{}0x{:x})", below ? '-' : '+', delta);
 			}
+			if (fault.stores != 0) {
+				out->Append(" after store #{}", fault.stores);
+			}
 			out->Append("\n");
 		}
 	}
@@ -308,9 +556,15 @@ inline void FormatGuestFaultMemory(const GuestFaultMemoryReport& report, Text* o
 			} else {
 				AppendModuleLocation(report.modules, thread.rip, out);
 			}
-			out->Append(" rsp=0x{:016x}\n", thread.rsp);
+			out->Append(" rsp=0x{:016x}", thread.rsp);
+			if (thread.guest_caller != 0) {
+				out->Append(" guest caller 0x{:016x}", thread.guest_caller);
+				AppendModuleLocation(report.modules, thread.guest_caller, out);
+			}
+			out->Append("\n");
 		}
 	}
+	AppendGuestStores(report, out);
 }
 
 } // namespace Loader

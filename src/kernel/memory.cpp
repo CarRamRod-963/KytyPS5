@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -808,7 +809,12 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (!g_guest_address_space->TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	// The emulator's own stores into guest memory, for the report of a guest fault over them.
+	Common::RecordGuestStore(vaddr, size, data);
+	return true;
 }
 
 void SettleLabelAccess(uint64_t vaddr, uint64_t size) {

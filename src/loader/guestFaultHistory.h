@@ -27,6 +27,9 @@ struct HandledFault {
 	uint64_t         rsp     = 0;
 	uint64_t         time_ns = 0; // monotonic
 	HandledFaultKind kind    = HandledFaultKind::Read;
+	// Stores the emulator had made into guest memory when the fault was resolved (the store ring's
+	// count): a read fault's readback is among the stores numbered after it.
+	uint64_t stores = 0;
 };
 
 // The last faults one thread had resolved, for the report of a fatal fault on the same thread.

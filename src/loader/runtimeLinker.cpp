@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/fpEnv.h"
+#include "common/guestStoreRing.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -705,7 +706,8 @@ static void RecordHandledFault(const Common::HostException::ExceptionInfo& info,
 	                         .pc      = info.exception_address,
 	                         .rsp     = info.rsp,
 	                         .time_ns = MonotonicNs(),
-	                         .kind    = kind});
+	                         .kind    = kind,
+	                         .stores  = Common::GuestStores().Count()});
 }
 
 // Copies the 16-byte rows of [start, start + rows * 16) that can be read, without faulting even
@@ -753,25 +755,6 @@ static GuestFaultMemory DumpAround(std::string_view name, uint64_t value, uint64
 	return window;
 }
 
-static bool WindowCovers(const GuestFaultMemory& window, uint64_t address) {
-	return window.readable_rows != 0 && address >= window.start &&
-	       address - window.start < window.bytes.size();
-}
-
-// The qword at `address` when a dump holds it.
-static bool ReadDumped(const GuestFaultMemory& window, uint64_t address, uint64_t* value) {
-	if (!WindowCovers(window, address) || address + 8 > window.start + window.bytes.size()) {
-		return false;
-	}
-	const uint64_t offset = address - window.start;
-	if (((window.readable_rows >> (offset / 16)) & 1u) == 0 ||
-	    ((window.readable_rows >> ((offset + 7) / 16)) & 1u) == 0) {
-		return false;
-	}
-	std::memcpy(value, window.bytes.data() + offset, sizeof(*value));
-	return true;
-}
-
 // Storage of the second part of a fatal report: static, so that a report from a thread near the
 // end of its stack does not need tens of KiB of it. One report at a time.
 struct GuestFaultMemoryStorage {
@@ -783,14 +766,20 @@ struct GuestFaultMemoryStorage {
 	uint8_t              register_bytes[Registers][WindowBytes];
 	uint8_t              stack_bytes[GuestFaultStackBefore + GuestFaultStackAfter];
 	uint8_t              frame_bytes[GuestFaultFrameBefore + GuestFaultFrameAfter];
+	static constexpr size_t InterestMax = 2 * (Registers + GuestFaultIndirectMax) + 1;
+	static constexpr size_t CallerScan  = 0x1000;
+
 	uint8_t              indirect_bytes[GuestFaultIndirectMax][GuestFaultIndirectAfter];
-	char                 indirect_names[GuestFaultIndirectMax][24];
+	std::array<char, GuestFaultIndirectName> indirect_names[GuestFaultIndirectMax];
 	GuestFaultMemory     registers[Registers];
 	GuestFaultMemory     stack[2];
 	GuestFaultMemory     indirect[GuestFaultIndirectMax];
 	GuestThreadState     threads[ThreadsMax];
 	char                 thread_names[ThreadsMax][GuestThreadRegistry::NameSize];
 	char                 host_modules[ThreadsMax][HostNameSize];
+	uint8_t              caller_bytes[CallerScan];
+	Common::GuestStore   stores[Common::GuestStoreRing::Capacity];
+	GuestFaultInterest   interest[InterestMax];
 	GuestFaultMemoryText text;
 };
 static GuestFaultMemoryStorage g_fault_memory;
@@ -799,63 +788,38 @@ static std::atomic_flag        g_fault_memory_busy;
 // Pointers found in the first GuestFaultPointerScan bytes of the register dumps (first qword of
 // each register, then the second, ...) and in the frame below rbp (nearest first), dumped once
 // more when they point to readable memory no dump holds yet, off this thread's stack and outside
-// the guest modules.
+// the guest modules; then the pointers in the first GuestFaultPointerScan bytes of those dumps
+// once more (a second level).
 static size_t DumpIndirect(GuestFaultMemoryStorage* s, uint64_t rsp) {
-	size_t count = 0;
-	auto   add   = [&](uint64_t target, std::string_view base, char sign, uint64_t offset) {
-		if (count >= GuestFaultIndirectMax || !MayBePointer(target) ||
-		    (target + 0x1000 >= rsp && target < rsp + 0x100000) ||
-		    !g_guest_modules.Find(target).module.empty()) {
-			return;
+	return CollectGuestFaultIndirect(
+	    s->registers, s->stack, s->indirect, s->indirect_names,
+	    [&](uint64_t target) {
+		    return MayBePointer(target) && !(target + 0x1000 >= rsp && target < rsp + 0x100000) &&
+		           g_guest_modules.Find(target).module.empty();
+	    },
+	    [&](std::string_view name, uint64_t target, size_t index) {
+		    return DumpAround(name, target, 0, GuestFaultIndirectAfter, s->indirect_bytes[index]);
+	    });
+}
+
+// The first return address into a guest module on the stack above rsp, for a thread that is in
+// host code (an HLE function called by guest code keeps running on the guest stack).
+[[maybe_unused]] static uint64_t FindGuestCaller(GuestFaultMemoryStorage* s, uint64_t rsp) {
+	constexpr size_t rows     = GuestFaultMemoryStorage::CallerScan / 16;
+	const uint64_t   readable = CopyReadableRows(rsp & ~uint64_t {15}, s->caller_bytes, rows);
+	for (size_t row = 0; row < rows; row++) {
+		if (((readable >> row) & 1u) == 0) {
+			continue;
 		}
-		for (const auto& w: s->registers) {
-			if (WindowCovers(w, target)) {
-				return;
-			}
-		}
-		for (const auto& w: s->stack) {
-			if (WindowCovers(w, target)) {
-				return;
-			}
-		}
-		for (size_t i = 0; i < count; i++) {
-			if (WindowCovers(s->indirect[i], target)) {
-				return;
-			}
-		}
-		auto*      name    = s->indirect_names[count];
-		const auto written = fmt::format_to_n(name, sizeof(s->indirect_names[0]) - 1,
-		                                      "[{}{}0x{:x}]", base, sign, offset);
-		name[written.size < sizeof(s->indirect_names[0]) - 1 ? written.size
-		                                                     : sizeof(s->indirect_names[0]) - 1] =
-		    '\0';
-		auto window =
-		    DumpAround(name, target, 0, GuestFaultIndirectAfter, s->indirect_bytes[count]);
-		if (window.readable_rows != 0) {
-			s->indirect[count++] = window;
-		}
-	};
-	for (uint64_t offset = 0; offset < GuestFaultPointerScan; offset += 8) {
-		for (size_t r = 0; r < GuestFaultMemoryStorage::Registers; r++) {
-			const auto& window = s->registers[r];
-			uint64_t    value  = 0;
-			bool        same   = false;
-			for (size_t j = 0; j < r && !same; j++) {
-				same = s->registers[j].readable_rows != 0 && s->registers[j].value == window.value;
-			}
-			if (!same && ReadDumped(window, window.value + offset, &value)) {
-				add(value, window.name, '+', offset);
+		for (size_t word = 0; word < 2; word++) {
+			uint64_t value = 0;
+			std::memcpy(&value, s->caller_bytes + row * 16 + word * 8, sizeof(value));
+			if (!g_guest_modules.Find(value).module.empty()) {
+				return value;
 			}
 		}
 	}
-	const auto& frame = s->stack[1];
-	for (uint64_t offset = 8; offset <= GuestFaultFrameBefore; offset += 8) {
-		uint64_t value = 0;
-		if (ReadDumped(frame, frame.value - offset, &value)) {
-			add(value, "rbp", '-', offset);
-		}
-	}
-	return count;
+	return 0;
 }
 
 // Suspends the other registered guest threads together, reads where they are and resumes them
@@ -925,6 +889,7 @@ static size_t SnapshotGuestThreads(GuestFaultMemoryStorage* s, size_t* total) {
 		s->host_modules[i][length] = '\0';
 		state.host_module          = {s->host_modules[i], length};
 		state.host_offset          = state.rip - reinterpret_cast<uint64_t>(base);
+		state.guest_caller         = FindGuestCaller(s, state.rsp);
 	}
 #else
 	(void)s;
@@ -988,6 +953,16 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	report.now_ns        = now_ns;
 	report.threads       = {s->threads, threads};
 	report.threads_total = threads_total;
+	// The emulator's own stores into guest memory, newest last, and the ranges whose stores the
+	// report lists: around the fault, the registers and the dumps.
+	const auto& ring          = Common::GuestStores();
+	report.store_tsc_now      = Common::GuestStoreClock();
+	report.store_ticks_per_us = Common::GuestStoreClockTicksPerUs();
+	report.stores_total       = ring.Count();
+	report.stores   = {s->stores, ring.Snapshot(s->stores, Common::GuestStoreRing::Capacity)};
+	report.interest = {s->interest,
+	                   CollectGuestFaultInterest(info.access_violation_vaddr, s->registers,
+	                                             report.indirect, s->interest)};
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
 }

@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -366,6 +367,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
 	                download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
+		const Common::GuestStoreScope store_path(Common::GuestStorePath::BufferReadback);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(
 			    buffer_address + copy.srcOffset,
@@ -422,6 +424,7 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 			                   std::chrono::steady_clock::now() - read_start)
 			                   .count();
 			    read_bytes += end - start;
+			    const Common::GuestStoreScope store_path(Common::GuestStorePath::InPlaceReadback);
 			    Libs::LibKernel::Memory::WriteBacking(start, m_in_place_scratch.data(),
 			                                          end - start);
 			    copied = true;
@@ -1002,6 +1005,8 @@ void BufferCache::RunGuestCopy(GuestCopy& copy) {
 					    if (from < to) {
 						    copy.buffer->ReadMapped(from - copy.buffer_address, to - from,
 						                            scratch.data());
+						    const Common::GuestStoreScope store_path(
+						        Common::GuestStorePath::GuestThreadReadback);
 						    Libs::LibKernel::Memory::WriteBacking(from, scratch.data(), to - from);
 						    copied += to - from;
 					    }
@@ -1251,6 +1256,8 @@ void BufferCache::RecordAsyncDownloads() {
 					        const auto end =
 					            std::min(address + bytes, interval.address + interval.size);
 					        if (begin < end) {
+						        const Common::GuestStoreScope store_path(
+						            Common::GuestStorePath::AsyncReadback);
 						        LibKernel::Memory::WriteBacking(
 						            begin, mapped + interval.offset + (begin - interval.address),
 						            end - begin);
