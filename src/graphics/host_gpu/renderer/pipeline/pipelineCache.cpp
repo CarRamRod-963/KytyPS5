@@ -2016,23 +2016,24 @@ void PipelineCache::InitializeDriverCache() {
 	m_title_id = title_id;
 	SetPipelineManifest(
 	    std::make_unique<PipelineManifest>(PipelineManifest::PathFor(directory, title_id),
-	                                       PipelineManifest::PreviousPathFor(directory, title_id)));
+	                                       PipelineManifest::PreviousPathFor(directory, title_id),
+	                                       PipelineManifest::OlderPathFor(directory, title_id)));
 	m_program_cache->list_predicts = [this](uint64_t key) {
 		std::lock_guard lock(m_list_mutex);
 		return m_list_keys.contains(key);
 	};
 	const auto pipelines = m_pipeline_manifest->Loaded();
-	PipelineCacheLog("Pipeline manifest: {} graphics pipelines, {} stages in {}{}{}",
-	                 pipelines.pipelines, pipelines.stages,
-	                 Common::PathToString(m_pipeline_manifest->Path()),
-	                 pipelines.imported
-	                     ? fmt::format(" (imported from the v8 file, {} vertex-side stages without "
-	                                   "a pipeline not converted)",
-	                                   pipelines.unconverted_stages)
-	                     : std::string {},
-	                 pipelines.rewritten ? fmt::format(" (rewritten, {} unreadable bytes dropped)",
-	                                                   pipelines.dropped_bytes)
-	                                     : std::string {});
+	PipelineCacheLog(
+	    "Pipeline manifest: {} graphics pipelines, {} stages in {}{}{}", pipelines.pipelines,
+	    pipelines.stages, Common::PathToString(m_pipeline_manifest->Path()),
+	    pipelines.imported
+	        ? fmt::format(" (imported from the v{} file, {} vertex-side stages without "
+	                      "a pipeline not converted)",
+	                      pipelines.imported_layout + 4u, pipelines.unconverted_stages)
+	        : std::string {},
+	    pipelines.rewritten
+	        ? fmt::format(" (rewritten, {} unreadable bytes dropped)", pipelines.dropped_bytes)
+	        : std::string {});
 	SetCreatedCode(
 	    std::make_unique<ShaderCodeStore>(ShaderCodeStore::PathFor(directory, title_id)));
 	PipelineCacheLog("Created shader code: {} shaders in {}", m_created_code->Size(),

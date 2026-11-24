@@ -55,7 +55,7 @@ ShaderCode Code(uint32_t seed, uint32_t words) {
 }
 
 GraphicsStageRecord VertexStage(uint32_t seed, ShaderCode code) {
-  GraphicsStageRecord record;
+  GraphicsStageRecord record{};
   record.stage = ShaderType::Vertex;
   record.shader_hash = 0x5000u + seed;
   record.user_data_count = 16;
@@ -80,7 +80,7 @@ GraphicsStageRecord VertexStage(uint32_t seed, ShaderCode code) {
 }
 
 GraphicsStageRecord PixelStage(uint32_t seed, ShaderCode code) {
-  GraphicsStageRecord record;
+  GraphicsStageRecord record{};
   record.stage = ShaderType::Pixel;
   record.shader_hash = 0x6000u + seed;
   record.user_data_count = 8;
@@ -239,12 +239,13 @@ void TestManifestDamage() {
   Check(manifest.Loaded().stages == 1, "the replaced file is appended to");
 }
 
-// A layout-4 file (<title>.v8.pipelines) is imported once into the current
-// file: its stages keep their fields, each pipeline gives its stages the
-// push-data windows of their cursors, the pipelines name the stages by their
-// new keys, and the old file stays. Layout 4 records the cursor the stages of
-// a draw advanced in turn, from the draw's own dwords, pixel stage first; the
-// window gives the pixel stage the end of the push constants instead.
+// Without a layout-5 file, a layout-4 file (<title>.v8.pipelines) is imported
+// once into the current file: its stages keep their fields, each pipeline gives
+// its stages the push-data windows of their cursors, the pipelines name the
+// stages by their new keys, and the old file stays. Layout 4 records the cursor
+// the stages of a draw advanced in turn, from the draw's own dwords, pixel
+// stage first; the window gives the pixel stage the end of the push constants
+// instead.
 void TestManifestImport() {
   namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
   using Libs::Graphics::ManifestFormat::Writer;
@@ -252,7 +253,8 @@ void TestManifestImport() {
   constexpr uint32_t dwords =
       Libs::Graphics::ShaderRecompiler::IR::PushData::DwordCount;
   const auto previous = TempPath("import.v8.pipelines");
-  const auto path = TempPath("import.v9.pipelines");
+  const auto missing = TempPath("import.v9.pipelines");
+  const auto path = TempPath("import.v10.pipelines");
   // A draw with the object ID (1 dword) and a pixel stage taking 6 dwords:
   // the pixel stage's cursor is 1, the vertex stage's 7.
   auto vs = VertexStage(4, Code(4, 80));
@@ -288,7 +290,7 @@ void TestManifestImport() {
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{2});
-    RecordFormat::PutStage(w, *stage, RecordFormat::PreviousLayoutVersion);
+    RecordFormat::PutStage(w, *stage, RecordFormat::OlderLayoutVersion);
     old_keys.push_back(XXH3_64bits(body.data(), body.size()));
     w.Put(stage->spirv_hash);
     payloads.push_back(std::move(body));
@@ -302,7 +304,7 @@ void TestManifestImport() {
     std::vector<uint8_t> body;
     Writer w(body);
     w.Put(uint8_t{3});
-    RecordFormat::PutPipeline(w, *record, RecordFormat::PreviousLayoutVersion);
+    RecordFormat::PutPipeline(w, *record, RecordFormat::OlderLayoutVersion);
     payloads.push_back(std::move(body));
   }
   Check(old_keys[0] != vs.Key(), "the layouts encode a stage differently");
@@ -326,9 +328,10 @@ void TestManifestImport() {
     return stage;
   }();
   {
-    PipelineManifest manifest(path, previous);
+    PipelineManifest manifest(path, missing, previous);
     const auto loaded = manifest.Loaded();
-    Check(loaded.imported && loaded.stages == 4 && loaded.pipelines == 2 &&
+    Check(loaded.imported && loaded.imported_layout == 4 &&
+              loaded.stages == 4 && loaded.pipelines == 2 &&
               loaded.unconverted_stages == 1,
           "the layout-4 records are imported, but for the lone vertex stage");
     const auto imported = manifest.FindStage(new_vs.Key());
@@ -355,7 +358,7 @@ void TestManifestImport() {
   }
   Check(std::filesystem::file_size(previous) == previous_size,
         "the layout-4 file is left as it is");
-  PipelineManifest manifest(path, previous);
+  PipelineManifest manifest(path, missing, previous);
   const auto loaded = manifest.Loaded();
   Check(!loaded.imported && !loaded.rewritten && loaded.stages == 5 &&
             loaded.pipelines == 2,
@@ -367,6 +370,163 @@ void TestManifestImport() {
   Check(masks != nullptr && masks->pixel.target_uint_mask == 2 &&
             masks->pixel.target_sint_mask == 4,
         "the integer target masks read back");
+}
+
+// A layout-5 file (<title>.v9.pipelines) is imported once into the current
+// file in place of the layout-4 one: its stages keep their windows and fields
+// and get the default float mode, every stage is kept (also one no pipeline
+// names), and the pipelines name the stages by their new keys.
+void TestManifestImportLayout5() {
+  namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
+  using Libs::Graphics::ManifestFormat::Writer;
+  using Window = Libs::Graphics::ShaderRecompiler::IR::PushData::Window;
+  const auto previous = TempPath("import5.v9.pipelines");
+  const auto older = TempPath("import5.v8.pipelines");
+  const auto path = TempPath("import5.v10.pipelines");
+  auto vs = VertexStage(21, Code(21, 40));
+  vs.push_data = Window{.begin = 2, .end = 26};
+  auto ps = PixelStage(22, Code(22, 30));
+  ps.push_data = Window{.begin = 2, .end = 32};
+  auto lone_vs = VertexStage(23, Code(23, 24));
+  lone_vs.push_data = Window{.begin = 0, .end = 32};
+  std::vector<std::vector<uint8_t>> payloads;
+  std::vector<uint64_t> old_keys;
+  for (const GraphicsStageRecord *stage : {&vs, &ps, &lone_vs}) {
+    std::vector<uint8_t> code;
+    Writer c(code);
+    c.Put(uint8_t{1});
+    const auto id = ShaderCodeId::Of(*stage->code);
+    c.Put(id.hash);
+    c.Put(id.words);
+    c.PutWords(*stage->code);
+    payloads.push_back(std::move(code));
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{2});
+    RecordFormat::PutStage(w, *stage, RecordFormat::PreviousLayoutVersion);
+    old_keys.push_back(XXH3_64bits(body.data(), body.size()));
+    w.Put(stage->spirv_hash);
+    payloads.push_back(std::move(body));
+  }
+  auto pipeline = Pipeline(vs, &ps, 3);
+  pipeline.vertex_stages[0] = old_keys[0];
+  pipeline.pixel_stage = old_keys[1];
+  {
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{3});
+    RecordFormat::PutPipeline(w, pipeline, RecordFormat::PreviousLayoutVersion);
+    payloads.push_back(std::move(body));
+  }
+  Check(old_keys[0] != vs.Key(), "layouts 5 and 6 encode a stage differently");
+  Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
+            previous, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
+            PipelineManifest::FormatVersion, payloads),
+        "the layout-5 file is written");
+  // An older file next to it is not read.
+  Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
+            older, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
+            PipelineManifest::FormatVersion, {}),
+        "the layout-4 file is written");
+  const auto previous_size = std::filesystem::file_size(previous);
+  {
+    PipelineManifest manifest(path, previous, older);
+    const auto loaded = manifest.Loaded();
+    Check(loaded.imported && loaded.imported_layout == 5 &&
+              loaded.stages == 3 && loaded.pipelines == 1 &&
+              loaded.unconverted_stages == 0,
+          "every layout-5 record is imported");
+    const auto vertex = manifest.FindStage(vs.Key());
+    Check(vertex != nullptr && vertex->push_data == vs.push_data &&
+              vertex->vertex.float_mode ==
+                  Libs::Graphics::ShaderVertexInputInfo{}.float_mode,
+          "a layout-5 stage keeps its window and gets the default float mode");
+    Check(manifest.FindStage(lone_vs.Key()) != nullptr,
+          "a layout-5 vertex stage no pipeline names is kept");
+    const auto pipelines = manifest.Pipelines();
+    Check(pipelines.size() == 1 && pipelines[0]->vertex_stages[0] == vs.Key() &&
+              pipelines[0]->pixel_stage == ps.Key(),
+          "an imported pipeline names its stages by their current keys");
+  }
+  Check(std::filesystem::file_size(previous) == previous_size,
+        "the layout-5 file is left as it is");
+  PipelineManifest manifest(path, previous, older);
+  Check(!manifest.Loaded().imported && manifest.Loaded().stages == 3,
+        "the current file is read without importing again");
+}
+
+// Before layout 6 a draw's object ID was the first push-constant dword; it is
+// the last one now. An imported pipeline with an object ID moves its stages'
+// windows there (one dword earlier at both ends without mesh parameters or
+// clip planes), and so does a pixel stage no pipeline names.
+void TestManifestImportObjectId() {
+  namespace RecordFormat = Libs::Graphics::PipelineRecordFormat;
+  using Libs::Graphics::ManifestFormat::Writer;
+  using Window = Libs::Graphics::ShaderRecompiler::IR::PushData::Window;
+  const auto previous = TempPath("importid.v9.pipelines");
+  const auto path = TempPath("importid.v10.pipelines");
+  auto vs = VertexStage(31, Code(31, 40));
+  vs.push_data = Window{.begin = 1, .end = 32};
+  auto ps = PixelStage(32, Code(32, 30));
+  ps.pixel.object_primitive_id = true;
+  ps.push_data = Window{.begin = 1, .end = 32};
+  auto lone_ps = PixelStage(33, Code(33, 24));
+  lone_ps.pixel.object_primitive_id = true;
+  lone_ps.push_data = Window{.begin = 1, .end = 32};
+  auto plain_vs = VertexStage(34, Code(34, 20));
+  plain_vs.push_data = Window{.begin = 0, .end = 32};
+  auto plain_ps = PixelStage(35, Code(35, 20));
+  plain_ps.push_data = Window{.begin = 0, .end = 32};
+  std::vector<std::vector<uint8_t>> payloads;
+  std::vector<uint64_t> old_keys;
+  for (const GraphicsStageRecord *stage :
+       {&vs, &ps, &lone_ps, &plain_vs, &plain_ps}) {
+    std::vector<uint8_t> code;
+    Writer c(code);
+    c.Put(uint8_t{1});
+    const auto id = ShaderCodeId::Of(*stage->code);
+    c.Put(id.hash);
+    c.Put(id.words);
+    c.PutWords(*stage->code);
+    payloads.push_back(std::move(code));
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{2});
+    RecordFormat::PutStage(w, *stage, RecordFormat::PreviousLayoutVersion);
+    old_keys.push_back(XXH3_64bits(body.data(), body.size()));
+    w.Put(stage->spirv_hash);
+    payloads.push_back(std::move(body));
+  }
+  for (const auto [v, p] : {std::pair{0, 1}, std::pair{3, 4}}) {
+    auto pipeline = Pipeline(vs, &ps, 7 + v);
+    pipeline.vertex_stages[0] = old_keys[v];
+    pipeline.pixel_stage = old_keys[p];
+    std::vector<uint8_t> body;
+    Writer w(body);
+    w.Put(uint8_t{3});
+    RecordFormat::PutPipeline(w, pipeline, RecordFormat::PreviousLayoutVersion);
+    payloads.push_back(std::move(body));
+  }
+  Check(Libs::Graphics::ManifestFormat::WriteEntryFile(
+            previous, {'K', 'y', 'G', 'f', 'x', 'P', 'l', 'n'},
+            PipelineManifest::FormatVersion, payloads),
+        "the layout-5 file with an object ID is written");
+  PipelineManifest manifest(path, previous, {});
+  Check(manifest.Loaded().imported && manifest.Loaded().stages == 5 &&
+            manifest.Loaded().pipelines == 2,
+        "every record with an object ID is imported");
+  const auto moved = Window{.begin = 0, .end = 31};
+  for (auto *stage : {&vs, &ps, &lone_ps}) {
+    stage->push_data = moved;
+  }
+  Check(manifest.FindStage(vs.Key()) != nullptr &&
+            manifest.FindStage(ps.Key()) != nullptr,
+        "the stages of a pipeline with an object ID get the current window");
+  Check(manifest.FindStage(lone_ps.Key()) != nullptr,
+        "a pixel stage with an object ID no pipeline names gets the window");
+  Check(manifest.FindStage(plain_vs.Key()) != nullptr &&
+            manifest.FindStage(plain_ps.Key()) != nullptr,
+        "stages without an object ID keep their window");
 }
 
 void TestFieldValidation() {
@@ -409,6 +569,18 @@ void TestFieldValidation() {
     return Format::GetStage(r, out) && r.AtEnd() && out.Key() == record.Key();
   };
   Check(decode_stage(vs), "a valid stage decodes to itself");
+  auto denormals = vs;
+  denormals.vertex.float_mode = 0x80;
+  Check(decode_stage(denormals) && denormals.Key() != vs.Key(),
+        "a stage's float mode is stored and keys it");
+  auto mesh_ids = vs;
+  mesh_ids.vertex.mesh.input_primitive_id = true;
+  auto mesh_out = vs;
+  mesh_out.vertex.mesh.output_primitive_id = true;
+  Check(decode_stage(mesh_ids) && decode_stage(mesh_out) &&
+            mesh_ids.Key() != vs.Key() && mesh_out.Key() != vs.Key() &&
+            mesh_ids.Key() != mesh_out.Key(),
+        "a mesh stage's primitive ID input and output are stored and key it");
   auto bad_stage = vs;
   bad_stage.vertex.wave_size = 48;
   Check(!decode_stage(bad_stage), "an invalid wave size is rejected");
@@ -674,6 +846,8 @@ int main() {
   TestManifestRoundTrip();
   TestManifestDamage();
   TestManifestImport();
+  TestManifestImportLayout5();
+  TestManifestImportObjectId();
   TestFieldValidation();
   TestCodeStore();
   TestListRoundTrip();

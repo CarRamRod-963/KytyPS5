@@ -102,10 +102,16 @@ namespace PipelineRecordFormat {
 // Layout 4: the mesh stage's output primitive size. Layout 5: a stage's push-data window (the
 // pixel stage takes the end of the push constants) instead of the cursor the stages advanced in
 // turn. Layouts 1 to 4 are still read (and written, for tests); their stages carry the cursor in
-// push_data.begin and an end of PushData::DwordCount.
-constexpr uint32_t LayoutVersion = 5;
+// push_data.begin and an end of PushData::DwordCount. Layout 6: the stages' float mode (MODE),
+// which selects FP16 input denormal flushing (ShaderFlushF16Inputs); older stages read the
+// default of ShaderVertexInputInfo/ShaderPixelInputInfo. Layout 6 also stores the mesh stage's
+// primitive ID input and output; the windows of older pipelines with an object ID are moved to
+// where the object ID is now (the last push-constant dword).
+constexpr uint32_t LayoutVersion = 6;
 // The layout of the previous manifest file, which a manifest without its own file imports.
-constexpr uint32_t PreviousLayoutVersion = 4;
+constexpr uint32_t PreviousLayoutVersion = 5;
+// The layout of the file before that, imported when the previous file does not exist either.
+constexpr uint32_t OlderLayoutVersion = 4;
 void               PutStage(ManifestFormat::Writer& w, const GraphicsStageRecord& record,
                             uint32_t layout = LayoutVersion);
 // The record's code stays null; its code ids are read.
@@ -118,7 +124,7 @@ bool GetPipeline(ManifestFormat::Reader& r, GraphicsPipelineRecord& record,
 } // namespace PipelineRecordFormat
 
 // The graphics pipelines a title has needed and their stage programs, persisted next to its
-// driver pipeline cache (_PipelineCache/<title>.v9.pipelines), so that the pipelines can be
+// driver pipeline cache (_PipelineCache/<title>.v10.pipelines), so that the pipelines can be
 // built ahead of their first use (--precompile-pipelines, --precompile-only). Append-only like
 // ProgramManifest: checksummed entries, guest code once per shader, a torn or corrupt tail or
 // another format version rewrites the file with the readable entries. A pipeline is kept only
@@ -130,13 +136,16 @@ public:
 	static constexpr uint32_t FormatVersion = 1;
 
 	// An empty path keeps the manifest in memory only. Without a file at `path`, the records of
-	// `previous` (record layout 4, <title>.v8.pipelines) are read and written to `path`; that
-	// file stays as it is for builds that read it. Layout 4 stages hold the push-data cursor the
-	// stages of a draw advanced in turn, starting after the draw's own dwords with the pixel
-	// stage; a pipeline gives each of its stages that cursor's window (ConvertLegacyPipeline). A
-	// pixel stage converts on its own; a vertex-side stage no imported pipeline names cannot be
-	// converted (the pixel stage's size is unknown) and is dropped.
-	explicit PipelineManifest(std::filesystem::path path = {}, std::filesystem::path previous = {});
+	// `previous` (record layout 5, <title>.v9.pipelines), or without that file the records of
+	// `older` (record layout 4, <title>.v8.pipelines), are read and written to `path`; the old
+	// file stays as it is for builds that read it. Layout 5 stages keep their windows and get the
+	// default float mode; every one of them is imported. Layout 4 stages hold the push-data
+	// cursor the stages of a draw advanced in turn, starting after the draw's own dwords with the
+	// pixel stage; a pipeline gives each of its stages that cursor's window
+	// (ConvertLegacyPipeline). A pixel stage converts on its own; a vertex-side stage no imported
+	// pipeline names cannot be converted (the pixel stage's size is unknown) and is dropped.
+	explicit PipelineManifest(std::filesystem::path path = {}, std::filesystem::path previous = {},
+	                          std::filesystem::path older = {});
 	~PipelineManifest();
 	KYTY_CLASS_NO_COPY(PipelineManifest);
 
@@ -144,6 +153,8 @@ public:
 	                                     const std::string&           title_id);
 	static std::filesystem::path PreviousPathFor(const std::filesystem::path& directory,
 	                                             const std::string&           title_id);
+	static std::filesystem::path OlderPathFor(const std::filesystem::path& directory,
+	                                          const std::string&           title_id);
 
 	struct LoadStats {
 		size_t stages        = 0;
@@ -151,8 +162,9 @@ public:
 		size_t code_entries  = 0;
 		size_t dropped_bytes = 0;
 		bool   rewritten     = false;
-		// The records came from the previous file.
-		bool imported = false;
+		// The records came from the previous (or older) file, of this record layout.
+		bool     imported        = false;
+		uint32_t imported_layout = 0;
 		// Imported vertex-side stages no imported pipeline names, which could not be converted.
 		size_t unconverted_stages = 0;
 	};
@@ -176,7 +188,12 @@ private:
 	void AddLoadedStage(std::shared_ptr<GraphicsStageRecord> record);
 	// Gives the stages of a pipeline of another layout their windows and the pipeline their
 	// current keys; false when the stages are missing or inconsistent.
-	bool       ConvertLegacyPipeline(GraphicsPipelineRecord& record);
+	bool ConvertLegacyPipeline(GraphicsPipelineRecord& record, uint32_t layout);
+	// The window of a stage of a draw with an object ID as layout 6 places it (the object ID in
+	// the last push-constant dword); a mesh stage then outputs the primitive ID.
+	static void MoveObjectIdWindow(GraphicsStageRecord& stage, uint32_t begin_shift);
+	// Reads the records of a file of another record layout and converts them.
+	void       Import(const std::filesystem::path& path, uint32_t layout);
 	ShaderCode StoreCode(const ShaderCode& code, std::vector<std::vector<uint8_t>>* out);
 	bool       Rewrite();
 
