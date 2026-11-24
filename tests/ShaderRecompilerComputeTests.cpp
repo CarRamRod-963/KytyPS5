@@ -14844,6 +14844,46 @@ public:
               std::all_of(aged_bytes, aged_bytes + image_size,
                           [](uint8_t value) { return value == 0x5a; }),
               "the displaced image's superseded contents reached guest memory");
+      // The collection frees a GPU-written image as soon as its write-back is
+      // recorded; until the copy lands, a guest store into its memory waits
+      // for it, instead of landing first and being overwritten with the older
+      // image bytes. A parked priority operation holds the write-back back.
+      {
+        const auto held_address = base + 10 * stride;
+        const auto held_id = written_image(held_address);
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            cache, std::array{held_id}, 300, UINT64_MAX);
+        std::binary_semaphore parked{0};
+        scheduler.DeferPriorityOperation([&] { parked.acquire(); });
+        Require(name, "held image freed",
+                TextureCacheTestAccess::CollectOverLimit(cache, used, 0) == 1 &&
+                    !contains(held_id),
+                "the collection did not write back and free the image");
+        scheduler.Flush();
+        constexpr uint32_t stored = 0x51515151u;
+        std::atomic<bool> store_done{false};
+        std::thread guest([&] {
+          std::memcpy(reinterpret_cast<void *>(held_address), &stored,
+                      sizeof(stored));
+          store_done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const bool waited = !store_done;
+        parked.release();
+        guest.join();
+        scheduler.Finish();
+        uint32_t landed = 0;
+        std::memcpy(&landed, reinterpret_cast<const void *>(held_address),
+                    sizeof(landed));
+        uint32_t beside = 0;
+        std::memcpy(&beside, reinterpret_cast<const void *>(held_address + 4),
+                    sizeof(beside));
+        Require(name, "store into a freed image's memory",
+                waited && landed == stored && beside == written &&
+                    !TextureCacheTestAccess::WriteBacksPending(cache),
+                "a guest store did not wait for the write-back of a freed "
+                "image, or was overwritten by it");
+      }
       // An image a buffer write overlapped since its last native write holds
       // older bytes than its memory there: the collection writes back the rest
       // of the image and frees it.

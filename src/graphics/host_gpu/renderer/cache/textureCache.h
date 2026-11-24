@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <map>
@@ -381,7 +382,10 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Writes a GPU-written image back into its memory when its copy completes. With
+	// `held`, guest accesses to that memory wait until it landed (the image is about to be freed,
+	// so nothing else watches the memory: a guest store before the copy lands would be lost).
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool held = false);
 	[[nodiscard]] bool DownloadQueuedImages();
 
 	GraphicContext&                                   m_graphics;
@@ -397,6 +401,8 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
+	// m_write_backs.size(), read without the mutex by every guest fault.
+	std::atomic<size_t>                               m_write_backs_pending {0};
 	std::vector<WrittenBack>                          m_written_back;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// Orders native image writes against guest metadata reads (see Image).
