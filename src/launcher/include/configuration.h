@@ -148,6 +148,9 @@ public:
 	bool                   no_shader_simplification    = false;
 	bool                   no_selection_feedback       = false;
 	bool                   lazy_bda_sync               = true;
+	bool                   narrow_readbacks            = false;
+	bool                   guest_thread_readbacks      = false;
+	bool                   gpu_thread_priority         = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -208,6 +211,9 @@ public:
 		no_shader_simplification    = other.no_shader_simplification;
 		no_selection_feedback       = other.no_selection_feedback;
 		lazy_bda_sync               = other.lazy_bda_sync;
+		narrow_readbacks            = other.narrow_readbacks;
+		guest_thread_readbacks      = other.guest_thread_readbacks;
+		gpu_thread_priority         = other.gpu_thread_priority;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
