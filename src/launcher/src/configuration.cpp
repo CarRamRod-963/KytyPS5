@@ -52,6 +52,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(narrow_readbacks);
 	KYTY_CFG_SET(guest_thread_readbacks);
 	KYTY_CFG_SET(gpu_thread_priority);
+	KYTY_CFG_SET(vulkan_recording_thread);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
@@ -136,6 +137,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(narrow_readbacks);
 	KYTY_CFG_GET(guest_thread_readbacks);
 	KYTY_CFG_GET(gpu_thread_priority);
+	KYTY_CFG_GET(vulkan_recording_thread);
 	if (s.contains(QStringLiteral("in_place_readbacks"))) {
 		KYTY_CFG_GET(in_place_readbacks);
 		if (EnumToText(in_place_readbacks).isEmpty()) {

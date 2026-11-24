@@ -296,6 +296,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.narrow_readbacks, "--narrow-readbacks");
 	AddFlag(args, info.guest_thread_readbacks, "--guest-thread-readbacks");
 	AddFlag(args, info.gpu_thread_priority, "--gpu-thread-priority");
+	AddFlag(args, info.vulkan_recording_thread, "--vulkan-recording-thread");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

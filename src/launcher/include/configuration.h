@@ -146,6 +146,7 @@ public:
 	bool                   narrow_readbacks            = false;
 	bool                   guest_thread_readbacks      = false;
 	bool                   gpu_thread_priority         = false;
+	bool                   vulkan_recording_thread     = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -207,6 +208,7 @@ public:
 		narrow_readbacks            = other.narrow_readbacks;
 		guest_thread_readbacks      = other.guest_thread_readbacks;
 		gpu_thread_priority         = other.gpu_thread_priority;
+		vulkan_recording_thread     = other.vulkan_recording_thread;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
