@@ -1442,9 +1442,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (m_buffer_cache.ConsumeCpuModified(range.address, range.size)) {
 		metadata_written = true;
 	}
+	const auto covers = [&viewed](const GuestRange& outer) {
+		return outer.size != 0 && outer.address <= viewed.address && viewed.End() <= outer.End();
+	};
+	// Whether an applied clear may expand its keys in guest memory, as a decompress pass would:
+	// only for the image's own metadata, the keys a color target binding names. A texture
+	// descriptor can name memory the guest has reused for other data since (a descriptor left in a
+	// table): that memory is never written, and the clear its bytes describe only goes to the
+	// image.
+	bool expand_keys = false;
 	{
 		std::scoped_lock lock {m_lock};
 		auto&            image = m_slot_images[id];
+		expand_keys            = desc.type == BindingType::RenderTarget ||
+		                         (image.usage.render_target && covers(image.target_metadata));
 		// Rendering natively leaves the guest's metadata as it was, so a clear code already read
 		// before a later native write is stale: honouring it again would wipe what was rendered.
 		// Metadata the GPU wrote since (a new clear) is read afresh.
@@ -1452,12 +1463,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			metadata_written              = true;
 			image.metadata_write_sequence = write_sequence;
 		}
+		// A clear applied without expanding its keys stays applied until the metadata changes.
 		if (!metadata_written && image.metadata_read_sequence != 0 &&
-		    image.native_write_sequence > image.metadata_read_sequence) {
+		    (image.native_write_sequence > image.metadata_read_sequence ||
+		     covers(image.unexpanded_clear))) {
 			return;
 		}
 		image.metadata_read_sequence = ++m_event_sequence;
+		image.unexpanded_clear       = {};
 	}
+	bool unexpanded = false;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
 		uint8_t code = 0;
@@ -1466,7 +1481,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		if (code == DccConstant::Key && !volume_texture &&
 		    desc.info.metadata.kind == ImageMetadataKind::Dcc) {
-			ExpandDccConstantSlice(id, desc, address, slice_size, first + slice);
+			// Decompressing writes the slice's data and keys in guest memory.
+			if (expand_keys) {
+				ExpandDccConstantSlice(id, desc, address, slice_size, first + slice);
+			}
 			continue;
 		}
 		vk::ClearValue clear {};
@@ -1495,11 +1513,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
-		if (desc.type != BindingType::VideoOut) {
+		if (!expand_keys) {
+			unexpanded = true;
+		} else if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
+	}
+	if (unexpanded) {
+		std::scoped_lock lock {m_lock};
+		m_slot_images[id].unexpanded_clear = viewed;
 	}
 }
 
@@ -1949,6 +1973,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	image.usage.render_target = true;
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+	    desc.info.metadata.kind == ImageMetadataKind::Cmask) {
+		image.target_metadata = desc.info.metadata.range;
+	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
