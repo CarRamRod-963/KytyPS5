@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 
 #include <SDL3/SDL_loadso.h>
 #include <algorithm>
@@ -213,6 +214,9 @@ Context* CreateContext(const Creation& creation) {
 
 bool Evaluate(vk::CommandBuffer command, Context* context, const Pssr::Request& request,
               const Inputs& inputs, bool reset) {
+	// The library records into `command` with the driver's own entries: every queued Vulkan
+	// recording call of this thread is made first.
+	VulkanRecording::Drain();
 	// PSSR has no frame time; the vblank period stands in. FidelityFX reuses a dispatch's views
 	// three dispatches later, which one PSSR dispatch a frame keeps clear of the GPU.
 	const float            frame_time = 1000.0f / static_cast<float>(Config::GetVblankFrequency());

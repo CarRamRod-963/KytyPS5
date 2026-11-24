@@ -222,6 +222,11 @@ static void PrintUsage() {
 	    "                                       take them when they are bound). Default: only\n"
 	    "                                       those (--lazy-bda-sync).\n");
 	::printf(
+	    "  --vulkan-recording-thread            Make the GPU thread's Vulkan command recording\n"
+	    "                                       calls on a thread of their own (experimental).\n"
+	    "                                       --no-vulkan-recording-thread turns it off\n"
+	    "                                       (default).\n");
+	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");
 	::printf(
@@ -381,6 +386,8 @@ static constexpr Flag FLAGS[] = {
     {"--no-narrow-readbacks", &ConfigOptions::narrow_readbacks, false},
     {"--guest-thread-readbacks", &ConfigOptions::guest_thread_readbacks},
     {"--no-guest-thread-readbacks", &ConfigOptions::guest_thread_readbacks, false},
+    {"--vulkan-recording-thread", &ConfigOptions::vulkan_recording_thread},
+    {"--no-vulkan-recording-thread", &ConfigOptions::vulkan_recording_thread, false},
     {"--serialize-dispatches", &ConfigOptions::serialize_dispatches},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},

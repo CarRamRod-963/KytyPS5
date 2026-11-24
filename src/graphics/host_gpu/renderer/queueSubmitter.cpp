@@ -3,8 +3,11 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <iterator>
 
 namespace Libs::Graphics {
 
@@ -28,6 +31,9 @@ QueueSubmitter::~QueueSubmitter() {
 uint64_t QueueSubmitter::Push(vk::CommandBuffer buffer, SubmitInfo submit,
                               MasterSemaphore& master) {
 	EXIT_IF(buffer == nullptr);
+	// A buffer the calling thread recorded through the Vulkan recording thread is complete only
+	// once its queued calls were made.
+	VulkanRecording::Drain();
 	uint64_t tick = 0;
 	{
 		std::lock_guard lock(m_mutex);
@@ -38,6 +44,30 @@ uint64_t QueueSubmitter::Push(vk::CommandBuffer buffer, SubmitInfo submit,
 	}
 	m_available.notify_one();
 	return tick;
+}
+
+uint64_t QueueSubmitter::Reserve(SubmitInfo submit, MasterSemaphore& master) {
+	std::lock_guard lock(m_mutex);
+	const auto      tick = master.NextTick();
+	submit.AddSignal(master.Handle(), tick);
+	m_queued.push_back({nullptr, submit, tick, master.Handle()});
+	m_pushed.fetch_add(1, std::memory_order_release);
+	return tick;
+}
+
+void QueueSubmitter::PushReserved(vk::Semaphore semaphore, uint64_t tick,
+                                  vk::CommandBuffer buffer) {
+	EXIT_IF(buffer == nullptr || semaphore == nullptr);
+	{
+		std::lock_guard lock(m_mutex);
+		const auto      batch = std::find_if(m_queued.begin(), m_queued.end(), [&](const auto& b) {
+			return b.reserved == semaphore && b.tick == tick;
+		});
+		EXIT_IF(batch == m_queued.end());
+		batch->buffer   = buffer;
+		batch->reserved = nullptr;
+	}
+	m_available.notify_one();
 }
 
 void QueueSubmitter::Drain() {
@@ -55,11 +85,22 @@ void QueueSubmitter::Run(const std::stop_token& stop) {
 	for (;;) {
 		{
 			std::unique_lock lock(m_mutex);
-			m_available.wait(lock, stop, [this] { return !m_queued.empty(); });
-			if (m_queued.empty()) {
+			// A reserved buffer holds back the buffers behind it.
+			m_available.wait(lock, stop, [this] {
+				return !m_queued.empty() && m_queued.front().reserved == nullptr;
+			});
+			if (m_queued.empty() || m_queued.front().reserved != nullptr) {
 				return;
 			}
-			batches.swap(m_queued);
+			const auto ready = std::find_if(m_queued.begin(), m_queued.end(),
+			                                [](const auto& b) { return b.reserved != nullptr; });
+			if (ready == m_queued.end()) {
+				batches.swap(m_queued);
+			} else {
+				batches.assign(std::make_move_iterator(m_queued.begin()),
+				               std::make_move_iterator(ready));
+				m_queued.erase(m_queued.begin(), ready);
+			}
 		}
 		SubmitBatches(batches);
 		m_submitted.fetch_add(batches.size(), std::memory_order_release);

@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/selectionFeedback.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "kernel/eventQueue.h"
 
 #include <atomic>
@@ -141,6 +142,8 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
+	// The thread that started the GPU thread records directly meanwhile (Vulkan recording).
+	std::unique_ptr<VulkanRecording::PauseScope> m_recording_pause;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	// Labels handed to the GPU thread and not yet written.

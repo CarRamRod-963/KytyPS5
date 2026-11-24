@@ -52,6 +52,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include <vulkan/vulkan_format_traits.hpp>
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
@@ -1396,6 +1397,23 @@ bool TestGuestCopies() {
   return guest_copies != nullptr && std::strcmp(guest_copies, "1") == 0;
 }
 
+// KYTY_TEST_RECORDING_THREAD=1: the test thread records through a Vulkan
+// recording thread; =gpu: the GPU threads of the cases do, as the emulator's
+// GPU thread with --vulkan-recording-thread (the test thread records
+// directly).
+enum class TestRecording { Off, TestThread, GpuThreads };
+TestRecording TestRecordingMode() {
+  const char *mode = std::getenv("KYTY_TEST_RECORDING_THREAD");
+  if (mode == nullptr) {
+    return TestRecording::Off;
+  }
+  if (std::strcmp(mode, "1") == 0) {
+    return TestRecording::TestThread;
+  }
+  return std::strcmp(mode, "gpu") == 0 ? TestRecording::GpuThreads
+                                        : TestRecording::Off;
+}
+
 void LoadTestConfig(Config::ConfigOptions options) {
   options.lazy_bda_sync = TestLazyBdaSync();
   options.guest_thread_readbacks =
@@ -1403,6 +1421,8 @@ void LoadTestConfig(Config::ConfigOptions options) {
   // No startup probe of the readback paths: a test's ticks start at its own
   // commands (CheckSubmittedDownloadReadback runs the probe itself).
   options.in_place_readbacks = Config::InPlaceReadbacks::On;
+  options.vulkan_recording_thread =
+      TestRecordingMode() == TestRecording::GpuThreads;
   Config::Load(options);
 }
 
@@ -3149,6 +3169,9 @@ public:
           draining.Shutdown();
           release_priority.acquire();
         });
+    // Other threads finish the recording this thread began (with
+    // KYTY_TEST_RECORDING_THREAD=1 its commands must reach the driver first).
+    Libs::Graphics::VulkanRecording::Drain();
     std::jthread shutdown_thread([&draining] { draining.Shutdown(); });
     priority_entered.acquire();
     std::jthread second_shutdown_thread([&draining] { draining.Shutdown(); });
@@ -3744,6 +3767,27 @@ public:
       timelines[0]->Wait(blocked_tick);
       Require(name, "batched push order", ReadBuffer(name, target, 4)[2] == 15,
               "buffers submitted together reached the queue out of push order");
+
+      // A reserved buffer (the Vulkan recording thread still records it) keeps
+      // its place: a buffer pushed later, on any timeline, waits for it.
+      SubmitInfo reserved_submit{};
+      const auto reserved_tick =
+          submitter.Reserve(reserved_submit, *timelines[0]);
+      const auto behind_tick =
+          submitter.Push(record(2, 21, 3), {}, *timelines[1]);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      timelines[1]->Refresh();
+      Require(name, "reserved place",
+              submitter.Submitted() + 2 == submitter.Pushed() &&
+                  !timelines[1]->IsFree(behind_tick),
+              "a buffer pushed after a reserved one reached the queue first");
+      const auto reserved_buffer = record(2, 20, 3);
+      Libs::Graphics::VulkanRecording::Drain();
+      submitter.PushReserved(timelines[0]->Handle(), reserved_tick,
+                             reserved_buffer);
+      timelines[1]->Wait(behind_tick);
+      Require(name, "reserved order", ReadBuffer(name, target, 4)[2] == 21,
+              "a reserved buffer did not reach the queue in its place");
     }
     m_device.freeCommandBuffers(
         m_command_pool, static_cast<u32>(buffers.size()), buffers.data());
@@ -31707,6 +31751,9 @@ private:
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+    functions.vkFreeMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory;
+    functions.vkDestroyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer;
+    functions.vkDestroyImage = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
 
     VmaAllocatorCreateInfo allocator_info{};
     allocator_info.instance = m_instance;
@@ -32094,6 +32141,16 @@ private:
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    if (const auto mode = TestRecordingMode(); mode != TestRecording::Off) {
+      Libs::Graphics::VulkanRecording::Install();
+      if (mode == TestRecording::TestThread) {
+        m_recording =
+            std::make_unique<Libs::Graphics::VulkanRecording::ProducerScope>();
+      }
+      std::printf("[host]    Vulkan recording thread on (%s)\n",
+                  mode == TestRecording::TestThread ? "test thread"
+                                                    : "GPU threads");
+    }
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -32107,6 +32164,7 @@ private:
 
   void Destroy() {
     if (m_device != nullptr) {
+      m_recording.reset();
       m_runtime_context.DrainSubmissions();
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
@@ -32420,6 +32478,7 @@ private:
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
   std::unique_ptr<QueueSubmitter> m_submitter;
+  std::unique_ptr<Libs::Graphics::VulkanRecording::ProducerScope> m_recording;
 };
 
 void CompareWords(const TestCase &test, const char *stage,

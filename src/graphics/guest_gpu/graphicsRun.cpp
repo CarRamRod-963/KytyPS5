@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -80,6 +81,8 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	// A recording producer hands its Vulkan objects to the GPU thread: its queued calls first.
+	VulkanRecording::Drain();
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
@@ -110,6 +113,9 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	std::binary_semaphore done {0};
 	SendCommand([operation = std::move(command), &done]() mutable {
 		operation();
+		// The caller goes on as if the command's Vulkan calls were made (an unmap frees host
+		// memory an imported allocation may still name until its queued release).
+		VulkanRecording::Drain();
 		done.release();
 	});
 	done.acquire();
@@ -442,6 +448,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	// Guest stores made before the submission are ordered by its first command, later ones by a
 	// later submission or a wait.
 	submission.store_epoch = m_renderer.BeginGuestStoreEpoch();
+	// A recording producer hands its Vulkan objects to the GPU thread: its queued calls first.
+	VulkanRecording::Drain();
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -483,6 +491,9 @@ void GuestGpu::ThreadRun(void* data) {
 	     Config::NarrowReadbacksEnabled() ? "on" : "off",
 	     Config::GuestThreadReadbacksEnabled() ? "on" : "off",
 	     Config::GpuThreadPriorityEnabled() ? "above normal" : "normal");
+	// With --vulkan-recording-thread the thread's Vulkan recording calls are made by a thread of
+	// their own (VulkanRecording::Install).
+	const VulkanRecording::ProducerScope recording(Config::VulkanRecordingThreadEnabled());
 
 	for (;;) {
 		Submission                   submission;
@@ -491,6 +502,8 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Whoever waits for the idle GPU thread uses what it recorded.
+				VulkanRecording::Drain();
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				const auto start = std::chrono::steady_clock::now();
