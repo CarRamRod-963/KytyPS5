@@ -110,6 +110,10 @@ public:
 		       m_pending_labels.Elide(address, size, std::forward<Condition>(condition));
 	}
 	[[nodiscard]] bool HasElidedLabels() const noexcept { return m_pending_labels.HasElided(); }
+	// Labels the GPU thread did not store because their range was no longer mapped.
+	[[nodiscard]] uint64_t LabelsSkippedUnmapped() const noexcept {
+		return m_labels_skipped_unmapped.load(std::memory_order_relaxed);
+	}
 	// GPU thread, before a command accesses guest memory: waits until the elided labels in the
 	// range are stored. Other threads return at once.
 	void SettleElidedLabels(uint64_t vaddr, uint64_t size);
@@ -151,6 +155,8 @@ private:
 	bool                      m_fault_process_pending = false;
 	// Labels handed to the GPU thread and not yet written.
 	std::atomic<uint32_t> m_gpu_thread_labels {0};
+	// Labels handed to the GPU thread whose range was unmapped before it stored them.
+	std::atomic<uint64_t> m_labels_skipped_unmapped {0};
 	PendingLabels         m_pending_labels;
 	// m_gpu for threads outside the GPU thread's lifetime, and how many of them use it now.
 	std::atomic<GuestGpu*> m_notified_gpu {nullptr};

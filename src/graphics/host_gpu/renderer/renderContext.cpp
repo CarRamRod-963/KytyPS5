@@ -169,7 +169,10 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	}
 	Common::GpuTiming::Sync().AddLabel(false);
 	m_gpu_thread_labels.fetch_add(1, std::memory_order_relaxed);
-	GetGpu().SendCommand([this, dst, value, size, label_id, notify = std::move(notify)]() mutable {
+	// Whether the label's range is guest memory mapped now: the GPU thread stores it later.
+	const bool was_mapped = IsMapped(reinterpret_cast<uint64_t>(dst), size);
+	GetGpu().SendCommand([this, dst, value, size, label_id, was_mapped,
+	                      notify = std::move(notify)]() mutable {
 		const auto vaddr = reinterpret_cast<uint64_t>(dst);
 		const auto epoch = m_buffer_cache.CurrentBdaStoreEpoch();
 		// A settled access may have stored the label, and later ones, already.
@@ -191,8 +194,13 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 			if (GuestRange {vaddr, size}.Valid() && m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) {
 				m_buffer_cache.ReadMemory(vaddr, size, true);
 			}
-			(void)InvalidateMemory(vaddr, size);
-			if (store()) {
+			// A range the guest unmapped before the label landed takes no store: the store would
+			// fault, or land in whatever the address space holds there now.
+			const bool unmapped = !InvalidateMemory(vaddr, size) && was_mapped;
+			if (unmapped) {
+				m_labels_skipped_unmapped.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (!unmapped && store()) {
 				if (size == sizeof(uint32_t)) {
 					const auto word = static_cast<uint32_t>(value);
 					std::memcpy(dst, &word, sizeof(word));
