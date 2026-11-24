@@ -284,6 +284,9 @@ private:
 	mutable std::vector<ScatterDestination>   m_scatter_destinations;
 	mutable vk::Buffer                        m_scatter_source         = nullptr;
 	mutable vk::DeviceAddress                 m_scatter_source_address = 0;
+	// The source offsets those pieces copy, for the command log.
+	mutable uint32_t m_scatter_first_offset = UINT32_MAX;
+	mutable uint32_t m_scatter_end_offset   = 0;
 	// Regions of a CopyToBuffer call recorded as a copy command.
 	mutable std::vector<vk::BufferCopy> m_direct_regions;
 	HW::Context*        m_registers   = nullptr;
@@ -324,6 +327,9 @@ public:
 	// Optional source, such a T# returns a binding without an image instead.
 	enum class TextureSource : uint8_t { Bound, Optional };
 	void ValidateTextureUse(const ShaderRecompiler::IR::ImageResource& resource);
+	// The command log's view of the bindings CommitBindings bound last: the bindless flag and the
+	// bindless table's slot-write count, when the table is bound.
+	void                         NoteBindless(CommandLog::Command& command);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value,
 	                                            TextureSource source = TextureSource::Bound);
@@ -521,6 +527,8 @@ private:
 	// descriptor, the image resource each heap's T#s are decoded as, and the texture cache
 	// deletions the slots were validated at.
 	bool                                  m_bindless_placeholder_ready = false;
+	// Whether the last CommitBindings bound the bindless table (for the command log).
+	bool m_committed_bindless = false;
 	// A heap did not fit in the translation table since the last reset.
 	bool                                             m_bindless_heap_refused = false;
 	std::vector<ShaderRecompiler::IR::ImageResource> m_bindless_resources;

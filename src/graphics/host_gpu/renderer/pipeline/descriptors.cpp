@@ -1877,6 +1877,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                             ShaderRecompiler::IR::BindlessDescriptorSet, 1, &set, 0,
 		                             nullptr);
 	}
+	m_committed_bindless = bindless;
+}
+
+void RenderExecutor::NoteBindless(CommandLog::Command& command) {
+	if (m_committed_bindless) {
+		command.flags |= CommandLog::FlagBindless;
+		command.bindless_writes = m_context.GetBindlessTable().SlotWrites();
+	}
 }
 
 } // namespace Libs::Graphics

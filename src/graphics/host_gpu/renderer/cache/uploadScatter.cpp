@@ -67,36 +67,38 @@ void UploadScatter::AddPieces(std::vector<Piece>& pieces, uint64_t destination,
 	}
 }
 
-bool UploadScatter::Record(vk::CommandBuffer command, vk::DeviceAddress source,
-                           std::span<const Piece> pieces) {
-	if (pieces.empty()) {
-		return true;
-	}
-	const auto tables = (pieces.size() + MaxTablePieces - 1) / MaxTablePieces;
+UploadScatter::Tables UploadScatter::Reserve(size_t pieces) {
+	EXIT_IF(pieces == 0);
+	const auto tables = (pieces + MaxTablePieces - 1) / MaxTablePieces;
 	// A table is a header (the source address), its pieces and the padding to the next one.
 	const auto bytes =
 	    (tables - 1) * Common::AlignUp((MaxTablePieces + 1) * sizeof(Piece), TableAlignment) +
-	    (pieces.size() - (tables - 1) * MaxTablePieces + 1) * sizeof(Piece);
+	    (pieces - (tables - 1) * MaxTablePieces + 1) * sizeof(Piece);
 	// No wait: it would submit the command buffer before the copies are recorded.
 	const auto [mapped, offset] = m_ring.Map(bytes, TableAlignment, false);
 	if (mapped == nullptr) {
-		return false;
+		return {};
 	}
 	EXIT_IF(offset % TableAlignment != 0);
+	return {mapped, offset, m_ring.BufferDeviceAddress() + offset};
+}
+
+void UploadScatter::Record(vk::CommandBuffer command, vk::DeviceAddress source,
+                           std::span<const Piece> pieces, const Tables& tables) {
+	EXIT_IF(tables.mapped == nullptr || pieces.empty());
 	const Piece header {static_cast<uint32_t>(source), static_cast<uint32_t>(source >> 32u), 0, 0};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	uint64_t position = 0;
 	for (uint64_t first = 0; first < pieces.size(); first += MaxTablePieces) {
 		const auto count = std::min<uint64_t>(MaxTablePieces, pieces.size() - first);
-		std::memcpy(mapped + position, &header, sizeof(header));
-		std::memcpy(mapped + position + sizeof(Piece), pieces.data() + first,
+		std::memcpy(tables.mapped + position, &header, sizeof(header));
+		std::memcpy(tables.mapped + position + sizeof(Piece), pieces.data() + first,
 		            count * sizeof(Piece));
-		command.dispatchBase(0, static_cast<uint32_t>((offset + position) / TableAlignment), 0,
-		                     static_cast<uint32_t>(count), 1, 1);
+		command.dispatchBase(0, static_cast<uint32_t>((tables.offset + position) / TableAlignment),
+		                     0, static_cast<uint32_t>(count), 1, 1);
 		position += Common::AlignUp((count + 1) * sizeof(Piece), TableAlignment);
 	}
 	m_ring.Commit();
-	return true;
 }
 
 } // namespace Libs::Graphics

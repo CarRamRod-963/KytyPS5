@@ -33,9 +33,13 @@ enum class Kind : uint8_t {
 	DrawMesh,         // x, y, z: mesh workgroup counts
 	DrawMeshIndirect, // x: draw count
 	Internal,         // an emulator pass: `name`
+	Scatter,          // an upload scatter dispatch (see Command)
+	UploadCopies,     // the copy commands that stood in for a scatter dispatch
 };
 
 inline constexpr uint8_t FlagAsyncCompute = 1u << 0u; // from a guest compute queue
+// Binds the bindless image table; `bindless_writes` is the table's slot-write count at recording.
+inline constexpr uint8_t FlagBindless = 1u << 1u;
 
 struct Command {
 	Kind    kind  = Kind::None;
@@ -44,11 +48,22 @@ struct Command {
 	// and the pixel shader; 0 for none.
 	uint64_t shader0 = 0;
 	uint64_t shader1 = 0;
+	// Kind::Scatter, Kind::UploadCopies: x, y = the first and the end source offset copied;
+	// Kind::Scatter: z = its pieces.
+	// Kind::DispatchIndirect: x, y = low and high word of the guest address of the arguments.
 	uint32_t x       = 0;
 	uint32_t y       = 0;
 	uint32_t z       = 0;
 	// For Kind::Internal: a string with static storage duration.
 	const char* name = nullptr;
+	// Kind::DispatchIndirect: the device address of the arguments. Kind::Scatter and
+	// Kind::UploadCopies: the device address of the source buffer the offsets are in.
+	uint64_t address = 0;
+	// Kind::Scatter: the device address of its first piece table (header, then the pieces).
+	uint64_t table = 0;
+	// With FlagBindless: how many bindless slot descriptors had been written when the command
+	// was recorded.
+	uint64_t bindless_writes = 0;
 };
 
 struct Entry {
@@ -99,7 +114,8 @@ public:
 		                      (uint64_t {static_cast<uint8_t>(command.kind)} << 32u) |
 		                      (uint64_t {command.flags} << 40u),
 		                  std::memory_order_relaxed);
-		slot.name.store(command.name, std::memory_order_relaxed);
+		slot.word.store(PackWord(command), std::memory_order_relaxed);
+		slot.address.store(command.address, std::memory_order_relaxed);
 		slot.sequence.store(sequence, std::memory_order_release);
 		return sequence;
 	}
@@ -121,7 +137,8 @@ public:
 		entry.command.shader1 = slot.shader1.load(std::memory_order_relaxed);
 		const uint64_t xy     = slot.xy.load(std::memory_order_relaxed);
 		const uint64_t z_kind = slot.z_kind.load(std::memory_order_relaxed);
-		entry.command.name    = slot.name.load(std::memory_order_relaxed);
+		const uint64_t word   = slot.word.load(std::memory_order_relaxed);
+		entry.command.address = slot.address.load(std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_acquire);
 		if (slot.sequence.load(std::memory_order_relaxed) != sequence) {
 			return false;
@@ -131,11 +148,31 @@ public:
 		entry.command.z     = static_cast<uint32_t>(z_kind);
 		entry.command.kind  = static_cast<Kind>(static_cast<uint8_t>(z_kind >> 32u));
 		entry.command.flags = static_cast<uint8_t>(z_kind >> 40u);
-		out                 = entry;
+		UnpackWord(word, entry.command);
+		out = entry;
 		return true;
 	}
 
 private:
+	// One slot word holds the field that matters for the kind: a pass name, a scatter's table
+	// address or a bindless slot-write count. That keeps a slot in one cache line.
+	static uint64_t PackWord(const Command& command) noexcept {
+		switch (command.kind) {
+			case Kind::Internal: return reinterpret_cast<uintptr_t>(command.name);
+			case Kind::Scatter: return command.table;
+			default: return command.bindless_writes;
+		}
+	}
+	static void UnpackWord(uint64_t word, Command& command) noexcept {
+		switch (command.kind) {
+			case Kind::Internal:
+				command.name = reinterpret_cast<const char*>(static_cast<uintptr_t>(word));
+				break;
+			case Kind::Scatter: command.table = word; break;
+			default: command.bindless_writes = word; break;
+		}
+	}
+
 	struct alignas(64) Slot {
 		std::atomic<uint64_t>    sequence {0};
 		std::atomic<uint64_t>    tick {0};
@@ -143,8 +180,10 @@ private:
 		std::atomic<uint64_t>    shader1 {0};
 		std::atomic<uint64_t>    xy {0};
 		std::atomic<uint64_t>    z_kind {0};
-		std::atomic<const char*> name {nullptr};
+		std::atomic<uint64_t>    word {0};
+		std::atomic<uint64_t>    address {0};
 	};
+	static_assert(sizeof(Slot) == 64);
 
 	uint32_t                m_log_id;
 	uint32_t                m_mask;
@@ -167,6 +206,8 @@ inline const char* KindName(Kind kind) {
 		case Kind::DrawMesh: return "draw mesh";
 		case Kind::DrawMeshIndirect: return "draw mesh indirect";
 		case Kind::Internal: return "internal";
+		case Kind::Scatter: return "upload scatter";
+		case Kind::UploadCopies: return "upload copies";
 		default: return "unknown";
 	}
 }
@@ -184,7 +225,10 @@ inline std::string Describe(const Command& c) {
 			              c.shader0, c.x, c.y, c.z);
 			break;
 		case Kind::DispatchIndirect:
-			std::snprintf(line, sizeof(line), "dispatch indirect CS %016" PRIx64, c.shader0);
+			std::snprintf(line, sizeof(line),
+			              "dispatch indirect CS %016" PRIx64 " args 0x%" PRIx64 " (guest 0x%" PRIx64
+			              ")",
+			              c.shader0, c.address, uint64_t {c.x} | (uint64_t {c.y} << 32u));
 			break;
 		case Kind::Draw:
 		case Kind::DrawIndexed:
@@ -206,9 +250,24 @@ inline std::string Describe(const Command& c) {
 		case Kind::Internal:
 			std::snprintf(line, sizeof(line), "internal %s", c.name != nullptr ? c.name : "pass");
 			break;
+		case Kind::Scatter:
+			std::snprintf(line, sizeof(line),
+			              "upload scatter source 0x%" PRIx64
+			              " offsets 0x%x-0x%x pieces %u table 0x%" PRIx64,
+			              c.address, c.x, c.y, c.z, c.table);
+			break;
+		case Kind::UploadCopies:
+			std::snprintf(line, sizeof(line),
+			              "upload copies source 0x%" PRIx64 " offsets 0x%x-0x%x", c.address, c.x,
+			              c.y);
+			break;
 		default: std::snprintf(line, sizeof(line), "unknown command"); break;
 	}
 	std::string out = line;
+	if ((c.flags & FlagBindless) != 0) {
+		std::snprintf(line, sizeof(line), " bindless (slot writes %" PRIu64 ")", c.bindless_writes);
+		out += line;
+	}
 	if ((c.flags & FlagAsyncCompute) != 0) {
 		out += " (compute queue)";
 	}
@@ -297,7 +356,7 @@ inline std::string Format(const Ring& ring, std::string_view log_name, uint64_t 
 			out += line;
 		}
 		const auto& c = entry.command;
-		if (c.kind == Kind::Internal) {
+		if (c.kind == Kind::Internal || c.kind == Kind::Scatter || c.kind == Kind::UploadCopies) {
 			continue;
 		}
 		const Kind group = IsDispatch(c.kind) ? Kind::Dispatch : Kind::Draw;

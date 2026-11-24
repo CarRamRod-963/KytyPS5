@@ -12,8 +12,10 @@ namespace {
 
 using Libs::Graphics::CommandLog::Checkpoint;
 using Libs::Graphics::CommandLog::Command;
+using Libs::Graphics::CommandLog::Describe;
 using Libs::Graphics::CommandLog::Entry;
 using Libs::Graphics::CommandLog::FlagAsyncCompute;
+using Libs::Graphics::CommandLog::FlagBindless;
 using Libs::Graphics::CommandLog::Format;
 using Libs::Graphics::CommandLog::Kind;
 using Libs::Graphics::CommandLog::MakeMarker;
@@ -62,7 +64,10 @@ void TestReportOfLostSubmission() {
   ring.Note(6, {.kind = Kind::Internal, .name = "tiling pass"});
   ring.Note(6, {.kind = Kind::DispatchIndirect,
                 .flags = FlagAsyncCompute,
-                .shader0 = 0xf716f0efbbc7e677});
+                .shader0 = 0xf716f0efbbc7e677,
+                .x = 0x40010,
+                .y = 0x30,
+                .address = 0x4300a0100});
   ring.Note(7, Dispatch(0x22, 3));
   ring.Note(8, Dispatch(0x22, 4));
   CheckText(
@@ -75,7 +80,8 @@ void TestReportOfLostSubmission() {
       "00000000000000bb count 36 instances 2\n"
       "Lost submission (main) command 2: internal tiling pass\n"
       "Lost submission (main) command 3: dispatch indirect CS "
-      "f716f0efbbc7e677 (compute queue)\n"
+      "f716f0efbbc7e677 args 0x4300a0100 (guest 0x3000040010) (compute "
+      "queue)\n"
       "Lost submission (main) shader: CS f716f0efbbc7e677 x 2\n"
       "Lost submission (main) shader: VS 00000000000000aa PS "
       "00000000000000bb x 1\n"
@@ -89,6 +95,78 @@ void TestReportOfLostSubmission() {
             "Lost submission (main): tick 9, GPU at 8, submitted up to 9, 0 "
             "command(s) noted\n",
             "submission without noted commands");
+}
+
+// The facts that tell the causes of a boot-time loss apart: what an upload
+// scatter read, whether a command binds the bindless table and how many slot
+// writes it saw, where an indirect dispatch reads its arguments.
+void TestLossFacts() {
+  Ring ring(3, 64);
+  ring.Note(11, {.kind = Kind::Scatter,
+                 .x = 0x48d0000,
+                 .y = 0x48f2000,
+                 .z = 34,
+                 .address = 0x500000000,
+                 .table = 0x500a00100});
+  ring.Note(11, {.kind = Kind::UploadCopies,
+                 .x = 0x100,
+                 .y = 0x200,
+                 .address = 0x500000000});
+  ring.Note(11, {.kind = Kind::Dispatch,
+                 .flags = FlagBindless,
+                 .shader0 = 0xb5710780d3d8eb7b,
+                 .x = 32,
+                 .y = 32,
+                 .z = 16,
+                 .bindless_writes = 412});
+  ring.Note(11, {.kind = Kind::DrawIndexed,
+                 .flags = FlagBindless | FlagAsyncCompute,
+                 .shader0 = 0xaa,
+                 .shader1 = 0xbb,
+                 .x = 3,
+                 .y = 1,
+                 .bindless_writes = 413});
+  ring.Note(11, {.kind = Kind::Internal, .name = "tiling pass"});
+  CheckText(
+      Format(ring, "main", 10, 11),
+      "Lost submission (main): tick 11, GPU at 10, submitted up to 11, 5 "
+      "command(s) noted\n"
+      "Lost submission (main) command 0: upload scatter source 0x500000000 "
+      "offsets 0x48d0000-0x48f2000 pieces 34 table 0x500a00100\n"
+      "Lost submission (main) command 1: upload copies source 0x500000000 "
+      "offsets 0x100-0x200\n"
+      "Lost submission (main) command 2: dispatch CS b5710780d3d8eb7b groups "
+      "32x32x16 bindless (slot writes 412)\n"
+      "Lost submission (main) command 3: draw indexed VS 00000000000000aa PS "
+      "00000000000000bb count 3 instances 1 bindless (slot writes 413) "
+      "(compute queue)\n"
+      "Lost submission (main) command 4: internal tiling pass\n"
+      "Lost submission (main) shader: CS b5710780d3d8eb7b x 1\n"
+      "Lost submission (main) shader: VS 00000000000000aa PS "
+      "00000000000000bb x 1\n",
+      "loss facts");
+  // Each kind keeps its own field in the shared slot word.
+  Entry entry;
+  Check(ring.Read(1, entry) && entry.command.table == 0x500a00100 &&
+            entry.command.bindless_writes == 0 &&
+            entry.command.name == nullptr &&
+            entry.command.address == 0x500000000,
+        "scatter fields read back");
+  Check(ring.Read(3, entry) && entry.command.bindless_writes == 412 &&
+            entry.command.table == 0 && entry.command.name == nullptr,
+        "bindless count read back");
+  Check(ring.Read(5, entry) && entry.command.bindless_writes == 0 &&
+            std::string_view(entry.command.name) == "tiling pass",
+        "pass name read back");
+  // Without the flag a command shows no bindless count.
+  Check(Describe({.kind = Kind::Dispatch,
+                  .shader0 = 1,
+                  .x = 1,
+                  .y = 1,
+                  .z = 1,
+                  .bindless_writes = 7})
+                .find("bindless") == std::string::npos,
+        "bindless count without the flag");
 }
 
 void TestReadAndMarkers() {
@@ -197,7 +275,9 @@ void TestConcurrentNotes() {
                     .shader1 = i * 5,
                     .x = static_cast<uint32_t>(i),
                     .y = static_cast<uint32_t>(i >> 32u),
-                    .z = static_cast<uint32_t>(i * 7)});
+                    .z = static_cast<uint32_t>(i * 7),
+                    .address = i * 11,
+                    .bindless_writes = i * 13});
     }
     done.store(true, std::memory_order_release);
   });
@@ -215,6 +295,8 @@ void TestConcurrentNotes() {
                 entry.command.shader1 == s * 5 &&
                 entry.command.x == static_cast<uint32_t>(s) &&
                 entry.command.z == static_cast<uint32_t>(s * 7) &&
+                entry.command.address == s * 11 &&
+                entry.command.bindless_writes == s * 13 &&
                 entry.command.kind == Kind::Dispatch,
             "torn read");
     }
@@ -227,6 +309,7 @@ void TestConcurrentNotes() {
 
 int main() {
   TestReportOfLostSubmission();
+  TestLossFacts();
   TestReadAndMarkers();
   TestOverwrittenStart();
   TestLongSubmission();

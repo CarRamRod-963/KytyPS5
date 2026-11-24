@@ -1,11 +1,14 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -40,9 +43,11 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &m_layout) !=
 	        vk::Result::eSuccess);
 	graphics.bindless_set_layout = m_layout;
+	graphics.RegisterLostWorkReport(&BindlessTable::ReportLostDevice, this);
 }
 
 BindlessTable::~BindlessTable() {
+	m_graphics.UnregisterLostWorkReport(this);
 	if (m_pool != nullptr) {
 		m_graphics.device.destroyDescriptorPool(m_pool, nullptr);
 	}
@@ -128,6 +133,18 @@ void BindlessTable::WriteSlot(uint32_t slot, vk::ImageView view, vk::ImageLayout
 	write.descriptorType  = vk::DescriptorType::eSampledImage;
 	write.pImageInfo      = &image;
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	// One writer (the GPU thread); the lost-device report reads it from any thread.
+	m_slot_writes.store(m_slot_writes.load(std::memory_order_relaxed) + 1u,
+	                    std::memory_order_relaxed);
+}
+
+void BindlessTable::ReportLostDevice(const void* object,
+                                     std::span<const CommandLog::Checkpoint> /*checkpoints*/) {
+	const auto& table = *static_cast<const BindlessTable*>(object);
+	char        line[128];
+	std::snprintf(line, sizeof(line), "Lost submission: bindless slot writes now %" PRIu64 "%s\n",
+	              table.SlotWrites(), table.Created() ? "" : " (table never used)");
+	Log::WriteToConsoleAndLog(line);
 }
 
 void BindlessTable::MakeFeedbackVisible(vk::CommandBuffer command_buffer) {
