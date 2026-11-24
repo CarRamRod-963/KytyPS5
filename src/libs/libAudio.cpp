@@ -64,6 +64,13 @@ AudioPropagationSystemCreate(const void* /*options*/, AudioPropagationSystemMemo
 	return 0;
 }
 
+static int32_t KYTY_SYSV_ABI
+AudioPropagationSystemDestroy(AudioPropagationHandle /*system_handle*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
 static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
                                                         AudioPropagationHandle* out_room_handle) {
 	PRINT_NAME();
@@ -82,6 +89,13 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSourceCreate(
 	if (out_source_handle != nullptr) {
 		*out_source_handle = AudioPropagationNextHandle();
 	}
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI
+AudioPropagationSourceDestroy(AudioPropagationHandle /*source_handle*/) {
+	PRINT_NAME();
 
 	return 0;
 }
@@ -133,6 +147,13 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
 	return 0;
 }
 
+static int32_t KYTY_SYSV_ABI AudioPropagationSystemUnregisterMaterial(
+    AudioPropagationHandle /*system_handle*/, AudioPropagationHandle /*material_handle*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
 static int32_t KYTY_SYSV_ABI
 AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
                                     const void* /*attributes*/, uint32_t /*num_attributes*/) {
@@ -155,13 +176,16 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandl
 LIB_DEFINE(InitAudio_1_AudioPropagation) {
 	LIB_FUNC("7xyAxrusLko", LibAudioPropagation::AudioPropagationSystemQueryMemory);
 	LIB_FUNC("aNEqtSHdUSo", LibAudioPropagation::AudioPropagationSystemCreate);
+	LIB_FUNC("x5VPqg5iyAk", LibAudioPropagation::AudioPropagationSystemDestroy);
 	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
 	LIB_FUNC("d84otraxt2s", LibAudioPropagation::AudioPropagationSourceCreate);
+	LIB_FUNC("wkseM3LWPuc", LibAudioPropagation::AudioPropagationSourceDestroy);
 	LIB_FUNC("-wsUTr31yeg", LibAudioPropagation::AudioPropagationSourceSetAttributes);
 	LIB_FUNC("eEeKqFeNI3o", LibAudioPropagation::AudioPropagationSourceGetAudioPath);
 	LIB_FUNC("tKSmk2JsMAA", LibAudioPropagation::AudioPropagationSourceSetAudioPath);
 	LIB_FUNC("hhz9pITnC8k", LibAudioPropagation::AudioPropagationSourceRender);
 	LIB_FUNC("CPLV6G-eXmk", LibAudioPropagation::AudioPropagationSystemRegisterMaterial);
+	LIB_FUNC("XKCN4gpeYsM", LibAudioPropagation::AudioPropagationSystemUnregisterMaterial);
 	LIB_FUNC("kIdb+iQUzCs", LibAudioPropagation::AudioPropagationSystemSetAttributes);
 	LIB_FUNC("ht-QXT3zGxo", LibAudioPropagation::AudioPropagationSystemGetRays);
 }
