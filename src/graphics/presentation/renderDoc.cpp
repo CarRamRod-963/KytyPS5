@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 
 #include <array>
 #include <atomic>
@@ -166,6 +167,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 
 	// Capture boundaries follow presentation and exclude concurrent queue access.
 	Common::LockGuard render_lock(renderer.GetMutex());
+	VulkanRecording::Drain();
 	renderer.GetGraphics().DrainSubmissions();
 	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {

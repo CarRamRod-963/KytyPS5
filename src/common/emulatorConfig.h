@@ -138,6 +138,9 @@ struct ConfigOptions {
 	// when the GPU thread has nothing to record for it (--guest-thread-readbacks; off: the GPU
 	// thread serves every request).
 	bool guest_thread_readbacks = false;
+	// The GPU thread's Vulkan recording calls are made by a thread of their own
+	// (graphics/host_gpu/vulkanRecording.h).
+	bool vulkan_recording_thread = false;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
@@ -245,6 +248,7 @@ bool     GpuCheckpointsEnabled();
 bool     LazyBdaSyncEnabled();
 bool                  NarrowReadbacksEnabled();
 bool                  GuestThreadReadbacksEnabled();
+bool                  VulkanRecordingThreadEnabled();
 std::filesystem::path ExportPipelineListPath();
 std::filesystem::path ImportPipelineListPath();
 uint32_t LookaheadThreads();

@@ -305,6 +305,10 @@ bool GuestThreadReadbacksEnabled() {
 	return g_config->guest_thread_readbacks;
 }
 
+bool VulkanRecordingThreadEnabled() {
+	return g_config->vulkan_recording_thread;
+}
+
 std::filesystem::path ExportPipelineListPath() {
 	return g_config->export_pipeline_list;
 }

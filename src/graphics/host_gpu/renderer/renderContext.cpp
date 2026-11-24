@@ -5,6 +5,7 @@
 #include "common/gpuTiming.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -58,6 +59,9 @@ RenderContext::~RenderContext() {
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
+	// The GPU thread records into the schedulers this thread began; it owns the recording from
+	// here on.
+	m_recording_pause = std::make_unique<VulkanRecording::PauseScope>();
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
 	m_notified_gpu.store(m_gpu.get());
@@ -72,6 +76,7 @@ void RenderContext::ShutdownGpu() {
 			std::this_thread::yield();
 		}
 		m_gpu.reset();
+		m_recording_pause.reset();
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {

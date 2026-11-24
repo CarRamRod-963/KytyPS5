@@ -4,6 +4,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <SDL3/SDL_loadso.h>
@@ -345,6 +346,9 @@ Feature* CreateFeature(vk::CommandBuffer command, const Creation& creation) {
 
 bool Evaluate(vk::CommandBuffer command, const Feature* feature, const Pssr::Request& request,
               Inputs& inputs, bool reset) {
+	// The library records into `command` with the driver's own entries: every queued Vulkan
+	// recording call of this thread is made first.
+	VulkanRecording::Drain();
 	SetEvaluation(*g_parameters, request, inputs, reset);
 	if (const auto result =
 	        g_api.evaluate(static_cast<VkCommandBuffer>(command), feature, g_parameters, nullptr);

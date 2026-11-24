@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanRecording.h"
 
 #include <algorithm>
 #include <chrono>
@@ -420,7 +421,30 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                std::chrono::steady_clock::now().time_since_epoch())
 		                .count();
-		tick      = graphics.submitter->Push(buffer, submit, m_master);
+		if (VulkanRecording::Recording()) {
+			// The buffer's commands, and its end, are still on their way to the driver: the
+			// recording thread hands it to the submission thread behind them. The tick and the
+			// buffer's place among the submissions are taken now.
+			struct Handover {
+				QueueSubmitter*   submitter;
+				vk::Semaphore     semaphore;
+				uint64_t          tick;
+				vk::CommandBuffer buffer;
+			};
+			tick = graphics.submitter->Reserve(submit, m_master);
+			const Handover handover {graphics.submitter, m_master.Handle(), tick, buffer};
+			const auto     push_reserved = [](const void* data) {
+				const auto& queued = *static_cast<const Handover*>(data);
+				queued.submitter->PushReserved(queued.semaphore, queued.tick, queued.buffer);
+			};
+			if (!VulkanRecording::EnqueueOrdered(push_reserved, &handover, sizeof(handover))) {
+				push_reserved(&handover);
+			}
+		} else {
+			// (Calls a producer queued before it stopped recording come first.)
+			VulkanRecording::Drain();
+			tick = graphics.submitter->Push(buffer, submit, m_master);
+		}
 	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();

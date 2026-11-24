@@ -912,6 +912,11 @@ add_executable(command_log_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(command_log_tests PRIVATE ${inc_headers})
 
+add_executable(recording_stream_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RecordingStreamTests.cpp"
+)
+target_include_directories(recording_stream_tests PRIVATE ${inc_headers})
+
 add_executable(memory_priority_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryPriorityTests.cpp"
 )
@@ -1107,6 +1112,10 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_in_place_readbacks_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --in-place-readbacks sometimes)
 	set_tests_properties(emulator_in_place_readbacks_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_vulkan_recording_thread_on
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --vulkan-recording-thread)
+	add_test(NAME emulator_vulkan_recording_thread_off
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-vulkan-recording-thread)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -1133,6 +1142,7 @@ if(BUILD_TESTING)
 	add_test(NAME in_place_readbacks COMMAND $<TARGET_FILE:in_place_readbacks_tests>)
 	add_test(NAME device_fault COMMAND $<TARGET_FILE:device_fault_tests>)
 	add_test(NAME command_log COMMAND $<TARGET_FILE:command_log_tests>)
+	add_test(NAME recording_stream COMMAND $<TARGET_FILE:recording_stream_tests>)
 	add_test(NAME candidate_selection COMMAND $<TARGET_FILE:candidate_selection_tests>)
 	add_test(NAME pending_draw_policy COMMAND $<TARGET_FILE:pending_draw_policy_tests>)
 	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
@@ -1215,6 +1225,22 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME queue_submitter
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-thread-only)
+	# Every GPU case with a Vulkan recording thread: for the test thread, and for the GPU
+	# threads as with --vulkan-recording-thread.
+	add_test(NAME shader_recompiler_compute_recording_thread
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_recording_thread
+		PROPERTIES ENVIRONMENT "KYTY_TEST_RECORDING_THREAD=1")
+	# Cases that drive a guest GPU thread, with that thread recording through its own
+	# recording thread (the other cases record on the test thread, which is not one then).
+	foreach(case native-indirect label-delivery gpu-command-lane flip pm4-wait pm4-draw-multi
+	        dma-data predication rewind reset-queue occlusion-dump bda-page-table eop-timestamps
+	        scalar-walk indirect-buffer submit-thread buffer-publication depth-readback command-log)
+		add_test(NAME recording_thread_gpu_${case}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --${case}-only)
+		set_tests_properties(recording_thread_gpu_${case}
+			PROPERTIES ENVIRONMENT "KYTY_TEST_RECORDING_THREAD=gpu")
+	endforeach()
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
 	add_test(NAME video_out_flip_rate
@@ -1296,6 +1322,7 @@ if(BUILD_TESTING)
 		in_place_readbacks_tests
 		device_fault_tests
 		command_log_tests
+		recording_stream_tests
 		candidate_selection_tests
 		barrier_tracker_tests
 		memory_tracker_tests

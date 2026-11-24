@@ -39,6 +39,11 @@ bool GraphicContext::CreateAllocator() {
 	VmaVulkanFunctions functions {};
 	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
 	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	// Destruction through the dispatcher, so that it keeps its place behind queued Vulkan
+	// recording calls (vulkanRecording.h).
+	functions.vkFreeMemory    = VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory;
+	functions.vkDestroyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer;
+	functions.vkDestroyImage  = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
 
 	VmaAllocatorCreateInfo info {};
 	info.instance         = instance;
