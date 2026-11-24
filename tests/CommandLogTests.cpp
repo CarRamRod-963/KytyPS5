@@ -12,11 +12,13 @@ namespace {
 
 using Libs::Graphics::CommandLog::Checkpoint;
 using Libs::Graphics::CommandLog::Command;
+using Libs::Graphics::CommandLog::CompletedTick;
 using Libs::Graphics::CommandLog::Describe;
 using Libs::Graphics::CommandLog::Entry;
 using Libs::Graphics::CommandLog::FlagAsyncCompute;
 using Libs::Graphics::CommandLog::FlagBindless;
 using Libs::Graphics::CommandLog::Format;
+using Libs::Graphics::CommandLog::FormatCounterNote;
 using Libs::Graphics::CommandLog::Kind;
 using Libs::Graphics::CommandLog::MakeMarker;
 using Libs::Graphics::CommandLog::Ring;
@@ -169,6 +171,75 @@ void TestLossFacts() {
         "bindless count without the flag");
 }
 
+// After a lost device the timeline counter may read UINT64_MAX (or fail):
+// such a value is no completed tick, and the report must still name the
+// commands of a submission the GPU may not have finished.
+void TestUnknownCompletedTick() {
+  // Only a submitted tick is taken from the counter.
+  Check(CompletedTick(true, 41, 30, 45) == 41, "counter taken");
+  Check(CompletedTick(true, 45, 30, 45) == 45, "counter at the last submitted");
+  Check(CompletedTick(true, UINT64_MAX, 30, 45) == 30, "UINT64_MAX ignored");
+  Check(CompletedTick(true, 46, 30, 45) == 30,
+        "counter past submitted ignored");
+  Check(CompletedTick(false, 41, 30, 45) == 30, "failed read ignored");
+  Check(CompletedTick(false, 0, 50, 45) == 45, "known value bounded");
+  CheckText(FormatCounterNote("main", true, 41, 30, 45), "",
+            "no note for a used counter");
+  CheckText(FormatCounterNote("main", true, UINT64_MAX, 30, 45),
+            "Lost submission (main): GPU counter after the loss "
+            "18446744073709551615 is not a submitted tick; using the last one "
+            "read before, 30\n",
+            "note for UINT64_MAX");
+  CheckText(FormatCounterNote("present", false, 0, 7, 9),
+            "Lost submission (present): GPU counter unreadable after the "
+            "loss; using the last one read before, 7\n",
+            "note for a failed read");
+
+  // The known tick is current: its successor's commands are listed.
+  Ring ring(1, 8);
+  ring.Note(30, Dispatch(0x30, 1));
+  ring.Note(31, Dispatch(0x31, 1));
+  ring.Note(31, Dispatch(0x32, 2));
+  ring.Note(32, Dispatch(0x33, 3));
+  const auto text =
+      Format(ring, "main", CompletedTick(true, UINT64_MAX, 30, 32), 32);
+  Check(text.find("Lost submission (main): tick 31, GPU at 30, submitted up "
+                  "to 32, 2 command(s) noted\n") != std::string::npos &&
+            text.find("command 1: dispatch CS 0000000000000032 groups 2x1x1") !=
+                std::string::npos,
+        "known tick used after an unreadable counter");
+
+  // UINT64_MAX given directly: the oldest held submission is listed, not
+  // "tick 0 ... 0 commands".
+  const auto unknown = Format(ring, "main", UINT64_MAX, 32);
+  Check(unknown.find("Lost submission (main): tick 30 (the oldest held: the "
+                     "first unfinished one is not held), GPU at unknown, "
+                     "submitted up to 32, 1 command(s) noted\n") !=
+                std::string::npos &&
+            unknown.find("command 0: dispatch CS 0000000000000030") !=
+                std::string::npos &&
+            unknown.find("later submissions: 3 command(s) noted\n") !=
+                std::string::npos,
+        "oldest held submission for an unknown tick");
+  Check(unknown.find("tick 0,") == std::string::npos, "no tick 0 report");
+
+  // A stale known tick whose successor was overwritten: the oldest held
+  // submission is listed (bounded like any other).
+  Ring small(1, 4);
+  for (uint32_t i = 0; i < 9; i++) {
+    small.Note(100 + i / 3, Dispatch(0x40 + i, i));
+  }
+  const auto stale = Format(small, "main", 50, 102);
+  Check(
+      stale.find("Lost submission (main): tick 101 (the oldest held: the "
+                 "first unfinished one is not held), GPU at 50, submitted up "
+                 "to 102, 1 command(s) noted (earlier ones overwritten)\n") !=
+              std::string::npos &&
+          stale.find("command 0: dispatch CS 0000000000000045 groups 5x1x1") !=
+              std::string::npos,
+      "oldest held submission for an overwritten tick");
+}
+
 void TestReadAndMarkers() {
   Ring ring(7, 4);
   Check(ring.Capacity() == 4, "capacity");
@@ -310,6 +381,7 @@ void TestConcurrentNotes() {
 int main() {
   TestReportOfLostSubmission();
   TestLossFacts();
+  TestUnknownCompletedTick();
   TestReadAndMarkers();
   TestOverwrittenStart();
   TestLongSubmission();
