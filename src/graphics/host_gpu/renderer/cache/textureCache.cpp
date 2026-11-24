@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1564,6 +1565,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		} else if (desc.type != BindingType::VideoOut) {
 			block.fill(0xff);
 			m_buffer_cache.InvalidateMemory(address, mip.size);
+			const Common::GuestStoreScope store_path(Common::GuestStorePath::MetadataClearPublish);
 			for (uint64_t offset = 0; offset < mip.size; offset += block.size()) {
 				const auto size = std::min<uint64_t>(block.size(), mip.size - offset);
 				LibKernel::Memory::WriteBacking(address + offset, block.data(), size);
@@ -1624,6 +1626,7 @@ void TextureCache::ExpandDccConstantSlice(ImageId id, const ImageDesc& desc,
 	// The blocks are uncompressed now; publish that like the keys of an expanded clear.
 	std::fill(keys.begin(), keys.end(), uint8_t {0xff});
 	m_buffer_cache.InvalidateMemory(metadata_address, metadata_size);
+	const Common::GuestStoreScope store_path(Common::GuestStorePath::DccConstantPublish);
 	LibKernel::Memory::WriteBacking(metadata_address, keys.data(), keys.size());
 }
 
@@ -2602,6 +2605,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool held) {
 	m_scheduler.DeferPriorityOperation(
 	    [this, download = std::move(download), range, kept, trapped] {
 		    download.buffer->Invalidate(download.offset, range.size);
+		    const Common::GuestStoreScope store_path(Common::GuestStorePath::ImageWriteBack);
 		    const auto kept_begin = std::clamp(kept.address, range.address, range.End());
 		    const auto kept_end   = std::clamp(kept.End(), kept_begin, range.End());
 		    if (kept.size == 0) {

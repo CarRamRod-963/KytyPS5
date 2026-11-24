@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/vulkanRecording.h"
@@ -154,6 +155,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	// labels, so whatever the label announces is already in guest memory. The store epoch is read
 	// before the store: a wait of a submission of that epoch or earlier saw the store come later.
 	const auto epoch = m_buffer_cache.CurrentBdaStoreEpoch();
+	const Common::GuestStoreScope store_path(Common::GuestStorePath::Label);
 	if (m_gpu_thread_labels.load(std::memory_order_acquire) == 0 &&
 	    m_page_manager.TryWriteUnwatched(reinterpret_cast<uint64_t>(dst), &value, size)) {
 		m_pending_labels.NoteStoredValue(reinterpret_cast<uint64_t>(dst), size, value, epoch);
@@ -175,6 +177,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 	                      notify = std::move(notify)]() mutable {
 		const auto vaddr = reinterpret_cast<uint64_t>(dst);
 		const auto epoch = m_buffer_cache.CurrentBdaStoreEpoch();
+		const Common::GuestStoreScope store_path(Common::GuestStorePath::GpuThreadLabel);
 		// A settled access may have stored the label, and later ones, already.
 		const auto store = [&] { return label_id == 0 || m_pending_labels.ShouldStore(label_id); };
 		// As upstream's RELEASE_MEM (2463e3aaf): a label beside GPU-written bytes goes to the
@@ -207,6 +210,7 @@ void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
 				} else {
 					std::memcpy(dst, &value, sizeof(value));
 				}
+				Common::RecordGuestStore(vaddr, size, &value);
 			}
 		}
 		if (store()) {
@@ -242,6 +246,7 @@ void RenderContext::SettleElidedLabels(uint64_t vaddr, uint64_t size) {
 	// ... unless it handed them to this thread, behind the current command. Those are stored
 	// here, through the backing like the completion thread's own stores, and skipped there.
 	m_pending_labels.StoreCompleted(vaddr, size, tick, [](const PendingLabels::Label& label) {
+		const Common::GuestStoreScope store_path(Common::GuestStorePath::ElidedLabel);
 		(void)LibKernel::Memory::TryWriteBacking(label.address, &label.value, label.size);
 	});
 	settling = false;

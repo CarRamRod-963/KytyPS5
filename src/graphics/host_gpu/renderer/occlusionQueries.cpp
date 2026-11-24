@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
+#include "common/guestStoreRing.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -67,8 +68,12 @@ void OcclusionQueries::PublishDumps() {
 		for (; m_read < dump.queries; m_read++) {
 			m_samples += m_results[m_read % QUERY_COUNT];
 		}
-		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address),
-		                   m_samples + dump.uncounted, (dump.address & 8u) == 0);
+		const auto samples = m_samples + dump.uncounted;
+		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address), samples,
+		                   (dump.address & 8u) == 0);
+		const auto first = OCCLUSION_QUERY_READY | samples;
+		Common::RecordGuestStore(Common::GuestStorePath::OcclusionCounters, dump.address,
+		                         OCCLUSION_QUERY_DBS * 2 * sizeof(uint64_t), &first);
 	}
 	m_dumps.clear();
 }

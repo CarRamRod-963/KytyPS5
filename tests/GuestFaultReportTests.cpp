@@ -1,12 +1,16 @@
 #include "loader/guestFaultReport.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -484,6 +488,237 @@ void TestCopyLocation() {
         "no rsp line where RSP is the guest's");
 }
 
+void TestGuestStoreRing() {
+  static Common::GuestStoreRing ring;
+  using Path = Common::GuestStorePath;
+  std::array<Common::GuestStore, 8> few{};
+  Check(ring.Count() == 0 && ring.Snapshot(few.data(), few.size()) == 0,
+        "empty store ring");
+  const uint64_t word = 0x1122334455667788ull;
+  ring.Record(Path::ImageWriteBack, 0x30c0000000ull, 0x1000, &word, 7, 100);
+  const uint16_t half = 0xabcd;
+  ring.Record(Path::Label, 0x30c0001000ull, sizeof(half), &half, 8, 200);
+  ring.Record(Path::BufferReadback, 0x30c0002000ull, 0x10, nullptr, 9, 300);
+  Check(ring.Snapshot(few.data(), few.size()) == 3, "three stores kept");
+  Check(few[0].sequence == 1 && few[0].path == Path::ImageWriteBack &&
+            few[0].address == 0x30c0000000ull && few[0].size == 0x1000 &&
+            few[0].first == word && few[0].thread == 7 && few[0].tsc == 100,
+        "a store keeps its path, range, first bytes, thread and time");
+  Check(few[1].first == 0xabcd, "a short store keeps only its bytes");
+  Check(few[2].sequence == 3 && few[2].first == 0, "no data, no bytes");
+  Check(ring.Snapshot(few.data(), 2) == 2 && few[1].sequence == 2,
+        "a short buffer takes the oldest stores");
+
+  // Past the capacity the ring keeps the newest stores, oldest first.
+  for (uint64_t i = 0; i < Common::GuestStoreRing::Capacity + 10; i++) {
+    ring.Record(Path::Backing, i, 8, &i, 1, i);
+  }
+  static std::array<Common::GuestStore, Common::GuestStoreRing::Capacity> all{};
+  const auto kept = ring.Snapshot(all.data(), all.size());
+  const auto total = ring.Count();
+  Check(total == Common::GuestStoreRing::Capacity + 13, "every store counted");
+  Check(kept == Common::GuestStoreRing::Capacity &&
+            all[0].sequence == total - kept + 1 &&
+            all[kept - 1].sequence == total,
+        "the ring keeps the last Capacity stores");
+  for (size_t i = 0; i < kept; i++) {
+    Check(all[i].first == all[i].address, "a kept store is the one recorded");
+  }
+
+  // Concurrent writers, and a reader meanwhile: every slot read is one whole
+  // store.
+  constexpr uint64_t writers = 4;
+  constexpr uint64_t each = 20000;
+  std::vector<std::thread> threads;
+  for (uint64_t t = 0; t < writers; t++) {
+    threads.emplace_back([t] {
+      for (uint64_t i = 0; i < each; i++) {
+        const uint64_t address = (t << 32u) | i;
+        ring.Record(Common::GuestStorePath::AsyncReadback, address, 8, &address,
+                    static_cast<uint32_t>(t), i);
+      }
+    });
+  }
+  for (int round = 0; round < 20; round++) {
+    const auto seen = ring.Snapshot(all.data(), all.size());
+    for (size_t i = 0; i < seen; i++) {
+      Check(all[i].first == all[i].address, "a torn store was read");
+    }
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  Check(ring.Count() == total + writers * each, "concurrent stores counted");
+  const auto after = ring.Snapshot(all.data(), all.size());
+  Check(after == Common::GuestStoreRing::Capacity, "full ring after writers");
+  for (size_t i = 0; i < after; i++) {
+    Check(all[i].first == all[i].address &&
+              all[i].thread == (all[i].address >> 32u) &&
+              all[i].tsc == (all[i].address & 0xffffffffu),
+          "a concurrent store is whole");
+    Check(i == 0 || all[i].sequence == all[i - 1].sequence + 1,
+          "kept stores are consecutive");
+  }
+
+  Common::GuestStore point{.address = 0x2000, .size = 0};
+  Check(Common::GuestStoreOverlaps(point, 0x2000, 0x2001) &&
+            !Common::GuestStoreOverlaps(point, 0x2001, 0x3000),
+        "an empty store overlaps its own byte only");
+  Common::GuestStore range{.address = 0x1000, .size = 0x1000};
+  Check(!Common::GuestStoreOverlaps(range, 0x2000, 0x3000) &&
+            Common::GuestStoreOverlaps(range, 0x1fff, 0x2000) &&
+            Common::GuestStoreOverlaps(range, 0, 0x1001),
+        "store ranges overlap by byte");
+}
+
+void TestStoreReport() {
+  Common::HostException::ExceptionInfo info;
+  info.exception_address = 0x900ff8048ull;
+  info.access_violation_vaddr = 0x3204420158ull;
+  std::array<uint8_t, PointerBytes> bytes{};
+  const std::array<Loader::GuestFaultMemory, 1> registers{
+      MakeWindow("rax", 0x3300000020ull, 16, bytes, PointerRows)};
+  std::array<Loader::GuestFaultInterest, 8> interest{};
+  const auto interest_count = Loader::CollectGuestFaultInterest(
+      info.access_violation_vaddr, registers, {}, interest);
+  Check(interest_count == 3 && interest[0].begin == 0x3204420000ull &&
+            interest[0].end == 0x3204430000ull &&
+            interest[1].begin == 0x3300000000ull &&
+            interest[2].begin == 0x3300000010ull &&
+            interest[2].end == 0x3300000010ull + PointerBytes,
+        "interest: the fault's granule, the register's granule and dump");
+  using Path = Common::GuestStorePath;
+  const std::array<Common::GuestStore, 4> stores{
+      // Over the second chunk of the faulting array: the store to find.
+      Common::GuestStore{.sequence = 41,
+                         .tsc = 1000,
+                         .address = 0x3204420000ull,
+                         .size = 0x1000,
+                         .first = ~0ull,
+                         .thread = 5,
+                         .path = Path::MetadataClearPublish},
+      // Elsewhere.
+      Common::GuestStore{.sequence = 42,
+                         .tsc = 2000,
+                         .address = 0x5000000000ull,
+                         .size = 8,
+                         .first = 1,
+                         .thread = 6,
+                         .path = Path::Label},
+      // In the granule of rax.
+      Common::GuestStore{.sequence = 43,
+                         .tsc = 3000,
+                         .address = 0x330000f000ull,
+                         .size = 0x2000,
+                         .first = 2,
+                         .thread = 7,
+                         .path = Path::BufferReadback},
+      Common::GuestStore{.sequence = 44,
+                         .tsc = 4000,
+                         .address = 0x5000001000ull,
+                         .size = 8,
+                         .first = 3,
+                         .thread = 6,
+                         .path = Path::Label},
+  };
+  Loader::HandledFaultRing ring;
+  ring.Record({.address = 0x3204420158ull,
+               .pc = 0x900ff8030ull,
+               .rsp = 0,
+               .time_ns = 10,
+               .kind = Loader::HandledFaultKind::Read,
+               .stores = 42});
+  const std::array<Loader::GuestThreadState, 1> threads{
+      Loader::GuestThreadState{.name = "Background Worker #6",
+                               .host_thread_id = 99,
+                               .rip = 0x7ff600002000ull,
+                               .rsp = 0x7ec000000ull,
+                               .read = true,
+                               .host_module = "kyty_emulator.exe",
+                               .host_offset = 0x2000,
+                               .guest_caller = 0x900e7cab9ull}};
+  Loader::GuestModuleMap modules;
+  modules.Add(0x900000000ull, 0x4000000ull, "eboot.bin");
+  Loader::GuestFaultMemoryReport report;
+  report.info = &info;
+  report.modules = &modules;
+  report.handled = &ring;
+  report.threads = threads;
+  report.threads_total = 1;
+  report.stores = stores;
+  report.stores_total = 44;
+  report.store_tsc_now = 5000;
+  report.store_ticks_per_us = 10;
+  report.interest = {interest.data(), interest_count};
+  Loader::GuestFaultMemoryText out;
+  Loader::FormatGuestFaultMemory(report, &out);
+  const std::string text(out.View());
+  Check(Contains(text, " after store #42\n"),
+        "a resolved fault names the stores made before it");
+  Check(Contains(text, "rsp=0x00000007ec000000 guest caller 0x0000000900e7cab9 "
+                       "(eboot.bin+0xe7cab9)\n"),
+        "a thread in host code names its guest caller");
+  Check(Contains(text,
+                 "--- The emulator's own stores into guest memory near this "
+                 "fault (2 of the last 4; 44 recorded) ---\n"
+                 "  #41 400 us before: metadata clear publish "
+                 "0x0000003204420000 size 0x1000 first ffffffffffffffff "
+                 "thread 5\n"
+                 "  #43 200 us before: buffer readback 0x000000330000f000 "
+                 "size 0x2000 first 0000000000000002 thread 7\n"
+                 "--- The emulator's last 4 stores into guest memory ---\n"
+                 "  #41 "),
+        "stores near the fault, then the last ones");
+  Check(text.ends_with("  #44 100 us before: label 0x0000005000001000 size 0x8 "
+                       "first 0000000000000003 thread 6\n"),
+        "the newest store ends the report");
+}
+
+void TestTwoLevelIndirect() {
+  // rax -> A; A -> B, A -> A and A -> rax's window; B -> C. Two levels dump A
+  // and B; pointers into a dump are not dumped again (cycles end), and C,
+  // a third level, is not dumped.
+  constexpr uint64_t a = 0x31000000ull, b = 0x32000000ull, c = 0x33000000ull;
+  constexpr uint64_t rax_value = 0x30000000ull;
+  std::array<uint8_t, PointerBytes> rax_bytes{};
+  auto rax = MakeWindow("rax", rax_value, 16, rax_bytes, PointerRows);
+  std::memset(rax_bytes.data(), 0, rax_bytes.size());
+  std::memcpy(rax_bytes.data() + 16, &a, 8);
+  static std::array<std::array<uint8_t, 0x110>, 8> memory{};
+  const auto contents = [](uint64_t address) -> std::array<uint8_t, 0x110> & {
+    return memory[(address >> 24u) & 7u];
+  };
+  std::memcpy(contents(a).data(), &b, 8);
+  std::memcpy(contents(a).data() + 8, &a, 8);
+  std::memcpy(contents(a).data() + 16, &rax_value, 8);
+  std::memcpy(contents(b).data(), &c, 8);
+  const std::array<Loader::GuestFaultMemory, 1> registers{rax};
+  std::array<Loader::GuestFaultMemory, Loader::GuestFaultIndirectMax> out{};
+  std::array<std::array<char, Loader::GuestFaultIndirectName>,
+             Loader::GuestFaultIndirectMax>
+      names{};
+  std::vector<uint64_t> dumped;
+  const auto count = Loader::CollectGuestFaultIndirect(
+      registers, {}, out, names,
+      [](uint64_t target) { return target >= 0x10000; },
+      [&](std::string_view name, uint64_t target, size_t) {
+        dumped.push_back(target);
+        Loader::GuestFaultMemory window;
+        window.name = name;
+        window.value = target;
+        window.start = target;
+        window.bytes = contents(target);
+        window.readable_rows = 0x1ffff;
+        return window;
+      });
+  Check(count == 2 && out[0].value == a && out[0].name == "[rax+0x0]" &&
+            out[1].value == b && out[1].name == "[[rax+0x0]+0x0]",
+        "two levels of pointers, named by their path");
+  Check(dumped.size() == 2 &&
+            std::find(dumped.begin(), dumped.end(), c) == dumped.end(),
+        "pointers into a dump end a cycle; no third level");
+}
+
 } // namespace
 
 int main() {
@@ -498,6 +733,9 @@ int main() {
   TestHandledFaultReport();
   TestMemoryReportFits();
   TestCopyLocation();
+  TestGuestStoreRing();
+  TestStoreReport();
+  TestTwoLevelIndirect();
   std::printf("GuestFaultReportTests: all cases passed\n");
   return 0;
 }
