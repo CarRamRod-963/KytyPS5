@@ -251,6 +251,14 @@ public:
 	uint64_t         native_write_sequence  = 0;
 	uint64_t         metadata_read_sequence = 0;
 	uint64_t         metadata_write_sequence = 0;
+	// The color metadata (DCC or CMASK) a color target binding of this image named last: the image
+	// owns these keys, so a clear it applies from them may expand them in guest memory, as a
+	// decompress pass would. A texture descriptor can name any memory as metadata, also memory the
+	// guest has reused since (a stale descriptor in a table).
+	GuestRange target_metadata {};
+	// Metadata whose clear was applied to the image without expanding its keys in guest memory
+	// (they are not the image's own): read again only after a write to it.
+	GuestRange unexpanded_clear {};
 	// A GPU buffer write overlapped the image since its last native write (TextureCache::
 	// PrepareGpuBufferWrite): its memory may hold newer bytes than the image.
 	bool       buffer_written = false;

@@ -22132,12 +22132,16 @@ public:
               "sampling read stale color bytes instead of the DCC opaque black clear");
       context.GetBufferCache().ReadMemory(dcc_address, metadata_size);
       std::vector<uint8_t> expanded_metadata(metadata_size);
-      Require(name, "sampled clear expands native metadata",
-              LibKernel::Memory::TryReadBacking(dcc_address, expanded_metadata.data(),
-                                               expanded_metadata.size()) &&
-                  std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
-                              [](uint8_t byte) { return byte == 0xff; }),
-              "the sampled clear retained native clear keys after materialization");
+      // A texture descriptor does not own the keys it names (they may be
+      // memory the guest reused): the clear goes to the image only.
+      Require(name, "sampled clear leaves the metadata",
+              LibKernel::Memory::TryReadBacking(dcc_address,
+                                                expanded_metadata.data(),
+                                                expanded_metadata.size()) &&
+                  std::all_of(expanded_metadata.begin(),
+                              expanded_metadata.end(),
+                              [](uint8_t byte) { return byte == 0x40; }),
+              "the sampled clear wrote keys it does not own into guest memory");
       WriteMetadata(context, dcc_address, metadata_size, 0x80808080u);
       binding.image_id = cache.FindImage(binding.desc);
       (void)cache.FindTexture(binding.image_id, binding.desc);
@@ -22211,11 +22215,16 @@ public:
                     std::vector<u32>{code == 0x40404040u ? 0u : 0x3f800000u},
                 "DCC clear used the native depth format or color aspect");
         std::array<uint8_t, 0x1000> metadata{};
-        Require(name, "comparison clear expands metadata",
-                LibKernel::Memory::TryReadBacking(comparison_dcc, metadata.data(),
-                                                 metadata.size()) &&
-                    std::ranges::all_of(metadata, [](uint8_t byte) { return byte == 0xff; }),
-                "comparison clear retained the native DCC clear key");
+        // The image was never a color target with these keys: the clear goes
+        // to the image only.
+        const auto key = static_cast<uint8_t>(code);
+        Require(
+            name, "comparison clear leaves the metadata",
+            LibKernel::Memory::TryReadBacking(comparison_dcc, metadata.data(),
+                                              metadata.size()) &&
+                std::ranges::all_of(
+                    metadata, [key](uint8_t byte) { return byte == key; }),
+            "comparison clear wrote keys it does not own into guest memory");
       }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -22302,6 +22311,42 @@ public:
               ReadCachedTexel(name, context, cleared.image_id, {63, 63, 0}) ==
                   std::vector<u32>{0u},
           "the mapped DCC clear key was not applied");
+      // The texture was never a color target with these keys: they may be
+      // memory the guest reused (zeroed for a new owner, which reads as a
+      // clear to 0) under a descriptor left in a table. The clear goes to the
+      // image only; guest memory keeps the bytes it holds.
+      scheduler.Finish();
+      std::vector<uint8_t> keys(0x1000, 0x5a);
+      Require(
+          name, "unowned metadata kept",
+          LibKernel::Memory::TryReadBacking(dcc_address, keys.data(),
+                                            keys.size()) &&
+              std::ranges::all_of(keys, [](uint8_t key) { return key == 0; }),
+          "a texture binding expanded keys it does not own in guest "
+          "memory");
+      // Binding it again before the metadata changes neither writes it nor
+      // applies the clear again over what the image holds since.
+      vk::ClearValue painted{};
+      painted.color.float32 = std::array{1.0f, 0.0f, 0.0f, 0.0f};
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), cleared.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      const auto again =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      scheduler.Finish();
+      Require(
+          name, "unowned clear applied once",
+          again.image_id == cleared.image_id &&
+              LibKernel::Memory::TryReadBacking(dcc_address, keys.data(),
+                                                keys.size()) &&
+              std::ranges::all_of(keys, [](uint8_t key) { return key == 0; }) &&
+              ReadCachedTexel(name, context, again.image_id, {0, 0, 0}) ==
+                  std::vector<u32>{0x3f800000u},
+          "a second binding changed the unowned metadata or the image");
+      // Back to the cleared contents the later steps expect.
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), cleared.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, vk::ClearValue{});
       WriteMetadata(context, dcc_address, 0x1000, UINT32_MAX);
       TextureBinding memo{};
       RenderExecutorTestAccess::ResolveTextureMemo(executor, resource, value,
