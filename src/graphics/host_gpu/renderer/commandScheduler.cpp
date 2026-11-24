@@ -106,16 +106,18 @@ CommandScheduler::~CommandScheduler() {
 void CommandScheduler::ReportLostSubmission(const void*                             object,
                                             std::span<const CommandLog::Checkpoint> checkpoints) {
 	const auto& scheduler = *static_cast<const CommandScheduler*>(object);
-	// The semaphore value the GPU reached; on failure (as after a lost device on some drivers)
-	// the last value this process read.
-	uint64_t completed = 0;
-	if (scheduler.m_graphics.device.getSemaphoreCounterValue(scheduler.m_master.Handle(),
-	                                                         &completed) != vk::Result::eSuccess) {
-		completed = scheduler.m_master.KnownGpuTick();
-	}
-	Log::WriteToConsoleAndLog(CommandLog::Format(scheduler.m_command_log, scheduler.m_name,
-	                                             completed, scheduler.m_master.CurrentTick() - 1u,
-	                                             checkpoints));
+	// The semaphore value the GPU reached. When it cannot be read or is past the submitted ticks
+	// (some drivers return UINT64_MAX after a lost device), the last value this process read.
+	uint64_t       counter   = 0;
+	const bool     read      = scheduler.m_graphics.device.getSemaphoreCounterValue(
+	                               scheduler.m_master.Handle(), &counter) == vk::Result::eSuccess;
+	const uint64_t known     = scheduler.m_master.KnownGpuTick();
+	const uint64_t submitted = scheduler.m_master.CurrentTick() - 1u;
+	Log::WriteToConsoleAndLog(
+	    CommandLog::FormatCounterNote(scheduler.m_name, read, counter, known, submitted) +
+	    CommandLog::Format(scheduler.m_command_log, scheduler.m_name,
+	                       CommandLog::CompletedTick(read, counter, known, submitted), submitted,
+	                       checkpoints));
 }
 
 void CommandScheduler::Shutdown() {

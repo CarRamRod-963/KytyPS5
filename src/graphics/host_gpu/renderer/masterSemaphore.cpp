@@ -32,6 +32,13 @@ void MasterSemaphore::Refresh() {
 	if (result != vk::Result::eSuccess) {
 		Failed("vkGetSemaphoreCounterValue", result, 0);
 	}
+	// Only submissions signal the semaphore, so a value past the ticks handed out is no completed
+	// tick: some drivers return UINT64_MAX for a lost device. Taking it would mark every pending
+	// submission complete.
+	if (counter >= CurrentTick()) {
+		Failed("vkGetSemaphoreCounterValue (a value past the submitted ticks)",
+		       vk::Result::eErrorDeviceLost, 0);
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&

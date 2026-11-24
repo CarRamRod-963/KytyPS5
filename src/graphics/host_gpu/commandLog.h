@@ -274,18 +274,53 @@ inline std::string Describe(const Command& c) {
 	return out;
 }
 
+// The last completed tick a report can rely on. A timeline counter read after a lost device may
+// be any value (some drivers return UINT64_MAX): only a tick that was submitted counts, otherwise
+// the last value the scheduler read before the loss (`known`).
+inline uint64_t CompletedTick(bool read, uint64_t counter, uint64_t known, uint64_t submitted) {
+	if (read && counter <= submitted) {
+		return counter;
+	}
+	return std::min(known, submitted);
+}
+
+// A line about a counter read that CompletedTick did not use, or an empty string.
+inline std::string FormatCounterNote(std::string_view log_name, bool read, uint64_t counter,
+                                     uint64_t known, uint64_t submitted) {
+	if (read && counter <= submitted) {
+		return {};
+	}
+	char      line[200];
+	const int name_size = static_cast<int>(std::min<size_t>(log_name.size(), 32));
+	if (read) {
+		std::snprintf(line, sizeof(line),
+		              "Lost submission (%.*s): GPU counter after the loss %" PRIu64
+		              " is not a submitted tick; using the last one read before, %" PRIu64 "\n",
+		              name_size, log_name.data(), counter, std::min(known, submitted));
+	} else {
+		std::snprintf(line, sizeof(line),
+		              "Lost submission (%.*s): GPU counter unreadable after the loss; using the "
+		              "last one read before, %" PRIu64 "\n",
+		              name_size, log_name.data(), std::min(known, submitted));
+	}
+	return line;
+}
+
 // The report about one log: the commands noted for the first submission the GPU did not finish
-// (`completed` + 1), which holds a command that never finished, in recording order. `log_name`
-// names the scheduler. `checkpoints` (may be empty) are the queue's checkpoints; those of other
-// logs are left out. Lines end in a newline.
+// (`completed` + 1), which holds a command that never finished, in recording order. When none of
+// its commands is held any more, or `completed` is not a submitted tick (unknown), the commands
+// of the oldest submission still held are listed instead: the first unfinished one is that one or
+// an older one. `log_name` names the scheduler. `checkpoints` (may be empty) are the queue's
+// checkpoints; those of other logs are left out. Lines end in a newline.
 inline std::string Format(const Ring& ring, std::string_view log_name, uint64_t completed,
                           uint64_t submitted, std::span<const Checkpoint> checkpoints = {}) {
 	std::string    out;
-	char           line[200];
-	const uint64_t lost   = completed + 1u;
+	char           line[256];
+	const bool     known  = completed <= submitted;
+	uint64_t       lost   = known ? completed + 1u : 0;
 	const uint64_t newest = ring.Count();
 	const auto     prefix = "Lost submission (" + std::string(log_name) + ")";
-	if (submitted < lost) {
+	if (known && submitted < lost) {
 		std::snprintf(line, sizeof(line), "%s: none, GPU at tick %" PRIu64 "\n", prefix.c_str(),
 		              completed);
 		return out + line;
@@ -296,33 +331,58 @@ inline std::string Format(const Ring& ring, std::string_view log_name, uint64_t 
 	uint64_t       last   = 0;
 	uint64_t       later  = 0; // commands of later submissions
 	bool           gap    = false;
+	bool           older  = false;      // reached a command of an earlier submission
+	uint64_t       lowest = UINT64_MAX; // the lowest tick of the commands read
 	Entry          entry;
-	for (uint64_t sequence = newest; sequence >= oldest && sequence != 0; sequence--) {
-		if (!ring.Read(sequence, entry)) {
-			gap = true;
-			break;
+	const auto     scan = [&](uint64_t target) {
+		first = 0;
+		last  = 0;
+		later = 0;
+		gap   = false;
+		older = false;
+		for (uint64_t sequence = newest; sequence >= oldest && sequence != 0; sequence--) {
+			if (!ring.Read(sequence, entry)) {
+				gap = true;
+				break;
+			}
+			lowest = std::min(lowest, entry.tick);
+			if (entry.tick > target) {
+				later++;
+				continue;
+			}
+			if (entry.tick < target) {
+				older = true;
+				break;
+			}
+			if (last == 0) {
+				last = sequence;
+			}
+			first = sequence;
 		}
-		if (entry.tick > lost) {
-			later++;
-			continue;
-		}
-		if (entry.tick < lost) {
-			break;
-		}
-		if (last == 0) {
-			last = sequence;
-		}
-		first = sequence;
+	};
+	scan(lost);
+	// Nothing of the lost tick is held and the held commands do not reach back before it.
+	const bool fallback = first == 0 && !older && later != 0;
+	if (fallback) {
+		lost = lowest;
+		scan(lost);
 	}
 	// When the oldest command still held belongs to the lost submission, earlier ones may have
 	// been overwritten.
 	const bool     truncated = first != 0 && (first == oldest || gap) && first > 1u;
 	const uint64_t count     = first != 0 ? last - first + 1u : 0;
+	char           gpu[32];
+	if (known) {
+		std::snprintf(gpu, sizeof(gpu), "%" PRIu64, completed);
+	} else {
+		std::snprintf(gpu, sizeof(gpu), "unknown");
+	}
 	std::snprintf(line, sizeof(line),
-	              "%s: tick %" PRIu64 ", GPU at %" PRIu64 ", submitted up to %" PRIu64 ", %" PRIu64
+	              "%s: tick %" PRIu64 "%s, GPU at %s, submitted up to %" PRIu64 ", %" PRIu64
 	              " command(s) noted%s\n",
-	              prefix.c_str(), lost, completed, submitted, count,
-	              truncated ? " (earlier ones overwritten)" : "");
+	              prefix.c_str(), lost,
+	              fallback ? " (the oldest held: the first unfinished one is not held)" : "", gpu,
+	              submitted, count, truncated ? " (earlier ones overwritten)" : "");
 	out += line;
 
 	struct ShaderCount {
