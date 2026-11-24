@@ -479,6 +479,10 @@ void GuestGpu::ThreadRun(void* data) {
 	} else {
 		LOGF("Host: power throttling opt-out: off\n");
 	}
+	LOGF("Readbacks: narrow %s, guest-thread copies %s; GPU thread priority %s\n",
+	     Config::NarrowReadbacksEnabled() ? "on" : "off",
+	     Config::GuestThreadReadbacksEnabled() ? "on" : "off",
+	     Config::GpuThreadPriorityEnabled() ? "above normal" : "normal");
 
 	for (;;) {
 		Submission                   submission;
