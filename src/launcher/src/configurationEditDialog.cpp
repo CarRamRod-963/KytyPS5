@@ -323,6 +323,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_narrow_readbacks->setChecked(info.narrow_readbacks);
 	m_ui->checkBox_guest_thread_readbacks->setChecked(info.guest_thread_readbacks);
 	m_ui->checkBox_gpu_thread_priority->setChecked(info.gpu_thread_priority);
+	m_ui->checkBox_vulkan_recording_thread->setChecked(info.vulkan_recording_thread);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
@@ -590,6 +591,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.narrow_readbacks          = ui.checkBox_narrow_readbacks->isChecked();
 	info.guest_thread_readbacks    = ui.checkBox_guest_thread_readbacks->isChecked();
 	info.gpu_thread_priority       = ui.checkBox_gpu_thread_priority->isChecked();
+	info.vulkan_recording_thread   = ui.checkBox_vulkan_recording_thread->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();

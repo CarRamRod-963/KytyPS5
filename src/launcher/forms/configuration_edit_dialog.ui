@@ -147,6 +147,12 @@
               <property name="text"><string>Run the GPU thread at higher priority</string></property>
              </widget>
             </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_vulkan_recording_thread">
+              <property name="toolTip"><string>Make the graphics driver's command recording calls on a second thread, so the emulator's graphics thread has less to do. Uses about half a CPU core more.</string></property>
+              <property name="text"><string>Record GPU commands on a second thread (experimental)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
