@@ -20501,6 +20501,41 @@ public:
     Require(name, "watched page bookkeeping", cpu_modified,
             "a label written into a watched page left it clean");
 
+    // A label the GPU thread stores after the guest unmapped its range is
+    // dropped: the store would fault, or land in whatever is mapped there now.
+    // The GPU thread unmaps the range in the context once both labels were
+    // handed to it (they run behind this command); the guest mapping stays, so
+    // a store would show in the backing.
+    constexpr uint64_t watched_again = base + 0x90000;
+    constexpr uint64_t unmapped_label = base + 0xc0000;
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      (void)cache.ObtainBuffer(watched_again, 0x8000, false);
+      context.GetCommandScheduler().Finish();
+    });
+    const auto skipped_before = context.LabelsSkippedUnmapped();
+    bool both_handed = false;
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      write_label(watched_again, 0x6161u, 0);
+      write_label(unmapped_label, 0x6262u, 0);
+      both_handed = wait_for([&] {
+        return Common::GpuTiming::Sync()
+                   .Snapshot()
+                   .Since(before_watched)
+                   .labels_gpu_thread == 4u;
+      });
+      context.UnmapMemory(unmapped_label, 0x1000);
+    });
+    gpu.SendCommandSync([] {});
+    Require(name, "label into an unmapped range",
+            both_handed && backing(watched_again) == 0x6161u &&
+                backing(unmapped_label) == 0 &&
+                context.LabelsSkippedUnmapped() == skipped_before + 1,
+            "the GPU thread stored a label into a range the guest had "
+            "unmapped");
+    context.MapMemory(unmapped_label, 0x1000);
+
     // Labels are direct again once the GPU thread wrote the held ones. The GPU
     // first finishes every earlier submission: a label behind work it still
     // runs rides with later commands (below), and with a submission thread the
