@@ -293,6 +293,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.no_selection_feedback, "--no-selection-feedback");
 	AddFlag(args, !info.lazy_bda_sync, "--no-lazy-bda-sync");
 	args << "--in-place-readbacks" << EnumToText(info.in_place_readbacks);
+	AddFlag(args, info.narrow_readbacks, "--narrow-readbacks");
+	AddFlag(args, info.guest_thread_readbacks, "--guest-thread-readbacks");
+	AddFlag(args, info.gpu_thread_priority, "--gpu-thread-priority");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");

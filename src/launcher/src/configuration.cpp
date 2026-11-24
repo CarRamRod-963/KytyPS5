@@ -49,6 +49,9 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(no_shader_simplification);
 	KYTY_CFG_SET(no_selection_feedback);
 	KYTY_CFG_SET(lazy_bda_sync);
+	KYTY_CFG_SET(narrow_readbacks);
+	KYTY_CFG_SET(guest_thread_readbacks);
+	KYTY_CFG_SET(gpu_thread_priority);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
@@ -130,6 +133,9 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(no_shader_simplification);
 	KYTY_CFG_GET(no_selection_feedback);
 	lazy_bda_sync    = s.value(QStringLiteral("lazy_bda_sync"), true).toBool();
+	KYTY_CFG_GET(narrow_readbacks);
+	KYTY_CFG_GET(guest_thread_readbacks);
+	KYTY_CFG_GET(gpu_thread_priority);
 	if (s.contains(QStringLiteral("in_place_readbacks"))) {
 		KYTY_CFG_GET(in_place_readbacks);
 		if (EnumToText(in_place_readbacks).isEmpty()) {
