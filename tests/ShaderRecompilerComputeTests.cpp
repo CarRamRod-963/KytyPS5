@@ -7834,6 +7834,58 @@ public:
                             "2x3x4\n") != std::string::npos,
             "the report does not list the submission's commands");
     scheduler.Finish();
+
+    // A run of batched uploads is noted as one scatter with its source, the
+    // source offsets it copies, its pieces and the address of its table.
+    using GpuBuffer = ::Libs::Graphics::Buffer;
+    constexpr auto flags =
+        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    GpuBuffer source(context.GetGraphics(), scheduler, MemoryUsage::Upload, 0,
+                     flags, 64 * 1024);
+    GpuBuffer destination(context.GetGraphics(), scheduler,
+                          MemoryUsage::DeviceLocal, 0, flags, 64 * 1024);
+    const uint64_t scatter_before = log.Count();
+    {
+      auto &command = scheduler.Current();
+      const auto batch = command.BatchCopies();
+      const std::array<vk::BufferCopy, 2> regions{
+          vk::BufferCopy{0x3000, 0x100, 0x2000},
+          vk::BufferCopy{0x1000, 0x8000, 0x1004}};
+      command.CopyToBuffer(source.Handle(), destination.Handle(), regions,
+                           source.BufferDeviceAddress(),
+                           destination.BufferDeviceAddress());
+    }
+    CmdLog::Entry scatter{};
+    Require(name, "scatter noted",
+            log.Count() == scatter_before + 1 &&
+                log.Read(scatter_before + 1, scatter),
+            "the scatter of a copy batch was not noted once");
+    Require(name, "scatter facts",
+            scatter.command.kind == CmdLog::Kind::Scatter &&
+                scatter.command.address == source.BufferDeviceAddress() &&
+                scatter.command.x == 0x1000 && scatter.command.y == 0x5000 &&
+                scatter.command.z == 4 && scatter.command.table != 0 &&
+                scatter.command.table % 256 == 0,
+            "the scatter's source, offsets, pieces or table differ");
+    Require(name, "scatter report",
+            CmdLog::Describe(scatter.command)
+                    .find(" offsets 0x1000-0x5000 pieces 4 table 0x") !=
+                std::string::npos,
+            "the report does not describe the scatter");
+    scheduler.Finish();
+
+    // The bindless table counts its slot writes for the loss report.
+    auto &bindless = context.GetBindlessTable();
+    if (bindless.Enabled()) {
+      (void)bindless.Set();
+      const uint64_t writes = bindless.SlotWrites();
+      bindless.WriteSlot(Libs::Graphics::BindlessTranslation::PlaceholderSlot,
+                         nullptr, vk::ImageLayout::eGeneral);
+      bindless.WriteSlot(Libs::Graphics::BindlessTranslation::PlaceholderSlot,
+                         nullptr, vk::ImageLayout::eGeneral);
+      Require(name, "bindless slot writes", bindless.SlotWrites() == writes + 2,
+              "the bindless table did not count its slot writes");
+    }
     std::printf("[host]    %-32s ok\n", name);
   }
 

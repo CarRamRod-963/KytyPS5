@@ -2,12 +2,15 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_BINDLESSTABLE_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/commandLog.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -34,6 +37,11 @@ public:
 	[[nodiscard]] bool                    Created() const noexcept { return m_set != nullptr; }
 
 	void WriteSlot(uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
+	// Slot descriptors written so far (WriteSlot calls). Commands that bind the table note it, and
+	// a lost device reports it, to tell whether slots changed while those commands were pending.
+	[[nodiscard]] uint64_t SlotWrites() const noexcept {
+		return m_slot_writes.load(std::memory_order_relaxed);
+	}
 	// Makes the GPU's shader writes to the feedback words visible to the host.
 	void MakeFeedbackVisible(vk::CommandBuffer command_buffer);
 	// The entries shaders flagged, up to `limit`, cleared as they are taken.
@@ -45,6 +53,7 @@ public:
 
 private:
 	void Create();
+	static void ReportLostDevice(const void* object, std::span<const CommandLog::Checkpoint>);
 
 	GraphicContext&                    m_graphics;
 	CommandScheduler&                  m_scheduler;
@@ -55,6 +64,7 @@ private:
 	std::unique_ptr<Buffer>            m_feedback;
 	std::optional<BindlessTranslation> m_entries;
 	uint32_t                           m_feedback_cursor = 0;
+	std::atomic<uint64_t>              m_slot_writes {0};
 };
 
 } // namespace Libs::Graphics

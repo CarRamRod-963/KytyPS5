@@ -43,12 +43,20 @@ public:
 	static void AddPieces(std::vector<Piece>& pieces, uint64_t destination, uint32_t source_offset,
 	                      uint32_t size);
 
-	// Records the dispatches that copy `pieces` from the buffer at `source`; they are ordered
-	// like copy commands, by barriers the caller records for the compute shader stage. Binds
-	// its own compute pipeline. Records nothing and returns false when the pieces do not fit in
-	// the ring without a wait.
-	[[nodiscard]] bool Record(vk::CommandBuffer command, vk::DeviceAddress source,
-	                          std::span<const Piece> pieces);
+	// Ring space for the tables of a run of pieces.
+	struct Tables {
+		uint8_t*          mapped  = nullptr; // null when the pieces do not fit without a wait
+		uint64_t          offset  = 0;
+		vk::DeviceAddress address = 0; // of the first table
+	};
+	// Reserves the tables for `pieces` pieces (at least one). Record must follow when `mapped`
+	// is not null.
+	[[nodiscard]] Tables Reserve(size_t pieces);
+	// Records the dispatches that copy `pieces` from the buffer at `source` through `tables`, the
+	// space Reserve gave for them; they are ordered like copy commands, by barriers the caller
+	// records for the compute shader stage. Binds its own compute pipeline.
+	void Record(vk::CommandBuffer command, vk::DeviceAddress source, std::span<const Piece> pieces,
+	            const Tables& tables);
 
 private:
 	// Pieces per table: the dispatch size every device supports.

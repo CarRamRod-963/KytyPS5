@@ -209,6 +209,10 @@ void CommandBuffer::CopyToBuffer(vk::Buffer source, vk::Buffer destination,
 		UploadScatter::AddPieces(m_scatter_pieces, destination_address + region.dstOffset,
 		                         static_cast<uint32_t>(region.srcOffset),
 		                         static_cast<uint32_t>(body));
+		m_scatter_first_offset =
+		    std::min(m_scatter_first_offset, static_cast<uint32_t>(region.srcOffset));
+		m_scatter_end_offset =
+		    std::max(m_scatter_end_offset, static_cast<uint32_t>(region.srcOffset + body));
 		if (body != region.size) {
 			m_direct_regions.emplace_back(region.srcOffset + body, region.dstOffset + body,
 			                              region.size - body);
@@ -238,9 +242,24 @@ void CommandBuffer::RecordScatter() const {
 	if (m_scatter_pieces.empty()) {
 		return;
 	}
-	NoteInternal(m_buffer, "upload scatter");
-	if (!m_context.GetUploadScatter().Record(m_buffer, m_scatter_source_address,
-	                                         m_scatter_pieces)) {
+	auto&      scatter = m_context.GetUploadScatter();
+	const auto tables  = scatter.Reserve(m_scatter_pieces.size());
+	Note(m_buffer, {.kind    = tables.mapped != nullptr ? CommandLog::Kind::Scatter
+	                                                    : CommandLog::Kind::UploadCopies,
+	                .x       = m_scatter_first_offset,
+	                .y       = m_scatter_end_offset,
+	                .z       = static_cast<uint32_t>(m_scatter_pieces.size()),
+	                .address = m_scatter_source_address,
+	                .table   = tables.address});
+	m_scatter_first_offset = UINT32_MAX;
+	m_scatter_end_offset   = 0;
+	if (tables.mapped != nullptr) {
+		scatter.Record(m_buffer, m_scatter_source_address, m_scatter_pieces, tables);
+		if (m_compute_pipeline) {
+			// The pipeline bound for a guest dispatch about to be recorded.
+			m_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, m_compute_pipeline);
+		}
+	} else {
 		// The ring is full: a copy command per destination buffer.
 		std::vector<vk::BufferCopy> copies;
 		size_t                      first = 0;
@@ -256,9 +275,6 @@ void CommandBuffer::RecordScatter() const {
 			                    static_cast<uint32_t>(copies.size()), copies.data());
 			first = destination.end;
 		}
-	} else if (m_compute_pipeline) {
-		// The pipeline bound for a guest dispatch about to be recorded.
-		m_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, m_compute_pipeline);
 	}
 	m_scatter_pieces.clear();
 	m_scatter_destinations.clear();

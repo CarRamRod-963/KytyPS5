@@ -1379,6 +1379,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			noted.x    = draw.index_count;
 			noted.y    = draw.instance_count;
 		}
+		NoteBindless(noted);
 		buffer.Note(vk_buffer, noted);
 	}
 	if (mesh_task) {
