@@ -32,6 +32,9 @@ struct GuestWrites {
 	}
 };
 
+// What a priority operation hands the guest (CommandScheduler::DeferPriorityOperation).
+enum class PriorityKind : uint8_t { Data, Signal };
+
 class CommandScheduler {
 public:
 	// `name` (a string literal) names the scheduler in lost-device reports.
@@ -58,15 +61,19 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
-	// `writes` is the guest memory a priority operation writes.
+	// `writes` is the guest memory a priority operation writes. A signal (a label, an interrupt,
+	// a flip, a suspend point) tells the guest that work is done: it runs after every data
+	// operation (a download publication, a write-back) of its submission, even one queued later.
 	void DeferOperation(Common::UniqueFunction<void>&& operation);
-	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, GuestWrites writes = {});
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, GuestWrites writes = {},
+	                            PriorityKind kind = PriorityKind::Data);
 	// For an operation that depends only on GPU work recorded before this call, such as an
 	// end-of-pipe label: while the current command buffer holds no commands it completes with
 	// the previous submission, so it needs no submission of its own. Returns the tick the
 	// operation waits for (0 when it ran at once during shutdown).
 	uint64_t DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation,
-	                                             GuestWrites                    writes = {});
+	                                             GuestWrites                    writes = {},
+	                                             PriorityKind kind = PriorityKind::Data);
 	// The tick the running priority operation waited for; 0 outside one.
 	[[nodiscard]] uint64_t ActivePriorityTick();
 	// Whether a queued or running priority operation writes guest memory in the range.
@@ -114,12 +121,14 @@ private:
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
 		GuestWrites                  writes;
+		PriorityKind                 kind = PriorityKind::Data;
 	};
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	uint64_t QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-	                        bool after_recorded = false, GuestWrites writes = {});
+	                        bool after_recorded = false, GuestWrites writes = {},
+	                        PriorityKind kind = PriorityKind::Data);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
 	// GraphicContext::LostWorkReport: the noted commands of the first unfinished submission.

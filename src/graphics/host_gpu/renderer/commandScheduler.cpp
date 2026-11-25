@@ -252,14 +252,14 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
-                                              GuestWrites                    writes) {
-	QueueOperation(std::move(operation), true, false, writes);
+                                              GuestWrites writes, PriorityKind kind) {
+	QueueOperation(std::move(operation), true, false, writes, kind);
 }
 
 uint64_t
 CommandScheduler::DeferPriorityOperationAfterRecorded(Common::UniqueFunction<void>&& operation,
-                                                      GuestWrites                    writes) {
-	return QueueOperation(std::move(operation), true, true, writes);
+                                                      GuestWrites writes, PriorityKind kind) {
+	return QueueOperation(std::move(operation), true, true, writes, kind);
 }
 
 uint64_t CommandScheduler::ActivePriorityTick() {
@@ -268,7 +268,8 @@ uint64_t CommandScheduler::ActivePriorityTick() {
 }
 
 uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-                                          bool after_recorded, GuestWrites writes) {
+                                          bool after_recorded, GuestWrites writes,
+                                          PriorityKind kind) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -281,7 +282,18 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 		}
 		if (priority) {
 			m_last_priority_tick = tick;
-			m_priority_operations.push_back({std::move(operation), tick, writes});
+			// A signal of this tick may already be queued: a label that rode in the open command
+			// buffer comes before the publication of the tick's downloads, which is queued at its
+			// submission. Data goes ahead of the tick's signals, so the guest that sees one finds
+			// what the work wrote. The signals keep their order, and so does the data.
+			auto at = m_priority_operations.end();
+			if (kind == PriorityKind::Data) {
+				while (at != m_priority_operations.begin() && std::prev(at)->tick == tick &&
+				       std::prev(at)->kind == PriorityKind::Signal) {
+					--at;
+				}
+			}
+			m_priority_operations.insert(at, {std::move(operation), tick, writes, kind});
 		} else {
 			m_pending_operations.push({std::move(operation), tick});
 		}
@@ -314,7 +326,7 @@ bool CommandScheduler::HasPendingPriorityWrites(uint64_t address, uint64_t size)
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	const Common::GpuTiming::SyncScope reason(Common::GpuTiming::SyncReason::Completion);
 	while (!stop.stop_requested()) {
-		PendingOperation operation;
+		uint64_t tick = 0;
 		{
 			std::unique_lock lock(m_operation_mutex);
 			m_operation_available.wait(lock, [this, &stop] {
@@ -323,15 +335,25 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			if (stop.stop_requested()) {
 				return;
 			}
+			tick = m_priority_operations.front().tick;
+		}
+		// The operation stays queued while its submission runs: data of that submission queued
+		// meanwhile goes ahead of a signal (QueueOperation). Once the tick completed nothing more
+		// is queued for it, and the front is an operation of this tick or an earlier one.
+		WaitTick(tick);
+		PendingOperation operation;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (stop.stop_requested()) {
+				return;
+			}
+			EXIT_IF(m_priority_operations.empty() || m_priority_operations.front().tick > tick);
 			operation = std::move(m_priority_operations.front());
 			m_priority_operations.pop_front();
 			m_priority_active_tick   = operation.tick;
 			m_priority_active_writes = operation.writes;
 		}
-		WaitTick(operation.tick);
-		if (!stop.stop_requested()) {
-			RunOperation(std::move(operation.callback));
-		}
+		RunOperation(std::move(operation.callback));
 		{
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active_tick   = 0;

@@ -1677,8 +1677,9 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 	auto&      labels = m_renderer.GetPendingLabels();
 	const auto label_id = labels.Add(reinterpret_cast<uint64_t>(dst), sizeof(T),
 	                                 static_cast<uint64_t>(value), !timestamp);
-	// Queued after the flush: the submission queued the publication of its asynchronous
-	// downloads, which then runs before the label on the completion thread.
+	// A signal: the publication of its submission's asynchronous downloads runs before it on the
+	// completion thread, also when the label rides in the open command buffer and that
+	// publication is only queued at the submission.
 	const auto label_tick = scheduler.DeferPriorityOperationAfterRecorded(
 	    [&renderer = m_renderer, &scheduler, dst, value, with_interrupt, issued_ns, label_id,
 	     event_id  = m_interrupt_event_id, interrupt_context_id, timestamp] {
@@ -1699,7 +1700,7 @@ void CommandProcessor::WriteLabelAtEndOfPipe(T* dst, T value, bool with_interrup
 		        },
 		        label_id);
 	    },
-	    GuestWrites {reinterpret_cast<uint64_t>(dst), sizeof(T)});
+	    GuestWrites {reinterpret_cast<uint64_t>(dst), sizeof(T)}, PriorityKind::Signal);
 	if (label_tick == 0) {
 		labels.Stored(label_id); // Shutdown: already stored.
 	} else {
@@ -1713,7 +1714,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 	    },
-	    GuestWrites::None());
+	    GuestWrites::None(), PriorityKind::Signal);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1812,7 +1813,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
-	    GuestWrites::None());
+	    GuestWrites::None(), PriorityKind::Signal);
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 	NoteGpuThreadCpu();
@@ -1823,7 +1824,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); },
-	    GuestWrites::None());
+	    GuestWrites::None(), PriorityKind::Signal);
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();
 	NoteGpuThreadCpu();
