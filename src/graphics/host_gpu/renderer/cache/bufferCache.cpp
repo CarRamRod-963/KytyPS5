@@ -873,15 +873,11 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
 	const auto touch = ++m_hot_touch_sequence;
-	for (auto it = m_hot_pages.lower_bound(first);
-	     it != m_hot_pages.end() && it->first < vaddr + size; ++it) {
+	const auto end   = m_hot_pages.lower_bound(vaddr + size);
+	for (auto it = m_hot_pages.lower_bound(first); it != end; ++it) {
 		// A page served asynchronously never faults again, so the GPU writes keep it hot; it
 		// ages out once the GPU stops writing it.
 		it->second.touched = touch;
-		// The epoch advances before the write is marked GPU-dirty (SynchronizeBuffer): a publish
-		// that reads the old epoch under the region lock completes before the mark and a later
-		// one sees the new epoch and keeps the page dirty.
-		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
 		m_pending_async.Add(it->first, CACHING_PAGESIZE);
 		// A clean page keeps its (current) bytes readable while the recorded write is pending;
 		// a page still holding an unpublished write must fault into a readback instead.
@@ -890,6 +886,17 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		} else {
 			m_keep_readable.push_back(it->first);
 		}
+	}
+	// A page holding an unpublished write stops being readable before its epoch advances: the
+	// new epoch rejects the publication of that write, and the guest must not read the page's
+	// older bytes meanwhile.
+	m_memory_tracker.SetGpuModifiedReadable(m_make_unreadable, CACHING_PAGESIZE, false);
+	m_make_unreadable.clear();
+	// The epoch advances before the write is marked GPU-dirty (SynchronizeBuffer): a publish
+	// that reads the old epoch under the region lock completes before the mark and a later one
+	// sees the new epoch and keeps the page dirty.
+	for (auto it = m_hot_pages.lower_bound(first); it != end; ++it) {
+		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
 	}
 }
 
@@ -1491,9 +1498,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteGpuWrite(vaddr, size);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
-	m_memory_tracker.SetGpuModifiedReadable(m_make_unreadable, CACHING_PAGESIZE, false);
 	m_memory_tracker.SetGpuModifiedReadable(m_keep_readable, CACHING_PAGESIZE, true);
-	m_make_unreadable.clear();
 	m_keep_readable.clear();
 	if (is_written) {
 		NoteOpenWrite(buffer, id);
