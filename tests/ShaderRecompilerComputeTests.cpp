@@ -305,6 +305,22 @@ struct BufferCacheTestAccess {
                            uint64_t size) {
     cache.NoteGpuWrite(address, size);
   }
+
+  // Evicts the hot page of `address` through the hot set's own eviction: the
+  // page is made the coldest one.
+  static void EvictHotPage(BufferCache &cache, uint64_t address) {
+    const auto it =
+        cache.m_hot_pages.find(address & ~(BufferCache::CACHING_PAGESIZE - 1u));
+    if (it != cache.m_hot_pages.end()) {
+      it->second.touched = 0;
+    }
+    cache.EvictColdHotPages(UINT64_MAX);
+  }
+
+  static bool IsHotPage(const BufferCache &cache, uint64_t address) {
+    return cache.m_hot_pages.contains(address &
+                                      ~(BufferCache::CACHING_PAGESIZE - 1u));
+  }
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
@@ -20522,6 +20538,69 @@ public:
               "bytes after its submission's label");
       Require(name, "readback publishes", seen == value,
               "the GPU-thread readback did not publish the write");
+    }
+
+    // A page evicted from the hot set while its download is on its way, then
+    // written again: the download must not clean the page, and the newer write
+    // must be read back. The page must not stay readable meanwhile.
+    {
+      constexpr uint64_t target = base + 0x22000;
+      vk::SemaphoreTypeCreateInfo timeline_type{};
+      timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo timeline_create{};
+      timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      timeline_create.pNext = &timeline_type;
+      vk::Semaphore gpu_gate = nullptr;
+      Require(name, "eviction gate",
+              m_runtime_context.device.createSemaphore(
+                  &timeline_create, nullptr, &gpu_gate) == vk::Result::eSuccess,
+              "failed to create the GPU gate");
+      bool evicted = false;
+      bool readable_after_write = true;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        gpu_fill(target, 0x44444444u);
+        cache.ReadMemory(target, bytes); // Hot page.
+        SubmitInfo gated;
+        gated.AddWait(gpu_gate, 1);
+        scheduler.Flush(gated);
+        gpu_fill(target, 0x55555555u);
+        scheduler.Flush(); // Records the page's download, held by the gate.
+        BufferCacheTestAccess::EvictHotPage(cache, target);
+        evicted = !BufferCacheTestAccess::IsHotPage(cache, target);
+        gpu_fill(target, 0x66666666u);
+        readable_after_write =
+            BufferCacheTestAccess::IsGpuModifiedReadable(cache, target, bytes);
+        scheduler.Flush();
+      });
+      vk::SemaphoreSignalInfo open_gate{};
+      open_gate.sType = vk::StructureType::eSemaphoreSignalInfo;
+      open_gate.semaphore = gpu_gate;
+      open_gate.value = 1;
+      const bool opened = m_runtime_context.device.signalSemaphore(
+                              &open_gate) == vk::Result::eSuccess;
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1u);
+      });
+      uint32_t seen = 0;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        cache.ReadMemory(target, bytes);
+        (void)LibKernel::Memory::TryReadBacking(target + bytes - 4, &seen,
+                                                sizeof(seen));
+        scheduler.Finish();
+      });
+      m_runtime_context.device.destroySemaphore(gpu_gate, nullptr);
+      Require(name, "eviction fixture", evicted && opened,
+              "the hot page was not evicted");
+      Require(name, "evicted page unreadable", !readable_after_write,
+              "an evicted page with a pending write stayed readable");
+      Require(
+          name, "evicted page keeps the newer write", seen == 0x66666666u,
+          "a download given up by eviction cleaned a newer GPU write (read " +
+              Hex(seen) + ")");
     }
 
     gpu.SendCommandSync([&] {
