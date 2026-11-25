@@ -183,6 +183,18 @@ public:
 			return;
 		}
 		RegionBits mask(bits, start, end);
+		if constexpr (clear && source == DirtySource::Gpu) {
+			// A publication: the bytes go into the guest first, then the pages become clean and
+			// readable. The other order lets a guest read in between pass with the old bytes.
+			for (const auto [first, last]: mask) {
+				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			}
+			const StateChange change(*this);
+			bits.UnsetRange(start, end);
+			m_stale_readable.UnsetRange(start, end);
+			UpdateProtection<false, true>();
+			return;
+		}
 		if constexpr (clear) {
 			const StateChange change(*this);
 			bits.UnsetRange(start, end);
