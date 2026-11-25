@@ -20704,6 +20704,91 @@ public:
               "the interrupt of a label behind a busy GPU was lost");
     }
 
+    // A label that rides in the open command buffer is queued before the
+    // publication of its submission's downloads, which the submission queues.
+    // The guest that sees the label must still find the data: the label waits
+    // for the publication. A completion operation queued between them holds
+    // the publication here; the label must not land while it is held.
+    {
+      constexpr uint64_t held_label = base + 0x70000;
+      vk::SemaphoreTypeCreateInfo timeline_type{};
+      timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo timeline_create{};
+      timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      timeline_create.pNext = &timeline_type;
+      vk::Semaphore gpu_gate = nullptr;
+      Require(name, "held publication gate",
+              m_runtime_context.device.createSemaphore(
+                  &timeline_create, nullptr, &gpu_gate) == vk::Result::eSuccess,
+              "failed to create the GPU gate");
+      auto &scheduler = context.GetCommandScheduler();
+      std::binary_semaphore hold{0};
+      std::atomic<bool> held{false};
+      bool rode = false;
+      constexpr uint32_t held_value = 0x7a7a7a7au;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        gpu_fill(0x79797979u);
+        cache.ReadMemory(data, bytes); // Hot page.
+        // Nothing earlier is left on the completion thread: the label is the
+        // first operation it sees.
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1u);
+        // The GPU runs a submission that waits for the gate, so the label
+        // below rides with the commands recorded after it.
+        SubmitInfo gated;
+        gated.AddWait(gpu_gate, 1);
+        scheduler.Flush(gated);
+        const auto tick = scheduler.CurrentTick();
+        gpu_fill(held_value);
+        write_label(held_label, 1u, 0);
+        rode = scheduler.CurrentTick() == tick;
+        // A completion thread that took the label off its queue before the
+        // submission ran would show it running now; the operations queued
+        // next could no longer go ahead of it.
+        const auto taken_by =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (scheduler.ActivePriorityTick() == 0 &&
+               std::chrono::steady_clock::now() < taken_by) {
+          std::this_thread::yield();
+        }
+        scheduler.DeferPriorityOperation(
+            [&] {
+              held.store(true);
+              hold.acquire();
+            },
+            GuestWrites::None());
+        scheduler.Flush();
+      });
+      vk::SemaphoreSignalInfo open_gate{};
+      open_gate.sType = vk::StructureType::eSemaphoreSignalInfo;
+      open_gate.semaphore = gpu_gate;
+      open_gate.value = 1;
+      const bool opened = m_runtime_context.device.signalSemaphore(
+                              &open_gate) == vk::Result::eSuccess;
+      const bool holding = wait_for([&] { return held.load(); });
+      // Long enough for a label that does not wait to land.
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      const bool early = backing(held_label) == 1u;
+      const auto early_data =
+          static_cast<uint32_t>(backing(data + bytes - 8) >> 32u);
+      hold.release();
+      const bool landed = wait_for([&] { return backing(held_label) == 1u; });
+      const auto seen = static_cast<uint32_t>(backing(data + bytes - 8) >> 32u);
+      gpu.SendCommandSync([&] { scheduler.Finish(); });
+      m_runtime_context.device.destroySemaphore(gpu_gate, nullptr);
+      Require(name, "held publication fixture", rode && opened && holding,
+              "the label did not ride with later commands, or the held "
+              "operation did not run");
+      Require(name, "label waits for a later-queued publication",
+              !early && landed && seen == held_value,
+              "a label landed before its submission's data was published "
+              "(label early: " +
+                  std::to_string(early) + ", data then " + Hex(early_data) +
+                  ", after " + Hex(seen) + ")");
+    }
+
     // A stream suspended on WAIT_REG_MEM for a label resumes when the label
     // lands, not when the GPU thread's next poll times out. The timeouts
     // counted between the label landing and the stream resuming tell them
