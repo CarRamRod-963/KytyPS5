@@ -855,8 +855,20 @@ void BufferCache::EvictColdHotPages(uint64_t keep) {
 	std::nth_element(touched.begin(), coldest, touched.end());
 	// Pages touched by the current request stay.
 	const auto threshold = std::min(*coldest, keep - 1u);
-	std::erase_if(m_hot_pages,
-	              [&](const auto& entry) { return entry.second.touched <= threshold; });
+	// A download of an evicted page may be on its way. Its epoch advances, so the publication
+	// leaves the page dirty: no GPU write recorded from now on moves that epoch, and the
+	// publication would otherwise clean a page a newer write left dirty. The page stops being
+	// readable: a pending write of it is read back on demand now.
+	std::vector<uint64_t> evicted;
+	std::erase_if(m_hot_pages, [&](const auto& entry) {
+		if (entry.second.touched > threshold) {
+			return false;
+		}
+		entry.second.epoch->fetch_add(1, std::memory_order_acq_rel);
+		evicted.push_back(entry.first);
+		return true;
+	});
+	m_memory_tracker.SetGpuModifiedReadable(evicted, CACHING_PAGESIZE, false);
 }
 
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
