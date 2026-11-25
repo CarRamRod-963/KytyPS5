@@ -861,6 +861,227 @@ void TestWindowsGuestRedZoneJumpTableBounds() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Shrink-wrapped frame-pointer functions: compilers test the arguments and return before
+// `push rbp; mov rbp, rsp`, so the prologue does not open the function. Frame slots below RSP are
+// red-zone data there too; the early exits run without a frame. A function that only keeps RBP as a
+// general register, and one whose red-zone data is dead at the fault, need no copy; a frame slot
+// that code before the prologue reaches too has no known place and protects the whole function.
+void TestWindowsGuestRedZoneShrinkWrappedFrame() {
+	const char*        test            = "WindowsGuestRedZoneShrinkWrappedFrame";
+	constexpr uint64_t CODE_SIZE       = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	enum : uint64_t {
+		Loop      = 0x000, // test; jz; test; jz; push rbp; mov rbp, rsp: loop count at [rbp - 0x40]
+		LongTests = 0x100, // nine compare-and-branch pairs before the frame, value at [rbp - 0x20]
+		TailCall  = 0x200, // the early exit leaves through an indirect jump
+		ReturnZero = 0x300,
+		Dead       = 0x380, // the frame slot below RSP is dead when the load faults
+		Register   = 0x400, // push rbp, then RBP as a general register: no frame
+		Merged     = 0x480, // as Dead, but a branch before the prologue reaches the frame access
+		CodeEnd    = 0x580,
+	};
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x000000090e000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_shrink_wrap_test");
+	Check(test, mapping != 0, "failed to allocate test code");
+	std::memset(reinterpret_cast<void*>(mapping), 0xcc, CODE_SIZE);
+	const auto at = [&](uint64_t offset) { return reinterpret_cast<uint8_t*>(mapping + offset); };
+
+	g_red_zone_clobber_page =
+	    VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_clobber_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneClobberHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	const auto make = [&](uint64_t offset, auto&& body) {
+		Xbyak::CodeGenerator code(0x100, at(offset));
+		body(code);
+		Check(test, Xbyak::GetError() == 0, "failed to generate red-zone fixture");
+	};
+	using Xbyak::CodeGenerator;
+	// The loop of Detour's unconnectLinks: the bound lives below RSP, the first store faults.
+	const auto frame_loop = [](CodeGenerator& c, Xbyak::Label& exit) {
+		Xbyak::Label loop;
+		Xbyak::Label done;
+		c.push(c.rbp);
+		c.mov(c.rbp, c.rsp);
+		c.push(c.rbx);
+		c.mov(c.dword[c.rbp - 0x40], c.esi); // below RSP (= RBP - 8)
+		c.xor_(c.ebx, c.ebx);
+		c.L(loop);
+		c.mov(c.ptr[c.rdi + c.rbx * 8], c.rbx); // the first store faults
+		c.inc(c.ebx);
+		c.cmp(c.ebx, 0x200); // stay inside the page when the bound is lost
+		c.je(done);
+		c.cmp(c.dword[c.rbp - 0x40], c.ebx);
+		c.jne(loop);
+		c.L(done);
+		c.mov(c.eax, c.ebx);
+		c.pop(c.rbx);
+		c.pop(c.rbp);
+		c.L(exit);
+		c.ret();
+	};
+	make(Loop, [&](CodeGenerator& c) {
+		Xbyak::Label exit;
+		c.xor_(c.eax, c.eax);
+		c.test(c.rdi, c.rdi);
+		c.jz(exit, CodeGenerator::T_NEAR);
+		c.test(c.esi, c.esi);
+		c.jz(exit, CodeGenerator::T_NEAR); // early exit to the shared RET after `pop rbp`
+		frame_loop(c, exit);
+	});
+	make(LongTests, [&](CodeGenerator& c) {
+		Xbyak::Label early;
+		for (uint32_t index = 0; index < 9; ++index) {
+			c.cmp(c.esi, 0x1000 + index);
+			c.je(early, CodeGenerator::T_NEAR);
+		}
+		c.push(c.rbp);
+		c.mov(c.rbp, c.rsp);
+		c.mov(c.qword[c.rbp - 0x20], c.rsi); // below RSP (= RBP)
+		c.mov(c.rcx, c.ptr[c.rdi]);          // faults
+		c.mov(c.rax, c.qword[c.rbp - 0x20]);
+		c.pop(c.rbp);
+		c.ret();
+		c.L(early);
+		c.mov(c.eax, 0xffff);
+		c.ret();
+	});
+	make(TailCall, [&](CodeGenerator& c) {
+		Xbyak::Label body;
+		Xbyak::Label exit;
+		c.test(c.esi, c.esi);
+		c.jnz(body, CodeGenerator::T_NEAR);
+		c.mov(c.rax, reinterpret_cast<uint64_t>(at(ReturnZero)));
+		c.jmp(c.rax);
+		c.L(body);
+		frame_loop(c, exit);
+	});
+	make(ReturnZero, [&](CodeGenerator& c) {
+		c.xor_(c.eax, c.eax);
+		c.ret();
+	});
+	make(Dead, [&](CodeGenerator& c) {
+		Xbyak::Label exit;
+		c.mov(c.rax, c.rsi);
+		c.test(c.rdi, c.rdi);
+		c.jz(exit);
+		c.push(c.rbp);
+		c.mov(c.rbp, c.rsp);
+		c.mov(c.qword[c.rbp - 0x20], c.rsi); // below RSP, read back before the fault
+		c.mov(c.rax, c.qword[c.rbp - 0x20]);
+		c.mov(c.rcx, c.ptr[c.rdi]); // faults
+		c.pop(c.rbp);
+		c.L(exit);
+		c.ret();
+	});
+	make(Register, [&](CodeGenerator& c) {
+		c.push(c.rbp);
+		c.lea(c.rbp, c.ptr[c.rdi + 0x40]);
+		c.mov(c.rcx, c.ptr[c.rbp - 0x40]); // the fault page, not the stack
+		c.lea(c.rax, c.ptr[c.rsi + 1]);
+		c.pop(c.rbp);
+		c.ret();
+	});
+	make(Merged, [&](CodeGenerator& c) {
+		Xbyak::Label shared;
+		c.mov(c.rax, c.rsi);
+		c.test(c.rdi, c.rdi);
+		c.jz(shared); // never taken here: RBP would still hold the caller's value
+		c.push(c.rbp);
+		c.mov(c.rbp, c.rsp);
+		c.mov(c.qword[c.rbp - 0x20], c.rsi);
+		c.L(shared);
+		c.mov(c.rax, c.qword[c.rbp - 0x20]);
+		c.mov(c.rcx, c.ptr[c.rdi]); // faults
+		c.pop(c.rbp);
+		c.ret();
+	});
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush generated test code");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(void*, uint64_t);
+	const auto call     = [&](uint64_t offset, uint64_t argument, bool fault) {
+		DWORD old_protection = 0;
+		Check(test,
+		      VirtualProtect(g_red_zone_clobber_page, 0x1000,
+		                     fault ? PAGE_NOACCESS : PAGE_READWRITE, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+		return reinterpret_cast<GuestFunction>(mapping + offset)(g_red_zone_clobber_page, argument);
+	};
+	struct Case {
+		const char* name;
+		uint64_t    offset;
+		uint64_t    argument;
+		uint64_t    expected;
+		bool        clobbered; // without a copy, the fault destroys the result
+	};
+	const std::array<Case, 9> cases      = {{
+	    {"loop", Loop, 16, 16, true},
+	    {"loop early exit", Loop, 0, 0, false},
+	    {"long tests", LongTests, 0x55, 0x55, true},
+	    {"long tests early exit", LongTests, 0x1004, 0xffff, false},
+	    {"tail call", TailCall, 16, 16, true},
+	    {"tail call early exit", TailCall, 0, 0, false},
+	    {"dead slot", Dead, 0x66, 0x66, false},
+	    {"general register", Register, 0x41, 0x42, false},
+	    {"merged frame state", Merged, 0x77, 0x77, false},
+	}};
+	bool                      reproduced = true;
+	for (const auto& entry: cases) {
+		const uint64_t value = call(entry.offset, entry.argument, true);
+		std::printf("[host]    shrink-wrapped %-24s unpatched=%llx\n", entry.name,
+		            static_cast<unsigned long long>(value));
+		reproduced &= (value != entry.expected) == entry.clobbered;
+	}
+
+	const std::array<uintptr_t, 7> function_starts = {
+	    mapping + Loop, mapping + LongTests, mapping + TailCall, mapping + ReturnZero,
+	    mapping + Dead, mapping + Register,  mapping + Merged};
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
+	                                            reinterpret_cast<void*>(mapping + CODE_SIZE),
+	                                            TRAMPOLINE_SIZE);
+	const auto result =
+	    Loader::PatchGuestInstructions(mapping, CodeEnd, function_starts, false, false,
+	                                   Loader::GetGuestInstructionHostFeatures(), 0, true, {});
+	std::printf("[host]    shrink-wrapped copies candidates=%llu rewritten=%llu early=%llu\n",
+	            static_cast<unsigned long long>(result.red_zone_copy_candidate_count),
+	            static_cast<unsigned long long>(result.rewritten_function_count),
+	            static_cast<unsigned long long>(result.partially_rewritten_function_count));
+
+	bool preserved = true;
+	for (const auto& entry: cases) {
+		const uint64_t faulted   = call(entry.offset, entry.argument, true);
+		const uint64_t unfaulted = call(entry.offset, entry.argument, false);
+		std::printf("[host]    shrink-wrapped %-24s patched=%llx without fault=%llx\n", entry.name,
+		            static_cast<unsigned long long>(faulted),
+		            static_cast<unsigned long long>(unfaulted));
+		preserved &= faulted == entry.expected && unfaulted == entry.expected;
+	}
+	// Functions without a copy keep their original entry.
+	const bool originals = at(Dead)[0] != 0xe9 && at(Register)[0] != 0xe9;
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_clobber_page, 0, MEM_RELEASE);
+	g_red_zone_clobber_page = nullptr;
+	const bool freed =
+	    Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, reproduced, "test handler did not reproduce red-zone corruption");
+	// Loop, LongTests, TailCall and (conservatively) Merged are copied; TailCall leaves the copy at
+	// its indirect jump.
+	Check(test,
+	      result.red_zone_copy_candidate_count == 4 && result.rewritten_function_count == 4 &&
+	          result.partially_rewritten_function_count == 1,
+	      "unexpected shrink-wrapped copy counts");
+	Check(test, preserved, "a shrink-wrapped function lost its red zone or changed its result");
+	Check(test, originals, "a function without red-zone data was copied");
+	Check(test, freed, "failed to free test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 // Single-instruction red-zone patches (--redzone) of functions that cannot be copied must not
 // take the trampoline room of the function copies that follow them in the segment.
 void TestWindowsGuestRedZoneCopySpace() {
@@ -1242,6 +1463,9 @@ void TestWindowsGuestRedZoneCopySpace() {
 
 void TestWindowsGuestRedZoneCopyProofs() {
   std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneCopyProofs");
+}
+void TestWindowsGuestRedZoneShrinkWrappedFrame() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneShrinkWrappedFrame");
 }
 #endif
 
@@ -7292,6 +7516,7 @@ int main(int argc, char** argv) {
 		RunTest(TestWindowsGuestRedZoneJumpTableBounds);
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		RunTest(TestWindowsGuestRedZoneFunctionCopy);
+		RunTest(TestWindowsGuestRedZoneShrinkWrappedFrame);
 		RunTest(TestWindowsGuestRedZoneCopySpace);
                 RunTest(TestWindowsGuestRedZoneCopyProofs);
                 return g_failed_tests == 0 ? 0 : 1;
@@ -7312,6 +7537,7 @@ int main(int argc, char** argv) {
 	RunTest(TestWindowsGuestRedZoneJumpTableBounds);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestWindowsGuestRedZoneFunctionCopy);
+	RunTest(TestWindowsGuestRedZoneShrinkWrappedFrame);
 	RunTest(TestWindowsGuestRedZoneCopySpace);
         RunTest(TestWindowsGuestRedZoneCopyProofs);
         RunTest(TestProsperoArgumentAndInfoSizeContracts);
