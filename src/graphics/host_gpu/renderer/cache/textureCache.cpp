@@ -1268,10 +1268,12 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		// An image created over memory an image write-back stored starts from the stored bytes
+		// An image created again over memory its write-back stored starts from the stored bytes
 		// (once they landed), as it does when no buffer holds the range: a buffer that does keeps
-		// the bytes it had before the written-back image was rendered.
-		const auto written_back = TakeWrittenBack(image.info.data);
+		// the bytes it had before the written-back image was rendered. Another image over that
+		// memory (Saros streams flipbook arrays into memory a transient target was written back
+		// from) takes what a buffer holds, the bytes later GPU writes put there.
+		const auto written_back = TakeWrittenBack(image.info);
 		if (written_back) {
 			m_scheduler.Wait(*written_back);
 			m_scheduler.WaitPriorityOperations(*written_back);
@@ -1290,14 +1292,15 @@ void TextureCache::InitializeImage(ImageId id) {
 	image.RefreshComplete();
 }
 
-void TextureCache::NoteWrittenBack(const GuestRange& range, uint64_t tick) {
+void TextureCache::NoteWrittenBack(const GuestRange& range, uint64_t tick,
+                                   const WrittenBackLayout& layout) {
 	ForgetWrittenBack(range.address, range.size, false);
 	// Buffer writes test every record: the oldest go first (an image created over their memory
 	// then takes what a buffer holds of it, as before the record).
 	if (m_written_back.size() == MaxWrittenBack) {
 		m_written_back.erase(m_written_back.begin());
 	}
-	m_written_back.push_back({range, tick});
+	m_written_back.push_back({range, tick, layout});
 }
 
 void TextureCache::ForgetWrittenBack(uint64_t address, uint64_t size, bool covered_ok) {
@@ -1314,16 +1317,18 @@ void TextureCache::ForgetWrittenBack(uint64_t address, uint64_t size, bool cover
 	});
 }
 
-std::optional<uint64_t> TextureCache::TakeWrittenBack(const GuestRange& range) {
-	const auto record = std::ranges::find_if(m_written_back, [&](const WrittenBack& entry) {
+std::optional<uint64_t> TextureCache::TakeWrittenBack(const ImageInfo& info) {
+	const auto& range  = info.data;
+	const auto  record = std::ranges::find_if(m_written_back, [&](const WrittenBack& entry) {
 		return entry.range.address <= range.address && range.End() <= entry.range.End();
 	});
 	if (record == m_written_back.end()) {
 		return std::nullopt;
 	}
 	const auto tick = record->tick;
+	const bool same = record->layout == WrittenBackLayout::Of(info);
 	m_written_back.erase(record);
-	return tick;
+	return same ? std::optional<uint64_t> {tick} : std::nullopt;
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -2554,10 +2559,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		const auto kept_end =
 		    kept.size == 0 ? range.End() : std::clamp(kept.End(), kept_begin, range.End());
 		if (kept_begin > range.address) {
-			NoteWrittenBack({range.address, kept_begin - range.address}, m_scheduler.CurrentTick());
+			NoteWrittenBack({range.address, kept_begin - range.address}, m_scheduler.CurrentTick(),
+			                WrittenBackLayout::Of(image.info));
 		}
 		if (kept_end < range.End()) {
-			NoteWrittenBack({kept_end, range.End() - kept_end}, m_scheduler.CurrentTick());
+			NoteWrittenBack({kept_end, range.End() - kept_end}, m_scheduler.CurrentTick(),
+			                WrittenBackLayout::Of(image.info));
 		}
 	}
 	m_scheduler.DeferPriorityOperation(

@@ -14844,7 +14844,10 @@ public:
   // write fault, so the buffer has to be told. An image created again over the
   // range (Saros re-creates its virtual-texture page table at the same address
   // after a respawn) is uploaded from that buffer. A buffer write recorded over
-  // the range after the write-back is newer than the stored bytes.
+  // the range after the write-back is newer than the stored bytes. Another
+  // image created over the written-back memory (Saros streams flipbook arrays
+  // into memory a transient target was written back from) takes what the
+  // buffer holds, as before the write-back.
   void CheckWrittenBackBufferCopy() {
     constexpr const char *name = "WrittenBackBufferCopy";
     constexpr uintptr_t base = 0x000000020e800000ull;
@@ -14886,7 +14889,8 @@ public:
       auto &cache = context.GetTextureCache();
       auto &buffers = context.GetBufferCache();
       const auto check = [&](const char *step, uint64_t address,
-                             bool gpu_written_buffer, bool written_after) {
+                             bool gpu_written_buffer, bool written_after,
+                             bool other_layout = false) {
         auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
                                    Prospero::BufferFormat::k32UInt,
                                    Prospero::ImageType::kColor2D,
@@ -14946,27 +14950,46 @@ public:
         }
 
         // The same image again: it holds what the deleted one held, or what
-        // the buffer write stored after it.
-        const auto expected = written_after ? written_later : written;
-        const auto again_id = cache.FindImage(desc);
-        (void)cache.FindTexture(again_id, desc);
+        // the buffer write stored after it. An image of another layout over
+        // the memory holds what the buffer holds.
+        const uint32_t again_width = other_layout ? width * 2u : width;
+        const uint32_t again_height = other_layout ? height / 2u : height;
+        auto again_desc = desc;
+        if (other_layout) {
+          again_desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                      Prospero::BufferFormat::k32UInt,
+                                      Prospero::ImageType::kColor2D,
+                                      {again_width, again_height, 1}, 1, 4, 1);
+          again_desc.type = BindingType::Storage;
+          again_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        }
+        const auto expected =
+            other_layout ? (gpu_written_buffer ? buffer_written : 0x5a5a5a5au)
+            : written_after ? written_later
+                            : written;
+        const auto again_id = cache.FindImage(again_desc);
+        (void)cache.FindTexture(again_id, again_desc);
         Require(name, step,
                 ReadCachedTexel(name, context, again_id) ==
                         std::vector<u32>{expected} &&
                     ReadCachedTexel(name, context, again_id,
-                                    {static_cast<int32_t>(width) - 1,
-                                     static_cast<int32_t>(height) - 1, 0}) ==
-                        std::vector<u32>{expected},
-                written_after ? "the image ignored a buffer write recorded "
-                                "after the write-back"
-                              : "the image was created from a buffer that "
-                                "kept its bytes from before the write-back");
+                                    {static_cast<int32_t>(again_width) - 1,
+                                     static_cast<int32_t>(again_height) - 1,
+                                     0}) == std::vector<u32>{expected},
+                other_layout    ? "an image of another layout was created from "
+                                  "the bytes the written-back image stored"
+                : written_after ? "the image ignored a buffer write recorded "
+                                  "after the write-back"
+                                : "the image was created from a buffer that "
+                                  "kept its bytes from before the write-back");
       };
       check("buffer with guest bytes", base, false, false);
       check("buffer written by the GPU before the image", base + stride, true,
             false);
       check("buffer written after the write-back", base + 2 * stride, false,
             true);
+      check("another image over the written-back memory", base + 3 * stride,
+            true, false, true);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();

@@ -172,11 +172,29 @@ private:
 		GuestRange range;
 		uint64_t   tick;
 	};
+	// How an image lays out the memory it was written back to. The stored bytes are what that
+	// image held, so they start only an image created again with the same layout.
+	struct WrittenBackLayout {
+		Prospero::BufferFormat guest_format = Prospero::BufferFormat::kInvalid;
+		Prospero::ImageType    type         = Prospero::ImageType::kColor2D;
+		vk::Extent3D           extent       = {1, 1, 1};
+		ImageSubresources      resources;
+		uint32_t               pitch     = 0;
+		Prospero::TileMode     tile_mode = Prospero::TileMode::kLinear;
+
+		bool operator==(const WrittenBackLayout&) const = default;
+
+		[[nodiscard]] static WrittenBackLayout Of(const ImageInfo& info) noexcept {
+			return {info.guest_format, info.type,  info.extent,
+			        info.resources,    info.pitch, info.tile_mode};
+		}
+	};
 	// Guest memory an image write-back stored (it lands when its submission completes), with no
 	// buffer write recorded over it since: see TakeWrittenBack.
 	struct WrittenBack {
-		GuestRange range;
-		uint64_t   tick;
+		GuestRange        range;
+		uint64_t          tick;
+		WrittenBackLayout layout;
 	};
 	static constexpr size_t MaxWrittenBack = 256;
 
@@ -338,11 +356,11 @@ private:
 	                            uint64_t metadata_size, uint32_t layer);
 
 	// Write-back records (m_written_back): NoteWrittenBack adds one, ForgetWrittenBack drops those
-	// a buffer write or an unmap touches, TakeWrittenBack returns (and drops) the one that contains
-	// a range, if any.
-	void NoteWrittenBack(const GuestRange& range, uint64_t tick);
+	// a buffer write or an unmap touches, TakeWrittenBack drops the one that contains an image's
+	// memory and returns its tick when the image has the layout of the image written back.
+	void NoteWrittenBack(const GuestRange& range, uint64_t tick, const WrittenBackLayout& layout);
 	void ForgetWrittenBack(uint64_t address, uint64_t size, bool covered_ok);
-	[[nodiscard]] std::optional<uint64_t> TakeWrittenBack(const GuestRange& range);
+	[[nodiscard]] std::optional<uint64_t> TakeWrittenBack(const ImageInfo& info);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
