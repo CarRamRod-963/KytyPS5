@@ -1293,6 +1293,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --selection-feedback-only)
 	add_test(NAME bindless_slot_image_reuse
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-slot-reuse-only)
+	add_test(NAME bindless_integer_texels
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-integer-texels-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 

@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <span>
@@ -544,6 +545,17 @@ private:
 		uint64_t serial = 0;
 	};
 	std::unordered_map<uint64_t, std::vector<BindlessResolved>> m_bindless_resolved;
+	// Keys resolved since the last report line (ResolveBindlessImages, one line every 30 s while
+	// keys resolve): through a bits view (BindlessBitsViewFormat) and to the placeholder.
+	struct BindlessReport {
+		std::chrono::steady_clock::time_point time;
+		uint64_t                              frames      = 0;
+		uint64_t                              resolved    = 0;
+		uint64_t                              bits_views  = 0;
+		uint64_t                              placeholder = 0;
+	};
+	BindlessReport m_bindless_report;
+	void           ReportBindlessImages();
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
