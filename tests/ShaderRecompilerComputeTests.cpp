@@ -20800,6 +20800,89 @@ public:
               "a page whose pending download was given up stayed readable");
     }
 
+    // A readback on the GPU thread writes the bytes it copies only after the
+    // labels of the submission that copies them were delivered. A label riding
+    // in that submission, then a held completion operation behind it: while it
+    // is held the label is visible, and the page must not be readable with its
+    // old bytes.
+    {
+      constexpr uint64_t target = base + 0x12000;
+      constexpr uint64_t label = base + 0x40000;
+      constexpr uint32_t value = 0x33333333u;
+      vk::SemaphoreTypeCreateInfo timeline_type{};
+      timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo timeline_create{};
+      timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      timeline_create.pNext = &timeline_type;
+      vk::Semaphore gpu_gate = nullptr;
+      Require(name, "readback gate",
+              m_runtime_context.device.createSemaphore(
+                  &timeline_create, nullptr, &gpu_gate) == vk::Result::eSuccess,
+              "failed to create the GPU gate");
+      std::binary_semaphore hold{0};
+      std::atomic<bool> held{false};
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        gpu_fill(target, 0x11111111u);
+        cache.ReadMemory(target, bytes); // Hot page.
+      });
+      bool rode = false;
+      std::binary_semaphore recorded{0};
+      gpu.SendCommand([&] {
+        processor->BufferInit();
+        SubmitInfo gated;
+        gated.AddWait(gpu_gate, 1);
+        scheduler.Flush(gated);
+        const auto tick = scheduler.CurrentTick();
+        gpu_fill(target, value); // Pending, the old bytes readable.
+        processor->ReleaseMem(2, 0, reinterpret_cast<void *>(label), 1, 0,
+                              false);
+        rode = scheduler.CurrentTick() == tick;
+        scheduler.DeferPriorityOperation(
+            [&] {
+              held.store(true);
+              hold.acquire();
+            },
+            GuestWrites::None(), PriorityKind::Signal);
+        recorded.release();
+        cache.ReadMemory(target, bytes); // Waits for the gate.
+      });
+      recorded.acquire();
+      vk::SemaphoreSignalInfo open_gate{};
+      open_gate.sType = vk::StructureType::eSemaphoreSignalInfo;
+      open_gate.semaphore = gpu_gate;
+      open_gate.value = 1;
+      const bool opened = m_runtime_context.device.signalSemaphore(
+                              &open_gate) == vk::Result::eSuccess;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!held.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      uint32_t label_value = 0;
+      (void)LibKernel::Memory::TryReadBacking(label, &label_value,
+                                              sizeof(label_value));
+      const bool stale_readable =
+          BufferCacheTestAccess::IsGpuModifiedReadable(cache, target, bytes);
+      hold.release();
+      gpu.SendCommandSync([] {});
+      uint32_t seen = 0;
+      (void)LibKernel::Memory::TryReadBacking(target + bytes - 4, &seen,
+                                              sizeof(seen));
+      gpu.SendCommandSync([&] { scheduler.Finish(); });
+      m_runtime_context.device.destroySemaphore(gpu_gate, nullptr);
+      Require(name, "readback fixture",
+              rode && opened && held.load() && label_value == 1u,
+              "the label did not ride with the readback's submission or did "
+              "not land");
+      Require(name, "readback pages unreadable until written", !stale_readable,
+              "a page a GPU-thread readback took stayed readable with old "
+              "bytes after its submission's label");
+      Require(name, "readback publishes", seen == value,
+              "the GPU-thread readback did not publish the write");
+    }
+
     gpu.SendCommandSync([&] {
       processor->BufferInit();
       context.UnmapMemory(base, allocation_size);
