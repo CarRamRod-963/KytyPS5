@@ -357,6 +357,55 @@ static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::Bu
 	}
 }
 
+// The float view through which a bindless image reads a T# of a 32-bit integer format; undefined
+// for every other T# and resource. A program declares its bindless image array once, as float
+// images, before any key is read (the numeric class comes from the instruction, not from a T#),
+// so an integer T# has no view of its own class there. A texel load through the float view of
+// the same layout returns the integer's bits, which the shader keeps as register bits; nothing
+// converts a 32-bit float on a load. Narrower integers have no float view that keeps their bits.
+static vk::Format BindlessBitsViewFormat(const ShaderRecompiler::IR::ImageResource& resource,
+                                         Prospero::BufferFormat                     format) {
+	if (!resource.bindless ||
+	    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled ||
+	    resource.numeric_class != Prospero::TextureNumericClass::Float || resource.written ||
+	    resource.depth_compare || resource.conversion_format != Prospero::BufferFormat::kInvalid) {
+		return vk::Format::eUndefined;
+	}
+	switch (format) {
+		case Prospero::BufferFormat::k32UInt:
+		case Prospero::BufferFormat::k32SInt: return vk::Format::eR32Sfloat;
+		case Prospero::BufferFormat::k32_32UInt:
+		case Prospero::BufferFormat::k32_32SInt: return vk::Format::eR32G32Sfloat;
+		case Prospero::BufferFormat::k32_32_32_32UInt:
+		case Prospero::BufferFormat::k32_32_32_32SInt: return vk::Format::eR32G32B32A32Sfloat;
+		default: return vk::Format::eUndefined;
+	}
+}
+
+// The texel components a load through a bits view (BindlessBitsViewFormat) reads as one: a
+// component its swizzle sets to one, or the alpha of a format without it. A float view gives
+// them as 1.0f; the shader replaces them with the integer 1 the guest's load returns
+// (IR::BindlessOnesShift). Missing red to blue components read as zero, whose bits are equal.
+static uint32_t BindlessBitsViewOnes(vk::Format view_format, const vk::ComponentMapping& mapping) {
+	const uint32_t channels = view_format == vk::Format::eR32Sfloat      ? 1u
+	                          : view_format == vk::Format::eR32G32Sfloat ? 2u
+	                                                                     : 4u;
+	const std::array<vk::ComponentSwizzle, 4> swizzles {mapping.r, mapping.g, mapping.b, mapping.a};
+	uint32_t                                  ones = 0;
+	for (uint32_t component = 0; component < 4u; ++component) {
+		auto swizzle = swizzles[component];
+		if (swizzle == vk::ComponentSwizzle::eIdentity) {
+			swizzle = static_cast<vk::ComponentSwizzle>(
+			    static_cast<uint32_t>(vk::ComponentSwizzle::eR) + component);
+		}
+		if (swizzle == vk::ComponentSwizzle::eOne ||
+		    (swizzle == vk::ComponentSwizzle::eA && channels < 4u)) {
+			ones |= 1u << component;
+		}
+	}
+	return ones;
+}
+
 // Atomics and raw signed stores use unsigned integer views; sRGB images store through UNorm.
 static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& resource,
                                     Prospero::BufferFormat format, vk::Format pixel_format) {
@@ -622,8 +671,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool sampled_numeric_class =
 	    storage || resource.numeric_class ==
 	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	const auto bits_view_format =
+	    sampled_numeric_class ? vk::Format::eUndefined : BindlessBitsViewFormat(resource, format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
-	    !sampled_numeric_class) {
+	    !sampled_numeric_class && bits_view_format == vk::Format::eUndefined) {
 		if (optional) {
 			return {};
 		}
@@ -785,8 +836,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {};
 	} else {
 		// Set after FindImage, whose metadata clears need the attachment-capable format.
-		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
-		                                          resource.skip_degamma);
+		desc.view_info.format = bits_view_format != vk::Format::eUndefined
+		                            ? bits_view_format
+		                            : SampledViewFormat(m_context.GetGraphics(), format,
+		                                                pixel_format, resource.skip_degamma);
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -1396,11 +1449,18 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	if (image.info.IsDepth() || image.info.data.Empty()) {
 		return BindlessTranslation::PlaceholderSlot;
 	}
+	const auto bits_view_format =
+	    BindlessBitsViewFormat(m_bindless_resources[heap], binding.desc.info.guest_format);
+	const bool bits_view = bits_view_format != vk::Format::eUndefined &&
+	                       binding.desc.view_info.format == bits_view_format;
+	m_bindless_report.bits_views += bits_view ? 1u : 0u;
 	const auto view = cache.FindTexture(binding.image_id, binding.desc);
 	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkImageView>(view));
 	auto       slot   = translation.FindSlot(binding.image_id, image.serial, handle);
 	if (slot == BindlessTranslation::NoSlot) {
-		slot = translation.AllocateSlot(binding.image_id, image.serial, handle);
+		const auto ones =
+		    bits_view ? BindlessBitsViewOnes(bits_view_format, binding.desc.view_info.mapping) : 0u;
+		slot = translation.AllocateSlot(binding.image_id, image.serial, handle, ones);
 		if (slot == BindlessTranslation::NoSlot) {
 			static bool reported = false;
 			if (!std::exchange(reported, true)) {
@@ -1503,9 +1563,27 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	for (const auto entry: m_bindless_feedback) {
 		BindlessTranslation::Request request;
 		if (!translation.Decode(entry, request)) continue;
-		translation.Translate(entry, ResolveBindlessKey(request.heap, request));
+		const auto slot = ResolveBindlessKey(request.heap, request);
+		++m_bindless_report.resolved;
+		m_bindless_report.placeholder += slot == BindlessTranslation::PlaceholderSlot ? 1u : 0u;
+		translation.Translate(entry, slot);
 	}
 	table.FlushTranslation();
+	ReportBindlessImages();
+}
+
+// One line every 30 s while keys resolve.
+void RenderExecutor::ReportBindlessImages() {
+	auto&      report = m_bindless_report;
+	const auto now    = std::chrono::steady_clock::now();
+	++report.frames;
+	if (now - report.time < std::chrono::seconds(30)) return;
+	if (report.resolved != 0) {
+		LOGF("Bindless images: %" PRIu64 " keys resolved in %" PRIu64 " frames, %" PRIu64
+		     " to the placeholder, %" PRIu64 " through the float view of integer texels\n",
+		     report.resolved, report.frames, report.placeholder, report.bits_views);
+	}
+	report = {.time = now};
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

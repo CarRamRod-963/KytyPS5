@@ -148,11 +148,42 @@ void TestReset() {
         "freeing a slot after a reset touches only its new entries");
 }
 
+// An integer T# bound through the float view of its bits reads a component
+// its swizzle sets to one as 1.0f; the entries of its slot carry those
+// components above the slot for the shader to read them as the integer 1.
+void TestSlotOnes() {
+  namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+  std::vector<uint32_t> entries(32, 0);
+  BindlessTranslation table(entries, IR::BindlessImageSlots);
+  const auto heap = table.FindOrCreateHeap(Key(0x1000), 2);
+  const auto plain = table.AllocateSlot(Common::SlotId{7}, 70, 0x10);
+  const auto bits = table.AllocateSlot(Common::SlotId{8}, 80, 0x20, 0x8);
+  const auto region = table.GetHeap(heap).region;
+  table.Translate(region, plain);
+  table.Translate(region + 1, bits);
+  Check(entries[region] == plain && table.EntryValue(region) == plain,
+        "a slot without ones is its entry's value");
+  Check((entries[region + 1] & IR::BindlessSlotMask) == bits &&
+            entries[region + 1] >> IR::BindlessOnesShift == 0x8 &&
+            entries[region + 1] != Pending,
+        "a slot's ones ride above the slot in its entries");
+  // An entry with every component one is still not the pending value.
+  const auto last = table.AllocateSlot(Common::SlotId{9}, 90, 0x30, 0xf);
+  table.Translate(region + 2, last);
+  BindlessTranslation::Request request;
+  Check(entries[region + 2] != Pending && !table.Decode(region + 2, request),
+        "an entry with every component one is not pending");
+  table.FreeSlot(bits);
+  Check(entries[region + 1] == Pending,
+        "freeing a slot with ones makes its entries pending");
+}
+
 } // namespace
 
 int main() {
   TestHeapsAndKeys();
   TestReset();
+  TestSlotOnes();
   std::printf("BindlessTranslationTests: all tests passed\n");
   return 0;
 }

@@ -749,6 +749,14 @@ inline constexpr uint32_t BindlessTranslationBinding = 1;
 inline constexpr uint32_t BindlessFeedbackBinding    = 2;
 inline constexpr uint32_t BindlessImageSlots         = 4096;
 inline constexpr uint32_t BindlessPending            = 0xffffffffu;
+// A translation entry holds the key's slot in its low bits and, above them, the texel components
+// a load through the slot must read as the integer 1: an integer T# bound through the float view
+// of its bits (the image array is float) reads a component its swizzle sets to one as 1.0f.
+inline constexpr uint32_t BindlessSlotMask  = BindlessImageSlots - 1u;
+inline constexpr uint32_t BindlessOnesShift = 12;
+static_assert((BindlessImageSlots & BindlessSlotMask) == 0u &&
+              BindlessSlotMask < (1u << BindlessOnesShift) &&
+              (0xfu << BindlessOnesShift | BindlessSlotMask) != BindlessPending);
 
 struct SrtRead {
 	Value    value;

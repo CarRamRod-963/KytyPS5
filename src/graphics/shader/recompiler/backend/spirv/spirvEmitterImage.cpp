@@ -669,9 +669,10 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 // placeholder) outside it and while the entry is pending. A pending entry is flagged in the
 // feedback buffer for the renderer to resolve (the renderer clears the flags it takes). Only a
 // pending read stores: the feedback buffer lives in host memory, and a store per lane and access
-// of every resolved read sends every pixel's writes over the bus.
-static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& image,
-                                 uint32_t key) {
+// of every resolved read sends every pixel's writes over the bus. `ones`, when given, receives
+// the components a load through the slot reads as the integer 1 (IR::BindlessOnesShift).
+static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& image, uint32_t key,
+                                 uint32_t* ones) {
 	const auto Load = [&](uint32_t variable, uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
@@ -699,7 +700,15 @@ static uint32_t EmitBindlessSlot(EmitterState& state, const IR::ImageResource& i
 			state.builder.AddFunction(spv::OpStore, pointer, ConstantU32(state, 1u));
 		});
 	}
-	return Select(state, TypeU32(state), pending, ConstantU32(state, 0u), raw);
+	const auto zero = ConstantU32(state, 0u);
+	if (ones != nullptr) {
+		*ones = Select(state, TypeU32(state), pending, zero,
+		               Binary(state, spv::OpShiftRightLogical, TypeU32(state), raw,
+		                      ConstantU32(state, IR::BindlessOnesShift)));
+	}
+	return Select(state, TypeU32(state), pending, zero,
+	              Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+	                     ConstantU32(state, IR::BindlessSlotMask)));
 }
 
 // Selection feedback (IR::Bindings::selection_dword): an active lane stores the frame's stamp at
@@ -752,7 +761,7 @@ static void EmitSelectionFeedback(ValueEmitContext& ctx, const IR::Inst& inst, u
 
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit) {
+                     const Emit& emit, uint32_t* bindless_ones = nullptr) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
@@ -775,7 +784,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		                        ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
 		                                 ConstantU32(state, 2u))
 		                        : key;
-		return emit(mem.resource, EmitBindlessSlot(state, image, record));
+		return emit(mem.resource, EmitBindlessSlot(state, image, record, bindless_ones));
 	}
 	if (state.flattened_srt_variable == 0 ||
 	    image.indirect_resources.size() < 2u) {
@@ -882,6 +891,11 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 		                         : state.program.info.images[resource].numeric_class,
 		                    scalar, candidate_mem, gather);
 	};
+	// A bindless load reads the components its slot names as the integer 1 (an integer T# bound
+	// through the float view of its bits reads them as 1.0f; BindlessBitsViewOnes).
+	uint32_t   ones          = 0;
+	const bool bindless_load = image.bindless && inst.GetOpcode() == IR::ValueOpcode::ImageRead &&
+	                           !mixed && !scalar && mem.data_bits == 32u;
 	// RDNA returns register bits. Convert per typed run only when the join mixes
 	// numeric classes; homogeneous accesses keep their single conversion after it.
 	const auto value = EmitImageAccess(
@@ -889,8 +903,25 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	    [&](uint32_t resource, uint32_t array_index) {
 		    const auto native = emit(resource, array_index, native_type(resource));
 		    return mixed ? result_bits(resource, native) : native;
-	    });
-	return mixed ? value : result_bits(mem.resource, value);
+	    },
+	    bindless_load ? &ones : nullptr);
+	if (mixed) return value;
+	const auto bits = result_bits(mem.resource, value);
+	if (!bindless_load) return bits;
+	uint32_t components[4] {};
+	for (uint32_t component = 0; component < 4u; ++component) {
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), texel, bits, component);
+		const auto one        = Binary(state, spv::OpINotEqual, TypeBool(state),
+		                               Binary(state, spv::OpBitwiseAnd, TypeU32(state), ones,
+		                                      ConstantU32(state, 1u << component)),
+		                               ConstantU32(state, 0u));
+		components[component] = Select(state, TypeU32(state), one, ConstantU32(state, 1u), texel);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result,
+	                          components[0], components[1], components[2], components[3]);
+	return result;
 }
 
 // Ordinals outside the table select candidates[0]. Past ordinal 0, a consecutive table is an

@@ -97,14 +97,15 @@ uint32_t BindlessTranslation::FindSlot(Common::SlotId image, uint64_t serial, ui
 	return NoSlot;
 }
 
-uint32_t BindlessTranslation::AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view) {
-	EXIT_IF(!image);
+uint32_t BindlessTranslation::AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view,
+                                           uint32_t ones) {
+	EXIT_IF(!image || ones > 0xfu);
 	if (m_free_slots.empty()) {
 		return NoSlot;
 	}
 	const auto slot = m_free_slots.back();
 	m_free_slots.pop_back();
-	m_slots[slot] = {image, serial, view, {}};
+	m_slots[slot] = {image, serial, view, ones, {}};
 	return slot;
 }
 
@@ -113,7 +114,7 @@ void BindlessTranslation::Translate(uint32_t entry, uint32_t slot) {
 	        !m_slots[slot].InUse());
 	const auto* region = FindRegion(entry);
 	EXIT_IF(region == nullptr || region->heap == NoHeap);
-	m_entries[entry] = slot;
+	m_entries[entry] = slot | m_slots[slot].ones << ShaderRecompiler::IR::BindlessOnesShift;
 	if (slot == PlaceholderSlot) {
 		return;
 	}

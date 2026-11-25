@@ -14296,6 +14296,204 @@ public:
                 skipped ? "skipped (no bindless images)" : "ok");
   }
 
+  // A bindless image array is declared as float images (the module is made
+  // before any key is read), and Saros reads the R32_UINT page tables of its
+  // sparse volumes through such a table: refused for their numeric class, they
+  // were the placeholder, every page read as page 0 and the volumes drew as
+  // flat boxes. A 32-bit integer T# binds through the float view of its bits;
+  // a load returns exactly the stored bits (NaN, infinity and denormal
+  // patterns included), and a component the T# sets to one reads as the
+  // integer 1, not as the bits of 1.0f.
+  void CheckBindlessIntegerTexels() {
+    constexpr const char *name = "BindlessIntegerTexels";
+    constexpr uintptr_t base = 0x0000000204f00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x1000, output = base + 0x8000;
+    constexpr u32 keys = 64; // More than a table the host enumerates.
+    const auto texel_address = [](u32 key) {
+      return base + 0x2000u + key * 0x100u;
+    };
+    // s20 = key from 0 while key < s2: s[24:31] = table[key];
+    // v[4:7] = image_load (0, 0, 0); output[key] = v[4:7].
+    std::vector<u32> code{EncodeSMovB32(20, InlineU32(0)),
+                          EncodeSopc(0x0a, 20, 2), // header: key < s2
+                          EncodeSopp(0x04, 0),     // s_cbranch_scc0 end
+                          EncodeSop2(0x1e, 21, 20, InlineU32(5)),
+                          EncodeSmem0(0x03, 24),
+                          EncodeSmem1(0, 21),
+                          EncodeSopp(0x0c, 0),
+                          EncodeVop1(0x01, 10, InlineU32(0)),
+                          EncodeVop1(0x01, 11, InlineU32(0)),
+                          EncodeVop1(0x01, 12, InlineU32(0)),
+                          EncodeMimg0(0x00, 0xf, 0, false, 2),
+                          EncodeMimg1(4, 10, 6),
+                          EncodeSopp(0x0c, 0),
+                          EncodeSop2(0x1e, 22, 20, InlineU32(4)),
+                          EncodeVop1(0x01, 30, 22),
+                          EncodeMubuf0(0x1e),
+                          EncodeMubuf1(4, 1, 30),
+                          EncodeSop2(0x00, 20, 20, InlineU32(1))};
+    // s_branch header; the exit lands on the end.
+    code.push_back(
+        EncodeSopp(0x02, static_cast<u32>(-static_cast<int32_t>(code.size()))));
+    code[2] = EncodeSopp(0x04, static_cast<u32>(code.size() - 3u));
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+
+    // Bits a float conversion would change: denormals, signalling and quiet
+    // NaNs with payloads, infinity, negative zero.
+    constexpr std::array<u32, 8> patterns{0x00000001u, 0x007fffffu, 0x7f800001u,
+                                          0x7fc00001u, 0xffffffffu, 0x80000000u,
+                                          0x7f800000u, 0x12345678u};
+    constexpr u32 wide_key = keys - 1u; // R32G32B32A32_UINT, all four stored.
+    constexpr std::array<u32, 4> wide{0x00000003u, 0xff800001u, 0x80000001u,
+                                      0x7fffffffu};
+    const auto expected = [&](u32 key) {
+      return key == wide_key ? wide
+                             : std::array<u32, 4>{
+                                   patterns[key % patterns.size()], 0u, 0u, 1u};
+    };
+
+    EnsureRuntimeContext();
+    struct RestoreFlag {
+      bool &flag;
+      bool value;
+      ~RestoreFlag() { flag = value; }
+    } restore_bindless{m_runtime_context.bindless_enabled,
+                       m_runtime_context.bindless_enabled};
+    m_runtime_context.bindless_enabled = true;
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "bindless integer texel allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bindless integer texel mapping failed");
+    std::memset(mapped, 0, size);
+    for (u32 key = 0; key < keys; ++key) {
+      const bool four = key == wide_key;
+      const auto format = four ? Prospero::BufferFormat::k32_32_32_32UInt
+                          : key % 3u == 1u ? Prospero::BufferFormat::k32SInt
+                                           : Prospero::BufferFormat::k32UInt;
+      // Saros' page tables select (X, 0, 0, 1); the identity selects alpha,
+      // which R32 does not store and so reads as one too.
+      const u32 swizzle =
+          four || key % 2u == 1u ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 1);
+      const ShaderTextureResource sharp{
+          {static_cast<u32>(texel_address(key) >> 8u),
+           static_cast<u32>(format) << 20u, 0,
+           swizzle | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+               (static_cast<u32>(Prospero::ImageType::kColor3D) << 28u),
+           0, 0x00700000u, 0, 0}};
+      std::memcpy(reinterpret_cast<void *>(table + key * 32u), sharp.fields,
+                  sizeof(sharp.fields));
+      const auto texel = expected(key);
+      std::memcpy(reinterpret_cast<void *>(texel_address(key)), texel.data(),
+                  four ? sizeof(texel) : sizeof(u32));
+    }
+    bool skipped = false;
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      if (!context.GetBindlessTable().Enabled()) {
+        skipped = true;
+        context.UnmapMemory(base, size);
+        context.GetCommandScheduler().Finish();
+        return;
+      }
+      auto &shaders = processor.GetShCtx();
+      auto &executor = context.GetRenderExecutor();
+      auto &scheduler = context.GetCommandScheduler();
+      for (u32 sgpr = 0; sgpr < 16; ++sgpr)
+        shaders.SetCsUserSgpr(sgpr, 0);
+      shaders.SetCsUserSgpr(0, static_cast<u32>(table));
+      shaders.SetCsUserSgpr(1, static_cast<u32>(table >> 32u));
+      shaders.SetCsUserSgpr(2, keys);
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = keys * 16u;
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(4 + i, out.fields[i]);
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 64,
+                           .num_thread_y = 1,
+                           .num_thread_z = 1,
+                           .wave_size = 64,
+                           .user_sgpr = 8});
+      ShaderComputeInputInfo input;
+      (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(),
+                                                         input);
+      const auto &images = input.stage.program->info.images;
+      Require(
+          name, "bindless table",
+          std::ranges::any_of(images,
+                              [](const auto &image) {
+                                return image.bindless &&
+                                       image.numeric_class ==
+                                           Prospero::TextureNumericClass::Float;
+                              }),
+          "the large table of T#s is not a bindless float image");
+      const auto outputs = [&] {
+        std::array<std::array<u32, 4>, keys> values{};
+        context.GetBufferCache().ReadMemory(output, sizeof(values));
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(output, values.data(),
+                                                  sizeof(values)),
+                "the loaded texels could not be read back");
+        return values;
+      };
+      // The first frame flags every key; the flip between frames resolves
+      // them; the second frame loads through their slots.
+      for (u32 frame = 0; frame < 2; ++frame) {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        scheduler.Finish();
+        executor.ResolveBindlessImages(scheduler.Current());
+        scheduler.Finish();
+      }
+      const auto values = outputs();
+      u32 wrong = 0;
+      for (u32 key = 0; key < keys; ++key) {
+        if (values[key] == expected(key))
+          continue;
+        ++wrong;
+        std::printf("[gpu]     %s key %u: %08x %08x %08x %08x, expected "
+                    "%08x %08x %08x %08x\n",
+                    name, key, values[key][0], values[key][1], values[key][2],
+                    values[key][3], expected(key)[0], expected(key)[1],
+                    expected(key)[2], expected(key)[3]);
+      }
+      Require(name, "integer texels through a bindless key", wrong == 0,
+              "a load through a bindless key did not return the T#'s "
+              "stored bits and integer ones");
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical,
+                                                                size) == 0,
+            "bindless integer texel memory release failed");
+    std::printf("[gpu]     %-32s %s\n", name,
+                skipped ? "skipped (no bindless images)" : "ok");
+  }
+
   // A title that aliases transient targets in one memory pool (Unreal Engine's
   // render graph) uses each of them once per frame, between hundreds of
   // submissions. An image another overlapping image displaces must survive
@@ -67746,6 +67944,12 @@ int main(int argc, char **argv) {
     vulkan.CheckBindlessSlotImageReuse();
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--bindless-integer-texels-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindlessIntegerTexels();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
@@ -68138,6 +68342,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckSelectionFeedback();
   vulkan.CheckBindlessSlotImageReuse();
+  vulkan.CheckBindlessIntegerTexels();
   vulkan.CheckSwappedDepthReadback();
   vulkan.CheckStencilPlaneStorage();
   vulkan.CheckBlockLayerViews();

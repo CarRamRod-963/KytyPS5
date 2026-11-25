@@ -49,10 +49,13 @@ public:
 	// A slot names its image by texture cache id and serial: the cache reuses the id of a
 	// deleted image, and a slot whose serial no longer matches holds a view of an image that is
 	// gone.
+	// `ones`: the texel components a load through the view reads as the integer 1
+	// (IR::BindlessOnesShift); its entries carry them for the shader.
 	struct Slot {
 		Common::SlotId        image;
 		uint64_t              serial = 0;
 		uint64_t              view   = 0;
+		uint32_t              ones   = 0;
 		std::vector<uint32_t> entries;
 
 		[[nodiscard]] bool InUse() const { return static_cast<bool>(image); }
@@ -77,9 +80,12 @@ public:
 	[[nodiscard]] bool Decode(uint32_t entry, Request& request) const;
 
 	[[nodiscard]] uint32_t    FindSlot(Common::SlotId image, uint64_t serial, uint64_t view) const;
-	[[nodiscard]] uint32_t    AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view);
+	[[nodiscard]] uint32_t    AllocateSlot(Common::SlotId image, uint64_t serial, uint64_t view,
+	                                       uint32_t ones = 0);
 	[[nodiscard]] const Slot& GetSlot(uint32_t slot) const { return m_slots[slot]; }
 	[[nodiscard]] uint32_t    SlotCount() const { return static_cast<uint32_t>(m_slots.size()); }
+	// The value the GPU reads at `entry`: pending, or its slot with the slot's ones.
+	[[nodiscard]] uint32_t    EntryValue(uint32_t entry) const { return m_entries[entry]; }
 	void                      Translate(uint32_t entry, uint32_t slot);
 	// The slot's entries become pending again (its image is gone).
 	void FreeSlot(uint32_t slot);
