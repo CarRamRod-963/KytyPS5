@@ -1061,6 +1061,39 @@ void TestGpuModifiedReadablePages() {
   Release(memory);
 }
 
+// Keeping a caching page readable marks only its GPU-dirty tracker pages: a
+// clean neighbour the GPU writes later must not be readable with old bytes.
+void TestStaleReadableOnlyDirtyPages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto caching_page = page_size * 4;
+  auto *memory = Allocate(8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto second = address + caching_page;
+  const std::array<uint64_t, 1> pages{second};
+
+  MarkGpuModified(tracker, address, page_size);
+  MarkGpuModified(tracker, second, page_size);
+  tracker.SetGpuModifiedReadable(address, caching_page, true);
+  tracker.SetGpuModifiedReadable(pages, caching_page, true);
+  for (const auto base : {address, second}) {
+    Check(tracker.IsGpuModifiedReadable(base, page_size),
+          "the dirty page of a caching page did not become readable");
+    Check(!tracker.IsGpuModifiedReadable(base + page_size, page_size * 3),
+          "a clean neighbour page took the readable mark");
+    // A later GPU write of the neighbour: no download is recorded for it, so
+    // it must fault.
+    MarkGpuModified(tracker, base + page_size, page_size);
+    Check(Protection(reinterpret_cast<void *>(base + page_size)) ==
+              PAGE_NOACCESS,
+          "a neighbour written later stayed readable with old bytes");
+  }
+  tracker.UnmarkRegionAsGpuModified(address, caching_page * 2);
+  tracker.MarkRegionAsCpuModified(address, caching_page * 2);
+  Release(memory);
+}
+
 // The page-list form gives each page exactly the single-page result (a clean
 // page is never kept readable) and updates the protection once per region: the
 // changed pages and an unchanged page between them that already has their
@@ -1942,6 +1975,7 @@ int main(int argc, char **argv) {
   TestPublishGpuModifiedHonoursAccept();
   TestGpuModifiedReadablePages();
   TestGpuModifiedReadablePageList();
+  TestStaleReadableOnlyDirtyPages();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
