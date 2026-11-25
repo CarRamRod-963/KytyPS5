@@ -300,6 +300,11 @@ struct BufferCacheTestAccess {
                                     uint64_t size) {
     return cache.m_memory_tracker.IsGpuModifiedReadable(address, size);
   }
+
+  static void NoteGpuWrite(BufferCache &cache, uint64_t address,
+                           uint64_t size) {
+    cache.NoteGpuWrite(address, size);
+  }
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
@@ -20357,6 +20362,91 @@ public:
         scheduler.Finish();
       });
     }
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A page the guest reads back stays readable with its old bytes while a GPU
+  // write of it is pending; it stops being readable before anything gives up
+  // a pending download of its bytes.
+  void CheckHotPageOrdering() {
+    constexpr const char *name = "HotPageOrdering";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t bytes = 64;
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    auto &cache = context.GetBufferCache();
+    auto &scheduler = context.GetCommandScheduler();
+    auto processor = std::make_unique<CommandProcessor>(context, 0);
+    const auto gpu_fill = [&](uint64_t address, uint32_t value) {
+      auto [buffer, offset] = cache.ObtainBuffer(address, bytes, true);
+      buffer->Fill(offset, bytes, value);
+    };
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      context.MapMemory(base, allocation_size);
+    });
+
+    // A second write of a page that still holds an unpublished one gives up
+    // that write's download (its epoch advances): the page must not stay
+    // readable with bytes older than the first write.
+    {
+      constexpr uint64_t target = base + 0x2000;
+      bool readable_before = false;
+      bool readable_after = true;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        gpu_fill(target, 0x11111111u);
+        cache.ReadMemory(target, bytes); // Hot page.
+        gpu_fill(target, 0x22222222u);   // Pending, the old bytes readable.
+        readable_before =
+            BufferCacheTestAccess::IsGpuModifiedReadable(cache, target, bytes);
+        BufferCacheTestAccess::NoteGpuWrite(cache, target, bytes);
+        readable_after =
+            BufferCacheTestAccess::IsGpuModifiedReadable(cache, target, bytes);
+        scheduler.Finish();
+      });
+      Require(name, "pending write keeps the old bytes readable",
+              readable_before, "the hot page did not stay readable");
+      Require(name, "readable state ends before the epoch advances",
+              !readable_after,
+              "a page whose pending download was given up stayed readable");
+    }
+
+    gpu.SendCommandSync([&] {
+      processor->BufferInit();
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    processor.reset();
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
@@ -67421,6 +67511,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--submitted-download-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSubmittedDownloadReadback();
+    vulkan.CheckHotPageOrdering();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--submit-thread-only") == 0) {
@@ -67428,6 +67519,7 @@ int main(int argc, char **argv) {
     vulkan.CheckQueueSubmitter();
     vulkan.EnableSubmitThread();
     vulkan.CheckSubmittedDownloadReadback();
+    vulkan.CheckHotPageOrdering();
     vulkan.CheckLabelDelivery();
     vulkan.CheckGpuCommandLane();
     return 0;
@@ -67752,6 +67844,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   vulkan.CheckScalarWalkGpuWrites();
   vulkan.CheckSubmittedDownloadReadback();
+  vulkan.CheckHotPageOrdering();
   vulkan.CheckLabelDelivery();
   vulkan.CheckQueueSubmitter();
   CheckComputeLdsLimit(vulkan);
