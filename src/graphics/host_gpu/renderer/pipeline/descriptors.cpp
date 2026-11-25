@@ -1392,8 +1392,16 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	ShaderRecompiler::IR::DescriptorValue value;
 	value.dword_count = static_cast<uint32_t>(value.dwords.size());
 	const auto descriptor = pointer + uint64_t {request.layer} * key.layer_stride + key.table_offset;
-	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords)) ||
-	    DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
+	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords))) {
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	// Whatever the record names now, a later change of it resolves the key again; a record of a
+	// pointer heap is reached through another, and those heaps are rebuilt by the games that
+	// use them (Ghost of Yotei).
+	if (key.pointer_offset == ShaderRecompiler::IR::BindlessUse::NoPointer) {
+		WatchBindlessRecord(heap, request, descriptor, value.dwords);
+	}
+	if (DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
 		return BindlessTranslation::PlaceholderSlot;
 	}
 	EXIT_IF(heap >= m_bindless_resources.size());
@@ -1515,6 +1523,7 @@ void RenderExecutor::ResetFullBindlessTable() {
 	m_context.GetCommandScheduler().Finish();
 	table.Reset();
 	m_bindless_resources.clear();
+	m_bindless_watches.clear();
 	m_bindless_heap_refused = false;
 }
 
@@ -1551,8 +1560,88 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 		m_bindless_report.placeholder += slot == BindlessTranslation::PlaceholderSlot ? 1u : 0u;
 		translation.Translate(entry, slot);
 	}
+	RecheckBindlessRecords();
 	table.FlushTranslation();
 	ReportBindlessImages();
+}
+
+void RenderExecutor::WatchBindlessRecord(uint32_t heap, const BindlessTranslation::Request& request,
+                                         uint64_t address, const std::array<uint32_t, 8>& dwords) {
+	auto&      watches = m_bindless_watches;
+	const auto found   = std::ranges::lower_bound(
+	    watches, std::pair {address, heap}, {},
+	    [](const BindlessWatch& watch) { return std::pair {watch.address, watch.heap}; });
+	if (found != watches.end() && found->address == address && found->heap == heap) {
+		found->record  = request.record;
+		found->layer   = request.layer;
+		found->dwords  = dwords;
+		found->dropped = false;
+		return;
+	}
+	if (watches.size() >= BindlessWatchLimit) {
+		++m_bindless_report.watch_overflow;
+		return;
+	}
+	watches.insert(found, {address, heap, request.record, request.layer, dwords});
+}
+
+// Once a frame the T# blocks of watched keys are read (consecutive records in pieces of up to
+// 64 KiB) and compared with what their keys were resolved from. A changed record resolves its
+// key again, up to BindlessRecheckPerFrame a frame; the others wait for the next frame. A key
+// whose entry went pending (its slot's image is gone) or whose heap is gone stops being watched:
+// a flag from the GPU resolves and watches it again.
+void RenderExecutor::RecheckBindlessRecords() {
+	auto& watches = m_bindless_watches;
+	if (watches.empty()) {
+		return;
+	}
+	auto&          translation  = m_context.GetBindlessTable().Translation();
+	constexpr auto record_bytes = sizeof(BindlessWatch::dwords);
+	constexpr auto piece_limit  = uint64_t {0x10000};
+	auto&          bytes        = m_bindless_record_bytes;
+	uint32_t       budget       = BindlessRecheckPerFrame;
+	bool           dropped      = false;
+	for (size_t first = 0; first < watches.size();) {
+		const auto start = watches[first].address;
+		auto       end   = first + 1u;
+		while (end < watches.size() && watches[end].address + record_bytes - start <= piece_limit) {
+			++end;
+		}
+		const auto size = watches[end - 1u].address + record_bytes - start;
+		bytes.resize(size);
+		if (!LibKernel::Memory::TryReadBacking(start, bytes.data(), size)) {
+			first = end;
+			continue;
+		}
+		for (auto index = first; index < end; ++index) {
+			auto& watch = watches[index];
+			if (std::memcmp(bytes.data() + (watch.address - start), watch.dwords.data(),
+			                record_bytes) == 0) {
+				continue;
+			}
+			const auto entry = translation.EntryOf(watch.heap, watch.record, watch.layer);
+			if (entry == BindlessTranslation::NoEntry ||
+			    translation.EntryValue(entry) == ShaderRecompiler::IR::BindlessPending) {
+				watch.dropped = true;
+				dropped       = true;
+				continue;
+			}
+			++m_bindless_report.changed;
+			if (budget == 0) {
+				continue;
+			}
+			--budget;
+			++m_bindless_report.retranslated;
+			// The new resolution refreshes the watched block.
+			std::memcpy(watch.dwords.data(), bytes.data() + (watch.address - start), record_bytes);
+			const BindlessTranslation::Request request {watch.heap, watch.record, watch.layer};
+			translation.Retranslate(entry, ResolveBindlessKey(watch.heap, request));
+		}
+		first = end;
+	}
+	if (dropped) {
+		std::erase_if(watches, [](const BindlessWatch& watch) { return watch.dropped; });
+	}
 }
 
 // One line every 30 s while keys resolve.
@@ -1561,10 +1650,13 @@ void RenderExecutor::ReportBindlessImages() {
 	const auto now    = std::chrono::steady_clock::now();
 	++report.frames;
 	if (now - report.time < std::chrono::seconds(30)) return;
-	if (report.resolved != 0) {
+	if (report.resolved != 0 || report.changed != 0) {
 		LOGF("Bindless images: %" PRIu64 " keys resolved in %" PRIu64 " frames, %" PRIu64
-		     " to the placeholder, %" PRIu64 " through the float view of integer texels\n",
-		     report.resolved, report.frames, report.placeholder, report.bits_views);
+		     " to the placeholder, %" PRIu64 " through the float view of integer texels; %" PRIu64
+		     " watched records changed, %" PRIu64 " keys resolved again, %zu records watched%s\n",
+		     report.resolved, report.frames, report.placeholder, report.bits_views, report.changed,
+		     report.retranslated, m_bindless_watches.size(),
+		     report.watch_overflow != 0 ? " (watch list full)" : "");
 	}
 	report = {.time = now};
 }

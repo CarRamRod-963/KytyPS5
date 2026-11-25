@@ -125,6 +125,29 @@ void BindlessTranslation::Translate(uint32_t entry, uint32_t slot) {
 	}
 }
 
+uint32_t BindlessTranslation::EntryOf(uint32_t heap, uint32_t record, uint32_t layer) const {
+	if (heap >= m_heaps.size()) {
+		return NoEntry;
+	}
+	const auto& found = m_heaps[heap];
+	if (record >= found.records || layer >= found.key.layer_count) {
+		return NoEntry;
+	}
+	return found.region + record * found.key.layer_count + layer;
+}
+
+void BindlessTranslation::Retranslate(uint32_t entry, uint32_t slot) {
+	EXIT_IF(entry < FirstEntry || entry >= m_used_entries);
+	const auto old = m_entries[entry];
+	if (old != ShaderRecompiler::IR::BindlessPending) {
+		const auto old_slot = old & ShaderRecompiler::IR::BindlessSlotMask;
+		if (old_slot != PlaceholderSlot) {
+			std::erase(m_slots[old_slot].entries, entry);
+		}
+	}
+	Translate(entry, slot);
+}
+
 void BindlessTranslation::Reset() {
 	std::fill(m_entries.begin() + FirstEntry, m_entries.begin() + m_used_entries,
 	          ShaderRecompiler::IR::BindlessPending);

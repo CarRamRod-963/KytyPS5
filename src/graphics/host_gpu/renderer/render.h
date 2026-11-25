@@ -545,14 +545,36 @@ private:
 		uint64_t serial = 0;
 	};
 	std::unordered_map<uint64_t, std::vector<BindlessResolved>> m_bindless_resolved;
+	// The T# blocks keys of direct-record heaps were resolved from, by address (then heap): a
+	// game that gives a record to another texture, or fills it after its first use, has its key
+	// resolved again (RecheckBindlessRecords) instead of sampling what the record named first.
+	struct BindlessWatch {
+		uint64_t                address = 0;
+		uint32_t                heap    = 0;
+		uint32_t                record  = 0;
+		uint32_t                layer   = 0;
+		std::array<uint32_t, 8> dwords {};
+		bool                    dropped = false;
+	};
+	static constexpr size_t    BindlessWatchLimit      = 65536;
+	static constexpr uint32_t  BindlessRecheckPerFrame = 64;
+	std::vector<BindlessWatch> m_bindless_watches;
+	std::vector<uint8_t>       m_bindless_record_bytes;
+	void WatchBindlessRecord(uint32_t heap, const BindlessTranslation::Request& request,
+	                         uint64_t address, const std::array<uint32_t, 8>& dwords);
+	void RecheckBindlessRecords();
 	// Keys resolved since the last report line (ResolveBindlessImages, one line every 30 s while
-	// keys resolve): through a bits view (BindlessBitsViewFormat) and to the placeholder.
+	// keys resolve): through a bits view (BindlessBitsViewFormat) and to the placeholder; watched
+	// records found changed and keys resolved again for them.
 	struct BindlessReport {
 		std::chrono::steady_clock::time_point time;
-		uint64_t                              frames      = 0;
-		uint64_t                              resolved    = 0;
-		uint64_t                              bits_views  = 0;
-		uint64_t                              placeholder = 0;
+		uint64_t                              frames         = 0;
+		uint64_t                              resolved       = 0;
+		uint64_t                              bits_views     = 0;
+		uint64_t                              placeholder    = 0;
+		uint64_t                              changed        = 0;
+		uint64_t                              retranslated   = 0;
+		uint64_t                              watch_overflow = 0;
 	};
 	BindlessReport m_bindless_report;
 	void           ReportBindlessImages();
