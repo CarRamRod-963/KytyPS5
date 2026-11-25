@@ -133,6 +133,8 @@ public:
 		}
 	}
 
+	// Only the GPU-dirty pages of the range take the mark: a clean page left with it would stay
+	// readable with its old bytes once the GPU writes it while no download is recorded for it.
 	// A GPU-dirty page whose guest bytes are still current (every earlier GPU write of it was
 	// published before the pending one was recorded) stays readable: the guest sees what the
 	// console would show before the pending write executes, and the publish of that write
@@ -140,11 +142,12 @@ public:
 	void SetStaleReadable(uint64_t offset, uint64_t size, bool readable) {
 		const auto [start, end] = GetPageRange(offset, size);
 		if (readable) {
-			if (RegionBits(m_gpu_dirty, start, end).None()) {
+			const RegionBits dirty(m_gpu_dirty, start, end);
+			if (dirty.None()) {
 				return;
 			}
 			const StateChange change(*this);
-			m_stale_readable.SetRange(start, end);
+			m_stale_readable |= dirty;
 			UpdateProtection<false, true>();
 		} else {
 			const StateChange change(*this);
@@ -161,7 +164,7 @@ public:
 			if (!readable) {
 				m_stale_readable.UnsetRange(start, end);
 			} else if (m_gpu_dirty.FirstRangeFrom(start).first < end) {
-				m_stale_readable.SetRange(start, end);
+				m_stale_readable |= RegionBits(m_gpu_dirty, start, end);
 			}
 		}
 		if (readable) {
