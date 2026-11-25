@@ -87,6 +87,13 @@ public:
 	// The value the GPU reads at `entry`: pending, or its slot with the slot's ones.
 	[[nodiscard]] uint32_t    EntryValue(uint32_t entry) const { return m_entries[entry]; }
 	void                      Translate(uint32_t entry, uint32_t slot);
+	// The entry of record `record`, layer `layer` of `heap` in its current region; NoEntry for a
+	// key outside the heap or a heap that is gone.
+	static constexpr uint32_t NoEntry = UINT32_MAX;
+	[[nodiscard]] uint32_t    EntryOf(uint32_t heap, uint32_t record, uint32_t layer) const;
+	// A translated entry takes another slot in one write: work in flight reads the old slot or
+	// the new one, never a pending entry. The old slot stops listing the entry.
+	void Retranslate(uint32_t entry, uint32_t slot);
 	// The slot's entries become pending again (its image is gone).
 	void FreeSlot(uint32_t slot);
 	// Drops every heap and region: all entries become pending and the next heap starts at

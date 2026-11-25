@@ -14481,6 +14481,49 @@ public:
       Require(name, "integer texels through a bindless key", wrong == 0,
               "a load through a bindless key did not return the T#'s "
               "stored bits and integer ones");
+
+      // A record the game gives to another texture, or empties and fills
+      // again, resolves its key again at the next flip: the key does not
+      // keep sampling what its record named when it was first resolved.
+      const auto write_record = [&](u32 key, const void *words) {
+        Require(name, "record rewrite",
+                context.InvalidateMemory(table + key * 32u, 32u),
+                "the table record escaped its mapped allocation");
+        std::memcpy(reinterpret_cast<void *>(table + key * 32u), words, 32u);
+      };
+      const auto frame = [&] {
+        executor.ResolveBindlessImages(scheduler.Current());
+        scheduler.Finish();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        scheduler.Finish();
+        return outputs();
+      };
+      constexpr u32 moved = 5, refilled = 12;
+      std::array<u32, 8> record{}, null_record{};
+      std::memcpy(record.data(),
+                  reinterpret_cast<const void *>(table + (moved + 1u) * 32u),
+                  sizeof(record));
+      write_record(moved, record.data());
+      std::array<u32, 8> refilled_record{};
+      std::memcpy(refilled_record.data(),
+                  reinterpret_cast<const void *>(table + refilled * 32u),
+                  sizeof(refilled_record));
+      write_record(refilled, null_record.data());
+      const auto rewritten = frame();
+      Require(name, "a record given to another texture",
+              rewritten[moved] == expected(moved + 1u),
+              "a key kept sampling the texture its record named before the "
+              "game gave the record to another one");
+      Require(name, "an emptied record",
+              rewritten[refilled] != expected(refilled),
+              "a key kept sampling the texture of a record the game emptied");
+      write_record(refilled, refilled_record.data());
+      const auto refilled_values = frame();
+      Require(name, "a record filled again",
+              refilled_values[refilled] == expected(refilled) &&
+                  refilled_values[moved] == expected(moved + 1u),
+              "a key whose record the game filled again kept the placeholder");
       context.UnmapMemory(base, size);
       context.GetCommandScheduler().Finish();
     });

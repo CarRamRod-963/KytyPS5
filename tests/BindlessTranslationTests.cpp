@@ -178,12 +178,47 @@ void TestSlotOnes() {
         "freeing a slot with ones makes its entries pending");
 }
 
+// A key resolved again (its record names another texture now) moves to the
+// new slot in one write, and the old slot stops listing it: freeing the old
+// slot later must not make the moved key pending.
+void TestRetranslate() {
+  std::vector<uint32_t> entries(32, 0);
+  BindlessTranslation table(entries, 4);
+  const auto heap = table.FindOrCreateHeap(Key(0x1000), 2);
+  const auto entry = table.EntryOf(heap, 1, 2);
+  Check(entry == table.GetHeap(heap).region + 1 * 4 + 2 &&
+            table.EntryOf(heap, 2, 0) == BindlessTranslation::NoEntry &&
+            table.EntryOf(heap, 0, 4) == BindlessTranslation::NoEntry &&
+            table.EntryOf(heap + 1, 0, 0) == BindlessTranslation::NoEntry,
+        "a key's entry is found in its heap's region and nowhere else");
+  const auto old_slot = table.AllocateSlot(Common::SlotId{7}, 70, 0x10);
+  const auto new_slot = table.AllocateSlot(Common::SlotId{8}, 80, 0x20);
+  table.Translate(entry, old_slot);
+  table.Retranslate(entry, new_slot);
+  Check(entries[entry] == new_slot && table.GetSlot(old_slot).entries.empty() &&
+            table.GetSlot(new_slot).entries.size() == 1,
+        "a key resolved again takes the new slot and leaves the old one");
+  table.FreeSlot(old_slot);
+  Check(entries[entry] == new_slot,
+        "freeing the slot a key left does not make the key pending");
+  table.Retranslate(entry, BindlessTranslation::PlaceholderSlot);
+  Check(entries[entry] == BindlessTranslation::PlaceholderSlot &&
+            table.GetSlot(new_slot).entries.empty(),
+        "a key whose record names nothing any more takes the placeholder");
+  // The heap grows: the key's entry moves with its region.
+  table.FindOrCreateHeap(Key(0x1000), 4);
+  Check(table.EntryOf(heap, 1, 2) == table.GetHeap(heap).region + 6 &&
+            table.EntryOf(heap, 1, 2) != entry,
+        "a key's entry follows its heap to the new region");
+}
+
 } // namespace
 
 int main() {
   TestHeapsAndKeys();
   TestReset();
   TestSlotOnes();
+  TestRetranslate();
   std::printf("BindlessTranslationTests: all tests passed\n");
   return 0;
 }
