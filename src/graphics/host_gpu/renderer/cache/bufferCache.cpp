@@ -324,6 +324,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	if constexpr (!async) {
+		// This readback publishes the bytes itself, after the labels of the submission that
+		// copies them: until then a guest read of a page kept readable would see its old bytes
+		// although the label says the write is done. The pages fault into a wait instead.
+		m_memory_tracker.SetGpuModifiedReadable(vaddr, size, false);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto download = m_download_buffer.MapDownload(total_size, 64);
