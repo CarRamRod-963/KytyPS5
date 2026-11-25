@@ -645,35 +645,52 @@ bool WritesFramePointer(const DecodedCodeInstruction& decoded) {
 	return false;
 }
 
+bool IsPushFramePointer(const DecodedCodeInstruction& decoded) {
+	return decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSH &&
+	       decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       decoded.operands[0].reg.value == ZYDIS_REGISTER_RBP;
+}
+
+// `mov rbp, rsp`: RBP holds the current RSP afterwards, whatever it held before.
+bool IsFramePointerSetup(const DecodedCodeInstruction& decoded) {
+	return decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+	       decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       decoded.operands[0].reg.value == ZYDIS_REGISTER_RBP &&
+	       decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       decoded.operands[1].reg.value == ZYDIS_REGISTER_RSP;
+}
+
 // Clang's frame-pointer prologue (push rbp; mov rbp, rsp; push ...) lets a leaf function address
 // its red zone through RBP: [rbp - d] lies below RSP once d exceeds the bytes pushed after the
 // MOV. Windows writes its exception frame there, so map such operands onto the RSP-relative red
 // zone bits the liveness analysis uses. Offsets come from a forward pass over the known RSP
 // deltas; anything the pass cannot prove makes the function conservative.
+// The prologue need not open the function: a shrink-wrapped function first tests its arguments
+// and returns early, and sets up the frame only on the path that needs it. The pass therefore
+// starts at the function entry, where RBP still holds the caller's value. Code that runs before
+// the frame exists cannot address this function's red zone through RBP; a frame access that can
+// be reached both with and without the frame (or after RBP took any other value) is unknown.
 void ModelFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
-	auto&      instructions = function.instructions;
-	const auto push_rbp     = instructions.find(function_start);
-	if (push_rbp == instructions.end() ||
-	    push_rbp->second.instruction.mnemonic != ZYDIS_MNEMONIC_PUSH ||
-	    push_rbp->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-	    push_rbp->second.operands[0].reg.value != ZYDIS_REGISTER_RBP) {
-		return;
-	}
-	const auto mov_rbp = instructions.find(function_start + push_rbp->second.instruction.length);
-	if (mov_rbp == instructions.end() ||
-	    mov_rbp->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
-	    mov_rbp->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-	    mov_rbp->second.operands[0].reg.value != ZYDIS_REGISTER_RBP ||
-	    mov_rbp->second.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-	    mov_rbp->second.operands[1].reg.value != ZYDIS_REGISTER_RSP) {
+	auto& instructions = function.instructions;
+	// Only functions with the frame-pointer prologue keep a frame in RBP; others may use RBP as a
+	// general register.
+	const bool has_prologue = std::ranges::any_of(instructions, [&](const auto& entry) {
+		const auto mov = instructions.find(entry.first + entry.second.instruction.length);
+		return IsPushFramePointer(entry.second) && mov != instructions.end() &&
+		       IsFramePointerSetup(mov->second) && !function.branch_targets.contains(mov->first);
+	});
+	if (!has_prologue) {
 		return;
 	}
 
-	// State before each instruction: RSP relative to RBP (RBP = entry RSP - 8), or nothing
-	// when unknown or RBP no longer holds the frame.
+	// State before each instruction: RBP still holds the caller's value, or RSP relative to RBP
+	// once `mov rbp, rsp` made RBP the frame, or unknown.
+	enum class Frame { Caller, Known, Unknown };
 	struct State {
-		bool known {};
-		s64  rsp_minus_rbp {};
+		Frame frame {};
+		s64   rsp_minus_rbp {};
+
+		bool operator==(const State&) const = default;
 	};
 	std::map<uintptr_t, State> state_in;
 	std::vector<uintptr_t>     work;
@@ -687,28 +704,28 @@ void ModelFramePointerRedZone(DecodedFunction& function, uintptr_t function_star
 			work.push_back(address);
 			return;
 		}
-		if (entry->second.known &&
-		    (!state.known || state.rsp_minus_rbp != entry->second.rsp_minus_rbp)) {
-			conflict |= state.known;
-			entry->second.known = false;
-			work.push_back(address);
+		if (entry->second == state || entry->second.frame == Frame::Unknown) {
+			return;
 		}
+		conflict |= entry->second.frame == Frame::Known && state.frame == Frame::Known;
+		entry->second = {.frame = Frame::Unknown};
+		work.push_back(address);
 	};
-	merge(mov_rbp->first + mov_rbp->second.instruction.length, {.known = true, .rsp_minus_rbp = 0});
+	merge(function_start, {.frame = Frame::Caller});
 	while (!work.empty()) {
 		const uintptr_t address = work.back();
 		work.pop_back();
 		const auto& decoded = instructions.at(address);
 		State       out     = state_in.at(address);
-		if (out.known) {
-			if (WritesFramePointer(decoded)) {
-				out.known = false;
-			} else if (decoded.changes_stack_pointer) {
-				if (decoded.stack_pointer_delta.has_value() && !decoded.replaces_stack_pointer) {
-					out.rsp_minus_rbp += *decoded.stack_pointer_delta;
-				} else {
-					out.known = false;
-				}
+		if (IsFramePointerSetup(decoded)) {
+			out = {.frame = Frame::Known, .rsp_minus_rbp = 0};
+		} else if (WritesFramePointer(decoded)) {
+			out = {.frame = Frame::Unknown};
+		} else if (out.frame == Frame::Known && decoded.changes_stack_pointer) {
+			if (decoded.stack_pointer_delta.has_value() && !decoded.replaces_stack_pointer) {
+				out.rsp_minus_rbp += *decoded.stack_pointer_delta;
+			} else {
+				out = {.frame = Frame::Unknown};
 			}
 		}
 		const uintptr_t next_address  = address + decoded.instruction.length;
@@ -739,20 +756,20 @@ void ModelFramePointerRedZone(DecodedFunction& function, uintptr_t function_star
 				continue;
 			}
 			has_memory_operand = true;
-			if (!IsFramePointerRegister(operand.mem.base) || operand.mem.disp.value >= 0) {
+			if (!IsFramePointerRegister(operand.mem.base) || operand.mem.disp.value >= 0 ||
+			    state == state_in.end() || state->second.frame == Frame::Caller) {
+				// Not this function's frame (code that is never reached counts as such).
 				only_frame_operands = false;
 				continue;
 			}
-			if (state == state_in.end() || !state->second.known || conflict ||
+			if (state->second.frame != Frame::Known || conflict ||
 			    operand.mem.index != ZYDIS_REGISTER_NONE ||
 			    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
 				// A frame access whose place relative to RSP is unknown, or a pointer into it.
-				if (state != state_in.end() || conflict) {
-					decoded.has_red_zone_operand                     = true;
-					decoded.has_unmodeled_red_zone_operand           = true;
-					function.uses_red_zone                           = true;
-					function.requires_conservative_red_zone_tracking = true;
-				}
+				decoded.has_red_zone_operand                     = true;
+				decoded.has_unmodeled_red_zone_operand           = true;
+				function.uses_red_zone                           = true;
+				function.requires_conservative_red_zone_tracking = true;
 				only_frame_operands = false;
 				continue;
 			}
@@ -778,7 +795,7 @@ void ModelFramePointerRedZone(DecodedFunction& function, uintptr_t function_star
 		}
 		// Stack accesses through the frame never fault: keep them out of the rewrite set.
 		if (has_memory_operand && only_frame_operands && state != state_in.end() &&
-		    state->second.known && !conflict) {
+		    state->second.frame == Frame::Known && !conflict) {
 			decoded.accesses_memory = false;
 		}
 	}
