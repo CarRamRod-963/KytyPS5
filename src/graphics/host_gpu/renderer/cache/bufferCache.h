@@ -419,6 +419,10 @@ private:
 	std::map<uint64_t, HotPage> m_hot_pages;
 	uint64_t                    m_hot_touch_sequence = 0;
 	RangeSet                    m_pending_async;
+	// The ranges a GPU-thread readback took out of the dirty ranges and has not written yet
+	// (ServeGuestReadbacks): the hot-page downloads of the submission it waits for leave their
+	// caching pages to a later submission.
+	RangeSet m_taken_downloads;
 	// The downloads one submission records are capped so that a few submissions in flight fit
 	// in the download ring, which synchronous readbacks share (at most a quarter of it).
 	static constexpr uint64_t MaxAsyncDownload     = uint64_t {16} << 20u;

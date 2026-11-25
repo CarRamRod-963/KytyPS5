@@ -317,6 +317,10 @@ struct BufferCacheTestAccess {
     cache.EvictColdHotPages(UINT64_MAX);
   }
 
+  static MemoryTracker &Tracker(BufferCache &cache) {
+    return cache.m_memory_tracker;
+  }
+
   static bool IsHotPage(const BufferCache &cache, uint64_t address) {
     return cache.m_hot_pages.contains(address &
                                       ~(BufferCache::CACHING_PAGESIZE - 1u));
@@ -20602,6 +20606,110 @@ public:
           "a download given up by eviction cleaned a newer GPU write (read " +
               Hex(seen) + ")");
     }
+
+    // With narrow readbacks a GPU-thread readback takes part of a hot caching
+    // page. (a) The page's download in the same submission must not clean the
+    // taken tracker page, whose bytes the readback writes later. (b) The
+    // readback writes only into pages still GPU-dirty: a page another
+    // publisher cleaned may hold a store the guest made since.
+    LoadTestConfig({.narrow_readbacks = true});
+    for (const bool cleaned_by_other : {false, true}) {
+      const uint64_t page = base + (cleaned_by_other ? 0x38000 : 0x30000);
+      const uint64_t taken = page + 0x1000; // Tracker page the readback takes.
+      const uint32_t value = cleaned_by_other ? 0x88888888u : 0x77777777u;
+      constexpr uint32_t guest_value = 0x99999999u;
+      vk::SemaphoreTypeCreateInfo timeline_type{};
+      timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo timeline_create{};
+      timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      timeline_create.pNext = &timeline_type;
+      vk::Semaphore gpu_gate = nullptr;
+      Require(name, "partial readback gate",
+              m_runtime_context.device.createSemaphore(
+                  &timeline_create, nullptr, &gpu_gate) == vk::Result::eSuccess,
+              "failed to create the GPU gate");
+      const auto fill_page = [&](uint32_t fill) {
+        auto [buffer, offset] = cache.ObtainBuffer(page, 0x2000, true);
+        buffer->Fill(offset, 0x2000, fill);
+      };
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        fill_page(0x12121212u);
+        cache.ReadMemory(page, 0x2000); // Hot page.
+      });
+      std::binary_semaphore hold{0};
+      std::atomic<bool> held{false};
+      std::binary_semaphore recorded{0};
+      gpu.SendCommand([&] {
+        processor->BufferInit();
+        SubmitInfo gated;
+        gated.AddWait(gpu_gate, 1);
+        scheduler.Flush(gated);
+        fill_page(value); // Both tracker pages pending.
+        scheduler.DeferPriorityOperation(
+            [&] {
+              held.store(true);
+              hold.acquire();
+            },
+            GuestWrites::None(), PriorityKind::Signal);
+        recorded.release();
+        const Common::GpuTiming::SyncScope reason(
+            Common::GpuTiming::SyncReason::WalkRead);
+        cache.ReadMemory(taken, 4); // Narrow: the taken tracker page only.
+      });
+      recorded.acquire();
+      vk::SemaphoreSignalInfo open_gate{};
+      open_gate.sType = vk::StructureType::eSemaphoreSignalInfo;
+      open_gate.semaphore = gpu_gate;
+      open_gate.value = 1;
+      const bool opened = m_runtime_context.device.signalSemaphore(
+                              &open_gate) == vk::Result::eSuccess;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!held.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      // The readback has not written its bytes yet (it waits for the held
+      // operation).
+      const bool taken_dirty = cache.IsRegionGpuModified(taken, 0x1000);
+      if (cleaned_by_other) {
+        // Another publisher cleans the page, then the guest stores into it.
+        auto &tracker = BufferCacheTestAccess::Tracker(cache);
+        tracker.UnmarkRegionAsGpuModified(taken, 0x1000);
+        LibKernel::Memory::WriteBacking(taken, &guest_value,
+                                        sizeof(guest_value));
+        tracker.MarkRegionAsCpuModified(taken, 0x1000);
+      }
+      hold.release();
+      gpu.SendCommandSync([] {});
+      uint32_t seen = 0;
+      gpu.SendCommandSync([&] {
+        processor->BufferInit();
+        scheduler.Finish();
+        (void)LibKernel::Memory::TryReadBacking(taken, &seen, sizeof(seen));
+        cache.ReadMemory(page, 0x2000);
+        scheduler.Finish();
+      });
+      m_runtime_context.device.destroySemaphore(gpu_gate, nullptr);
+      Require(name, "partial readback fixture", opened && held.load(),
+              "the held operation did not run");
+      if (!cleaned_by_other) {
+        Require(name, "partial readback keeps its page dirty", taken_dirty,
+                "a page download cleaned a tracker page a GPU-thread "
+                "readback had taken and not written yet");
+        Require(name, "partial readback publishes", seen == value,
+                "the GPU-thread readback did not publish the taken page "
+                "(read " +
+                    Hex(seen) + ")");
+      } else {
+        Require(name, "readback keeps a later guest store", seen == guest_value,
+                "a GPU-thread readback wrote over a store the guest made "
+                "after another publisher cleaned the page (read " +
+                    Hex(seen) + ")");
+      }
+    }
+    LoadTestConfig({});
 
     gpu.SendCommandSync([&] {
       processor->BufferInit();
