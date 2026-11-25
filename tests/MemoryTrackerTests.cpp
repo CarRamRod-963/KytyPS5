@@ -996,15 +996,21 @@ void TestPublishGpuModifiedHonoursAccept() {
   // page is skipped.
   uint64_t written_address = 0;
   uint64_t written_size = 0;
+  uint32_t protection_at_write = 0;
   tracker.PublishGpuModified(
       address, page_size * 2, [] { return true; },
       [&](uint64_t range_address, uint64_t range_size) noexcept {
         writes++;
         written_address = range_address;
         written_size = range_size;
+        protection_at_write = Protection(memory);
       });
   Check(writes == 1 && written_address == address && written_size == page_size,
         "accepted publish did not report the dirty page once");
+  // The page becomes readable only once its bytes are written: a guest read
+  // while the publication writes them faults and waits.
+  Check(protection_at_write == PAGE_NOACCESS,
+        "publish made the page readable before writing its bytes");
   Check(!tracker.IsRegionGpuModified(address, page_size * 2) &&
             Protection(memory) == PAGE_READONLY,
         "accepted publish did not restore write-only tracking");
