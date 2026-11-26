@@ -226,10 +226,9 @@ static void PrintUsage() {
 	    "                                       take them when they are bound). Default: only\n"
 	    "                                       those (--lazy-bda-sync).\n");
 	::printf(
-	    "  --vulkan-recording-thread            Make the GPU thread's Vulkan command recording\n"
-	    "                                       calls on a thread of their own (experimental).\n"
-	    "                                       --no-vulkan-recording-thread turns it off\n"
-	    "                                       (default).\n");
+	    "  --no-vulkan-recording-thread         Make the GPU thread's Vulkan command recording\n"
+	    "                                       calls on the GPU thread itself. Default: on a\n"
+	    "                                       thread of their own (--vulkan-recording-thread).\n");
 	::printf(
 	    "  --export-pipeline-list <file>        Write the pipelines recorded for the game as a\n"
 	    "                                       shareable list without shader code, and exit.\n");

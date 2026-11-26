@@ -139,8 +139,8 @@ struct ConfigOptions {
 	// thread serves every request).
 	bool guest_thread_readbacks = false;
 	// The GPU thread's Vulkan recording calls are made by a thread of their own
-	// (graphics/host_gpu/vulkanRecording.h).
-	bool vulkan_recording_thread = false;
+	// (graphics/host_gpu/vulkanRecording.h; --no-vulkan-recording-thread: by the GPU thread).
+	bool vulkan_recording_thread = true;
 	// --export-pipeline-list / --import-pipeline-list (empty = off).
 	std::filesystem::path  export_pipeline_list;
 	std::filesystem::path  import_pipeline_list;
