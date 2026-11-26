@@ -1225,6 +1225,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME queue_submitter
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submit-thread-only)
+	add_test(NAME recording_thunks
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --recording-thunks-only)
 	# Every GPU case with a Vulkan recording thread: for the test thread, and for the GPU
 	# threads as with --vulkan-recording-thread.
 	add_test(NAME shader_recompiler_compute_recording_thread

@@ -1492,6 +1492,158 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+// The recording thread's thunks copy what a queued call's pointers name: the
+// producer may reuse that memory as soon as the call returns. Driver entries
+// that keep what they are given replace the real ones (no device), the
+// recording thread is held back by a slow queued call, and the producer
+// overwrites every argument before the recording thread makes the calls.
+struct RecordingThunkSeen {
+  static inline VkConditionalRenderingBeginInfoEXT conditional{};
+  static inline VkImageMemoryBarrier2 image_barrier{};
+  static inline uint32_t image_barrier_count = 0;
+  static inline VkRenderingAttachmentInfo color{};
+  static inline VkViewport viewport{};
+  static inline std::array<uint32_t, 4> push{};
+  static inline VkBufferCopy copy{};
+};
+
+void CheckRecordingThunkCopies() {
+  namespace Recording = Libs::Graphics::VulkanRecording;
+  using Seen = RecordingThunkSeen;
+  auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+  dispatcher.vkBeginCommandBuffer = [](VkCommandBuffer,
+                                       const VkCommandBufferBeginInfo *) {
+    return VK_SUCCESS;
+  };
+  dispatcher.vkEndCommandBuffer = [](VkCommandBuffer) { return VK_SUCCESS; };
+  dispatcher.vkCmdBeginConditionalRenderingEXT =
+      [](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT *info) {
+        Seen::conditional = *info;
+      };
+  dispatcher.vkCmdPipelineBarrier2 = [](VkCommandBuffer,
+                                        const VkDependencyInfo *info) {
+    Seen::image_barrier_count = info->imageMemoryBarrierCount;
+    Seen::image_barrier = info->pImageMemoryBarriers[0];
+  };
+  dispatcher.vkCmdBeginRendering = [](VkCommandBuffer,
+                                      const VkRenderingInfo *info) {
+    Seen::color = info->pColorAttachments[0];
+  };
+  dispatcher.vkCmdSetViewport = [](VkCommandBuffer, uint32_t, uint32_t,
+                                   const VkViewport *viewports) {
+    Seen::viewport = viewports[0];
+  };
+  dispatcher.vkCmdPushConstants = [](VkCommandBuffer, VkPipelineLayout,
+                                     VkShaderStageFlags, uint32_t,
+                                     uint32_t size, const void *values) {
+    std::memcpy(Seen::push.data(), values,
+                std::min<size_t>(size, sizeof(Seen::push)));
+  };
+  dispatcher.vkCmdCopyBuffer = [](VkCommandBuffer, VkBuffer, VkBuffer, uint32_t,
+                                  const VkBufferCopy *regions) {
+    Seen::copy = regions[0];
+  };
+  Recording::Install();
+
+  const auto command = reinterpret_cast<VkCommandBuffer>(uintptr_t{0x1000});
+  const auto buffer = reinterpret_cast<VkBuffer>(uintptr_t{0x2000});
+  const auto other = reinterpret_cast<VkBuffer>(uintptr_t{0x3000});
+  const auto image = reinterpret_cast<VkImage>(uintptr_t{0x4000});
+  const auto view = reinterpret_cast<VkImageView>(uintptr_t{0x5000});
+  {
+    const Recording::ProducerScope producer;
+    Require("RecordingThunks", "producer", Recording::Recording(),
+            "the thread is not a producer");
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    Require("RecordingThunks", "begin",
+            dispatcher.vkBeginCommandBuffer(command, &begin) == VK_SUCCESS,
+            "begin failed");
+    // Holds the recording thread back until every argument below was
+    // overwritten.
+    const auto slow = [](const void *) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    };
+    Require("RecordingThunks", "slow call",
+            Recording::EnqueueOrdered(slow, nullptr, 0),
+            "the slow call was not queued");
+
+    VkConditionalRenderingBeginInfoEXT conditional{};
+    conditional.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+    conditional.buffer = buffer;
+    conditional.offset = 64;
+    conditional.flags = VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+    dispatcher.vkCmdBeginConditionalRenderingEXT(command, &conditional);
+
+    VkImageMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.image = image;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    dispatcher.vkCmdPipelineBarrier2(command, &dependency);
+
+    VkRenderingAttachmentInfo color{};
+    color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color.imageView = view;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    dispatcher.vkCmdBeginRendering(command, &rendering);
+
+    VkViewport viewport{1.0f, 2.0f, 30.0f, 40.0f, 0.0f, 1.0f};
+    dispatcher.vkCmdSetViewport(command, 0, 1, &viewport);
+    std::array<uint32_t, 4> push{11, 12, 13, 14};
+    dispatcher.vkCmdPushConstants(command, nullptr, VK_SHADER_STAGE_ALL, 0,
+                                  sizeof(push), push.data());
+    VkBufferCopy copy{8, 16, 24};
+    dispatcher.vkCmdCopyBuffer(command, buffer, other, 1, &copy);
+    Require("RecordingThunks", "end",
+            dispatcher.vkEndCommandBuffer(command) == VK_SUCCESS, "end failed");
+
+    // What a producer's stack holds next.
+    conditional = {};
+    barrier = {};
+    dependency = {};
+    color = {};
+    rendering = {};
+    viewport = {};
+    push = {};
+    copy = {};
+    // The calls are made while the producer's memory still holds the above.
+    Recording::Drain();
+  }
+  Require(
+      "RecordingThunks", "conditional rendering",
+      Seen::conditional.buffer == buffer && Seen::conditional.offset == 64 &&
+          Seen::conditional.flags == VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT,
+      "conditional rendering began from the producer's later memory");
+  Require("RecordingThunks", "barrier",
+          Seen::image_barrier_count == 1 &&
+              Seen::image_barrier.image == image &&
+              Seen::image_barrier.newLayout == VK_IMAGE_LAYOUT_GENERAL,
+          "a barrier was recorded from the producer's later memory");
+  Require("RecordingThunks", "rendering",
+          Seen::color.imageView == view &&
+              Seen::color.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR,
+          "rendering began from the producer's later memory");
+  Require("RecordingThunks", "viewport",
+          Seen::viewport.x == 1.0f && Seen::viewport.height == 40.0f,
+          "a viewport was set from the producer's later memory");
+  Require("RecordingThunks", "push constants",
+          Seen::push == std::array<uint32_t, 4>{11, 12, 13, 14},
+          "push constants were read from the producer's later memory");
+  Require("RecordingThunks", "copy",
+          Seen::copy.srcOffset == 8 && Seen::copy.dstOffset == 16 &&
+              Seen::copy.size == 24,
+          "a copy region was read from the producer's later memory");
+  std::printf("RecordingThunks ok\n");
+}
+
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
   namespace SystemDialog = Libs::Dialog::SystemDialog;
@@ -4022,6 +4174,30 @@ public:
         order == 2 && gpu_thread != caller_thread &&
             nested_thread == gpu_thread,
         "host command did not run on the GPU thread or nested sync deadlocked");
+
+    if (TestRecordingMode() == TestRecording::GpuThreads) {
+      // A synchronous command returns once the Vulkan calls it queued were
+      // made: its caller may free what they name (an unmap). The queued call
+      // is slow on purpose, so a return before it ran shows.
+      static std::atomic<bool> queued_call_ran{false};
+      queued_call_ran = false;
+      bool queued = false;
+      gpu.SendCommandSync([&] {
+        Require("GpuCommandLane", "recording producer",
+                Libs::Graphics::VulkanRecording::Recording(),
+                "the GPU thread does not record through a recording thread");
+        const auto call = [](const void *) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          queued_call_ran = true;
+        };
+        queued =
+            Libs::Graphics::VulkanRecording::EnqueueOrdered(call, nullptr, 0);
+      });
+      Require("GpuCommandLane", "synchronous command drain",
+              queued && queued_call_ran,
+              "a synchronous command returned before the recording thread "
+              "made the calls it queued");
+    }
 
     {
       const auto make_release_mem =
@@ -68284,6 +68460,11 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--recording-thunks-only") == 0) {
+    // No device: the driver entries are the test's own.
+    CheckRecordingThunkCopies();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--reference-clock-only") == 0) {
