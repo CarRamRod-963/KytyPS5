@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -283,6 +285,49 @@ void TestModuleMap() {
         "long names are cut, not overrun");
   modules.Clear();
   Check(modules.Find(0x900001010ull).module.empty(), "cleared");
+}
+
+// A thread that faults while another writes the report waits for that report
+// (or the time limit); the reporting thread waits for nothing.
+void TestFaultReportGate() {
+  {
+    Loader::FaultReportGate gate;
+    Check(gate.Begin(), "the first thread writes the report");
+    Check(!gate.Begin(),
+          "a second fault on the reporting thread is turned away");
+    uint32_t slept = 0;
+    Check(!gate.WaitForReport(100, [&](uint32_t ms) { slept += ms; }) &&
+              slept == 0,
+          "the reporting thread does not wait for its own report");
+    std::atomic<bool> other_returned{false};
+    std::atomic<bool> other_saw_report{false};
+    std::thread other([&] {
+      Check(!gate.Begin(), "a second thread is turned away");
+      other_saw_report = gate.WaitForReport(10000, [](uint32_t ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      });
+      other_returned = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Check(!other_returned,
+          "a second thread goes on before the report is written");
+    gate.Finish();
+    other.join();
+    Check(other_saw_report, "the second thread saw the finished report");
+  }
+  {
+    Loader::FaultReportGate gate;
+    Check(gate.Begin(), "the first thread writes the report");
+    std::thread other([&] {
+      uint32_t slept = 0;
+      Check(!gate.Begin(), "a second thread is turned away");
+      Check(!gate.WaitForReport(25, [&](uint32_t ms) { slept += ms; }) &&
+                slept == 25,
+            "a report that never ends holds the second thread for the limit "
+            "only");
+    });
+    other.join();
+  }
 }
 
 void TestThreadRegistry() {
@@ -729,6 +774,7 @@ int main() {
   TestIndirectAndThreads();
   TestModuleMap();
   TestThreadRegistry();
+  TestFaultReportGate();
   TestHandledFaultRing();
   TestHandledFaultReport();
   TestMemoryReportFits();

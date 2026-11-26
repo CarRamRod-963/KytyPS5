@@ -211,6 +211,52 @@ private:
 // The process's registry, filled by the guest thread library.
 GuestThreadRegistry& GuestThreads();
 
+// Lets one thread write the report of a fatal fault. A thread that faults while another one
+// writes it waits for the report before it goes on to end the process: its way out is much
+// shorter than the report (memory queries, a stop of every guest thread, a write of up to some
+// hundred KiB), and two threads that fault on one broken object within milliseconds would
+// otherwise leave a log without any report. The reporting thread itself (a fault inside the
+// report) waits for nothing.
+class FaultReportGate {
+public:
+	// True for the thread that writes the report (the first caller).
+	[[nodiscard]] bool Begin() {
+		if (m_busy.exchange(true, std::memory_order_acquire)) {
+			return false;
+		}
+		Reporter() = this;
+		return true;
+	}
+
+	void Finish() { m_done.store(true, std::memory_order_release); }
+
+	// For a caller Begin turned away: returns once the report is written, after `timeout_ms` at
+	// most, at once on the reporting thread. `sleep_ms(1)` waits a millisecond. True when the
+	// report was written.
+	template <typename Sleep>
+	bool WaitForReport(uint32_t timeout_ms, Sleep&& sleep_ms) const {
+		if (Reporter() == this) {
+			return m_done.load(std::memory_order_acquire);
+		}
+		for (uint32_t waited = 0; !m_done.load(std::memory_order_acquire); waited++) {
+			if (waited >= timeout_ms) {
+				return false;
+			}
+			sleep_ms(1);
+		}
+		return true;
+	}
+
+private:
+	static const FaultReportGate*& Reporter() {
+		thread_local const FaultReportGate* reporter = nullptr;
+		return reporter;
+	}
+
+	std::atomic<bool> m_busy {false};
+	std::atomic<bool> m_done {false};
+};
+
 } // namespace Loader
 
 #endif /* KYTY_LOADER_GUEST_FAULT_HISTORY_H_ */

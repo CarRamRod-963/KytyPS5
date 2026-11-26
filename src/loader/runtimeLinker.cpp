@@ -783,7 +783,7 @@ struct GuestFaultMemoryStorage {
 	GuestFaultMemoryText text;
 };
 static GuestFaultMemoryStorage g_fault_memory;
-static std::atomic_flag        g_fault_memory_busy;
+static Loader::FaultReportGate g_fault_memory_gate;
 
 // Pointers found in the first GuestFaultPointerScan bytes of the register dumps (first qword of
 // each register, then the second, ...) and in the frame below rbp (nearest first), dumped once
@@ -902,9 +902,12 @@ static size_t SnapshotGuestThreads(GuestFaultMemoryStorage* s, size_t* total) {
 // saved value an exception frame overwrote from data the program got wrong, and show a thread
 // that was working on the same data at the same moment.
 static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& info) {
-	if (g_fault_memory_busy.test_and_set(std::memory_order_acquire)) {
+	if (!g_fault_memory_gate.Begin()) {
 		Log::WriteToConsoleAndLog("--- Guest memory at the registers: left out (another thread is "
 		                          "reporting a fault) ---\n");
+		// This thread goes on to end the process: two seconds at most for the other report.
+		(void)g_fault_memory_gate.WaitForReport(
+		    2000, [](uint32_t ms) { Common::Thread::SleepMicro(ms * 1000u); });
 		return;
 	}
 	const uint64_t                         now_ns = MonotonicNs();
@@ -965,6 +968,7 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	                                             report.indirect, s->interest)};
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
+	g_fault_memory_gate.Finish();
 }
 
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
