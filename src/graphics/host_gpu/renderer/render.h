@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/commandLog.h"
 #include "graphics/host_gpu/renderer/barrierTracker.h"
 #include "graphics/host_gpu/renderer/cache/uploadScatter.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessReport.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -563,21 +564,29 @@ private:
 	void WatchBindlessRecord(uint32_t heap, const BindlessTranslation::Request& request,
 	                         uint64_t address, const std::array<uint32_t, 8>& dwords);
 	void RecheckBindlessRecords();
-	// Keys resolved since the last report line (ResolveBindlessImages, one line every 30 s while
-	// keys resolve): through a bits view (BindlessBitsViewFormat) and to the placeholder; watched
-	// records found changed and keys resolved again for them.
+	// Keys resolved since the last report line (ResolveBindlessImages, see BindlessReportSchedule):
+	// through a bits view (BindlessBitsViewFormat) and to the placeholder, by reason; watched
+	// records found changed, keys resolved again for them and how many of those got the
+	// placeholder; image bindings RebindReplacedImages left without an image.
 	struct BindlessReport {
-		std::chrono::steady_clock::time_point time;
-		uint64_t                              frames         = 0;
-		uint64_t                              resolved       = 0;
-		uint64_t                              bits_views     = 0;
-		uint64_t                              placeholder    = 0;
-		uint64_t                              changed        = 0;
-		uint64_t                              retranslated   = 0;
-		uint64_t                              watch_overflow = 0;
+		uint64_t frames         = 0;
+		uint64_t resolved       = 0;
+		uint64_t bits_views     = 0;
+		uint64_t placeholder    = 0;
+		uint64_t changed        = 0;
+		uint64_t retranslated   = 0;
+		uint64_t to_placeholder = 0;
+		uint64_t watch_overflow = 0;
+		uint64_t unbound        = 0;
+		std::array<uint64_t, static_cast<size_t>(BindlessPlaceholderReason::Count)> reasons {};
 	};
-	BindlessReport m_bindless_report;
-	void           ReportBindlessImages();
+	BindlessReport         m_bindless_report;
+	BindlessReportSchedule m_bindless_report_schedule;
+	uint32_t               BindlessPlaceholder(BindlessPlaceholderReason reason) {
+		++m_bindless_report.reasons[static_cast<size_t>(reason)];
+		return BindlessTranslation::PlaceholderSlot;
+	}
+	void ReportBindlessImages(uint32_t marker);
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

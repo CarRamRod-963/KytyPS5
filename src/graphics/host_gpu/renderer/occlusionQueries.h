@@ -4,7 +4,9 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -69,6 +71,44 @@ private:
 	uint64_t m_uncounted = 0;
 };
 
+// The guest queries whose results were written, counted from their dumps in the order they are
+// written: a query ends with no samples when its end dump writes the counter its begin dump
+// wrote. Begins of the last few queries are kept, enough for the ones a guest nests or
+// interleaves; an end whose begin was not kept is not counted.
+class ZPassQueryCounter {
+public:
+	struct Counts {
+		uint64_t ended = 0;
+		uint64_t empty = 0;
+	};
+
+	void Note(uint64_t address, uint64_t samples) {
+		if ((address & 8u) == 0) {
+			m_begins[m_next++ % m_begins.size()] = {address, samples};
+			return;
+		}
+		for (auto& begin: m_begins) {
+			if (begin.address != 0 && begin.address == address - 8u) {
+				m_counts.ended++;
+				m_counts.empty += samples == begin.samples ? 1u : 0u;
+				begin.address = 0;
+				return;
+			}
+		}
+	}
+	// The counts since the last call.
+	Counts Take() { return std::exchange(m_counts, {}); }
+
+private:
+	struct Begin {
+		uint64_t address = 0;
+		uint64_t samples = 0;
+	};
+	std::array<Begin, 16> m_begins {};
+	uint32_t              m_next = 0;
+	Counts                m_counts;
+};
+
 // The guest's z-pass counters from host occlusion queries: a draw counts its samples while a guest
 // query is open, and the dumps' counters are written before the guest can see the GPU ran them.
 class OcclusionQueries {
@@ -95,6 +135,8 @@ public:
 
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
+	// The guest queries that ended since the last call (ZPassQueryCounter).
+	[[nodiscard]] ZPassQueryCounter::Counts TakeQueryCounts() { return m_query_counter.Take(); }
 	// Waits for the GPU to run the dumps and writes their counters.
 	void Publish() {
 		if (!m_dumps.empty()) {
@@ -118,6 +160,7 @@ private:
 	std::vector<PendingDump> m_dumps;
 	std::vector<uint64_t>    m_results;
 	ZPassLedger              m_ledger;
+	ZPassQueryCounter        m_query_counter;
 	uint64_t                 m_begun   = 0;
 	uint64_t                 m_read    = 0;
 	uint64_t                 m_samples = 0;

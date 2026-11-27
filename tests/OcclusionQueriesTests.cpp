@@ -94,10 +94,40 @@ void TestUnissuedDraws() {
 	Publish(results.data(), end, 10);
 	CHECK(Passed(results) == 1);
 }
+// Guest queries count when their end dumps are written: empty when the end
+// writes the begin's counter, also nested; an end without a kept begin is not
+// counted.
+void TestQueryCounter() {
+  ZPassQueryCounter counter;
+  counter.Note(0x1000, 10);
+  counter.Note(0x1008, 10);
+  counter.Note(0x2000, 10);
+  counter.Note(0x3000, 12);
+  counter.Note(0x3008, 20);
+  counter.Note(0x2008, 20);
+  counter.Note(0x4008, 20);
+  auto counts = counter.Take();
+  CHECK(counts.ended == 3);
+  CHECK(counts.empty == 1);
+  counts = counter.Take();
+  CHECK(counts.ended == 0 && counts.empty == 0);
+  // A begin matches one end only.
+  counter.Note(0x1008, 20);
+  CHECK(counter.Take().ended == 0);
+  // The begin of a reused result slot is the newest one.
+  counter.Note(0x5000, 30);
+  counter.Note(0x5008, 31);
+  counter.Note(0x5000, 40);
+  counter.Note(0x5008, 40);
+  counts = counter.Take();
+  CHECK(counts.ended == 2 && counts.empty == 1);
+}
+
 } // namespace
 
 int main() {
 	TestCounters();
 	TestUnissuedDraws();
-	std::puts("Occlusion query tests passed");
+        TestQueryCounter();
+        std::puts("Occlusion query tests passed");
 }

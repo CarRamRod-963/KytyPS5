@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/diagnosticMarker.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -231,6 +232,14 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
+				}
+				break;
+			// A marker in the log (Common::DiagnosticMarker); F9 for keyboards without ScrollLock.
+			case SDLK_SCROLLLOCK:
+			case SDLK_F9:
+				if (!key.repeat) {
+					LOGF("Marker %u at %.4f s\n", Common::DiagnosticMarker::Request(),
+					     key.timestamp_seconds);
 				}
 				break;
 			case SDLK_RETURN:

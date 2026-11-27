@@ -1,6 +1,9 @@
+#include "common/diagnosticMarker.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessReport.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTranslation.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -212,6 +215,50 @@ void TestRetranslate() {
         "a key's entry follows its heap to the new region");
 }
 
+// The report line comes in the first frame, every 5 s for a minute, then every
+// 30 s, and in the frame after a marker without moving the periodic lines.
+void TestReportSchedule() {
+  using Schedule = Libs::Graphics::BindlessReportSchedule;
+  using std::chrono::milliseconds;
+  using std::chrono::seconds;
+  Schedule schedule;
+  const auto start = Schedule::Clock::time_point{} + seconds(1000);
+  Check(schedule.Due(start, false), "first frame reports");
+  Check(!schedule.Due(start + milliseconds(4999), false),
+        "no report before 5 s");
+  Check(schedule.Due(start + seconds(5), false), "report at 5 s");
+  Check(schedule.Due(start + seconds(6), true), "marker reports at once");
+  Check(!schedule.Due(start + milliseconds(10999), false),
+        "period restarts at the marker");
+  Check(schedule.Due(start + seconds(11), false),
+        "report 5 s after the marker");
+  Check(schedule.Due(start + seconds(56), false), "report at 56 s");
+  Check(!schedule.Due(start + seconds(61), false),
+        "30 s period after the first minute");
+  Check(!schedule.Due(start + milliseconds(85999), false),
+        "no report before 30 s");
+  Check(schedule.Due(start + seconds(86), false), "report 30 s later");
+  Check(schedule.Due(start + seconds(87), true),
+        "marker reports late in the session");
+}
+
+// A marker is taken once, and the newest of several pressed in one frame is the
+// one taken.
+void TestDiagnosticMarker() {
+  Check(Common::DiagnosticMarker::TakePending() == 0,
+        "no marker before a press");
+  const auto first = Common::DiagnosticMarker::Request();
+  Check(first == 1, "markers count from 1");
+  Check(Common::DiagnosticMarker::TakePending() == first,
+        "the pressed marker is taken");
+  Check(Common::DiagnosticMarker::TakePending() == 0, "a marker is taken once");
+  Common::DiagnosticMarker::Request();
+  const auto third = Common::DiagnosticMarker::Request();
+  Check(third == 3, "markers keep counting");
+  Check(Common::DiagnosticMarker::TakePending() == third,
+        "the newest marker is taken");
+}
+
 } // namespace
 
 int main() {
@@ -219,6 +266,8 @@ int main() {
   TestReset();
   TestSlotOnes();
   TestRetranslate();
+  TestReportSchedule();
+  TestDiagnosticMarker();
   std::printf("BindlessTranslationTests: all tests passed\n");
   return 0;
 }

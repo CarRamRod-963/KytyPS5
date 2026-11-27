@@ -69,6 +69,7 @@ void OcclusionQueries::PublishDumps() {
 			m_samples += m_results[m_read % QUERY_COUNT];
 		}
 		const auto samples = m_samples + dump.uncounted;
+		m_query_counter.Note(dump.address, samples);
 		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address), samples,
 		                   (dump.address & 8u) == 0);
 		const auto first = OCCLUSION_QUERY_READY | samples;

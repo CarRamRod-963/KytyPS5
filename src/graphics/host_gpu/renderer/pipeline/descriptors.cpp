@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/diagnosticMarker.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -1386,14 +1387,14 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		// The shader sign-extends bit 47; the bits above it carry what the game stores there.
 		pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
 		if (!readable || pointer == 0) {
-			return BindlessTranslation::PlaceholderSlot;
+			return BindlessPlaceholder(BindlessPlaceholderReason::NoPointer);
 		}
 	}
 	ShaderRecompiler::IR::DescriptorValue value;
 	value.dword_count = static_cast<uint32_t>(value.dwords.size());
 	const auto descriptor = pointer + uint64_t {request.layer} * key.layer_stride + key.table_offset;
 	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords))) {
-		return BindlessTranslation::PlaceholderSlot;
+		return BindlessPlaceholder(BindlessPlaceholderReason::UnreadableTsharp);
 	}
 	// Whatever the record names now, a later change of it resolves the key again; a record of a
 	// pointer heap is reached through another, and those heaps are rebuilt by the games that
@@ -1402,7 +1403,7 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		WatchBindlessRecord(heap, request, descriptor, value.dwords);
 	}
 	if (DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
-		return BindlessTranslation::PlaceholderSlot;
+		return BindlessPlaceholder(BindlessPlaceholderReason::NullTsharp);
 	}
 	EXIT_IF(heap >= m_bindless_resources.size());
 	// A T# a plain binding would refuse keeps the placeholder: the key may name a record the
@@ -1422,7 +1423,7 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
 			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
 		}
-		return BindlessTranslation::PlaceholderSlot;
+		return BindlessPlaceholder(BindlessPlaceholderReason::UnsupportedTsharp);
 	}
 	auto& cache   = m_context.GetTextureCache();
 	auto  binding = ResolveTexture(m_bindless_resources[heap], value, TextureSource::Optional);
@@ -1434,11 +1435,11 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
 			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
 		}
-		return BindlessTranslation::PlaceholderSlot;
+		return BindlessPlaceholder(BindlessPlaceholderReason::NotBindable);
 	}
 	auto& image = cache.GetImage(binding.image_id);
 	if (image.info.IsDepth() || image.info.data.Empty()) {
-		return BindlessTranslation::PlaceholderSlot;
+		return BindlessPlaceholder(BindlessPlaceholderReason::DepthOrEmptyImage);
 	}
 	const auto bits_view_format =
 	    BindlessBitsViewFormat(m_bindless_resources[heap], binding.desc.info.guest_format);
@@ -1457,7 +1458,7 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 			if (!std::exchange(reported, true)) {
 				LOGF("bindless image slots are exhausted; later keys sample the placeholder\n");
 			}
-			return BindlessTranslation::PlaceholderSlot;
+			return BindlessPlaceholder(BindlessPlaceholderReason::NoFreeSlot);
 		}
 		table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
 	}
@@ -1562,7 +1563,7 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	}
 	RecheckBindlessRecords();
 	table.FlushTranslation();
-	ReportBindlessImages();
+	ReportBindlessImages(Common::DiagnosticMarker::TakePending());
 }
 
 void RenderExecutor::WatchBindlessRecord(uint32_t heap, const BindlessTranslation::Request& request,
@@ -1635,7 +1636,10 @@ void RenderExecutor::RecheckBindlessRecords() {
 			// The new resolution refreshes the watched block.
 			std::memcpy(watch.dwords.data(), bytes.data() + (watch.address - start), record_bytes);
 			const BindlessTranslation::Request request {watch.heap, watch.record, watch.layer};
-			translation.Retranslate(entry, ResolveBindlessKey(watch.heap, request));
+			const auto                         slot = ResolveBindlessKey(watch.heap, request);
+			m_bindless_report.to_placeholder +=
+			    slot == BindlessTranslation::PlaceholderSlot ? 1u : 0u;
+			translation.Retranslate(entry, slot);
 		}
 		first = end;
 	}
@@ -1644,21 +1648,55 @@ void RenderExecutor::RecheckBindlessRecords() {
 	}
 }
 
-// One line every 30 s while keys resolve.
-void RenderExecutor::ReportBindlessImages() {
-	auto&      report = m_bindless_report;
-	const auto now    = std::chrono::steady_clock::now();
+// A line when BindlessReportSchedule says so while keys resolve, and after every marker: what
+// the keys resolved to since the last line, and how many watched keys sample the placeholder now
+// (a key whose image went missing stays there until its record changes or the GPU flags it).
+// The occlusion query line beside it counts the guest queries that ended with no samples: the
+// guest may cull what they cover.
+void RenderExecutor::ReportBindlessImages(uint32_t marker) {
+	auto& report = m_bindless_report;
 	++report.frames;
-	if (now - report.time < std::chrono::seconds(30)) return;
-	if (report.resolved != 0 || report.changed != 0) {
-		LOGF("Bindless images: %" PRIu64 " keys resolved in %" PRIu64 " frames, %" PRIu64
+	if (!m_bindless_report_schedule.Due(std::chrono::steady_clock::now(), marker != 0)) return;
+	const auto at_marker = marker != 0 ? fmt::format(" at marker {}", marker) : std::string();
+	if (report.resolved != 0 || report.changed != 0 || marker != 0) {
+		const auto& translation         = m_context.GetBindlessTable().Translation();
+		size_t      watched_placeholder = 0;
+		for (const auto& watch: m_bindless_watches) {
+			const auto entry = translation.EntryOf(watch.heap, watch.record, watch.layer);
+			if (entry != BindlessTranslation::NoEntry &&
+			    translation.EntryValue(entry) == BindlessTranslation::PlaceholderSlot) {
+				++watched_placeholder;
+			}
+		}
+		std::string reasons;
+		for (size_t reason = 0; reason < report.reasons.size(); reason++) {
+			if (report.reasons[reason] != 0) {
+				reasons +=
+				    fmt::format("{}{} {}", reasons.empty() ? "" : ", ", report.reasons[reason],
+				                BindlessPlaceholderReasonNames[reason]);
+			}
+		}
+		LOGF("Bindless images%s: %" PRIu64 " keys resolved in %" PRIu64 " frames, %" PRIu64
 		     " to the placeholder, %" PRIu64 " through the float view of integer texels; %" PRIu64
-		     " watched records changed, %" PRIu64 " keys resolved again, %zu records watched%s\n",
-		     report.resolved, report.frames, report.placeholder, report.bits_views, report.changed,
-		     report.retranslated, m_bindless_watches.size(),
-		     report.watch_overflow != 0 ? " (watch list full)" : "");
+		     " watched records changed, %" PRIu64 " keys resolved again (%" PRIu64
+		     " to the placeholder), %zu records watched%s, %zu of them on the placeholder; %" PRIu64
+		     " image bindings left unbound; placeholder results by reason, also of keys resolved "
+		     "again: %s\n",
+		     at_marker.c_str(), report.resolved, report.frames, report.placeholder,
+		     report.bits_views, report.changed, report.retranslated, report.to_placeholder,
+		     m_bindless_watches.size(), report.watch_overflow != 0 ? " (watch list full)" : "",
+		     watched_placeholder, report.unbound, reasons.empty() ? "none" : reasons.c_str());
 	}
-	report = {.time = now};
+	auto& queries = m_context.GetOcclusionQueries();
+	if (queries.Enabled()) {
+		const auto counts = queries.TakeQueryCounts();
+		if (counts.ended != 0 || marker != 0) {
+			LOGF("Occlusion queries%s: %" PRIu64 " guest queries ended, %" PRIu64
+			     " of them with no samples\n",
+			     at_marker.c_str(), counts.ended, counts.empty);
+		}
+	}
+	report = {};
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -1751,6 +1789,7 @@ void RenderExecutor::RebindReplacedImages(std::span<PreparedBindings* const> pre
 			if (!reported.exchange(true)) {
 				LOGF("image bindings kept replacing each other's images; one binds no image\n");
 			}
+			++m_bindless_report.unbound;
 			binding.image_id   = {};
 			binding.image_view = nullptr;
 			binding.mip_views.clear();
