@@ -335,8 +335,12 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
 		     f.timestamp_seconds);
 	} else if (f.axis) {
-		LOGF("Controller axis: %d, axis = %d, value = %d, time = %.04f\n", f.id, f.axis_id,
-		     f.axis_value, f.timestamp_seconds);
+		// Sticks and triggers send hundreds of events a second (a quarter of a tester's log):
+		// logged only with the graphics debug dump.
+		if (Config::GraphicsDebugDumpEnabled()) {
+			LOGF("Controller axis: %d, axis = %d, value = %d, time = %.04f\n", f.id, f.axis_id,
+			     f.axis_value, f.timestamp_seconds);
+		}
 	} else {
 		LOGF("Controller button: "
 		     "%d, %s%s, %s%s, button = %d, time = %.04f\n",
