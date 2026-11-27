@@ -2821,6 +2821,26 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::DescribeForFaultReport(uint64_t begin, uint64_t end,
+                                          Common::FaultReportLines* lines) {
+	if (!m_lock.try_lock()) {
+		(void)lines->Line("    images: busy (another thread holds the texture cache)");
+		return;
+	}
+	bool more = true;
+	ForEachImageInRegion(begin, end - begin, [&](ImageId id, Image& image) {
+		more = lines->Format(
+		    "    image #{} 0x{:016x} size 0x{:x} {}x{}x{} layers {}{}{}{}{}", id.index,
+		    image.info.data.address, image.info.data.size, image.info.extent.width,
+		    image.info.extent.height, image.info.extent.depth, image.info.resources.layers,
+		    image.IsGpuModified() ? ", GPU-written" : "",
+		    image.IsBufferModified() ? ", buffer-modified" : "",
+		    image.IsCpuDirty() ? ", CPU-dirty" : "", image.displaced ? ", displaced" : "");
+		return !more;
+	});
+	m_lock.unlock();
+}
+
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

@@ -33,10 +33,12 @@ struct HandledFault {
 };
 
 // The last faults one thread had resolved, for the report of a fatal fault on the same thread.
-// Recording is a few stores into thread-local memory: no lock, no allocation.
+// Recording is a few stores into thread-local memory: no lock, no allocation. 64 entries (3 KiB
+// per thread) keep the faults of a buffer the thread zeroed even after it touched a few more
+// pages elsewhere; the report prints runs of them as one line.
 class HandledFaultRing {
 public:
-	static constexpr size_t Capacity = 8;
+	static constexpr size_t Capacity = 64;
 
 	void Record(const HandledFault& fault) {
 		m_entries[m_count % Capacity] = fault;

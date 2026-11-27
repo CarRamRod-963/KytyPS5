@@ -163,6 +163,21 @@ public:
 		return true;
 	}
 
+	// The end of the run of pages from vaddr's page whose backing pages follow each other (one
+	// mapping of direct memory, or mappings of adjacent direct memory), at most `limit`; 0 when
+	// vaddr is not backed. Needs no lock, like IsBacked.
+	[[nodiscard]] uint64_t BackingRunEnd(uint64_t vaddr, uint64_t limit) const {
+		auto       page  = vaddr >> PageBits;
+		const auto entry = LoadPage(page);
+		if (entry == 0) {
+			return 0;
+		}
+		auto expected = entry + 1u;
+		for (page++; (page << PageBits) < limit && LoadPage(page) == expected; page++, expected++) {
+		}
+		return std::min(page << PageBits, limit);
+	}
+
 	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
 	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
@@ -584,6 +599,9 @@ public:
 		return m_backing->CompareBacking(vaddr, data, size);
 	}
 
+	[[nodiscard]] uint64_t BackingRunEnd(uint64_t vaddr, uint64_t limit) const {
+		return m_backing->BackingRunEnd(vaddr, limit);
+	}
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		return m_backing->IsBacked(vaddr, size);
 	}

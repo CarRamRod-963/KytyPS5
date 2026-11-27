@@ -34,6 +34,31 @@ public:
 	// tracking region): one lock and one protection update per region instead of per page.
 	void SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable);
 	[[nodiscard]] bool IsGpuModifiedReadable(uint64_t vaddr, uint64_t size);
+	// Calls f(page, state) for each tracked page of [vaddr, vaddr + size) (RegionManager::Page*
+	// bits; PageBusy when its region kept changing), without a lock: for a fault report, which
+	// must not wait for a lock the faulting thread may hold. Untracked pages are left out.
+	static constexpr uint8_t PageBusy = 0x80u;
+	template <typename F>
+	void DescribePagesUnlocked(uint64_t vaddr, uint64_t size, F&& f) const {
+		const auto end = vaddr + size;
+		for (auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < end; page += TRACKER_PAGE_SIZE) {
+			if (page >= TRACKER_ADDRESS_SIZE) {
+				return;
+			}
+			const auto* manager =
+			    m_regions[page / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				continue;
+			}
+			uint8_t state = PageBusy;
+			for (int attempt = 0; attempt < 16; attempt++) {
+				if (manager->TryPageStateUnlocked(page % TRACKER_REGION_SIZE, &state)) {
+					break;
+				}
+			}
+			f(page, state);
+		}
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

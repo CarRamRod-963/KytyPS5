@@ -106,6 +106,12 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+void RenderContext::DescribeForFaultReport(uint64_t begin, uint64_t end,
+                                           Common::FaultReportLines* lines) {
+	m_buffer_cache.DescribeForFaultReport(begin, end, lines);
+	m_texture_cache.DescribeForFaultReport(begin, end, lines);
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.

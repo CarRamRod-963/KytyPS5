@@ -828,6 +828,11 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	                         data, size);
 }
 
+uint64_t BackingRunEnd(uint64_t vaddr, uint64_t limit) noexcept {
+	return g_guest_address_space != nullptr ? g_guest_address_space->BackingRunEnd(vaddr, limit)
+	                                        : 0;
+}
+
 bool IsBacked(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsBacked(vaddr, size);
 }
@@ -944,6 +949,12 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+}
+
+void DescribeGpuResources(uint64_t begin, uint64_t end, Common::FaultReportLines* lines) {
+	if (g_gpu_resources != nullptr && begin < end) {
+		g_gpu_resources->DescribeForFaultReport(begin, end, lines);
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {

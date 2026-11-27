@@ -1019,6 +1019,49 @@ void TestPublishGpuModifiedHonoursAccept() {
   Release(memory);
 }
 
+// The page states a fault report reads without the lock, and the lock it may
+// only try.
+void TestDescribePagesUnlocked() {
+  Libs::Graphics::TrackingSpinLock lock;
+  Check(lock.try_lock(), "a free lock is taken");
+  Check(!lock.try_lock(), "a held lock is not taken again");
+  lock.unlock();
+  Check(lock.try_lock(), "an unlocked lock is taken");
+  lock.unlock();
+
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  using Region = Libs::Graphics::RegionManager;
+  auto *memory = Allocate(3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<std::pair<uint64_t, uint8_t>> pages;
+  auto describe = [&] {
+    pages.clear();
+    tracker.DescribePagesUnlocked(
+        address, page_size * 3,
+        [&](uint64_t page, uint8_t state) { pages.emplace_back(page, state); });
+  };
+  tracker.ForEachUploadRange(
+      address, page_size * 3, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.SetGpuModifiedReadable(address + page_size, page_size, true);
+  tracker.UnmarkRegionAsGpuModified(address + 2 * page_size, page_size);
+  describe();
+  Check(pages.size() == 3 && pages[0].first == address &&
+            pages[0].second == Region::PageGpuDirty &&
+            pages[1].second ==
+                (Region::PageGpuDirty | Region::PageStaleReadable) &&
+            pages[2].second == 0,
+        "GPU-dirty, stale-readable and synced pages are told apart");
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.MarkRegionAsCpuModified(address, page_size * 3);
+  describe();
+  Check(pages.size() == 3 && pages[2].second == Region::PageCpuDirty,
+        "a page the CPU wrote is CPU-dirty again");
+  Release(memory);
+}
+
 void TestGpuModifiedReadablePages() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1974,6 +2017,7 @@ int main(int argc, char **argv) {
   TestGpuDirtyBits();
   TestPublishGpuModifiedHonoursAccept();
   TestGpuModifiedReadablePages();
+  TestDescribePagesUnlocked();
   TestGpuModifiedReadablePageList();
   TestStaleReadableOnlyDirtyPages();
   TestExactDirtyIntervalsSharingTrackerPage();

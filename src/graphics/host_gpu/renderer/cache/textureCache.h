@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/faultReportLines.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/smallVector.h"
@@ -133,6 +134,10 @@ public:
 	// returns false for any other copy.
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+
+	// For a fatal fault report, from any thread and without waiting for the cache's lock: the
+	// images over [begin, end), or "busy" when another thread holds the lock.
+	void DescribeForFaultReport(uint64_t begin, uint64_t end, Common::FaultReportLines* lines);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

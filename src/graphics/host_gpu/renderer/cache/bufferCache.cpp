@@ -130,6 +130,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		buffer.bda_watch_tick = 0;
 		buffer.registered_tick = m_scheduler.CurrentTick();
 		buffer.registered_watched = IsBdaWatched(buffer);
+		m_directory.Set(id.index, buffer.CpuAddress(), buffer.Size());
 		WriteBdaEntries(buffer);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
@@ -142,8 +143,54 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		m_directory.Clear(id.index);
 		buffer.is_deleted = true;
 	}
+}
+
+void BufferCache::DescribeForFaultReport(uint64_t begin, uint64_t end,
+                                         Common::FaultReportLines* lines) const {
+	bool       more = true;
+	const auto busy = m_directory.ForEachOverlap(
+	    begin, end, [&](uint32_t index, const Common::RangeDirectory::Range& range) {
+		    if (more) {
+			    more = lines->Format(
+			        "    buffer #{} 0x{:016x} size 0x{:x}{}", index, range.base, range.size,
+			        (range.flags & DirectoryBdaWatched) != 0 ? ", BDA watched" : "");
+		    }
+	    });
+	if (more && busy != 0) {
+		more = lines->Format("    ({} buffer slots were being changed)", busy);
+	}
+	// Runs of pages in one state other than the default (CPU-dirty, i.e. not synced to a buffer).
+	uint64_t run_begin = 0;
+	uint64_t run_end   = 0;
+	uint8_t  run_state = 0;
+	auto     flush     = [&] {
+		if (!more || run_end == run_begin || run_state == RegionManager::PageCpuDirty) {
+			return;
+		}
+		if (run_state == MemoryTracker::PageBusy) {
+			more = lines->Format("    pages 0x{:016x}-0x{:016x}: busy", run_begin, run_end);
+			return;
+		}
+		more = lines->Format(
+		    "    pages 0x{:016x}-0x{:016x}:{}{}{}", run_begin, run_end,
+		    (run_state & RegionManager::PageCpuDirty) != 0 ? "" : " write-protected (synced)",
+		    (run_state & RegionManager::PageGpuDirty) != 0 ? " GPU-dirty" : "",
+		    (run_state & RegionManager::PageStaleReadable) != 0 ? " stale-readable" : "");
+	};
+	m_memory_tracker.DescribePagesUnlocked(begin, end - begin, [&](uint64_t page, uint8_t state) {
+		if (page == run_end && state == run_state) {
+			run_end = page + TRACKER_PAGE_SIZE;
+			return;
+		}
+		flush();
+		run_begin = page;
+		run_end   = page + TRACKER_PAGE_SIZE;
+		run_state = state;
+	});
+	flush();
 }
 
 void BufferCache::TouchBuffer(Buffer& buffer) {
@@ -155,6 +202,8 @@ void BufferCache::TouchBuffer(Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	if (buffer.bda_watch_tick != 0) {
 		buffer.bda_watch_tick = 0;
+		m_directory.SetFlags(m_buffers.find(buffer.CpuAddress())->second.index, DirectoryBdaWatched,
+		                     false);
 		if (!IsBdaWatched(buffer)) {
 			WriteBdaEntries(buffer);
 		}
@@ -1897,6 +1946,7 @@ void BufferCache::RunGarbageCollector() {
 			if (buffer.bda_watch_tick == 0) {
 				const bool watched    = IsBdaWatched(buffer);
 				buffer.bda_watch_tick = tick + 1;
+				m_directory.SetFlags(id.index, DirectoryBdaWatched, true);
 				if (!watched) {
 					WriteBdaEntries(buffer);
 				}

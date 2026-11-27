@@ -1,6 +1,7 @@
 #ifndef KYTY_LOADER_GUEST_FAULT_REPORT_H_
 #define KYTY_LOADER_GUEST_FAULT_REPORT_H_
 
+#include "common/faultReportLines.h"
 #include "common/guestStoreRing.h"
 #include "common/hostException.h"
 #include "loader/guestFaultHistory.h"
@@ -185,6 +186,9 @@ struct GuestFaultInterestSet {
 
 // Granule around an address whose emulator stores are listed.
 inline constexpr uint64_t GuestFaultStoreGranule = 0x10000;
+// A register or a pointer in a dump marks its granule and the memory after it up to the end of the
+// guest mapping holding it, at most this far from the granule: the array it points to.
+inline constexpr uint64_t GuestFaultPointerReach = 0x100000;
 // Ranges a report keeps at most: far more than the granules of its dumps' pointers usually are
 // (one granule holds many of them).
 inline constexpr size_t GuestFaultInterestMax = 1024;
@@ -342,12 +346,15 @@ inline size_t MergeGuestFaultInterest(std::span<GuestFaultInterest> out, size_t 
 // field anywhere in a structure, a local in the frame). The result is sorted and disjoint. When the
 // table is full it is merged; what still does not fit is counted in `dropped` (the lowest priority
 // goes first). No allocation: the handler of a fatal fault calls it.
-inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
-                                                       std::span<const GuestFaultMemory> registers,
-                                                       std::span<const GuestFaultMemory> stack,
-                                                       std::span<const GuestFaultMemory> indirect,
-                                                       const HandledFaultRing*           handled,
-                                                       std::span<GuestFaultInterest>     out) {
+//
+// mapping_end(address) returns the end of the guest mapping that holds `address` (0 when it does
+// not know): a register or a dump pointer marks [granule, min(mapping end, granule +
+// GuestFaultPointerReach)), at least its granule.
+template <typename MappingEnd>
+inline GuestFaultInterestSet CollectGuestFaultInterest(
+    uint64_t fault_address, std::span<const GuestFaultMemory> registers,
+    std::span<const GuestFaultMemory> stack, std::span<const GuestFaultMemory> indirect,
+    const HandledFaultRing* handled, std::span<GuestFaultInterest> out, MappingEnd&& mapping_end) {
 	GuestFaultInterestSet set;
 	auto                  add = [&](uint64_t begin, uint64_t end, uint8_t reason) {
 		if (end <= begin) {
@@ -369,6 +376,15 @@ inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
 		const auto begin = value & ~(GuestFaultStoreGranule - 1);
 		add(begin, begin + GuestFaultStoreGranule, reason);
 	};
+	auto pointer = [&](uint64_t value, uint8_t reason) {
+		if (value < 0x10000 || value > 0x00007fffffffffffull) {
+			return;
+		}
+		const auto begin = value & ~(GuestFaultStoreGranule - 1);
+		const auto end   = std::clamp<uint64_t>(mapping_end(value), begin + GuestFaultStoreGranule,
+		                                        begin + GuestFaultPointerReach);
+		add(begin, end, reason);
+	};
 	auto dump = [&](const GuestFaultMemory& window) {
 		if (window.readable_rows != 0) {
 			add(window.start, window.start + window.bytes.size(), GuestFaultNearDump);
@@ -383,7 +399,7 @@ inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
 			for (size_t word = 0; word < 2; word++) {
 				uint64_t value = 0;
 				std::memcpy(&value, window.bytes.data() + row * 16 + word * 8, sizeof(value));
-				granule(value, GuestFaultNearDumpPointer);
+				pointer(value, GuestFaultNearDumpPointer);
 			}
 		}
 	};
@@ -398,7 +414,7 @@ inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
 		}
 	}
 	for (const auto& window: registers) {
-		granule(window.value, GuestFaultNearRegister);
+		pointer(window.value, GuestFaultNearRegister);
 	}
 	for (const auto& window: registers) {
 		dump(window);
@@ -408,7 +424,7 @@ inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
 	}
 	for (const auto& window: indirect) {
 		if (window.readable_rows != 0) {
-			granule(window.value, GuestFaultNearDumpPointer);
+			pointer(window.value, GuestFaultNearDumpPointer);
 			dump(window);
 		}
 	}
@@ -423,6 +439,114 @@ inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
 	}
 	set.count = MergeGuestFaultInterest(out, set.count);
 	return set;
+}
+
+inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
+                                                       std::span<const GuestFaultMemory> registers,
+                                                       std::span<const GuestFaultMemory> stack,
+                                                       std::span<const GuestFaultMemory> indirect,
+                                                       const HandledFaultRing*           handled,
+                                                       std::span<GuestFaultInterest>     out) {
+	return CollectGuestFaultInterest(fault_address, registers, stack, indirect, handled, out,
+	                                 [](uint64_t) { return uint64_t {0}; });
+}
+
+// The end (exclusive) of the run of resolved faults that starts at entry i: one kind, pc, rsp and
+// store count, data addresses on consecutive 4 KiB pages in one direction (a loop zeroing or
+// filling memory the tracker protects takes one such fault per page).
+inline size_t HandledFaultRunEnd(const HandledFaultRing& ring, size_t i) {
+	const auto& first = ring.At(i);
+	if (first.kind == HandledFaultKind::EmulatedInstruction) {
+		return i + 1;
+	}
+	int64_t step = 0;
+	size_t  end  = i + 1;
+	for (; end < ring.Size(); end++) {
+		const auto& previous = ring.At(end - 1);
+		const auto& fault    = ring.At(end);
+		const auto delta = static_cast<int64_t>((fault.address >> 12u) - (previous.address >> 12u));
+		if (fault.kind != first.kind || fault.pc != first.pc || fault.rsp != first.rsp ||
+		    fault.stores != first.stores || (delta != 1 && delta != -1) ||
+		    (step != 0 && delta != step)) {
+			break;
+		}
+		step = delta;
+	}
+	return end;
+}
+
+// One line the GPU caches gave about an interest range.
+struct GuestFaultLine {
+	std::array<char, Common::FaultReportLines::LineSize> text {};
+	size_t                                               size = 0;
+
+	[[nodiscard]] std::string_view View() const { return {text.data(), size}; }
+};
+
+// Keeps lines in fixed storage and counts those that did not fit.
+class GuestFaultLineCollector final: public Common::FaultReportLines {
+public:
+	explicit GuestFaultLineCollector(std::span<GuestFaultLine> storage): m_storage(storage) {}
+
+	bool Line(std::string_view line) override {
+		if (m_count == m_storage.size()) {
+			m_dropped++;
+			return false;
+		}
+		auto& out = m_storage[m_count++];
+		out.size  = std::min(line.size(), out.text.size());
+		std::memcpy(out.text.data(), line.data(), out.size);
+		return true;
+	}
+
+	[[nodiscard]] size_t                          Count() const { return m_count; }
+	[[nodiscard]] size_t                          Dropped() const { return m_dropped; }
+	[[nodiscard]] std::span<const GuestFaultLine> Lines() const { return m_storage.first(m_count); }
+
+private:
+	std::span<GuestFaultLine> m_storage;
+	size_t                    m_count   = 0;
+	size_t                    m_dropped = 0;
+};
+
+// Interest ranges whose GPU cache state a report lists, at most.
+inline constexpr size_t GuestFaultCacheRanges = 32;
+inline constexpr size_t GuestFaultCacheLines  = 64;
+
+// For up to max_ranges interest ranges, most telling first (those around the fault or a resolved
+// fault, then a register's, then the pointers in the dumps; ranges that are only dumps, the stack,
+// are left out): a line naming the range, then what describe(begin, end, lines) says about it.
+// Returns how many ranges it described.
+template <typename Describe>
+inline size_t CollectGuestFaultCacheLines(std::span<const GuestFaultInterest> ranges,
+                                          size_t max_ranges, Describe&& describe,
+                                          GuestFaultLineCollector* lines) {
+	static constexpr uint8_t passes[] = {
+	    GuestFaultNearFault | GuestFaultNearResolvedFault,
+	    GuestFaultNearRegister,
+	    GuestFaultNearDumpPointer,
+	};
+	size_t  described = 0;
+	uint8_t done      = 0;
+	for (const auto pass: passes) {
+		for (const auto& range: ranges) {
+			if ((range.reasons & pass) == 0 || (range.reasons & done) != 0) {
+				continue;
+			}
+			if (described == max_ranges ||
+			    !lines->Format("  0x{:016x}-0x{:016x}:", range.begin, range.end)) {
+				return described;
+			}
+			described++;
+			const auto before = lines->Count();
+			describe(range.begin, range.end, static_cast<Common::FaultReportLines*>(lines));
+			if (lines->Count() == before && !lines->Line("    nothing cached")) {
+				return described;
+			}
+		}
+		done |= pass;
+	}
+	return described;
 }
 
 // The reasons of the sorted, disjoint ranges a store overlaps (0: none).
@@ -461,6 +585,11 @@ struct GuestFaultMemoryReport {
 	uint64_t                            store_ticks_per_us = 0;
 	std::span<const GuestFaultInterest> interest; // sorted, disjoint
 	size_t                              interest_dropped = 0;
+	// What the GPU caches held over the first cache_ranges interest ranges, and how many lines
+	// did not fit.
+	std::span<const GuestFaultLine> cache_lines;
+	size_t                          cache_ranges        = 0;
+	size_t                          cache_lines_dropped = 0;
 };
 
 // Room for every dump, every thread and the store lists at their limits (TestMemoryReportFits).
@@ -555,12 +684,19 @@ inline void AppendGuestStore(const GuestFaultMemoryReport& report, const Common:
 	out->Append("\n");
 }
 
+// Entries [first, end) of the ring, one run (HandledFaultRunEnd), as a mark among the stores.
 template <typename Text>
-inline void AppendResolvedFaultMark(const HandledFault& fault, const GuestModuleMap* modules,
-                                    Text* out) {
-	out->Append("  -- resolved {} fault", HandledFaultKindName(fault.kind));
-	if (fault.kind != HandledFaultKind::EmulatedInstruction) {
-		out->Append(" 0x{:016x}", fault.address);
+inline void AppendResolvedFaultMark(const HandledFaultRing& ring, size_t first, size_t end,
+                                    const GuestModuleMap* modules, Text* out) {
+	const auto& fault = ring.At(first);
+	if (end - first > 1) {
+		out->Append("  -- {} resolved {} faults 0x{:016x} .. 0x{:016x}", end - first,
+		            HandledFaultKindName(fault.kind), fault.address, ring.At(end - 1).address);
+	} else {
+		out->Append("  -- resolved {} fault", HandledFaultKindName(fault.kind));
+		if (fault.kind != HandledFaultKind::EmulatedInstruction) {
+			out->Append(" 0x{:016x}", fault.address);
+		}
 	}
 	out->Append(" pc=0x{:016x}", fault.pc);
 	AppendModuleLocation(modules, fault.pc, out);
@@ -597,8 +733,10 @@ inline void AppendGuestStoreWindow(const GuestFaultMemoryReport& report, Text* o
 	size_t           next = 0; // the next resolved fault to place
 	for (size_t i = first; i < report.stores.size(); i++) {
 		const auto& store = report.stores[i];
-		for (; next < ring->Size() && ring->At(next).stores < store.sequence; next++) {
-			AppendResolvedFaultMark(ring->At(next), report.modules, out);
+		while (next < ring->Size() && ring->At(next).stores < store.sequence) {
+			const auto end = HandledFaultRunEnd(*ring, next);
+			AppendResolvedFaultMark(*ring, next, end, report.modules, out);
+			next = end;
 		}
 		const size_t index = i - first;
 		if (in_window > GuestFaultStoresWindow && index >= half && index < in_window - half) {
@@ -609,8 +747,10 @@ inline void AppendGuestStoreWindow(const GuestFaultMemoryReport& report, Text* o
 		}
 		AppendGuestStore(report, store, out);
 	}
-	for (; next < ring->Size(); next++) {
-		AppendResolvedFaultMark(ring->At(next), report.modules, out);
+	while (next < ring->Size()) {
+		const auto end = HandledFaultRunEnd(*ring, next);
+		AppendResolvedFaultMark(*ring, next, end, report.modules, out);
+		next = end;
 	}
 }
 
@@ -643,6 +783,17 @@ inline void AppendGuestStores(const GuestFaultMemoryReport& report, Text* out) {
 			continue;
 		}
 		AppendGuestStore(report, store, out);
+	}
+	if (report.cache_ranges != 0) {
+		out->Append("--- GPU caches over {} of those ranges (buffers, tracked pages, images; read "
+		            "without waiting for a lock) ---\n",
+		            report.cache_ranges);
+		for (const auto& line: report.cache_lines) {
+			out->Append("{}\n", line.View());
+		}
+		if (report.cache_lines_dropped != 0) {
+			out->Append("  ({} more lines left out)\n", report.cache_lines_dropped);
+		}
 	}
 	AppendGuestStoreWindow(report, out);
 	const auto last = std::min(report.stores.size(), GuestFaultStoresLast);
@@ -704,13 +855,24 @@ inline void FormatGuestFaultMemory(const GuestFaultMemoryReport& report, Text* o
 	if (const auto* ring = report.handled; ring != nullptr && ring->Count() != 0) {
 		out->Append("--- Faults this thread had resolved before (newest last, {} in total) ---\n",
 		            ring->Count());
-		for (size_t i = 0; i < ring->Size(); i++) {
+		for (size_t i = 0; i < ring->Size();) {
+			const auto     end   = HandledFaultRunEnd(*ring, i);
 			const auto&    fault = ring->At(i);
 			const uint64_t age = report.now_ns >= fault.time_ns ? report.now_ns - fault.time_ns : 0;
-			out->Append("  {} us before: {}", age / 1000, HandledFaultKindName(fault.kind));
-			if (fault.kind != HandledFaultKind::EmulatedInstruction) {
-				out->Append(" 0x{:016x}", fault.address);
+			if (end - i > 1) {
+				const auto&    last = ring->At(end - 1);
+				const uint64_t last_age =
+				    report.now_ns >= last.time_ns ? report.now_ns - last.time_ns : 0;
+				out->Append("  {}..{} us before: {} {} faults 0x{:016x} .. 0x{:016x}", age / 1000,
+				            last_age / 1000, end - i, HandledFaultKindName(fault.kind),
+				            fault.address, last.address);
+			} else {
+				out->Append("  {} us before: {}", age / 1000, HandledFaultKindName(fault.kind));
+				if (fault.kind != HandledFaultKind::EmulatedInstruction) {
+					out->Append(" 0x{:016x}", fault.address);
+				}
 			}
+			i = end;
 			out->Append(" pc=0x{:016x}", fault.pc);
 			AppendModuleLocation(report.modules, fault.pc, out);
 			out->Append(" rsp=0x{:016x}", fault.rsp);

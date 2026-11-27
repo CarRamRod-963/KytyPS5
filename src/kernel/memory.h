@@ -9,6 +9,10 @@
 #include <span>
 #include <utility>
 
+namespace Common {
+class FaultReportLines;
+} // namespace Common
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -143,6 +147,9 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 // Whether every page of the range has backing, which TryReadBacking needs to read it.
 [[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size);
+// The end of the guest mapping that holds vaddr as far as its backing is contiguous, at most
+// `limit`; 0 when vaddr is not backed. Takes no lock (a fault report may call it).
+[[nodiscard]] uint64_t BackingRunEnd(uint64_t vaddr, uint64_t limit) noexcept;
 enum class BackingCompare : uint8_t { Unmapped, Equal, Different };
 // Compares what TryReadBacking would read (elided labels included) with `data`, without copying
 // the backing out when no elided label can overlay it.
@@ -172,6 +179,9 @@ void                   SettleLabelAccess(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// For a fatal fault report: the GPU caches' buffers, tracked pages and images over [begin, end),
+// as lines (nothing without a renderer). Waits for no lock.
+void DescribeGpuResources(uint64_t begin, uint64_t end, Common::FaultReportLines* lines);
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

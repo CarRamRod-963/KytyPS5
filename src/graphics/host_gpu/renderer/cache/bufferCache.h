@@ -3,8 +3,10 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/faultReportLines.h"
 #include "common/gpuTiming.h"
 #include "common/lruCache.h"
+#include "common/rangeDirectory.h"
 #include "common/slotVector.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/bdaSyncQueue.h"
@@ -306,6 +308,14 @@ private:
 	DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                     std::vector<Common::UniqueFunction<void>>* batch = nullptr);
 	void ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
+public:
+	// For a fatal fault report, from any thread and without waiting for a lock: the buffers over
+	// [begin, end) and the tracking state of its pages. Stops when `lines` takes no more.
+	void DescribeForFaultReport(uint64_t begin, uint64_t end,
+	                            Common::FaultReportLines* lines) const;
+
+private:
 	// Reads the GPU-dirty bytes of [vaddr, size) of a host-readable buffer straight from its
 	// mapping into guest memory, after waiting only for the submission that holds the buffer's
 	// latest GPU write (not for the work queued behind it). Returns false, doing nothing, when
@@ -479,6 +489,10 @@ private:
 	bool                                              m_watched_write_pending  = false;
 	uint64_t                                          m_gpu_write_sequence     = 0;
 	MemoryTracker                                     m_memory_tracker;
+	// The registered buffers' ranges by slot index, for DescribeForFaultReport (bit 0: BDA
+	// watched).
+	Common::RangeDirectory                            m_directory;
+	static constexpr uint32_t                         DirectoryBdaWatched = 1u;
 	std::mutex                                        m_bda_sync_mutex;
 	BdaSyncQueue                                      m_bda_sync;
 	std::atomic<uint64_t>                             m_bda_store_epoch {0};

@@ -47,6 +47,15 @@ public:
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
+	// Takes the lock only when it is free (a fault report must not wait for a lock the faulting
+	// thread may hold).
+	[[nodiscard]] bool try_lock() noexcept {
+		if (m_lock.test_and_set(std::memory_order_acquire)) {
+			return false;
+		}
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+		return true;
+	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
@@ -173,6 +182,30 @@ public:
 			UpdateProtection<true, true>();
 		}
 	}
+	// Bits of PageState.
+	static constexpr uint8_t PageCpuDirty = 1u << 0u; // written by the CPU, not write-protected
+	static constexpr uint8_t PageGpuDirty = 1u << 1u; // the GPU holds newer bytes
+	static constexpr uint8_t PageStaleReadable = 1u << 2u; // GPU-dirty, kept readable meanwhile
+
+	// The state of the page at `offset` without the lock, or false when a change ran meanwhile.
+	[[nodiscard]] bool TryPageStateUnlocked(uint64_t offset, uint8_t* state) const {
+		const auto version = m_version.load(std::memory_order_acquire);
+		if ((version & 1u) != 0u) {
+			return false;
+		}
+		const auto page = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		uint8_t    bits = 0;
+		bits |= m_cpu_dirty.Any(page, page + 1) ? PageCpuDirty : 0;
+		bits |= m_gpu_dirty.Any(page, page + 1) ? PageGpuDirty : 0;
+		bits |= m_stale_readable.FirstRangeFrom(page).first < page + 1 ? PageStaleReadable : 0;
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (m_version.load(std::memory_order_relaxed) != version) {
+			return false;
+		}
+		*state = bits;
+		return true;
+	}
+
 	[[nodiscard]] bool IsStaleReadable(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);
 		return m_stale_readable.FirstRangeFrom(start).first < end;

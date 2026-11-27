@@ -1,5 +1,7 @@
 #include "loader/guestFaultReport.h"
 
+#include "common/rangeDirectory.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -373,13 +375,15 @@ void TestHandledFaultRing() {
   }
   Check(ring.Size() == 3 && ring.At(0).address == 1 && ring.At(2).address == 3,
         "oldest first before the ring wraps");
-  for (uint64_t i = 4; i <= 20; i++) {
+  constexpr uint64_t total = Loader::HandledFaultRing::Capacity + 12;
+  for (uint64_t i = 4; i <= total; i++) {
     ring.Record({.address = i, .pc = 0x100 + i, .rsp = 0, .time_ns = i * 1000});
   }
-  Check(ring.Count() == 20, "every fault is counted");
-  Check(ring.Size() == Loader::HandledFaultRing::Capacity, "the ring keeps 8");
+  Check(ring.Count() == total, "every fault is counted");
+  Check(ring.Size() == 64 && Loader::HandledFaultRing::Capacity == 64,
+        "the ring keeps 64");
   for (size_t i = 0; i < ring.Size(); i++) {
-    Check(ring.At(i).address == 13 + i, "the last 8 faults, oldest first");
+    Check(ring.At(i).address == 13 + i, "the last 64 faults, oldest first");
   }
 }
 
@@ -393,37 +397,94 @@ void TestHandledFaultReport() {
 
   Loader::HandledFaultRing ring;
   using Kind = Loader::HandledFaultKind;
-  for (uint64_t i = 0; i < 10; i++) {
-    ring.Record({.address = i == 8 ? 0 : 0x30cbf00000ull + i * 0x1000,
-                 .pc = i == 9 ? 0x904000123ull : 0x900e7c000ull + i,
-                 .rsp = i == 9 ? 0x7ec1c3fc0ull : 0x7ec1c4040ull,
-                 .time_ns = 1'000'000 + i * 10'000,
-                 .kind = i == 0   ? Kind::Read
-                         : i == 8 ? Kind::EmulatedInstruction
-                                  : Kind::Write});
+  constexpr uint64_t n = Loader::HandledFaultRing::Capacity + 2;
+  for (uint64_t i = 0; i < n; i++) {
+    ring.Record({.address = i == n - 2 ? 0 : 0x30cbf00000ull + i * 0x1000,
+                 .pc = i == n - 1 ? 0x904000123ull : 0x900e7c000ull + i,
+                 .rsp = i == n - 1 ? 0x7ec1c3fc0ull : 0x7ec1c4040ull,
+                 .time_ns = 1'000'000 + i * 1000,
+                 .kind = i == 0       ? Kind::Read
+                         : i == n - 2 ? Kind::EmulatedInstruction
+                                      : Kind::Write});
   }
   Loader::GuestFaultMemoryReport report;
   report.info = &info;
   report.handled = &ring;
   report.modules = &modules;
-  report.now_ns = 1'500'000;
+  report.now_ns = 1'000'000 + n * 1000;
   Loader::GuestFaultMemoryText out;
   Loader::FormatGuestFaultMemory(report, &out);
   const std::string text(out.View());
   Check(Contains(text, "--- Faults this thread had resolved before (newest "
-                       "last, 10 in total) ---\n"
-                       "  480 us before: write 0x00000030cbf02000 "
+                       "last, 66 in total) ---\n"
+                       "  64 us before: write 0x00000030cbf02000 "
                        "pc=0x0000000900e7c002 (eboot.bin+0xe7c002) "
                        "rsp=0x00000007ec1c4040 (fault rsp+0x40)\n"),
         "the oldest kept fault first, with its age and module offset");
-  Check(Contains(text, "  420 us before: emulated instruction "
-                       "pc=0x0000000900e7c008 (eboot.bin+0xe7c008) "),
+  Check(Contains(text, "  2 us before: emulated instruction "
+                       "pc=0x0000000900e7c040 (eboot.bin+0xe7c040) "),
         "an emulated instruction has no data address");
-  Check(text.ends_with("  410 us before: write 0x00000030cbf09000 "
+  Check(text.ends_with("  1 us before: write 0x00000030cbf41000 "
                        "pc=0x0000000904000123 (eboot.bin patch area+0x123) "
                        "rsp=0x00000007ec1c3fc0 (fault rsp-0x40)\n"),
         "the newest fault last; a pc in the patch area is named");
   Check(!Contains(text, "read 0x"), "faults older than the ring are gone");
+
+  // A loop over protected pages: one line for the run, in either direction;
+  // a fault at another pc or after other stores starts a new line.
+  Loader::HandledFaultRing runs;
+  for (uint64_t i = 0; i < 5; i++) {
+    runs.Record({.address = 0x332b574000ull + i * 0x1000,
+                 .pc = 0x8000105aeull,
+                 .rsp = 0x7ec1c4000ull,
+                 .time_ns = 1'000'000 + i * 1000,
+                 .kind = Kind::Write,
+                 .stores = 7});
+  }
+  for (uint64_t i = 0; i < 3; i++) {
+    runs.Record({.address = 0x1e018eafe8ull - i * 0x1000,
+                 .pc = 0x900ff81c9ull,
+                 .rsp = 0x7ec1c4000ull,
+                 .time_ns = 1'010'000 + i * 1000,
+                 .kind = Kind::Write,
+                 .stores = 9});
+  }
+  runs.Record({.address = 0x1e018e7fe8ull,
+               .pc = 0x900ff81c9ull,
+               .rsp = 0x7ec1c4000ull,
+               .time_ns = 1'020'000,
+               .kind = Kind::Write,
+               .stores = 10});
+  report.handled = &runs;
+  report.now_ns = 1'100'000;
+  Loader::GuestFaultMemoryText run_out;
+  Loader::FormatGuestFaultMemory(report, &run_out);
+  const std::string run_text(run_out.View());
+  Check(Contains(
+            run_text,
+            "(newest last, 9 in total) ---\n"
+            "  100..96 us before: 5 write faults 0x000000332b574000 .. "
+            "0x000000332b578000 pc=0x00000008000105ae "
+            "rsp=0x00000007ec1c4000 (fault rsp+0x0) after store #7\n"
+            "  90..88 us before: 3 write faults 0x0000001e018eafe8 .. "
+            "0x0000001e018e8fe8 pc=0x0000000900ff81c9 (eboot.bin+0xff81c9) "
+            "rsp=0x00000007ec1c4000 (fault rsp+0x0) after store #9\n"
+            "  80 us before: write 0x0000001e018e7fe8 pc=0x0000000900ff81c9 "),
+        "runs of page faults are one line each");
+
+  // A run keeps one direction: back and forth over two pages is two lines.
+  Loader::HandledFaultRing zigzag;
+  for (const uint64_t page : {0x10ull, 0x11ull, 0x10ull}) {
+    zigzag.Record({.address = page << 12u,
+                   .pc = 0x900ff81c9ull,
+                   .rsp = 0x7ec1c4000ull,
+                   .time_ns = 1'000'000,
+                   .kind = Kind::Write,
+                   .stores = 3});
+  }
+  Check(Loader::HandledFaultRunEnd(zigzag, 0) == 2 &&
+            Loader::HandledFaultRunEnd(zigzag, 2) == 3,
+        "a run ends where its direction turns");
 }
 
 void TestMemoryReportFits() {
@@ -821,6 +882,38 @@ void TestStoreInterestDeep() {
         "the granule of a resolved fault is an interest range");
   Check(Loader::GuestStoreInterest(ranges, elsewhere) == 0,
         "other memory is not");
+  // A pointer marks the memory after its granule to the end of its mapping (the
+  // issue #17 second sighting: the bad entry at spans + 0x20030, 128 KiB past
+  // the pointer, with no resolved fault there), at most 1 MiB.
+  std::array<Loader::GuestFaultInterest, 16> reach{};
+  const auto reach_set = Loader::CollectGuestFaultInterest(
+      info.access_violation_vaddr, registers, {}, {}, nullptr, reach,
+      [](uint64_t address) {
+        return address >= spans && address < spans + 0x30000 ? spans + 0x30000
+                                                             : 0;
+      });
+  const std::span<const Loader::GuestFaultInterest> reach_ranges{
+      reach.data(), reach_set.count};
+  Check(Loader::GuestStoreInterest(reach_ranges, second_chunk) ==
+            Loader::GuestFaultNearDumpPointer,
+        "a pointer marks its mapping past its granule");
+  Check(Loader::GuestStoreInterest(
+            reach_ranges, {.address = spans + 0x30000, .size = 8}) == 0,
+        "and no further than the mapping's end");
+  const auto capped_set = Loader::CollectGuestFaultInterest(
+      info.access_violation_vaddr, registers, {}, {}, nullptr, reach,
+      [](uint64_t) { return ~0ull; });
+  const std::span<const Loader::GuestFaultInterest> capped{reach.data(),
+                                                           capped_set.count};
+  Check(Loader::GuestStoreInterest(
+            capped, {.address = spans + 0xff000, .size = 8}) != 0 &&
+            Loader::GuestStoreInterest(
+                capped, {.address = spans + 0x100000, .size = 8}) == 0,
+        "a pointer's reach stops at 1 MiB");
+  Check(Loader::GuestStoreInterest(capped,
+                                   {.address = hf + 0xf0000, .size = 8}) != 0,
+        "a register marks its mapping too");
+
   // Pointers in the stack dumps and in the indirect dumps count too, and the
   // stack dumps are interest ranges themselves.
   std::array<uint8_t, 0x120> frame{};
@@ -887,12 +980,8 @@ void TestStoreInterestDeep() {
           text,
           "--- The emulator's stores since the oldest of those resolved "
           "faults (4 made, 4 kept) ---\n"
-          "  -- resolved write fault 0x000000332b574000 pc=0x00000008000105ae "
-          "--\n"
-          "  -- resolved write fault 0x000000332b575000 pc=0x00000008000105ae "
-          "--\n"
-          "  -- resolved write fault 0x000000332b576000 pc=0x00000008000105ae "
-          "--\n"
+          "  -- 3 resolved write faults 0x000000332b574000 .. "
+          "0x000000332b576000 pc=0x00000008000105ae --\n"
           "  #101 4 us before: label 0x0000005000000100 size 0x8 first "
           "0000000000000000 thread 0\n"
           "  -- resolved write fault 0x000000332b57a828 pc=0x0000000900ff81e6 "
@@ -970,6 +1059,127 @@ void TestStoreInterestOverflow() {
         "the report says ranges were left out");
 }
 
+// The cache directory: slots set, cleared and flagged by the owner, read from
+// another thread meanwhile without a torn range.
+void TestRangeDirectory() {
+  static Common::RangeDirectory directory;
+  directory.Set(3, 0x332b540000ull, 0x20000);
+  directory.Set(7, 0x332b570000ull, 0x10000, 1);
+  directory.Set(9, 0x5000000000ull, 0x1000);
+  directory.Set(Common::RangeDirectory::Capacity, 0x332b570000ull, 0x10000);
+  std::vector<std::pair<uint32_t, uint64_t>> seen;
+  auto collect = [&](uint64_t begin, uint64_t end) {
+    seen.clear();
+    return directory.ForEachOverlap(
+        begin, end,
+        [&](uint32_t index, const Common::RangeDirectory::Range &r) {
+          seen.emplace_back(index, r.base | r.flags);
+        });
+  };
+  Check(collect(0x332b550000ull, 0x332b580000ull) == 0 && seen.size() == 2 &&
+            seen[0].first == 3 && seen[1].first == 7 &&
+            seen[1].second == (0x332b570000ull | 1),
+        "the ranges over an address range, with their flags");
+  directory.SetFlags(7, 1, false);
+  directory.Clear(3);
+  Check(collect(0x332b550000ull, 0x332b580000ull) == 0 && seen.size() == 1 &&
+            seen[0].second == 0x332b570000ull,
+        "a cleared slot and a cleared flag are gone");
+  Check(collect(0x332b580000ull, 0x332b590000ull) == 0 && seen.empty(),
+        "ranges that end before the query are left out");
+
+  std::atomic<bool> stop{false};
+  std::thread writer([&] {
+    for (uint64_t i = 0; !stop.load(); i++) {
+      directory.Set(11, 0x7000000000ull + (i % 16) * 0x10000,
+                    0x10000 + (i % 16));
+    }
+  });
+  for (int round = 0; round < 200000; round++) {
+    directory.ForEachOverlap(
+        0x7000000000ull, 0x7000100000ull,
+        [&](uint32_t, const Common::RangeDirectory::Range &r) {
+          Check(r.size - 0x10000 == ((r.base - 0x7000000000ull) >> 16u),
+                "a range read while it is written is whole");
+        });
+  }
+  stop = true;
+  writer.join();
+}
+
+// Lines the GPU caches give, most telling ranges first, within the caps.
+void TestCacheLines() {
+  const std::array<Loader::GuestFaultInterest, 4> ranges{
+      Loader::GuestFaultInterest{0x1000000ull, 0x1010000ull,
+                                 Loader::GuestFaultNearDumpPointer},
+      Loader::GuestFaultInterest{0x2000000ull, 0x2010000ull,
+                                 Loader::GuestFaultNearDump},
+      Loader::GuestFaultInterest{0x3000000ull, 0x3010000ull,
+                                 Loader::GuestFaultNearRegister},
+      Loader::GuestFaultInterest{0x4000000ull, 0x4010000ull,
+                                 Loader::GuestFaultNearResolvedFault}};
+  std::vector<uint64_t> asked;
+  auto describe = [&](uint64_t begin, uint64_t,
+                      Common::FaultReportLines *lines) {
+    asked.push_back(begin);
+    if (begin != 0x3000000ull) {
+      (void)lines->Format("    buffer 0x{:x}", begin);
+    }
+  };
+  std::array<Loader::GuestFaultLine, 16> storage{};
+  Loader::GuestFaultLineCollector lines(storage);
+  const auto ranges_described =
+      Loader::CollectGuestFaultCacheLines(ranges, 8, describe, &lines);
+  Check(ranges_described == 3 && asked.size() == 3 &&
+            asked[0] == 0x4000000ull && asked[1] == 0x3000000ull &&
+            asked[2] == 0x1000000ull,
+        "resolved faults first, then registers, then pointers; no stack dumps");
+  Check(lines.Count() == 6 &&
+            lines.Lines()[0].View() ==
+                "  0x0000000004000000-0x0000000004010000:" &&
+            lines.Lines()[1].View() == "    buffer 0x4000000" &&
+            lines.Lines()[3].View() == "    nothing cached",
+        "a line naming each range, then what is cached there");
+
+  std::array<Loader::GuestFaultLine, 3> small{};
+  Loader::GuestFaultLineCollector few(small);
+  Check(Loader::CollectGuestFaultCacheLines(ranges, 8, describe, &few) == 2 &&
+            few.Count() == 3 && few.Dropped() == 1,
+        "lines past the storage are counted");
+  asked.clear();
+  Loader::GuestFaultLineCollector one(storage);
+  Check(Loader::CollectGuestFaultCacheLines(ranges, 1, describe, &one) == 1 &&
+            asked.size() == 1,
+        "at most max_ranges ranges");
+
+  Common::HostException::ExceptionInfo info;
+  const std::array<Common::GuestStore, 1> stores{
+      Common::GuestStore{.sequence = 1,
+                         .address = 0x4000000ull,
+                         .size = 8,
+                         .path = Common::GuestStorePath::FileRead}};
+  Loader::GuestFaultMemoryReport report;
+  report.info = &info;
+  report.stores = stores;
+  report.stores_total = 1;
+  report.interest = ranges;
+  report.cache_lines = few.Lines();
+  report.cache_ranges = 2;
+  report.cache_lines_dropped = few.Dropped();
+  Loader::GuestFaultMemoryText out;
+  Loader::FormatGuestFaultMemory(report, &out);
+  Check(Contains(std::string(out.View()),
+                 "--- GPU caches over 2 of those ranges (buffers, tracked "
+                 "pages, images; read without waiting for a lock) ---\n"
+                 "  0x0000000004000000-0x0000000004010000:\n"
+                 "    buffer 0x4000000\n"
+                 "  0x0000000003000000-0x0000000003010000:\n"
+                 "  (1 more lines left out)\n"),
+        "the cache lines in the report");
+  Check(Contains(std::string(out.View()), ": file read 0x0000000004000000"),
+        "an HLE store names its path");
+}
+
 void TestTwoLevelIndirect() {
   // rax -> A; A -> B, A -> A and A -> rax's window; B -> C. Two levels dump A
   // and B; pointers into a dump are not dumped again (cycles end), and C,
@@ -1035,6 +1245,8 @@ int main() {
   TestTwoLevelIndirect();
   TestStoreInterestDeep();
   TestStoreInterestOverflow();
+  TestRangeDirectory();
+  TestCacheLines();
   std::printf("GuestFaultReportTests: all cases passed\n");
   return 0;
 }

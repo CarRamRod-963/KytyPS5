@@ -780,6 +780,7 @@ struct GuestFaultMemoryStorage {
 	uint8_t              caller_bytes[CallerScan];
 	Common::GuestStore   stores[Common::GuestStoreRing::Capacity];
 	GuestFaultInterest   interest[InterestMax];
+	GuestFaultLine       cache_lines[GuestFaultCacheLines];
 	GuestFaultMemoryText text;
 };
 static GuestFaultMemoryStorage g_fault_memory;
@@ -964,11 +965,26 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	report.store_ticks_per_us = Common::GuestStoreClockTicksPerUs();
 	report.stores_total       = ring.Count();
 	report.stores = {s->stores, ring.Snapshot(s->stores, Common::GuestStoreRing::Capacity)};
-	const auto interest =
-	    CollectGuestFaultInterest(info.access_violation_vaddr, s->registers, s->stack,
-	                              report.indirect, &g_handled_faults, s->interest);
+	const auto interest = CollectGuestFaultInterest(
+	    info.access_violation_vaddr, s->registers, s->stack, report.indirect, &g_handled_faults,
+	    s->interest, [](uint64_t address) {
+		    const auto granule = address & ~(GuestFaultStoreGranule - 1);
+		    return Libs::LibKernel::Memory::BackingRunEnd(address,
+		                                                  granule + GuestFaultPointerReach);
+	    });
 	report.interest         = {s->interest, interest.count};
 	report.interest_dropped = interest.dropped;
+	// What the GPU caches hold there: the buffers and images over those bytes and whether the
+	// tracker has them write-protected or GPU-dirty.
+	GuestFaultLineCollector cache_lines(s->cache_lines);
+	report.cache_ranges = CollectGuestFaultCacheLines(
+	    report.interest, GuestFaultCacheRanges,
+	    [](uint64_t begin, uint64_t end, Common::FaultReportLines* lines) {
+		    Libs::LibKernel::Memory::DescribeGpuResources(begin, end, lines);
+	    },
+	    &cache_lines);
+	report.cache_lines         = cache_lines.Lines();
+	report.cache_lines_dropped = cache_lines.Dropped();
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
 	g_fault_memory_gate.Finish();
