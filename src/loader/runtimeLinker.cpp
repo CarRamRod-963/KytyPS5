@@ -766,7 +766,7 @@ struct GuestFaultMemoryStorage {
 	uint8_t              register_bytes[Registers][WindowBytes];
 	uint8_t              stack_bytes[GuestFaultStackBefore + GuestFaultStackAfter];
 	uint8_t              frame_bytes[GuestFaultFrameBefore + GuestFaultFrameAfter];
-	static constexpr size_t InterestMax = 2 * (Registers + GuestFaultIndirectMax) + 1;
+	static constexpr size_t InterestMax = GuestFaultInterestMax;
 	static constexpr size_t CallerScan  = 0x1000;
 
 	uint8_t              indirect_bytes[GuestFaultIndirectMax][GuestFaultIndirectAfter];
@@ -957,15 +957,18 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	report.threads       = {s->threads, threads};
 	report.threads_total = threads_total;
 	// The emulator's own stores into guest memory, newest last, and the ranges whose stores the
-	// report lists: around the fault, the registers and the dumps.
+	// report lists: around the fault, the faults this thread resolved, the registers, the pointers
+	// in the dumps and the dumps.
 	const auto& ring          = Common::GuestStores();
 	report.store_tsc_now      = Common::GuestStoreClock();
 	report.store_ticks_per_us = Common::GuestStoreClockTicksPerUs();
 	report.stores_total       = ring.Count();
-	report.stores   = {s->stores, ring.Snapshot(s->stores, Common::GuestStoreRing::Capacity)};
-	report.interest = {s->interest,
-	                   CollectGuestFaultInterest(info.access_violation_vaddr, s->registers,
-	                                             report.indirect, s->interest)};
+	report.stores = {s->stores, ring.Snapshot(s->stores, Common::GuestStoreRing::Capacity)};
+	const auto interest =
+	    CollectGuestFaultInterest(info.access_violation_vaddr, s->registers, s->stack,
+	                              report.indirect, &g_handled_faults, s->interest);
+	report.interest         = {s->interest, interest.count};
+	report.interest_dropped = interest.dropped;
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
 	g_fault_memory_gate.Finish();

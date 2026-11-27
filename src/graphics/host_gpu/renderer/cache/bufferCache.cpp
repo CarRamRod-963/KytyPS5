@@ -379,7 +379,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		auto publish = [total_size, buffer_address, copies = std::move(copies),
 		                download = std::move(download)] {
 			download.buffer->Invalidate(download.offset, total_size);
-			const Common::GuestStoreScope store_path(Common::GuestStorePath::BufferReadback);
+			const Common::GuestStoreScope store_path(Common::GuestStorePath::BufferReadback,
+			                                         buffer_address);
 			for (const auto& copy: copies) {
 				Libs::LibKernel::Memory::WriteBacking(
 				    buffer_address + copy.srcOffset,
@@ -394,7 +395,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		auto publish = [this, total_size, buffer_address, copies = std::move(copies),
 		                download = std::move(download), taken = std::move(taken)] {
 			download.buffer->Invalidate(download.offset, total_size);
-			const Common::GuestStoreScope store_path(Common::GuestStorePath::BufferReadback);
+			const Common::GuestStoreScope store_path(Common::GuestStorePath::BufferReadback,
+			                                         buffer_address);
 			size_t                        next = 0;
 			for (const auto& range: taken) {
 				m_memory_tracker.PublishGpuModified(
@@ -470,7 +472,8 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 			                   std::chrono::steady_clock::now() - read_start)
 			                   .count();
 			    read_bytes += end - start;
-			    const Common::GuestStoreScope store_path(Common::GuestStorePath::InPlaceReadback);
+			    const Common::GuestStoreScope store_path(Common::GuestStorePath::InPlaceReadback,
+			                                             buffer_address);
 			    Libs::LibKernel::Memory::WriteBacking(start, m_in_place_scratch.data(),
 			                                          end - start);
 			    copied = true;
@@ -1072,7 +1075,7 @@ void BufferCache::RunGuestCopy(GuestCopy& copy) {
 						    copy.buffer->ReadMapped(from - copy.buffer_address, to - from,
 						                            scratch.data());
 						    const Common::GuestStoreScope store_path(
-						        Common::GuestStorePath::GuestThreadReadback);
+						        Common::GuestStorePath::GuestThreadReadback, copy.buffer_address);
 						    Libs::LibKernel::Memory::WriteBacking(from, scratch.data(), to - from);
 						    copied += to - from;
 					    }
@@ -1150,6 +1153,7 @@ void BufferCache::RecordAsyncDownloads() {
 		uint64_t size;
 		uint64_t offset;
 		BufferId buffer;
+		uint64_t buffer_address;
 	};
 	struct PageRecord {
 		uint64_t                               page;
@@ -1193,7 +1197,8 @@ void BufferCache::RecordAsyncDownloads() {
 			                   .bytes          = 0};
 			m_gpu_modified_ranges.ForEachInRange(
 			    page, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t last) {
-				    page_intervals.push_back({begin, last - begin, 0, *owner});
+				    page_intervals.push_back(
+				        {begin, last - begin, 0, *owner, m_slot_buffers[*owner].CpuAddress()});
 				    record.bytes += Common::AlignUp(last - begin, 64);
 			    });
 			record.interval_count = page_intervals.size() - record.first_interval;
@@ -1334,7 +1339,7 @@ void BufferCache::RecordAsyncDownloads() {
 					            std::min(address + bytes, interval.address + interval.size);
 					        if (begin < end) {
 						        const Common::GuestStoreScope store_path(
-						            Common::GuestStorePath::AsyncReadback);
+						            Common::GuestStorePath::AsyncReadback, interval.buffer_address);
 						        LibKernel::Memory::WriteBacking(
 						            begin, mapped + interval.offset + (begin - interval.address),
 						            end - begin);

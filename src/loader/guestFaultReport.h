@@ -159,18 +159,41 @@ struct GuestThreadState {
 	uint64_t guest_caller = 0;
 };
 
-// A range whose stores the report lists: around the faulting address, the registers' pointers and
-// the dumped memory.
+// Why a range's stores are listed (GuestFaultInterest::reasons is a mask of these).
+enum GuestFaultInterestReason : uint8_t {
+	GuestFaultNearFault         = 1u << 0u, // the granule of the faulting address
+	GuestFaultNearResolvedFault = 1u << 1u, // the granule of a fault the thread had resolved
+	GuestFaultNearRegister      = 1u << 2u, // the granule of a register value
+	GuestFaultNearDump          = 1u << 3u, // a dumped range
+	GuestFaultNearDumpPointer   = 1u << 4u, // the granule of a pointer anywhere in a dump
+};
+
+// A range whose stores the report lists: around the faulting address, the faults the thread had
+// resolved, the registers' pointers, the pointers in the dumped memory and the dumps themselves.
 struct GuestFaultInterest {
-	uint64_t begin = 0;
-	uint64_t end   = 0;
+	uint64_t begin   = 0;
+	uint64_t end     = 0;
+	uint8_t  reasons = 0;
+};
+
+// The ranges CollectGuestFaultInterest kept (sorted, disjoint) and how many it had to leave out
+// because the table was full.
+struct GuestFaultInterestSet {
+	size_t count   = 0;
+	size_t dropped = 0;
 };
 
 // Granule around an address whose emulator stores are listed.
 inline constexpr uint64_t GuestFaultStoreGranule = 0x10000;
+// Ranges a report keeps at most: far more than the granules of its dumps' pointers usually are
+// (one granule holds many of them).
+inline constexpr size_t GuestFaultInterestMax = 1024;
 // Stores listed: near the fault (the newest), and the last ones overall.
 inline constexpr size_t GuestFaultStoresNear = 96;
 inline constexpr size_t GuestFaultStoresLast = 32;
+// Stores listed since the oldest fault the thread had resolved: the first and the last half of
+// this many when there were more.
+inline constexpr size_t GuestFaultStoresWindow = 256;
 
 // Calls f(value, window, offset) for the qwords of the first `scan` bytes of each window: the first
 // qword of every window first, then the second, ...; a window whose value an earlier one has is
@@ -290,48 +313,130 @@ inline size_t CollectGuestFaultIndirect(std::span<const GuestFaultMemory> regist
 	return count;
 }
 
-// The interest ranges of a report: the 64 KiB granule around the fault address and around each
-// register value and dump address that may be a pointer, and every dumped range. Returns how many
-// it wrote (at most out.size()).
-inline size_t CollectGuestFaultInterest(uint64_t                          fault_address,
-                                        std::span<const GuestFaultMemory> registers,
-                                        std::span<const GuestFaultMemory> indirect,
-                                        std::span<GuestFaultInterest>     out) {
-	size_t count = 0;
-	auto   add   = [&](uint64_t begin, uint64_t end) {
+// Sorts out[0, count) by address and merges ranges that touch (their reasons combine). Returns
+// the new count.
+inline size_t MergeGuestFaultInterest(std::span<GuestFaultInterest> out, size_t count) {
+	if (count == 0) {
+		return 0;
+	}
+	std::sort(
+	    out.begin(), out.begin() + static_cast<ptrdiff_t>(count),
+	    [](const GuestFaultInterest& a, const GuestFaultInterest& b) { return a.begin < b.begin; });
+	size_t merged = 0;
+	for (size_t i = 1; i < count; i++) {
+		auto& last = out[merged];
+		if (out[i].begin <= last.end) {
+			last.end = std::max(last.end, out[i].end);
+			last.reasons |= out[i].reasons;
+		} else {
+			out[++merged] = out[i];
+		}
+	}
+	return merged + 1;
+}
+
+// The interest ranges of a report, in this order of priority: the 64 KiB granule around the fault
+// address; around the data address of each fault the thread had resolved (a page the thread wrote
+// just before, the bytes it then read); around each register value; the dumped ranges (registers,
+// stack, indirect); around every qword in the readable rows of any dump that may be a pointer (a
+// field anywhere in a structure, a local in the frame). The result is sorted and disjoint. When the
+// table is full it is merged; what still does not fit is counted in `dropped` (the lowest priority
+// goes first). No allocation: the handler of a fatal fault calls it.
+inline GuestFaultInterestSet CollectGuestFaultInterest(uint64_t fault_address,
+                                                       std::span<const GuestFaultMemory> registers,
+                                                       std::span<const GuestFaultMemory> stack,
+                                                       std::span<const GuestFaultMemory> indirect,
+                                                       const HandledFaultRing*           handled,
+                                                       std::span<GuestFaultInterest>     out) {
+	GuestFaultInterestSet set;
+	auto                  add = [&](uint64_t begin, uint64_t end, uint8_t reason) {
 		if (end <= begin) {
 			return;
 		}
-		for (size_t i = 0; i < count; i++) {
-			if (out[i].begin == begin && out[i].end == end) {
-				return;
-			}
+		if (set.count == out.size()) {
+			set.count = MergeGuestFaultInterest(out, set.count);
 		}
-		if (count < out.size()) {
-			out[count++] = {begin, end};
+		if (set.count == out.size()) {
+			set.dropped++;
+			return;
 		}
+		out[set.count++] = {begin, end, reason};
 	};
-	auto granule = [&](uint64_t value) {
+	auto granule = [&](uint64_t value, uint8_t reason) {
 		if (value < 0x10000 || value > 0x00007fffffffffffull) {
 			return;
 		}
 		const auto begin = value & ~(GuestFaultStoreGranule - 1);
-		add(begin, begin + GuestFaultStoreGranule);
+		add(begin, begin + GuestFaultStoreGranule, reason);
 	};
-	granule(fault_address);
-	for (const auto& window: registers) {
-		granule(window.value);
+	auto dump = [&](const GuestFaultMemory& window) {
 		if (window.readable_rows != 0) {
-			add(window.start, window.start + window.bytes.size());
+			add(window.start, window.start + window.bytes.size(), GuestFaultNearDump);
 		}
+	};
+	auto pointers = [&](const GuestFaultMemory& window) {
+		const size_t rows = std::min<size_t>(window.bytes.size() / 16, 64);
+		for (size_t row = 0; row < rows; row++) {
+			if (((window.readable_rows >> row) & 1u) == 0) {
+				continue;
+			}
+			for (size_t word = 0; word < 2; word++) {
+				uint64_t value = 0;
+				std::memcpy(&value, window.bytes.data() + row * 16 + word * 8, sizeof(value));
+				granule(value, GuestFaultNearDumpPointer);
+			}
+		}
+	};
+	granule(fault_address, GuestFaultNearFault);
+	if (handled != nullptr) {
+		// Newest first: when the table runs out the oldest faults are the ones left out.
+		for (size_t i = handled->Size(); i > 0; i--) {
+			const auto& fault = handled->At(i - 1);
+			if (fault.kind != HandledFaultKind::EmulatedInstruction) {
+				granule(fault.address, GuestFaultNearResolvedFault);
+			}
+		}
+	}
+	for (const auto& window: registers) {
+		granule(window.value, GuestFaultNearRegister);
+	}
+	for (const auto& window: registers) {
+		dump(window);
+	}
+	for (const auto& window: stack) {
+		dump(window);
 	}
 	for (const auto& window: indirect) {
 		if (window.readable_rows != 0) {
-			granule(window.value);
-			add(window.start, window.start + window.bytes.size());
+			granule(window.value, GuestFaultNearDumpPointer);
+			dump(window);
 		}
 	}
-	return count;
+	for (const auto& window: registers) {
+		pointers(window);
+	}
+	for (const auto& window: stack) {
+		pointers(window);
+	}
+	for (const auto& window: indirect) {
+		pointers(window);
+	}
+	set.count = MergeGuestFaultInterest(out, set.count);
+	return set;
+}
+
+// The reasons of the sorted, disjoint ranges a store overlaps (0: none).
+inline uint8_t GuestStoreInterest(std::span<const GuestFaultInterest> ranges,
+                                  const Common::GuestStore&           store) {
+	const uint64_t end = store.size == 0 ? store.address + 1 : store.address + store.size;
+	auto           it  = std::upper_bound(
+	    ranges.begin(), ranges.end(), store.address,
+	    [](uint64_t address, const GuestFaultInterest& range) { return address < range.end; });
+	uint8_t reasons = 0;
+	for (; it != ranges.end() && it->begin < end; ++it) {
+		reasons |= it->reasons;
+	}
+	return reasons;
 }
 
 // The second part of a fatal report: memory at the registers, the faults the thread had resolved
@@ -354,10 +459,12 @@ struct GuestFaultMemoryReport {
 	uint64_t                            stores_total       = 0;
 	uint64_t                            store_tsc_now      = 0;
 	uint64_t                            store_ticks_per_us = 0;
-	std::span<const GuestFaultInterest> interest;
+	std::span<const GuestFaultInterest> interest; // sorted, disjoint
+	size_t                              interest_dropped = 0;
 };
 
-using GuestFaultMemoryText = BasicGuestFaultText<256 * 1024>;
+// Room for every dump, every thread and the store lists at their limits (TestMemoryReportFits).
+using GuestFaultMemoryText = BasicGuestFaultText<384 * 1024>;
 
 template <typename Text>
 inline void AppendModuleLocation(const GuestModuleMap* modules, uint64_t address, Text* out) {
@@ -422,36 +529,113 @@ inline void AppendGuestStore(const GuestFaultMemoryReport& report, const Common:
 	} else {
 		out->Append("{} ticks before", ticks);
 	}
-	out->Append(": {} 0x{:016x} size 0x{:x} first {:016x} thread {}\n",
+	out->Append(": {} 0x{:016x} size 0x{:x} first {:016x} thread {}",
 	            Common::GuestStorePathName(store.path), store.address, store.size, store.first,
 	            store.thread);
+	if (store.source != 0) {
+		out->Append(" from {} 0x{:016x}", Common::GuestStoreSourceName(store.path), store.source);
+	}
+	if (const auto reasons = GuestStoreInterest(report.interest, store); reasons != 0) {
+		static constexpr std::pair<uint8_t, const char*> names[] = {
+		    {GuestFaultNearFault, "fault address"},
+		    {GuestFaultNearResolvedFault, "resolved fault"},
+		    {GuestFaultNearRegister, "register"},
+		    {GuestFaultNearDump, "dump"},
+		    {GuestFaultNearDumpPointer, "pointer in a dump"},
+		};
+		const char* separator = " (near: ";
+		for (const auto& [bit, name]: names) {
+			if ((reasons & bit) != 0) {
+				out->Append("{}{}", separator, name);
+				separator = ", ";
+			}
+		}
+		out->Append(")");
+	}
+	out->Append("\n");
+}
+
+template <typename Text>
+inline void AppendResolvedFaultMark(const HandledFault& fault, const GuestModuleMap* modules,
+                                    Text* out) {
+	out->Append("  -- resolved {} fault", HandledFaultKindName(fault.kind));
+	if (fault.kind != HandledFaultKind::EmulatedInstruction) {
+		out->Append(" 0x{:016x}", fault.address);
+	}
+	out->Append(" pc=0x{:016x}", fault.pc);
+	AppendModuleLocation(modules, fault.pc, out);
+	out->Append(" --\n");
+}
+
+// Every store between the oldest fault the thread had resolved and the fault (at most
+// GuestFaultStoresWindow, the first and the last half of them when there were more), with the
+// resolved faults at their place among them.
+template <typename Text>
+inline void AppendGuestStoreWindow(const GuestFaultMemoryReport& report, Text* out) {
+	const auto* ring = report.handled;
+	if (ring == nullptr || ring->Size() == 0) {
+		return;
+	}
+	// Stores numbered after the oldest fault's count were made after it.
+	const uint64_t after = ring->At(0).stores;
+	size_t         first = report.stores.size();
+	for (size_t i = 0; i < report.stores.size(); i++) {
+		if (report.stores[i].sequence > after) {
+			first = i;
+			break;
+		}
+	}
+	const size_t   in_window = report.stores.size() - first;
+	const uint64_t made      = report.stores_total > after ? report.stores_total - after : 0;
+	out->Append("--- The emulator's stores since the oldest of those resolved faults ({} made, {} "
+	            "kept) ---\n",
+	            made, in_window);
+	if (made > in_window) {
+		out->Append("  ({} of them are no longer in the ring)\n", made - in_window);
+	}
+	constexpr size_t half = GuestFaultStoresWindow / 2;
+	size_t           next = 0; // the next resolved fault to place
+	for (size_t i = first; i < report.stores.size(); i++) {
+		const auto& store = report.stores[i];
+		for (; next < ring->Size() && ring->At(next).stores < store.sequence; next++) {
+			AppendResolvedFaultMark(ring->At(next), report.modules, out);
+		}
+		const size_t index = i - first;
+		if (in_window > GuestFaultStoresWindow && index >= half && index < in_window - half) {
+			if (index == half) {
+				out->Append("  ... {} stores left out ...\n", in_window - 2 * half);
+			}
+			continue;
+		}
+		AppendGuestStore(report, store, out);
+	}
+	for (; next < ring->Size(); next++) {
+		AppendResolvedFaultMark(ring->At(next), report.modules, out);
+	}
 }
 
 // The emulator's own stores into guest memory: those over the report's interest ranges (the newest
-// GuestFaultStoresNear of them), then the last GuestFaultStoresLast of all.
+// GuestFaultStoresNear of them), those since the thread's oldest resolved fault, then the last
+// GuestFaultStoresLast of all.
 template <typename Text>
 inline void AppendGuestStores(const GuestFaultMemoryReport& report, Text* out) {
 	if (report.stores_total == 0) {
 		return;
 	}
-	const auto near = [&](const Common::GuestStore& store) {
-		for (const auto& range: report.interest) {
-			if (Common::GuestStoreOverlaps(store, range.begin, range.end)) {
-				return true;
-			}
-		}
-		return false;
-	};
 	size_t matched = 0;
 	for (const auto& store: report.stores) {
-		matched += near(store) ? 1 : 0;
+		matched += GuestStoreInterest(report.interest, store) != 0 ? 1 : 0;
 	}
 	out->Append("--- The emulator's own stores into guest memory near this fault ({} of the last "
-	            "{}; {} recorded) ---\n",
-	            matched, report.stores.size(), report.stores_total);
+	            "{}; {} recorded; {} ranges",
+	            matched, report.stores.size(), report.stores_total, report.interest.size());
+	if (report.interest_dropped != 0) {
+		out->Append(", {} more left out", report.interest_dropped);
+	}
+	out->Append(") ---\n");
 	size_t skip = matched > GuestFaultStoresNear ? matched - GuestFaultStoresNear : 0;
 	for (const auto& store: report.stores) {
-		if (!near(store)) {
+		if (GuestStoreInterest(report.interest, store) == 0) {
 			continue;
 		}
 		if (skip != 0) {
@@ -460,6 +644,7 @@ inline void AppendGuestStores(const GuestFaultMemoryReport& report, Text* out) {
 		}
 		AppendGuestStore(report, store, out);
 	}
+	AppendGuestStoreWindow(report, out);
 	const auto last = std::min(report.stores.size(), GuestFaultStoresLast);
 	out->Append("--- The emulator's last {} stores into guest memory ---\n", last);
 	for (size_t i = report.stores.size() - last; i < report.stores.size(); i++) {

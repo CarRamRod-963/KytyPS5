@@ -491,6 +491,27 @@ void TestMemoryReportFits() {
   report.now_ns = ~0ull;
   report.threads = threads;
   report.threads_total = threads.size();
+  static std::array<Common::GuestStore, Common::GuestStoreRing::Capacity>
+      stores{};
+  for (size_t i = 0; i < stores.size(); i++) {
+    stores[i] = {.sequence = ~0ull - stores.size() + i,
+                 .tsc = 0,
+                 .address = 0x7ff700000000ull,
+                 .size = ~0ull >> 1u,
+                 .first = ~0ull,
+                 .source = ~0ull,
+                 .thread = ~0u,
+                 .path = Common::GuestStorePath::MetadataClearPublish};
+  }
+  static std::array<Loader::GuestFaultInterest, Loader::GuestFaultInterestMax>
+      interest{};
+  const auto interest_set = Loader::CollectGuestFaultInterest(
+      ~0ull, registers, stack, indirect, &ring, interest);
+  report.stores = stores;
+  report.stores_total = ~0ull;
+  report.store_tsc_now = ~0ull;
+  report.interest = {interest.data(), interest_set.count};
+  report.interest_dropped = interest_set.dropped;
   static Loader::GuestFaultMemoryText out;
   Loader::FormatGuestFaultMemory(report, &out);
   Check(!out.Truncated(), "a report with everything readable fits");
@@ -543,8 +564,11 @@ void TestGuestStoreRing() {
   ring.Record(Path::ImageWriteBack, 0x30c0000000ull, 0x1000, &word, 7, 100);
   const uint16_t half = 0xabcd;
   ring.Record(Path::Label, 0x30c0001000ull, sizeof(half), &half, 8, 200);
-  ring.Record(Path::BufferReadback, 0x30c0002000ull, 0x10, nullptr, 9, 300);
+  ring.Record(Path::BufferReadback, 0x30c0002000ull, 0x10, nullptr, 9, 300,
+              0x30bf000000ull);
   Check(ring.Snapshot(few.data(), few.size()) == 3, "three stores kept");
+  Check(few[0].source == 0 && few[2].source == 0x30bf000000ull,
+        "a store keeps the buffer or image it came from");
   Check(few[0].sequence == 1 && few[0].path == Path::ImageWriteBack &&
             few[0].address == 0x30c0000000ull && few[0].size == 0x1000 &&
             few[0].first == word && few[0].thread == 7 && few[0].tsc == 100,
@@ -623,15 +647,28 @@ void TestStoreReport() {
   std::array<uint8_t, PointerBytes> bytes{};
   const std::array<Loader::GuestFaultMemory, 1> registers{
       MakeWindow("rax", 0x3300000020ull, 16, bytes, PointerRows)};
+  Loader::HandledFaultRing ring;
+  ring.Record({.address = 0x3204420158ull,
+               .pc = 0x900ff8030ull,
+               .rsp = 0,
+               .time_ns = 10,
+               .kind = Loader::HandledFaultKind::Read,
+               .stores = 42});
   std::array<Loader::GuestFaultInterest, 8> interest{};
-  const auto interest_count = Loader::CollectGuestFaultInterest(
-      info.access_violation_vaddr, registers, {}, interest);
-  Check(interest_count == 3 && interest[0].begin == 0x3204420000ull &&
+  const auto interest_set = Loader::CollectGuestFaultInterest(
+      info.access_violation_vaddr, registers, {}, {}, &ring, interest);
+  const auto interest_count = interest_set.count;
+  Check(interest_count == 2 && interest_set.dropped == 0 &&
+            interest[0].begin == 0x3204420000ull &&
             interest[0].end == 0x3204430000ull &&
+            interest[0].reasons == (Loader::GuestFaultNearFault |
+                                    Loader::GuestFaultNearResolvedFault) &&
             interest[1].begin == 0x3300000000ull &&
-            interest[2].begin == 0x3300000010ull &&
-            interest[2].end == 0x3300000010ull + PointerBytes,
-        "interest: the fault's granule, the register's granule and dump");
+            interest[1].end == 0x3300010000ull &&
+            interest[1].reasons ==
+                (Loader::GuestFaultNearRegister | Loader::GuestFaultNearDump),
+        "interest: the fault's granule, the register's granule with its dump, "
+        "sorted and merged");
   using Path = Common::GuestStorePath;
   const std::array<Common::GuestStore, 4> stores{
       // Over the second chunk of the faulting array: the store to find.
@@ -656,6 +693,7 @@ void TestStoreReport() {
                          .address = 0x330000f000ull,
                          .size = 0x2000,
                          .first = 2,
+                         .source = 0x3300000000ull,
                          .thread = 7,
                          .path = Path::BufferReadback},
       Common::GuestStore{.sequence = 44,
@@ -666,13 +704,6 @@ void TestStoreReport() {
                          .thread = 6,
                          .path = Path::Label},
   };
-  Loader::HandledFaultRing ring;
-  ring.Record({.address = 0x3204420158ull,
-               .pc = 0x900ff8030ull,
-               .rsp = 0,
-               .time_ns = 10,
-               .kind = Loader::HandledFaultKind::Read,
-               .stores = 42});
   const std::array<Loader::GuestThreadState, 1> threads{
       Loader::GuestThreadState{.name = "Background Worker #6",
                                .host_thread_id = 99,
@@ -705,18 +736,238 @@ void TestStoreReport() {
         "a thread in host code names its guest caller");
   Check(Contains(text,
                  "--- The emulator's own stores into guest memory near this "
-                 "fault (2 of the last 4; 44 recorded) ---\n"
+                 "fault (2 of the last 4; 44 recorded; 2 ranges) ---\n"
                  "  #41 400 us before: metadata clear publish "
                  "0x0000003204420000 size 0x1000 first ffffffffffffffff "
-                 "thread 5\n"
+                 "thread 5 (near: fault address, resolved fault)\n"
                  "  #43 200 us before: buffer readback 0x000000330000f000 "
-                 "size 0x2000 first 0000000000000002 thread 7\n"
+                 "size 0x2000 first 0000000000000002 thread 7 from buffer "
+                 "0x0000003300000000 (near: register, dump)\n"
+                 "--- The emulator's stores since the oldest of those "
+                 "resolved faults (2 made, 2 kept) ---\n"
+                 "  -- resolved read fault 0x0000003204420158 "
+                 "pc=0x0000000900ff8030 (eboot.bin+0xff8030) --\n"
+                 "  #43 200 us before: buffer readback 0x000000330000f000 "
+                 "size 0x2000 first 0000000000000002 thread 7 from buffer "
+                 "0x0000003300000000 (near: register, dump)\n"
+                 "  #44 100 us before: label 0x0000005000001000 size 0x8 "
+                 "first 0000000000000003 thread 6\n"
                  "--- The emulator's last 4 stores into guest memory ---\n"
                  "  #41 "),
-        "stores near the fault, then the last ones");
+        "stores near the fault, since the resolved fault, then the last "
+        "ones");
   Check(text.ends_with("  #44 100 us before: label 0x0000005000001000 size 0x8 "
                        "first 0000000000000003 thread 6\n"),
         "the newest store ends the report");
+}
+
+// The ff8048 shape (issue #17): a heightfield at r8 holds its spans pointer at
+// +0x48, past the first 0x40 bytes of the dump; the thread had just taken
+// write faults on the array's second 128 KiB (a memset) and faults reading
+// it. Stores there are found through the deep pointer scan and the resolved
+// faults' granules, and every store since the oldest resolved fault is listed
+// with the faults at their place.
+void TestStoreInterestDeep() {
+  constexpr uint64_t hf = 0x11c21c6700ull, spans = 0x332b550000ull;
+  Common::HostException::ExceptionInfo info;
+  info.exception_address = 0x900ff8048ull;
+  info.access_violation_vaddr = ~0ull;
+  std::array<uint8_t, PointerBytes> bytes{};
+  auto r8 = MakeWindow("r8", hf, 16, bytes, PointerRows);
+  std::memset(bytes.data(), 0, bytes.size());
+  std::memcpy(bytes.data() + 16 + 0x48, &spans, sizeof(spans));
+  const std::array<Loader::GuestFaultMemory, 1> registers{r8};
+  Loader::HandledFaultRing ring;
+  for (uint64_t page = 0; page < 3; page++) {
+    ring.Record({.address = spans + 0x24000 + page * 0x1000,
+                 .pc = 0x8000105aeull,
+                 .rsp = 0,
+                 .time_ns = 0,
+                 .kind = Loader::HandledFaultKind::Write,
+                 .stores = 100});
+  }
+  ring.Record({.address = 0x332b57a828ull,
+               .pc = 0x900ff81e6ull,
+               .rsp = 0,
+               .time_ns = 0,
+               .kind = Loader::HandledFaultKind::Write,
+               .stores = 101});
+  std::array<Loader::GuestFaultInterest, 16> interest{};
+  const auto set = Loader::CollectGuestFaultInterest(
+      info.access_violation_vaddr, registers, {}, {}, &ring, interest);
+  const std::span<const Loader::GuestFaultInterest> ranges{interest.data(),
+                                                           set.count};
+  using Path = Common::GuestStorePath;
+  const Common::GuestStore in_spans{.sequence = 102,
+                                    .tsc = 102,
+                                    .address = spans + 0x8000,
+                                    .size = 0x1000,
+                                    .path = Path::AsyncReadback};
+  const Common::GuestStore second_chunk{.sequence = 103,
+                                        .tsc = 103,
+                                        .address = spans + 0x203e8,
+                                        .size = 8,
+                                        .path = Path::BufferReadback};
+  const Common::GuestStore elsewhere{.sequence = 104,
+                                     .tsc = 104,
+                                     .address = 0x1ec29e0000ull,
+                                     .size = 0x4000,
+                                     .path = Path::AsyncReadback};
+  Check(Loader::GuestStoreInterest(ranges, in_spans) ==
+            Loader::GuestFaultNearDumpPointer,
+        "a pointer past the first 0x40 bytes of a dump is an interest range");
+  Check(Loader::GuestStoreInterest(ranges, second_chunk) ==
+            Loader::GuestFaultNearResolvedFault,
+        "the granule of a resolved fault is an interest range");
+  Check(Loader::GuestStoreInterest(ranges, elsewhere) == 0,
+        "other memory is not");
+  // Pointers in the stack dumps and in the indirect dumps count too, and the
+  // stack dumps are interest ranges themselves.
+  std::array<uint8_t, 0x120> frame{};
+  auto rbp = MakeWindow("rbp", 0x7ec1c4100ull, 0x100, frame, 0x3ffffull);
+  std::memset(frame.data(), 0, frame.size());
+  const uint64_t local = 0x6100000000ull;
+  std::memcpy(frame.data() + 0x40, &local, sizeof(local));
+  std::array<uint8_t, 0x110> target{};
+  auto deeper = MakeWindow("[r8+0x0]", 0x6200000000ull, 0, target, 0x1ffff);
+  std::memset(target.data(), 0, target.size());
+  const uint64_t field = 0x6300000000ull;
+  std::memcpy(target.data() + 0x100, &field, sizeof(field));
+  const std::array<Loader::GuestFaultMemory, 1> frames{rbp};
+  const std::array<Loader::GuestFaultMemory, 1> pointed{deeper};
+  std::array<Loader::GuestFaultInterest, 16> more{};
+  const auto more_set = Loader::CollectGuestFaultInterest(
+      ~0ull, {}, frames, pointed, nullptr, more);
+  const std::span<const Loader::GuestFaultInterest> more_ranges{more.data(),
+                                                                more_set.count};
+  Check(Loader::GuestStoreInterest(more_ranges,
+                                   {.address = 0x6100008000ull, .size = 8}) ==
+            Loader::GuestFaultNearDumpPointer,
+        "a pointer in the stack dumps is an interest range");
+  Check(Loader::GuestStoreInterest(more_ranges,
+                                   {.address = 0x6300000100ull, .size = 8}) ==
+            Loader::GuestFaultNearDumpPointer,
+        "a pointer deep in an indirect dump is an interest range");
+  Check((Loader::GuestStoreInterest(more_ranges,
+                                    {.address = 0x7ec1c4080ull, .size = 8}) &
+         Loader::GuestFaultNearDump) != 0,
+        "a stack dump is an interest range");
+  for (size_t i = 1; i < set.count; i++) {
+    Check(interest[i - 1].end < interest[i].begin, "ranges sorted, disjoint");
+  }
+
+  // The stores since the oldest resolved fault (#100): #101 .. #104, with the
+  // faults at their place, and #99 before them left out.
+  const std::array<Common::GuestStore, 5> stores{
+      Common::GuestStore{.sequence = 99, .address = 0x5000000000ull, .size = 8},
+      Common::GuestStore{.sequence = 101,
+                         .tsc = 101,
+                         .address = 0x5000000100ull,
+                         .size = 8,
+                         .path = Path::Label},
+      in_spans, second_chunk, elsewhere};
+  Loader::GuestModuleMap modules;
+  modules.Add(0x900000000ull, 0x4000000ull, "eboot.bin");
+  Loader::GuestFaultMemoryReport report;
+  report.info = &info;
+  report.modules = &modules;
+  report.handled = &ring;
+  report.stores = stores;
+  report.stores_total = 104;
+  report.store_tsc_now = 105;
+  report.store_ticks_per_us = 1;
+  report.interest = ranges;
+  Loader::GuestFaultMemoryText out;
+  Loader::FormatGuestFaultMemory(report, &out);
+  const std::string text(out.View());
+  Check(Contains(text, "near this fault (2 of the last 5; 104 recorded; "),
+        "both stores over the array are near the fault");
+  Check(
+      Contains(
+          text,
+          "--- The emulator's stores since the oldest of those resolved "
+          "faults (4 made, 4 kept) ---\n"
+          "  -- resolved write fault 0x000000332b574000 pc=0x00000008000105ae "
+          "--\n"
+          "  -- resolved write fault 0x000000332b575000 pc=0x00000008000105ae "
+          "--\n"
+          "  -- resolved write fault 0x000000332b576000 pc=0x00000008000105ae "
+          "--\n"
+          "  #101 4 us before: label 0x0000005000000100 size 0x8 first "
+          "0000000000000000 thread 0\n"
+          "  -- resolved write fault 0x000000332b57a828 pc=0x0000000900ff81e6 "
+          "(eboot.bin+0xff81e6) --\n"
+          "  #102 3 us before: async readback 0x000000332b558000 size 0x1000 "
+          "first 0000000000000000 thread 0 (near: pointer in a dump)\n"
+          "  #103 2 us before: buffer readback 0x000000332b5703e8 size 0x8 "
+          "first 0000000000000000 thread 0 (near: resolved fault)\n"
+          "  #104 1 us before: async readback"),
+      "the stores since the oldest resolved fault, faults in between");
+
+  // More than the window holds: its first and last half, and how many were
+  // left out; stores the ring no longer holds are counted.
+  static std::array<Common::GuestStore, 600> many{};
+  for (size_t i = 0; i < many.size(); i++) {
+    many[i] = {.sequence = 1000 + i, .address = 0x5000000000ull, .size = 8};
+  }
+  Loader::HandledFaultRing old_ring;
+  old_ring.Record({.address = 0x5000000000ull,
+                   .kind = Loader::HandledFaultKind::Write,
+                   .stores = 900});
+  report.handled = &old_ring;
+  report.stores = many;
+  report.stores_total = 1599;
+  report.store_tsc_now = 0;
+  report.interest = {};
+  static Loader::GuestFaultMemoryText long_out;
+  Loader::FormatGuestFaultMemory(report, &long_out);
+  const std::string long_text(long_out.View());
+  Check(Contains(long_text, "faults (699 made, 600 kept) ---\n"
+                            "  (99 of them are no longer in the ring)\n"
+                            "  -- resolved write fault"),
+        "a window larger than the ring says so");
+  Check(Contains(long_text, "  #1127 0 us before") &&
+            Contains(long_text, "  ... 344 stores left out ...\n  #1472 ") &&
+            !Contains(long_text, "  #1128 ") && !Contains(long_text, "#1471 "),
+        "a long window keeps its first and its last half");
+}
+
+// A table too small for every range: it merges first, then leaves the lowest
+// priority (pointers in dumps) out and counts them; the report says so.
+void TestStoreInterestOverflow() {
+  std::array<uint8_t, PointerBytes> bytes{};
+  auto rax = MakeWindow("rax", 0x3300000020ull, 16, bytes, PointerRows);
+  for (size_t i = 0; i < bytes.size() / 8; i++) {
+    const uint64_t pointer = 0x4000000000ull + i * 0x100000;
+    std::memcpy(bytes.data() + i * 8, &pointer, sizeof(pointer));
+  }
+  const std::array<Loader::GuestFaultMemory, 1> registers{rax};
+  std::array<Loader::GuestFaultInterest, 4> interest{};
+  const auto set = Loader::CollectGuestFaultInterest(0x3204420158ull, registers,
+                                                     {}, {}, nullptr, interest);
+  Check(set.count == 4 && set.dropped == bytes.size() / 8 - 2,
+        "a full table keeps what fits and counts the rest");
+  Check(interest[0].begin == 0x3204420000ull &&
+            interest[0].reasons == Loader::GuestFaultNearFault &&
+            interest[1].begin == 0x3300000000ull &&
+            interest[1].reasons ==
+                (Loader::GuestFaultNearRegister | Loader::GuestFaultNearDump),
+        "the fault and the register come first");
+  Common::HostException::ExceptionInfo info;
+  const std::array<Common::GuestStore, 1> stores{
+      Common::GuestStore{.sequence = 1, .address = 0x3204420000ull, .size = 8}};
+  Loader::GuestFaultMemoryReport report;
+  report.info = &info;
+  report.stores = stores;
+  report.stores_total = 1;
+  report.interest = {interest.data(), set.count};
+  report.interest_dropped = set.dropped;
+  Loader::GuestFaultMemoryText out;
+  Loader::FormatGuestFaultMemory(report, &out);
+  Check(Contains(std::string(out.View()),
+                 "(1 of the last 1; 1 recorded; 4 ranges, 34 more left out) "
+                 "---\n"),
+        "the report says ranges were left out");
 }
 
 void TestTwoLevelIndirect() {
@@ -782,6 +1033,8 @@ int main() {
   TestGuestStoreRing();
   TestStoreReport();
   TestTwoLevelIndirect();
+  TestStoreInterestDeep();
+  TestStoreInterestOverflow();
   std::printf("GuestFaultReportTests: all cases passed\n");
   return 0;
 }

@@ -21,6 +21,7 @@ namespace {
 GuestStoreRing g_guest_stores;
 
 thread_local GuestStorePath g_path   = GuestStorePath::Backing;
+thread_local uint64_t       g_source = 0;
 thread_local uint32_t       g_thread = 0;
 
 uint32_t CurrentThreadId() {
@@ -75,20 +76,24 @@ uint64_t GuestStoreClockTicksPerUs() {
 }
 
 void RecordGuestStore(uint64_t address, uint64_t size, const void* data) {
-	RecordGuestStore(g_path, address, size, data);
+	RecordGuestStore(g_path, address, size, data, g_source);
 }
 
-void RecordGuestStore(GuestStorePath path, uint64_t address, uint64_t size, const void* data) {
+void RecordGuestStore(GuestStorePath path, uint64_t address, uint64_t size, const void* data,
+                      uint64_t source) {
 	(void)Origin();
-	g_guest_stores.Record(path, address, size, data, CurrentThreadId(), GuestStoreClock());
+	g_guest_stores.Record(path, address, size, data, CurrentThreadId(), GuestStoreClock(), source);
 }
 
-GuestStoreScope::GuestStoreScope(GuestStorePath path): m_previous(g_path) {
-	g_path = path;
+GuestStoreScope::GuestStoreScope(GuestStorePath path, uint64_t source)
+    : m_previous(g_path), m_previous_source(g_source) {
+	g_path   = path;
+	g_source = source;
 }
 
 GuestStoreScope::~GuestStoreScope() {
-	g_path = m_previous;
+	g_path   = m_previous;
+	g_source = m_previous_source;
 }
 
 } // namespace Common

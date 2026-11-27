@@ -46,6 +46,22 @@ inline const char* GuestStorePathName(GuestStorePath path) {
 	return "?";
 }
 
+// What a store's source address (GuestStore::source) names: the buffer or the image whose bytes
+// it copied, or nothing for paths without one.
+inline const char* GuestStoreSourceName(GuestStorePath path) {
+	switch (path) {
+		case GuestStorePath::BufferReadback:
+		case GuestStorePath::InPlaceReadback:
+		case GuestStorePath::GuestThreadReadback:
+		case GuestStorePath::AsyncReadback: return "buffer";
+		case GuestStorePath::ImageWriteBack:
+		case GuestStorePath::MetadataClearPublish:
+		case GuestStorePath::DccConstantPublish: return "image";
+		default: break;
+	}
+	return "source";
+}
+
 // One store, as a fault report reads it back.
 struct GuestStore {
 	uint64_t       sequence = 0; // 1 for the first store recorded
@@ -53,6 +69,7 @@ struct GuestStore {
 	uint64_t       address  = 0;
 	uint64_t       size     = 0;
 	uint64_t       first    = 0; // the first (up to) 8 bytes stored, little-endian
+	uint64_t       source   = 0; // guest address of the buffer or image it came from, or 0
 	uint32_t       thread   = 0; // host thread id
 	GuestStorePath path     = GuestStorePath::Backing;
 };
@@ -67,7 +84,7 @@ public:
 	static constexpr size_t Capacity = 4096;
 
 	void Record(GuestStorePath path, uint64_t address, uint64_t size, const void* data,
-	            uint32_t thread, uint64_t tsc) noexcept {
+	            uint32_t thread, uint64_t tsc, uint64_t source = 0) noexcept {
 		const auto sequence = m_next.fetch_add(1, std::memory_order_relaxed) + 1;
 		auto&      slot     = m_slots[sequence % Capacity];
 		uint64_t   first    = 0;
@@ -81,6 +98,7 @@ public:
 		slot.address.store(address, std::memory_order_relaxed);
 		slot.size.store(size, std::memory_order_relaxed);
 		slot.first.store(first, std::memory_order_relaxed);
+		slot.source.store(source, std::memory_order_relaxed);
 		slot.info.store(uint64_t {thread} | (uint64_t {static_cast<uint8_t>(path)} << 32u),
 		                std::memory_order_relaxed);
 		slot.sequence.store(sequence, std::memory_order_release);
@@ -107,6 +125,7 @@ public:
 			store.address   = slot.address.load(std::memory_order_relaxed);
 			store.size      = slot.size.load(std::memory_order_relaxed);
 			store.first     = slot.first.load(std::memory_order_relaxed);
+			store.source    = slot.source.load(std::memory_order_relaxed);
 			const auto info = slot.info.load(std::memory_order_relaxed);
 			store.thread    = static_cast<uint32_t>(info);
 			const auto path = static_cast<uint8_t>(info >> 32u);
@@ -129,6 +148,7 @@ private:
 		std::atomic<uint64_t> address {0};
 		std::atomic<uint64_t> size {0};
 		std::atomic<uint64_t> first {0};
+		std::atomic<uint64_t> source {0};
 		std::atomic<uint64_t> info {0}; // thread | path << 32
 	};
 	// Writers on different cores take the counter and then different slots.
@@ -146,20 +166,24 @@ inline bool GuestStoreOverlaps(const GuestStore& store, uint64_t begin, uint64_t
 GuestStoreRing& GuestStores();
 GuestStorePath  CurrentGuestStorePath();
 
-// Records a store of the calling thread under the path its scope names (or `path` when given).
+// Records a store of the calling thread under the path and source its scope names (or `path`
+// and `source` when given).
 void RecordGuestStore(uint64_t address, uint64_t size, const void* data);
-void RecordGuestStore(GuestStorePath path, uint64_t address, uint64_t size, const void* data);
+void RecordGuestStore(GuestStorePath path, uint64_t address, uint64_t size, const void* data,
+                      uint64_t source = 0);
 
-// Names the path of the backing writes the calling thread makes while it is alive.
+// Names the path of the backing writes the calling thread makes while it is alive, and the guest
+// address of the buffer or image whose bytes they copy (0 when there is none).
 class GuestStoreScope {
 public:
-	explicit GuestStoreScope(GuestStorePath path);
+	explicit GuestStoreScope(GuestStorePath path, uint64_t source = 0);
 	~GuestStoreScope();
 	GuestStoreScope(const GuestStoreScope&)            = delete;
 	GuestStoreScope& operator=(const GuestStoreScope&) = delete;
 
 private:
 	GuestStorePath m_previous;
+	uint64_t       m_previous_source;
 };
 
 // The time stamp counter and how many of its ticks pass per microsecond (measured between the
