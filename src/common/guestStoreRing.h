@@ -24,6 +24,13 @@ enum class GuestStorePath : uint8_t {
 	GpuThreadLabel,       // the same, stored by the GPU thread it was handed to
 	ElidedLabel,          // a label whose store an earlier read had elided
 	OcclusionCounters,    // z-pass counters of an occlusion query dump
+	// Outputs of HLE functions the guest asked for (they may land long after the call, on another
+	// thread, or in memory the guest has reused meanwhile).
+	FileRead,          // bytes a file read copied into the guest buffer
+	AjmOutput,         // samples an AJM decode wrote into the guest's output buffers
+	AvPlayerFrame,     // a video or audio frame AvPlayer wrote into its guest buffer
+	VideoDecoderFrame, // a picture VideoDec2/Vdecsw wrote into the guest's frame buffer
+	Ngs2Output,        // a render buffer NGS2 filled
 	Count,
 };
 
@@ -41,6 +48,11 @@ inline const char* GuestStorePathName(GuestStorePath path) {
 		case GuestStorePath::GpuThreadLabel: return "GPU-thread label";
 		case GuestStorePath::ElidedLabel: return "elided label";
 		case GuestStorePath::OcclusionCounters: return "occlusion counters";
+		case GuestStorePath::FileRead: return "file read";
+		case GuestStorePath::AjmOutput: return "AJM decode output";
+		case GuestStorePath::AvPlayerFrame: return "AvPlayer frame";
+		case GuestStorePath::VideoDecoderFrame: return "video decoder frame";
+		case GuestStorePath::Ngs2Output: return "NGS2 render output";
 		case GuestStorePath::Count: break;
 	}
 	return "?";

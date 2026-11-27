@@ -1,5 +1,6 @@
 #include "libs/videoDec2Decoder.h"
 
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 
 #include <algorithm>
@@ -373,6 +374,9 @@ private:
 			}
 		}
 
+		Common::RecordGuestStore(Common::GuestStorePath::VideoDecoderFrame,
+		                         reinterpret_cast<uint64_t>(frame_buffer.data), required,
+		                         frame_buffer.data);
 		output->valid           = true;
 		output->error_frame     = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
 		output->buffer_accepted = true;

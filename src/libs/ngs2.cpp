@@ -1,6 +1,7 @@
 #include "libs/ngs2.h"
 
 #include "common/assert.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "libs/ajm/atrac9_decoder.h"
@@ -3329,6 +3330,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		if ((buffers.written >> i & 1u) == 0) {
 			std::memset(buffer_info[i].buffer, 0, buffer_info[i].buffer_size);
 		}
+		Common::RecordGuestStore(Common::GuestStorePath::Ngs2Output,
+		                         reinterpret_cast<uint64_t>(buffer_info[i].buffer),
+		                         buffer_info[i].buffer_size, buffer_info[i].buffer);
 	}
 	for (auto* voice: voices) {
 		Ngs2PublishVoiceState(*voice);

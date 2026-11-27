@@ -1,5 +1,6 @@
 #include "common/common.h"
 #include "common/file.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
@@ -1604,6 +1605,8 @@ private:
 		FillPadding(dst, pitch, h, width, height,
 		            s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16);
 		FillPadding(c, pitch, h / 2, width, chroma_rows, 128);
+		Common::RecordGuestStore(Common::GuestStorePath::AvPlayerFrame,
+		                         reinterpret_cast<uint64_t>(dst), size, dst);
 		std::memset(info, 0, sizeof(*info));
 		info->data       = dst;
 		info->time_stamp = to_ms(
@@ -1669,6 +1672,8 @@ private:
 			buffer = std::move(replacement);
 		}
 		std::memcpy(buffer->Get(), pcm->data[0], size);
+		Common::RecordGuestStore(Common::GuestStorePath::AvPlayerFrame,
+		                         reinterpret_cast<uint64_t>(buffer->Get()), size, buffer->Get());
 		auto* s = fmt->streams[audio_id.value()];
 		std::memset(info, 0, sizeof(*info));
 		info->data       = buffer->Get();

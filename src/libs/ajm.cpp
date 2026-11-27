@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
@@ -477,6 +478,19 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 	                              &state->gapless);
 }
 
+// A decode into the guest's own output buffer, recorded in the store ring.
+static AjmDecodeResult AjmDecodeIntoGuest(uint32_t instance, const void* input, size_t input_size,
+                                          void* output, size_t output_size, bool multiple_frames) {
+	auto result =
+	    AjmDecodeInstance(instance, input, input_size, output, output_size, multiple_frames);
+	if (output != nullptr && result.output_written != 0) {
+		Common::RecordGuestStore(Common::GuestStorePath::AjmOutput,
+		                         reinterpret_cast<uint64_t>(output),
+		                         std::min<uint64_t>(result.output_written, output_size), output);
+	}
+	return result;
+}
+
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
                                               size_t           input_buffers_num,
                                               const AjmBuffer* output_buffers,
@@ -511,6 +525,9 @@ static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer
 		    (result.output_written > output_offset ? result.output_written - output_offset : 0));
 		if (output_buffers[i].address != nullptr && bytes != 0) {
 			std::memcpy(output_buffers[i].address, output.data() + output_offset, bytes);
+			Common::RecordGuestStore(Common::GuestStorePath::AjmOutput,
+			                         reinterpret_cast<uint64_t>(output_buffers[i].address), bytes,
+			                         output_buffers[i].address);
 		}
 		output_offset += output_buffers[i].size;
 	}
@@ -869,8 +886,8 @@ int KYTY_SYSV_ABI AjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result = AjmDecodeInstance(instance, bitstream_input, bitstream_input_size,
-	                                             pcm_output, pcm_output_size, true);
+	const auto decode_result = AjmDecodeIntoGuest(instance, bitstream_input, bitstream_input_size,
+	                                              pcm_output, pcm_output_size, true);
 	AjmWriteStreamResult(
 	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
 	    decode_result, true);
@@ -891,8 +908,8 @@ int KYTY_SYSV_ABI AjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result = AjmDecodeInstance(instance, bitstream_input, bitstream_input_size,
-	                                             pcm_output, pcm_output_size, false);
+	const auto decode_result = AjmDecodeIntoGuest(instance, bitstream_input, bitstream_input_size,
+	                                              pcm_output, pcm_output_size, false);
 	AjmWriteStreamResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE, decode_result,
 	                     false);
 
@@ -1118,8 +1135,8 @@ int KYTY_SYSV_ABI AjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
 	auto decode_result =
-	    AjmDecodeInstance(instance, data_input, data_input_size, data_output, data_output_size,
-	                      (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
+	    AjmDecodeIntoGuest(instance, data_input, data_input_size, data_output, data_output_size,
+	                       (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
 	AjmDecoder*      decoder = nullptr;
 	AjmGaplessState* gapless = nullptr;
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);

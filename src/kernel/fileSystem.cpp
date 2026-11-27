@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/guestStoreRing.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -227,6 +228,9 @@ static uint32_t ReadFileToGuest(Common::File& f, void* buf, uint32_t size) {
 		uint32_t read = 0;
 		f.Read(staging.data(), request, &read);
 		std::memcpy(destination + total, staging.data(), read);
+		Common::RecordGuestStore(Common::GuestStorePath::FileRead,
+		                         reinterpret_cast<uint64_t>(destination + total), read,
+		                         destination + total);
 		total += read;
 		if (read < request) {
 			break;
