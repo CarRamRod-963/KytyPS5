@@ -23,7 +23,7 @@ Compatibility, stability, and performance are still being tested. Some reported 
 - **OS:** Windows 10 / Windows 11 (x64)
 - **CPU:** x86-64-v3 processor with **AVX2** support
 - **GPU:** Vulkan 1.3-capable NVIDIA or AMD Radeon graphics card with up-to-date drivers
-- **Runtime:** [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+- **Runtime:** [Microsoft Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)
 - **Game files:** Your own legally obtained backup copy of the game. No copyrighted game files or keys are included.
 
 ## Hardware-Specific Tips
@@ -49,12 +49,11 @@ For a useful report log, set these two options in the launcher's global settings
 - **Printf output:** `File`
 - **Shader logging:** `Silent`
 
-Leave all other settings at their defaults unless a maintainer asks you to change a specific option. Follow the complete **[Settings for a report log](https://github.com/CarRamRod-963/KytyPS5/releases/tag/saros-v0.1.12#settings-for-a-report-log-please-read-before-you-send-a-log)** instructions before submitting a log. Attach `_kyty.txt` from the emulator folder, along with your game version, emulator build, hardware details, and steps to reproduce the issue.
+Leave all other settings at their defaults unless a maintainer asks you to change a specific option. Follow the complete **[Settings for a report log](https://github.com/CarRamRod-963/KytyPS5/releases/latest)** instructions before submitting a log. Attach `_kyty.txt` from the emulator folder, along with your game version, emulator build, hardware details, and steps to reproduce the issue.
 
 ## Credits
 
 - Upstream emulator core by [KytyPS5](https://github.com/KytyPS5/KytyPS5) and its contributors.
-- Saros compatibility, synchronization, and CPU/GPU work by [@CarRamRod-963](https://github.com/CarRamRod-963/KytyPS5).
 
 ---
 
