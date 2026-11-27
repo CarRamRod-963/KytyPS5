@@ -1127,7 +1127,8 @@ struct IndirectBufferAccess {
 	uint32_t stride;
 	uint32_t swizzle;
 	uint32_t format;
-	uint32_t selector;
+	uint32_t selector;  // DST_SEL_X of a formatted access.
+	uint32_t selectors; // Word 3: DST_SEL_X/Y/Z/W at bits 0, 3, 6 and 9.
 	uint32_t mode;
 	uint32_t records;
 	uint32_t index_in_bounds;
@@ -1176,6 +1177,7 @@ IndirectBufferAccess PrepareIndirectBuffer(EmitterState& state,
 	    .swizzle          = swizzle,
 	    .format           = field(word3, 12, 7),
 	    .selector         = formatted ? field(word3, 0, 3) : 0u,
+	    .selectors        = word3,
 	    .mode             = field(word3, 28, 2),
 	    .records          = records,
 	    .index_in_bounds  = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
@@ -1536,8 +1538,10 @@ uint32_t DecodeIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAcce
 	});
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
-                                uint32_t active) {
+// A formatted X/XY/XYZ/XYZW load through a GPU-selected V#: every output component takes its own
+// DST_SEL from the descriptor and converts through the run-time format.
+uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                               uint32_t components, bool coherent, uint32_t active) {
 	auto& state = ctx.state;
 	// Everything but the load is arithmetic, so an inactive lane computes it and drops it: one
 	// select instead of a branch around every formatted load.
@@ -1549,42 +1553,99 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, geometry, index);
 		return value;
 	};
-	const auto bytes = field(0);
-	const auto component =
-	    Binary(state, spv::OpUMod, TypeU32(state),
-	           Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)),
-	           field(1));
+	const auto bytes     = field(0);
+	const auto count     = field(1);
+	const auto spacing   = field(2);
 	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3));
 	const auto base      = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                              Unary(state, spv::OpNot, TypeU64(state), alignment));
-	const auto address =
-	    Binary(state, spv::OpIAdd, TypeU64(state), base,
-	           Unary(state, spv::OpUConvert, TypeU64(state),
-	                 Binary(state, spv::OpIMul, TypeU32(state), component, field(2))));
-	const auto memory = AndCondition(
-	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-	           ConstantU32(state, 4)));
-	// Format alignment and component spacing keep every selected component within one DWORD.
-	const auto word = LoadBdaDword(
-	    ctx,
-	    Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
-	           ConstantU64(state, ~uint64_t {3})),
-	    false,
+	const auto in_bounds = AndCondition(
+	    state, active,
+	    AndCondition(state,
+	                 Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
+	                 IndirectBufferInBounds(state, buffer, 0u, bytes, true)));
+	std::array<uint32_t, 4> values {};
+	for (uint32_t output = 0; output < components; ++output) {
+		const auto selector  = output == 0u ? buffer.selector
+		                                    : EmitBitFieldUExtract(state, buffer.selectors,
+		                                                           ConstantU32(state, output * 3u),
+		                                                           ConstantU32(state, 3u));
+		const auto component = Binary(
+		    state, spv::OpUMod, TypeU32(state),
+		    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), count);
+		const auto address =
+		    Binary(state, spv::OpIAdd, TypeU64(state), base,
+		           Unary(state, spv::OpUConvert, TypeU64(state),
+		                 Binary(state, spv::OpIMul, TypeU32(state), component, spacing)));
+		const auto from_memory = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+		                                ConstantU32(state, 4));
+		// Format alignment and component spacing keep every selected component within one DWORD.
+		const auto word = LoadBdaDword(ctx,
+		                               Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+		                                      ConstantU64(state, ~uint64_t {3})),
+		                               coherent, AndCondition(state, from_memory, in_bounds));
+		const auto byte =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+		const auto raw = Binary(
+		    state, spv::OpShiftRightLogical, TypeU32(state), word,
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3)));
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
+		                          state.indirect_format_function, buffer.format, selector,
+		                          component, raw);
+		values[output] = Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
+	}
+	return ConstructU32Composite(state, components, values);
+}
+
+// A typed (MTBUF) load through a GPU-selected V#: the instruction supplies the format and the
+// channels in order; the V# supplies address, bounds and validity. An invalid V# reads zero.
+uint32_t LoadIndirectTyped(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                           const IR::MemoryInfo& mem, uint32_t components, uint32_t active) {
+	auto&      state = ctx.state;
+	const auto info  = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.byte_size == 0u) return ConstantU32CompositeZero(state, components);
+	const auto valid = AndCondition(
+	    state, active,
 	    AndCondition(
-	        state, active,
-	        AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true))));
-	const auto byte =
-	    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-	           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-	const auto raw =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
-	           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3)));
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, buffer.format, buffer.selector,
-	                          component, raw);
-	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
+	        state,
+	        Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0u)),
+	        IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, info.byte_size), true)));
+	const auto              base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                                      ConstantU64(state, ~uint64_t {3}));
+	std::array<uint32_t, 4> words {};
+	const auto              load_word = [&](uint32_t component) {
+		const auto slot = Format::GetFormatComponentByteOffset(info, component) / 4u;
+		auto&      word = words[slot];
+		if (word != 0u) return word;
+		const auto address = slot == 0u ? base
+		                                : Binary(state, spv::OpIAdd, TypeU64(state), base,
+		                                         ConstantU64(state, slot * 4u));
+		word               = LoadBdaDword(ctx, address, mem.coherent, valid);
+		if (info.byte_size < 4u) {
+			const auto byte = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			                         Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+			                         ConstantU32(state, 4u - info.byte_size));
+			word            = Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+			                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
+			                                ConstantU32(state, 3)));
+		}
+		return word;
+	};
+	const auto load_subword = [&](uint32_t component, uint32_t bits) {
+		const auto byte = Format::GetFormatComponentByteOffset(info, component) % 4u;
+		return EmitBitFieldUExtract(state, load_word(component), ConstantU32(state, byte * 8u),
+		                            ConstantU32(state, bits));
+	};
+	std::array<uint32_t, 4> values {};
+	for (uint32_t output = 0; output < components; ++output) {
+		const auto value = LoadFormattedComponent(
+		    ctx, info, ResolveFormattedSource(ctx, mem, info, output), load_word, load_subword);
+		// Constant channels of an invalid or out-of-bounds access read zero as well.
+		values[output] = Select(state, TypeU32(state), valid, value, ConstantU32(state, 0));
+	}
+	return ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1653,14 +1714,22 @@ uint32_t LoadIndirectFormattedD16X(ValueEmitContext& ctx, const IndirectBufferAc
 	});
 }
 
+// The load function of a GPU-selected access: data bits, components, coherence, formatted flag
+// and, for a typed load, the instruction's format.
+std::array<uint32_t, 5> IndirectBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
+	return {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted),
+	        mem.typed ? uint32_t(Format::DecodeTBufferFormat(mem.data_format, mem.number_format))
+	                  : UINT32_MAX};
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		// The function reads zero for an inactive lane; a branch around every call would give the
 		// driver one more region per inlined copy.
-		const auto function = state.indirect_buffer_load_functions.at(
-		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+		const auto function =
+		    state.indirect_buffer_load_functions.at(IndirectBufferLoadKey(mem, components));
 		const auto            args   = IndirectBufferArgs(ctx, inst);
 		const auto            result = state.builder.AllocateId();
 		std::vector<uint32_t> words {spv::OpFunctionCall, TypeU32Composite(state, components),
@@ -1765,7 +1834,7 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto&      state = ctx.state;
-	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 4>> {
+	const auto key   = [&](const IR::Inst& inst) -> std::optional<std::array<uint32_t, 5>> {
 		const auto components = IR::BufferComponentCount(inst.GetOpcode());
 		if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
 			return std::nullopt;
@@ -1775,10 +1844,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 		    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 			return std::nullopt;
 		}
-		return std::array {memory.data_bits, components, uint32_t(memory.coherent),
-		                   uint32_t(memory.formatted)};
+		return IndirectBufferLoadKey(memory, components);
 	};
-	std::map<std::array<uint32_t, 4>, uint32_t> calls;
+	std::map<std::array<uint32_t, 5>, uint32_t> calls;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
 			if (const auto found = key(inst)) calls[*found] += state.lane_count;
@@ -1791,8 +1859,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(*found, 0u);
 			if (!inserted) continue;
 			const auto& memory     = ctx.Memory(inst);
-			// The formatted X load converts through these; its D16 form decodes from the table.
-			if (memory.formatted && memory.data_bits != 16u &&
+			// Formatted loads convert through these; the D16 form decodes from the table and a
+			// typed load takes its format from the instruction.
+			if (memory.formatted && !memory.typed && memory.data_bits != 16u &&
 			    state.indirect_format_function == 0u) {
 				DefineIndirectBufferFormats(ctx);
 			}
@@ -1805,7 +1874,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                       type, type, type, TypeBool(state));
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "") +
-			                  (memory.formatted ? "_formatted" : "");
+			                  (memory.typed       ? "_typed" + std::to_string((*found)[4])
+			                   : memory.formatted ? std::string("_formatted")
+			                                      : std::string());
 			state.builder.AddName(function, name.c_str());
 			// NVIDIA inlines every call, and its compile time grows faster than the program: a
 			// shader with hundreds of GPU-selected loads took minutes. From OutlinedLoadCalls call
@@ -1824,10 +1895,12 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
 			const auto result =
-			    !memory.formatted ? LoadIndirectBuffer(ctx, buffer, memory.data_bits, components,
-			                                           memory.coherent, active)
-			    : memory.data_bits == 16u ? LoadIndirectFormattedD16X(ctx, buffer, active)
-			                              : LoadIndirectFormattedX(ctx, buffer, active);
+			    memory.typed        ? LoadIndirectTyped(ctx, buffer, memory, components, active)
+			    : !memory.formatted ? LoadIndirectBuffer(ctx, buffer, memory.data_bits, components,
+			                                             memory.coherent, active)
+			    : memory.data_bits == 16u
+			        ? LoadIndirectFormattedD16X(ctx, buffer, active)
+			        : LoadIndirectFormatted(ctx, buffer, components, memory.coherent, active);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}

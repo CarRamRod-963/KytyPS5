@@ -4775,8 +4775,8 @@ private:
 				if (source == UINT32_MAX) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load, "
-					     "or a raw 8/16/32-bit store");
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted "
+					     "DWORD load, or a raw 8/16/32-bit store");
 				}
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);

@@ -7361,6 +7361,16 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   const auto unbounded = MakeBufferRecordFixture(1u, true, false, 0u, false,
                                                  false, d32_components);
   const auto unbounded_plan = ExtractResourcePlan(unbounded->program);
+  // Formatted DWORD vectors of a record whose stride is no power of two are read per lane through
+  // their GPU-selected V# (no candidate table): only the D16 form keeps the probes below.
+  if (d32_components != 0u) {
+    Check(std::ranges::any_of(unbounded->program.memory_info,
+                              [](const MemoryInfo &memory) {
+                                return memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
+                              }),
+          "an unbounded formatted DWORD record load was not read per lane");
+    return;
+  }
   memory.words[0] = 4u;
   const auto probe =
       (table_offset + 192u + 64u + 160u) / 4u; // row 1, inside its fields

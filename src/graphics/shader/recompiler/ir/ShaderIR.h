@@ -92,18 +92,16 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
-		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 8u) return !formatted && !typed && opcode == ValueOpcode::LoadBufferU8;
 		// A D16 formatted X load converts its component to the 16-bit VGPR form.
 		if (data_bits == 16u)
-			return formatted ? opcode == ValueOpcode::LoadBufferU32 : opcode == ValueOpcode::LoadBufferU16;
+			return !typed && (formatted ? opcode == ValueOpcode::LoadBufferU32
+			                            : opcode == ValueOpcode::LoadBufferU16);
+		// Formatted and typed loads of one to four DWORD components decode each component.
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       ((!formatted && !typed && opcode == ValueOpcode::ReadConstBuffer) ||
+		        opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	// A raw byte/short/DWORD store through a GPU-selected V# is written through its device address.

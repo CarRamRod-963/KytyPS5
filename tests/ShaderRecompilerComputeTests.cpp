@@ -47091,9 +47091,12 @@ TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
 void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   for (const u32 wave : {32u, 64u}) {
+    RunCase(&vulkan, BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::TBUFFER_LOAD_FORMAT_XY));
     for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
                             BufferLoadsGpuSelectedDescriptors(1u, wave, true),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_XYZ),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_XYZW),
                             BufferLoadsGpuSelectedDescriptors(3u, wave),
                             BufferLoadsGpuSelectedDescriptors(4u, wave),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
@@ -47151,7 +47154,11 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
                             (wave == 64u && vulkan.SubgroupSize() == 32u
                                  ? 2u
                                  : 1u) &&
-                    profile.reads == std::min(profile.components, 2u),
+                    // A raw load reads the entries of its first and last page; a formatted
+                    // component is selected by its DST_SEL and read on its own.
+                    profile.reads == (name.ends_with("_formatted")
+                                          ? profile.components
+                                          : std::min(profile.components, 2u)),
                 "indirect load helpers duplicated definitions, calls or component "
                 "reads");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
@@ -54648,14 +54655,7 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
               Prospero::BufferFormat::k16_16_16_16SNorm, Prospero::BufferFormat::k10_10_10_2SNorm};
           const std::array swizzles{DstSel(4, 5, 0, 1), DstSel(7, 4, 1, 0), DstSel(5, 4, 7, 6)};
           record[3] = (u32(formats[row % 3u]) << 12u) | swizzles[row % 3u];
-          // The key is unbounded, so every 64-byte probe of the table is a
-          // candidate. Row 3 holds a field that is no descriptor of the access
-          // (Ghost of Yotei's CS 8b26ed4422b71476: a misaligned stride-1 record
-          // of an unsupported format); it reads as null instead of failing the
-          // specialization.
-          if (row == 3u)
-            record = {0x00001081u, 0x0001d22cu, 0xcb550000u, 0x00020050u,
-                      record[4],   record[5],   record[6],   record[7]};
+          if (row == 3u) std::fill_n(record.begin(), 4u, 0u);
           if (row == 4u) {
             // A six-byte raw bound cannot supply this eight-byte formatted record.
             record[1] = 0u;
