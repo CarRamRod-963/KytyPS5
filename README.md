@@ -1,3 +1,63 @@
+# KytyPS5 — Saros Experimental Fork
+
+An unofficial experimental fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5), focused on performance, stability, and rendering correctness for **Saros** (`PPSA07631`, game version `01.005.002`).
+
+> **Note:** This is an independent fork and is not affiliated with the upstream `KytyPS5` project. Please report issues, logs, and test results in this repository's [Issues](../../issues) tab, not upstream.
+
+Compatibility, stability, and performance are still being tested. Some reported problems and possible fixes remain under investigation. See the [latest release notes](../../releases) for what changed and what is still open.
+
+## Quick Start
+
+1. Download the latest portable archive from the [Releases](../../releases) page.
+2. Extract the ZIP into a **new, empty folder**. Settings (`Kyty.ini`), saves, shader caches, and logs remain portable inside this folder.
+3. Launch `kyty_launcher.exe`, select your game folder, and set your preferred display resolution.
+4. Double-click the game row (or right-click and choose **Run**).
+
+### Upgrading from an Earlier `saros` Build
+
+- Extract the new release into a fresh folder and copy over your `Kyty.ini` and `_SaveData` folder.
+- You can also copy `_PipelineCache`. The emulator may rebuild updated shaders in the background during the first boot.
+
+## System Requirements
+
+- **OS:** Windows 10 / Windows 11 (x64)
+- **CPU:** x86-64-v3 processor with **AVX2** support
+- **GPU:** Vulkan 1.3-capable NVIDIA or AMD Radeon graphics card with up-to-date drivers
+- **Runtime:** [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+- **Game files:** Your own legally obtained backup copy of the game. No copyrighted game files or keys are included.
+
+## Hardware-Specific Tips
+
+### NVIDIA GeForce
+
+- In the NVIDIA Control Panel, set **Shader Cache Size** to **Unlimited**.
+
+### AMD Radeon
+
+- Keep **Maximal reconvergence** set to **Auto**.
+- Leave **Emulate wave64 compute shaders** unticked.
+- If you encounter black/blocky characters, stretched triangles, or dark specks, capture a screenshot using the default settings. Then enable **Skip shader simplification for the driver**, restart, and capture a second screenshot in the same location. Include both screenshots, `_kyty.txt`, your GPU model, and driver version in the report.
+
+For current CPU-specific options and other hardware guidance, check the [latest release notes](../../releases).
+
+## Bug Reports and Logs
+
+Please report issues with this fork in its [Issues](../../issues) tab, not in the upstream KytyPS5 repository.
+
+For a useful report log, set these two options in the launcher's global settings:
+
+- **Printf output:** `File`
+- **Shader logging:** `Silent`
+
+Leave all other settings at their defaults unless a maintainer asks you to change a specific option. Follow the complete **[Settings for a report log](https://github.com/CarRamRod-963/KytyPS5/releases/tag/saros-v0.1.12#settings-for-a-report-log-please-read-before-you-send-a-log)** instructions before submitting a log. Attach `_kyty.txt` from the emulator folder, along with your game version, emulator build, hardware details, and steps to reproduce the issue.
+
+## Credits
+
+- Upstream emulator core by [KytyPS5](https://github.com/KytyPS5/KytyPS5) and its contributors.
+- Saros compatibility, synchronization, and CPU/GPU work by [@CarRamRod-963](https://github.com/CarRamRod-963/KytyPS5).
+
+---
+
 # KytyPS5
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
