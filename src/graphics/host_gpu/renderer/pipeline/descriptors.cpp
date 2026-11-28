@@ -2075,7 +2075,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 void RenderExecutor::NoteBindless(CommandLog::Command& command) {
 	if (m_committed_bindless) {
 		command.flags |= CommandLog::FlagBindless;
-		command.bindless_writes = m_context.GetBindlessTable().SlotWrites();
+		const auto counters      = m_context.GetBindlessTable().SlotCounters();
+		command.bindless_writes  = counters.writes;
+		command.bindless_highest = counters.highest;
+		command.bindless_reuses  = counters.reuses;
 	}
 }
 

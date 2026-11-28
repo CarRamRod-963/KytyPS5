@@ -5,10 +5,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,8 +40,82 @@ enum class Kind : uint8_t {
 };
 
 inline constexpr uint8_t FlagAsyncCompute = 1u << 0u; // from a guest compute queue
-// Binds the bindless image table; `bindless_writes` is the table's slot-write count at recording.
+// Binds the bindless image table; `bindless_*` hold the table's slot counters at recording.
 inline constexpr uint8_t FlagBindless = 1u << 1u;
+
+// The slot counters of the bindless image table (BindlessTable): descriptor writes, the highest
+// slot index written, and reuses: writes of an image into a slot that held a descriptor before
+// (a slot freed and handed out again).
+struct BindlessCounters {
+	uint64_t writes  = 0;
+	uint32_t highest = 0;
+	uint64_t reuses  = 0;
+};
+
+// A command keeps the counters in one word: the writes and reuses modulo these bounds (a pending
+// command never trails the table by that many), the slot below BindlessSlotBound.
+inline constexpr uint64_t BindlessWritesBound = uint64_t {1} << 32u;
+inline constexpr uint32_t BindlessSlotBound   = 1u << 12u;
+inline constexpr uint64_t BindlessReusesBound = uint64_t {1} << 20u;
+static_assert(std::countr_zero(BindlessWritesBound) + std::countr_zero(BindlessSlotBound) +
+                  std::countr_zero(BindlessReusesBound) ==
+              64);
+
+inline uint64_t PackBindless(const BindlessCounters& counters) noexcept {
+	return (counters.writes % BindlessWritesBound) |
+	       (uint64_t {counters.highest % BindlessSlotBound} << 32u) |
+	       ((counters.reuses % BindlessReusesBound) << 44u);
+}
+
+inline BindlessCounters UnpackBindless(uint64_t word) noexcept {
+	return {word % BindlessWritesBound, static_cast<uint32_t>((word >> 32u) % BindlessSlotBound),
+	        word >> 44u};
+}
+
+// Counts the bindless table's slot descriptor writes. One writer (the thread that writes the
+// descriptors); any thread may read. O(1) per write.
+class BindlessSlotTally {
+public:
+	// A descriptor write of `slot` (below BindlessSlotBound); `image` is false for a null one.
+	void Note(uint32_t slot, bool image) noexcept {
+		Increment(m_writes);
+		if (!m_written[slot]) {
+			m_written[slot] = true;
+			Increment(m_slots_written);
+		} else if (image) {
+			Increment(m_reuses);
+		}
+		if (slot > m_highest.load(std::memory_order_relaxed)) {
+			m_highest.store(slot, std::memory_order_relaxed);
+		}
+	}
+
+	[[nodiscard]] BindlessCounters Counters() const noexcept {
+		return {m_writes.load(std::memory_order_relaxed), m_highest.load(std::memory_order_relaxed),
+		        m_reuses.load(std::memory_order_relaxed)};
+	}
+	[[nodiscard]] uint64_t Writes() const noexcept {
+		return m_writes.load(std::memory_order_relaxed);
+	}
+	// Slots below the highest one written that never got a descriptor.
+	[[nodiscard]] uint32_t NeverWritten() const noexcept {
+		const uint64_t written = m_slots_written.load(std::memory_order_relaxed);
+		const uint64_t slots   = uint64_t {m_highest.load(std::memory_order_relaxed)} + 1u;
+		return written == 0 ? 0 : static_cast<uint32_t>(slots - std::min(written, slots));
+	}
+
+private:
+	template <typename T>
+	static void Increment(std::atomic<T>& counter) noexcept {
+		counter.store(counter.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+	}
+
+	std::atomic<uint64_t>          m_writes {0};
+	std::atomic<uint64_t>          m_slots_written {0};
+	std::atomic<uint64_t>          m_reuses {0};
+	std::atomic<uint32_t>          m_highest {0};
+	std::bitset<BindlessSlotBound> m_written;
+};
 
 struct Command {
 	Kind    kind  = Kind::None;
@@ -61,9 +137,11 @@ struct Command {
 	uint64_t address = 0;
 	// Kind::Scatter: the device address of its first piece table (header, then the pieces).
 	uint64_t table = 0;
-	// With FlagBindless: how many bindless slot descriptors had been written when the command
-	// was recorded.
-	uint64_t bindless_writes = 0;
+	// With FlagBindless: the bindless table's slot counters when the command was recorded
+	// (modulo the BindlessCounters bounds).
+	uint64_t bindless_writes  = 0;
+	uint32_t bindless_highest = 0;
+	uint64_t bindless_reuses  = 0;
 };
 
 struct Entry {
@@ -155,12 +233,14 @@ public:
 
 private:
 	// One slot word holds the field that matters for the kind: a pass name, a scatter's table
-	// address or a bindless slot-write count. That keeps a slot in one cache line.
+	// address or the bindless slot counters. That keeps a slot in one cache line.
 	static uint64_t PackWord(const Command& command) noexcept {
 		switch (command.kind) {
 			case Kind::Internal: return reinterpret_cast<uintptr_t>(command.name);
 			case Kind::Scatter: return command.table;
-			default: return command.bindless_writes;
+			default:
+				return PackBindless(
+				    {command.bindless_writes, command.bindless_highest, command.bindless_reuses});
 		}
 	}
 	static void UnpackWord(uint64_t word, Command& command) noexcept {
@@ -169,7 +249,13 @@ private:
 				command.name = reinterpret_cast<const char*>(static_cast<uintptr_t>(word));
 				break;
 			case Kind::Scatter: command.table = word; break;
-			default: command.bindless_writes = word; break;
+			default: {
+				const auto counters      = UnpackBindless(word);
+				command.bindless_writes  = counters.writes;
+				command.bindless_highest = counters.highest;
+				command.bindless_reuses  = counters.reuses;
+				break;
+			}
 		}
 	}
 
@@ -216,8 +302,11 @@ inline bool IsDispatch(Kind kind) {
 	return kind == Kind::Dispatch || kind == Kind::DispatchIndirect;
 }
 
-// One command as the end of a line: what it is, its shaders and counts.
-inline std::string Describe(const Command& c) {
+// One command as the end of a line: what it is, its shaders and counts. `bindless_now`, when
+// known, are the bindless table's counters at the report: a bindless command also says how many
+// slots were written and reused while it was pending.
+inline std::string Describe(const Command&                         c,
+                            const std::optional<BindlessCounters>& bindless_now = std::nullopt) {
 	char line[200];
 	switch (c.kind) {
 		case Kind::Dispatch:
@@ -265,8 +354,19 @@ inline std::string Describe(const Command& c) {
 	}
 	std::string out = line;
 	if ((c.flags & FlagBindless) != 0) {
-		std::snprintf(line, sizeof(line), " bindless (slot writes %" PRIu64 ")", c.bindless_writes);
+		std::snprintf(line, sizeof(line),
+		              " bindless (slot writes %" PRIu64 ", highest slot %u, reuses %" PRIu64,
+		              c.bindless_writes, c.bindless_highest, c.bindless_reuses);
 		out += line;
+		if (bindless_now) {
+			const auto writes = (bindless_now->writes - c.bindless_writes) % BindlessWritesBound;
+			const auto reuses = (bindless_now->reuses - c.bindless_reuses) % BindlessReusesBound;
+			std::snprintf(line, sizeof(line),
+			              "; since: %" PRIu64 " slot writes, %" PRIu64 " reuses, highest slot %u",
+			              writes, reuses, bindless_now->highest);
+			out += line;
+		}
+		out += ')';
 	}
 	if ((c.flags & FlagAsyncCompute) != 0) {
 		out += " (compute queue)";
@@ -311,9 +411,11 @@ inline std::string FormatCounterNote(std::string_view log_name, bool read, uint6
 // its commands is held any more, or `completed` is not a submitted tick (unknown), the commands
 // of the oldest submission still held are listed instead: the first unfinished one is that one or
 // an older one. `log_name` names the scheduler. `checkpoints` (may be empty) are the queue's
-// checkpoints; those of other logs are left out. Lines end in a newline.
+// checkpoints; those of other logs are left out. `bindless_now`: see Describe. Lines end in a
+// newline.
 inline std::string Format(const Ring& ring, std::string_view log_name, uint64_t completed,
-                          uint64_t submitted, std::span<const Checkpoint> checkpoints = {}) {
+                          uint64_t submitted, std::span<const Checkpoint> checkpoints = {},
+                          const std::optional<BindlessCounters>& bindless_now = std::nullopt) {
 	std::string    out;
 	char           line[256];
 	const bool     known  = completed <= submitted;
@@ -408,7 +510,7 @@ inline std::string Format(const Ring& ring, std::string_view log_name, uint64_t 
 		if (shown) {
 			std::snprintf(line, sizeof(line), "%s command %" PRIu64 ": ", prefix.c_str(), index);
 			out += line;
-			out += Describe(entry.command);
+			out += Describe(entry.command, bindless_now);
 			out += '\n';
 		} else if (index == ShownCommands) {
 			std::snprintf(line, sizeof(line), "%s commands not shown: %" PRIu64 "\n",

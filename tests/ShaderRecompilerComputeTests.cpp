@@ -8086,6 +8086,18 @@ public:
                          nullptr, vk::ImageLayout::eGeneral);
       Require(name, "bindless slot writes", bindless.SlotWrites() == writes + 2,
               "the bindless table did not count its slot writes");
+      // The scheduler's loss report reads the table's counters from the
+      // context.
+      const auto counters = bindless.SlotCounters();
+      const auto published =
+          CmdLog::UnpackBindless(m_runtime_context.bindless_counters.load());
+      Require(name, "bindless counters published",
+              counters.writes == writes + 2 &&
+                  published.writes ==
+                      counters.writes % CmdLog::BindlessWritesBound &&
+                  published.highest == counters.highest &&
+                  published.reuses == counters.reuses,
+              "the bindless table did not publish its slot counters");
     }
     std::printf("[host]    %-32s ok\n", name);
   }

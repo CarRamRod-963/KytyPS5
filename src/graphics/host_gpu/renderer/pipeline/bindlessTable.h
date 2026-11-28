@@ -37,10 +37,12 @@ public:
 	[[nodiscard]] bool                    Created() const noexcept { return m_set != nullptr; }
 
 	void WriteSlot(uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
-	// Slot descriptors written so far (WriteSlot calls). Commands that bind the table note it, and
-	// a lost device reports it, to tell whether slots changed while those commands were pending.
-	[[nodiscard]] uint64_t SlotWrites() const noexcept {
-		return m_slot_writes.load(std::memory_order_relaxed);
+	// Slot descriptors written so far (WriteSlot calls). Commands that bind the table note the
+	// slot counters, and a lost device reports them, to tell whether slots changed while those
+	// commands were pending.
+	[[nodiscard]] uint64_t SlotWrites() const noexcept { return m_slot_tally.Writes(); }
+	[[nodiscard]] CommandLog::BindlessCounters SlotCounters() const noexcept {
+		return m_slot_tally.Counters();
 	}
 	// Makes the GPU's shader writes to the feedback words visible to the host.
 	void MakeFeedbackVisible(vk::CommandBuffer command_buffer);
@@ -64,7 +66,7 @@ private:
 	std::unique_ptr<Buffer>            m_feedback;
 	std::optional<BindlessTranslation> m_entries;
 	uint32_t                           m_feedback_cursor = 0;
-	std::atomic<uint64_t>              m_slot_writes {0};
+	CommandLog::BindlessSlotTally      m_slot_tally;
 };
 
 } // namespace Libs::Graphics

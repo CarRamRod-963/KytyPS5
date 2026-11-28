@@ -234,6 +234,9 @@ struct GraphicContext {
 	static constexpr size_t                                     LostWorkReporterLimit = 4;
 	mutable std::mutex                                          lost_work_mutex;
 	mutable std::array<LostWorkReporter, LostWorkReporterLimit> lost_work_reporters {};
+	// The bindless image table's slot counters (CommandLog::PackBindless), for the lost-device
+	// report of the commands that bind it; 0 until the table writes a slot.
+	std::atomic<uint64_t>                    bindless_counters {0};
 	std::mutex                               cache_marks_mutex;
 	MemoryBudget::LiveMarks                  cache_marks;
 	MemoryPriority::Tracker                  memory_priority;

@@ -10,6 +10,10 @@
 
 namespace {
 
+using Libs::Graphics::CommandLog::BindlessCounters;
+using Libs::Graphics::CommandLog::BindlessReusesBound;
+using Libs::Graphics::CommandLog::BindlessSlotTally;
+using Libs::Graphics::CommandLog::BindlessWritesBound;
 using Libs::Graphics::CommandLog::Checkpoint;
 using Libs::Graphics::CommandLog::Command;
 using Libs::Graphics::CommandLog::CompletedTick;
@@ -21,9 +25,11 @@ using Libs::Graphics::CommandLog::Format;
 using Libs::Graphics::CommandLog::FormatCounterNote;
 using Libs::Graphics::CommandLog::Kind;
 using Libs::Graphics::CommandLog::MakeMarker;
+using Libs::Graphics::CommandLog::PackBindless;
 using Libs::Graphics::CommandLog::Ring;
 using Libs::Graphics::CommandLog::ShownCommands;
 using Libs::Graphics::CommandLog::ShownShaders;
+using Libs::Graphics::CommandLog::UnpackBindless;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -120,7 +126,9 @@ void TestLossFacts() {
                  .x = 32,
                  .y = 32,
                  .z = 16,
-                 .bindless_writes = 412});
+                 .bindless_writes = 412,
+                 .bindless_highest = 380,
+                 .bindless_reuses = 21});
   ring.Note(11, {.kind = Kind::DrawIndexed,
                  .flags = FlagBindless | FlagAsyncCompute,
                  .shader0 = 0xaa,
@@ -138,9 +146,10 @@ void TestLossFacts() {
       "Lost submission (main) command 1: upload copies source 0x500000000 "
       "offsets 0x100-0x200\n"
       "Lost submission (main) command 2: dispatch CS b5710780d3d8eb7b groups "
-      "32x32x16 bindless (slot writes 412)\n"
+      "32x32x16 bindless (slot writes 412, highest slot 380, reuses 21)\n"
       "Lost submission (main) command 3: draw indexed VS 00000000000000aa PS "
-      "00000000000000bb count 3 instances 1 bindless (slot writes 413) "
+      "00000000000000bb count 3 instances 1 bindless (slot writes 413, highest "
+      "slot 0, reuses 0) "
       "(compute queue)\n"
       "Lost submission (main) command 4: internal tiling pass\n"
       "Lost submission (main) shader: CS b5710780d3d8eb7b x 1\n"
@@ -155,8 +164,10 @@ void TestLossFacts() {
             entry.command.address == 0x500000000,
         "scatter fields read back");
   Check(ring.Read(3, entry) && entry.command.bindless_writes == 412 &&
-            entry.command.table == 0 && entry.command.name == nullptr,
-        "bindless count read back");
+            entry.command.bindless_highest == 380 &&
+            entry.command.bindless_reuses == 21 && entry.command.table == 0 &&
+            entry.command.name == nullptr,
+        "bindless counters read back");
   Check(ring.Read(5, entry) && entry.command.bindless_writes == 0 &&
             std::string_view(entry.command.name) == "tiling pass",
         "pass name read back");
@@ -169,6 +180,75 @@ void TestLossFacts() {
                   .bindless_writes = 7})
                 .find("bindless") == std::string::npos,
         "bindless count without the flag");
+}
+
+// A lost device reports, for each pending bindless command, the slots the
+// table wrote and handed out again while it was pending.
+void TestBindlessCountersSinceRecording() {
+  // The packed word keeps each counter modulo its bound.
+  const BindlessCounters big{BindlessWritesBound + 5, 4095,
+                             BindlessReusesBound * 3 + 9};
+  const auto unpacked = UnpackBindless(PackBindless(big));
+  Check(unpacked.writes == 5 && unpacked.highest == 4095 &&
+            unpacked.reuses == 9,
+        "packed counters");
+  Check(UnpackBindless(PackBindless({7, 0, 0})).writes == 7 &&
+            UnpackBindless(PackBindless({0, 0, 1})).reuses == 1 &&
+            UnpackBindless(PackBindless({0, 1, 0})).highest == 1,
+        "packed fields are separate");
+
+  Ring ring(3, 64);
+  // Recorded just before the counters wrapped.
+  ring.Note(20, {.kind = Kind::Dispatch,
+                 .flags = FlagBindless,
+                 .shader0 = 0x2a40620300000000,
+                 .x = 32,
+                 .y = 32,
+                 .z = 16,
+                 .bindless_writes = BindlessWritesBound - 4,
+                 .bindless_highest = 811,
+                 .bindless_reuses = BindlessReusesBound - 1});
+  ring.Note(20, Dispatch(0x77, 1));
+  const BindlessCounters now{BindlessWritesBound + 80, 830, 36};
+  CheckText(
+      Format(ring, "main", 19, 20, {}, now),
+      "Lost submission (main): tick 20, GPU at 19, submitted up to 20, 2 "
+      "command(s) noted\n"
+      "Lost submission (main) command 0: dispatch CS 2a40620300000000 groups "
+      "32x32x16 bindless (slot writes 4294967292, highest slot 811, reuses "
+      "1048575; since: 84 slot writes, 37 reuses, highest slot 830)\n"
+      "Lost submission (main) command 1: dispatch CS 0000000000000077 groups "
+      "1x1x1\n"
+      "Lost submission (main) shader: CS 2a40620300000000 x 1\n"
+      "Lost submission (main) shader: CS 0000000000000077 x 1\n",
+      "bindless counters since the command was recorded");
+  // Without the table's counters only the recorded ones are shown.
+  Check(Count(Format(ring, "main", 19, 20), "since") == 0,
+        "no since without the counters now");
+}
+
+// The table's tally: writes, the highest slot, reuses (an image written into a
+// slot that held a descriptor before) and the unwritten slots below the
+// highest.
+void TestBindlessSlotTally() {
+  BindlessSlotTally tally;
+  Check(tally.Writes() == 0 && tally.NeverWritten() == 0, "empty tally");
+  tally.Note(0, false); // the placeholder
+  tally.Note(1, true);
+  tally.Note(2, true);
+  Check(tally.NeverWritten() == 0 && tally.Counters().highest == 2 &&
+            tally.Counters().reuses == 0,
+        "slots handed out in order");
+  tally.Note(2, false); // freed
+  tally.Note(2, true);  // handed out again
+  tally.Note(6, true);  // above slots that never got a descriptor
+  const auto counters = tally.Counters();
+  Check(counters.writes == 6 && counters.highest == 6 && counters.reuses == 1,
+        "reuse and highest slot");
+  Check(tally.NeverWritten() == 3, "slots 3 to 5 never written");
+  tally.Note(4, true);
+  Check(tally.NeverWritten() == 2 && tally.Counters().reuses == 1,
+        "a first write is no reuse");
 }
 
 // After a lost device the timeline counter may read UINT64_MAX (or fail):
@@ -381,6 +461,8 @@ void TestConcurrentNotes() {
 int main() {
   TestReportOfLostSubmission();
   TestLossFacts();
+  TestBindlessCountersSinceRecording();
+  TestBindlessSlotTally();
   TestUnknownCompletedTick();
   TestReadAndMarkers();
   TestOverwrittenStart();

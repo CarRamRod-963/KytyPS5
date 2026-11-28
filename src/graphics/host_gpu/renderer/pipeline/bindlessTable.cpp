@@ -15,6 +15,8 @@ namespace Libs::Graphics {
 
 namespace IR = ShaderRecompiler::IR;
 
+static_assert(IR::BindlessImageSlots <= CommandLog::BindlessSlotBound);
+
 BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler) {
 	if (!graphics.bindless_enabled) {
@@ -133,17 +135,23 @@ void BindlessTable::WriteSlot(uint32_t slot, vk::ImageView view, vk::ImageLayout
 	write.descriptorType  = vk::DescriptorType::eSampledImage;
 	write.pImageInfo      = &image;
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
-	// One writer (the GPU thread); the lost-device report reads it from any thread.
-	m_slot_writes.store(m_slot_writes.load(std::memory_order_relaxed) + 1u,
-	                    std::memory_order_relaxed);
+	// One writer (the GPU thread); the lost-device report reads the counters from any thread.
+	m_slot_tally.Note(slot, static_cast<bool>(view));
+	m_graphics.bindless_counters.store(CommandLog::PackBindless(m_slot_tally.Counters()),
+	                                   std::memory_order_relaxed);
 }
 
 void BindlessTable::ReportLostDevice(const void* object,
                                      std::span<const CommandLog::Checkpoint> /*checkpoints*/) {
-	const auto& table = *static_cast<const BindlessTable*>(object);
-	char        line[128];
-	std::snprintf(line, sizeof(line), "Lost submission: bindless slot writes now %" PRIu64 "%s\n",
-	              table.SlotWrites(), table.Created() ? "" : " (table never used)");
+	const auto& table    = *static_cast<const BindlessTable*>(object);
+	const auto  counters = table.m_slot_tally.Counters();
+	char        line[256];
+	std::snprintf(line, sizeof(line),
+	              "Lost submission: bindless slot writes now %" PRIu64
+	              ", highest slot written %u, slot reuses %" PRIu64
+	              ", slots below the highest never written %u%s\n",
+	              counters.writes, counters.highest, counters.reuses,
+	              table.m_slot_tally.NeverWritten(), table.Created() ? "" : " (table never used)");
 	Log::WriteToConsoleAndLog(line);
 }
 
