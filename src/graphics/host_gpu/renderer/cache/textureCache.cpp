@@ -398,7 +398,8 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
-		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size,
+		                                        PageWatcher::TextureImage);
 		return;
 	}
 	if (image_begin < image.track_addr) {
@@ -423,7 +424,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	}
 	const auto size  = image.track_addr - image_begin;
 	image.track_addr = image_begin;
-	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
+	m_page_manager.UpdatePageWatchers<true>(image_begin, size, PageWatcher::TextureImage);
 }
 
 void TextureCache::TrackImageTail(ImageId id) {
@@ -441,7 +442,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
 	image.track_addr_end = image_end;
-	m_page_manager.UpdatePageWatchers<true>(address, size);
+	m_page_manager.UpdatePageWatchers<true>(address, size, PageWatcher::TextureImage);
 }
 
 void TextureCache::UntrackImage(ImageId id) {
@@ -454,7 +455,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers<false>(address, size);
+		m_page_manager.UpdatePageWatchers<false>(address, size, PageWatcher::TextureImage);
 	}
 }
 
@@ -476,7 +477,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers<false>(begin, size);
+		m_page_manager.UpdatePageWatchers<false>(begin, size, PageWatcher::TextureImage);
 	}
 }
 
@@ -496,7 +497,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers<false>(address, size);
+		m_page_manager.UpdatePageWatchers<false>(address, size, PageWatcher::TextureImage);
 	}
 }
 

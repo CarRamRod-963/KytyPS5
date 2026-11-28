@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -11,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -37,14 +39,22 @@ constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
+// Callers hold a region spin lock or run in the fault handler, so the message is formatted on
+// the stack; it goes to the log file (flushed) and the console before the process ends.
 [[noreturn]] void Fatal(const char* format, ...) {
-	std::fputs("PageManager fatal: ", stderr);
-	va_list args;
+	char       message[512];
+	const auto prefix = std::snprintf(message, sizeof(message), "PageManager fatal: ");
+	va_list    args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(message + prefix, sizeof(message) - static_cast<size_t>(prefix), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
+	const auto length = std::strlen(message);
+	if (length + 1 < sizeof(message)) {
+		message[length]     = '\n';
+		message[length + 1] = '\0';
+	}
+	Log::WriteToConsoleAndLog(message);
+	std::fflush(nullptr);
 	std::_Exit(322);
 }
 
@@ -80,6 +90,29 @@ struct PageManager::Impl {
 	struct PageState {
 		uint8_t write_watchers  = 0;
 		uint8_t access_watchers = 0;
+		// Of write_watchers; the memory tracker holds the rest.
+		uint8_t image_watchers = 0;
+		uint8_t heap_watchers  = 0;
+
+		[[nodiscard]] PageWatcherCounts WriteCounts() const noexcept {
+			return {write_watchers, image_watchers, heap_watchers};
+		}
+
+		// Watchers of one owner never exceed the page's total, which is checked first. A
+		// mismatched release only loses the split, never the total.
+		void AddOwner(PageWatcher watcher, int delta) noexcept {
+			uint8_t* count = nullptr;
+			switch (watcher) {
+				case PageWatcher::TextureImage: count = &image_watchers; break;
+				case PageWatcher::ImageHeap: count = &heap_watchers; break;
+				case PageWatcher::MemoryTracker: return;
+			}
+			if (delta > 0) {
+				(*count)++;
+			} else if (*count != 0) {
+				(*count)--;
+			}
+		}
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -92,7 +125,7 @@ struct PageManager::Impl {
 		}
 
 		template <int delta, bool is_read>
-		uint32_t AddDelta(uint64_t address) {
+		uint32_t AddDelta(uint64_t address, PageWatcher watcher = PageWatcher::MemoryTracker) {
 			static_assert(delta >= -1 && delta <= 1);
 			if constexpr (is_read) {
 				if constexpr (delta == 1) {
@@ -111,13 +144,20 @@ struct PageManager::Impl {
 			} else {
 				if constexpr (delta == 1) {
 					if (write_watchers == UINT8_MAX) {
-						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
+						const auto counts = WriteCounts();
+						Fatal("write-watcher overflow at 0x%016" PRIx64
+						      " (%u watchers: %u texture cache images, %u image heap, %u memory "
+						      "tracker; adding: %s)",
+						      address, counts.total, counts.texture_image, counts.image_heap,
+						      counts.MemoryTracker(), PageWatcherName(watcher));
 					}
+					AddOwner(watcher, 1);
 					return ++write_watchers;
 				} else if constexpr (delta == -1) {
 					if (write_watchers == 0) {
 						Fatal("write-watcher underflow at 0x%016" PRIx64, address);
 					}
+					AddOwner(watcher, -1);
 					return --write_watchers;
 				} else {
 					return write_watchers;
@@ -125,7 +165,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 2);
+	static_assert(sizeof(PageState) == 4);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -194,7 +234,8 @@ struct PageManager::Impl {
 
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                          const RegionBits* mask = nullptr) {
+	                          const RegionBits* mask    = nullptr,
+	                          PageWatcher       watcher = PageWatcher::MemoryTracker) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -216,7 +257,7 @@ struct PageManager::Impl {
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
+			const auto new_count = update ? page.AddDelta<delta, is_read>(address, watcher)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 
@@ -245,7 +286,7 @@ struct PageManager::Impl {
 	}
 
 	template <bool track, bool is_read>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, PageWatcher watcher) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -258,7 +299,8 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last, nullptr,
+			                                            watcher);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -275,14 +317,14 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 PageManager::~PageManager() = default;
 
 template <bool track, bool is_read>
-void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
+void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size, PageWatcher watcher) {
+	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size, watcher);
 }
 
-template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t, PageWatcher);
+template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t, PageWatcher);
+template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t, PageWatcher);
+template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t, PageWatcher);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
@@ -291,8 +333,8 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	const auto first       = start_range.first;
 	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
-		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		m_impl->UpdatePageWatchers<track, is_read>(
+		    base_addr + first * PAGE_SIZE, (last - first) * PAGE_SIZE, PageWatcher::MemoryTracker);
 		return;
 	}
 
@@ -310,6 +352,28 @@ bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t s
 
 bool PageManager::IsUnwatched(uint64_t vaddr, uint64_t size) {
 	return WithUnwatched(vaddr, size, [] { return true; });
+}
+
+PageWatcherCounts PageManager::WriteWatchers(uint64_t vaddr) {
+	if (vaddr >= ADDRESS_SIZE) {
+		return {};
+	}
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return {};
+	}
+	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	return region->pages[page].WriteCounts();
+}
+
+const char* PageWatcherName(PageWatcher watcher) noexcept {
+	switch (watcher) {
+		case PageWatcher::MemoryTracker: return "memory tracker";
+		case PageWatcher::TextureImage: return "texture cache image";
+		case PageWatcher::ImageHeap: return "image heap";
+	}
+	return "unknown";
 }
 
 template <typename Action>

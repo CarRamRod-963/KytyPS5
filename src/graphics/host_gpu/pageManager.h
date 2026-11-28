@@ -10,6 +10,23 @@ namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute };
 
+// Who holds a write watch. The page manager counts the watches of each owner per page, so that
+// a page with too many watchers can be traced to its owner.
+enum class PageWatcher : uint8_t { MemoryTracker, TextureImage, ImageHeap };
+
+[[nodiscard]] const char* PageWatcherName(PageWatcher watcher) noexcept;
+
+// The write watchers of one page.
+struct PageWatcherCounts {
+	uint32_t total         = 0;
+	uint32_t texture_image = 0;
+	uint32_t image_heap    = 0;
+	// The rest of the total.
+	[[nodiscard]] uint32_t MemoryTracker() const noexcept {
+		return total - texture_image - image_heap;
+	}
+};
+
 class PageManager final {
 public:
 	PageManager();
@@ -18,8 +35,10 @@ public:
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
+	// `watcher` names the owner of write watches (ignored for read watches).
 	template <bool track, bool is_read = false>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size,
+	                        PageWatcher watcher = PageWatcher::MemoryTracker);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
@@ -31,6 +50,9 @@ public:
 	[[nodiscard]] bool TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size);
 	// Whether TryWriteUnwatched would find no watcher on the range now.
 	[[nodiscard]] bool IsUnwatched(uint64_t vaddr, uint64_t size);
+
+	// The write watchers on the page of `vaddr` now.
+	[[nodiscard]] PageWatcherCounts WriteWatchers(uint64_t vaddr);
 
 private:
 	template <typename Action>

@@ -1,3 +1,5 @@
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
@@ -6,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +38,7 @@
 namespace {
 
 using Libs::Graphics::PageManager;
+using Libs::Graphics::PageWatcher;
 using Libs::Graphics::RegionBits;
 using Libs::Graphics::TRACKER_PAGE_SIZE;
 using Libs::Graphics::TRACKER_REGION_SIZE;
@@ -579,6 +585,87 @@ void TestConcurrentSharedWatchers() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestWatcherOwners() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  Check(manager.WriteWatchers(address).total == 0,
+        "unwatched page reported watchers");
+  for (int i = 0; i < 3; i++) {
+    manager.UpdatePageWatchers<true>(address, page_size * 2,
+                                     PageWatcher::TextureImage);
+  }
+  manager.UpdatePageWatchers<true>(address + 16, 16, PageWatcher::ImageHeap);
+  manager.UpdatePageWatchers<true>(address + 32, 16, PageWatcher::ImageHeap);
+  manager.UpdatePageWatchers<true>(address, 8);
+  // Read watchers are not write watchers.
+  manager.UpdatePageWatchers<true, true>(address, 8);
+  auto counts = manager.WriteWatchers(address + 100);
+  Check(counts.total == 6 && counts.texture_image == 3 &&
+            counts.image_heap == 2 && counts.MemoryTracker() == 1,
+        "write watchers were not counted by owner");
+  counts = manager.WriteWatchers(address + page_size);
+  Check(counts.total == 3 && counts.texture_image == 3 &&
+            counts.image_heap == 0 && counts.MemoryTracker() == 0,
+        "second page counted watchers of the first");
+
+  manager.UpdatePageWatchers<false>(address, page_size * 2,
+                                    PageWatcher::TextureImage);
+  manager.UpdatePageWatchers<false>(address + 16, 16, PageWatcher::ImageHeap);
+  counts = manager.WriteWatchers(address);
+  Check(counts.total == 4 && counts.texture_image == 2 &&
+            counts.image_heap == 1 && counts.MemoryTracker() == 1,
+        "released watchers were not taken from their owner");
+
+  manager.UpdatePageWatchers<false, true>(address, 8);
+  manager.UpdatePageWatchers<false>(address, 8);
+  manager.UpdatePageWatchers<false>(address + 32, 16, PageWatcher::ImageHeap);
+  for (int i = 0; i < 2; i++) {
+    manager.UpdatePageWatchers<false>(address, page_size * 2,
+                                      PageWatcher::TextureImage);
+  }
+  counts = manager.WriteWatchers(address);
+  Check(counts.total == 0 && counts.texture_image == 0 &&
+            counts.image_heap == 0,
+        "watchers left after every owner released the page");
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "released pages stayed protected");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+std::string ReadFile(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(file),
+          std::istreambuf_iterator<char>()};
+}
+
+// The fatal message and the lines the log still buffered reach the log file.
+[[noreturn]] void RunLoggedOverflow(const char *log_file) {
+  Config::Initialize();
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::File;
+  options.printf_output_file = log_file;
+  Config::Load(options);
+  Log::Initialize();
+  Log::Write({}, "buffered before the fatal error\n");
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  for (uint32_t count = 0; count < 250; count++) {
+    manager.UpdatePageWatchers<true>(address, page_size,
+                                     PageWatcher::TextureImage);
+  }
+  for (uint32_t count = 0; count < 5; count++) {
+    manager.UpdatePageWatchers<true>(address, page_size,
+                                     PageWatcher::ImageHeap);
+  }
+  manager.UpdatePageWatchers<true>(address, page_size);
+  std::_Exit(0x7f);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -618,12 +705,15 @@ void TestConcurrentSharedWatchers() {
   std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char *name) {
+void CheckDeathCase(const char *name, const char *argument = nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
         "GetModuleFileName failed");
   std::string command = std::string("\"") + path + "\" --death " + name;
+  if (argument != nullptr) {
+    command += std::string(" \"") + argument + "\"";
+  }
   std::vector<char> mutable_command(command.begin(), command.end());
   mutable_command.push_back('\0');
   STARTUPINFOA startup{sizeof(startup)};
@@ -655,9 +745,11 @@ void CheckDeathCase(const char *name) {
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
 #if defined(__APPLE__)
-    ::execl(path.data(), "PageManagerTests", "--death", name, nullptr);
+    ::execl(path.data(), "PageManagerTests", "--death", name, argument,
+            nullptr);
 #else
-    ::execl("/proc/self/exe", "PageManagerTests", "--death", name, nullptr);
+    ::execl("/proc/self/exe", "PageManagerTests", "--death", name, argument,
+            nullptr);
 #endif
     std::_Exit(0x7e);
   }
@@ -741,6 +833,25 @@ void TestFatalPaths() {
   }
 }
 
+void TestFatalMessageReachesLogFile() {
+  const auto log_file = std::filesystem::temp_directory_path() /
+                        "kyty_page_manager_fatal_log.txt";
+  std::error_code error;
+  std::filesystem::remove(log_file, error);
+  CheckDeathCase("logged-write-overflow", log_file.string().c_str());
+  const auto text = ReadFile(log_file);
+  std::filesystem::remove(log_file, error);
+  Check(text.find("buffered before the fatal error\n") == 0,
+        "lines buffered before the fatal error were lost");
+  Check(text.find("PageManager fatal: write-watcher overflow at 0x") !=
+                std::string::npos &&
+            text.find(" (255 watchers: 250 texture cache images, 5 image "
+                      "heap, 0 memory tracker; adding: memory tracker)\n") !=
+                std::string::npos,
+        "the overflow message with its owner counts did not reach the log "
+        "file");
+}
+
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -762,6 +873,10 @@ bool TryWriteBacking(uint64_t vaddr, const void *data, uint64_t size) {
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  if (argc == 4 && std::strcmp(argv[1], "--death") == 0 &&
+      std::strcmp(argv[2], "logged-write-overflow") == 0) {
+    RunLoggedOverflow(argv[3]);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -775,7 +890,9 @@ int main(int argc, char **argv) {
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestTryWriteUnwatched();
+  TestWatcherOwners();
   TestFatalPaths();
+  TestFatalMessageReachesLogFile();
   std::puts("PageManagerTests: all cases passed");
   return 0;
 }
