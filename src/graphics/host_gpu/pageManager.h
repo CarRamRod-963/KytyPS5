@@ -27,6 +27,12 @@ struct PageWatcherCounts {
 	}
 };
 
+// The most write watchers any page had at once in this process, and the page.
+struct PageWatcherPeak {
+	uint32_t count = 0;
+	uint64_t page  = 0;
+};
+
 class PageManager final {
 public:
 	PageManager();
@@ -50,6 +56,14 @@ public:
 	[[nodiscard]] bool TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t size);
 	// Whether TryWriteUnwatched would find no watcher on the range now.
 	[[nodiscard]] bool IsUnwatched(uint64_t vaddr, uint64_t size);
+
+	// A page holds at most 255 write watchers: one more ends the process. The peak is kept for
+	// all page managers of the process (O(1) per watch) and printed with the GPU timing line;
+	// the first page to reach each of WarnWriteWatchers is reported once.
+	static constexpr uint32_t            WarnWriteWatchers[] = {128, 192, 224};
+	[[nodiscard]] static PageWatcherPeak WriteWatcherPeak() noexcept;
+	// Tests only: forgets the peak and the warnings given.
+	static void ResetWriteWatcherPeak() noexcept;
 
 	// The write watchers on the page of `vaddr` now.
 	[[nodiscard]] PageWatcherCounts WriteWatchers(uint64_t vaddr);

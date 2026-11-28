@@ -666,6 +666,78 @@ std::string ReadFile(const std::filesystem::path &path) {
   std::_Exit(0x7f);
 }
 
+void TestWriteWatcherPeak() {
+  PageManager::ResetWriteWatcherPeak();
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  for (int i = 0; i < 3; i++) {
+    manager.UpdatePageWatchers<true>(address, 16, PageWatcher::TextureImage);
+  }
+  auto peak = PageManager::WriteWatcherPeak();
+  Check(peak.count == 3 && peak.page == address,
+        "peak did not follow the first page");
+  for (int i = 0; i < 5; i++) {
+    manager.UpdatePageWatchers<true>(address + page_size + 8, 8,
+                                     PageWatcher::ImageHeap);
+  }
+  // Read watchers do not count.
+  for (int i = 0; i < 7; i++) {
+    manager.UpdatePageWatchers<true, true>(address, 8);
+  }
+  peak = PageManager::WriteWatcherPeak();
+  Check(peak.count == 5 && peak.page == address + page_size,
+        "peak did not move to the page with more write watchers");
+  for (int i = 0; i < 7; i++) {
+    manager.UpdatePageWatchers<false, true>(address, 8);
+  }
+  for (int i = 0; i < 3; i++) {
+    manager.UpdatePageWatchers<false>(address, 16, PageWatcher::TextureImage);
+  }
+  for (int i = 0; i < 5; i++) {
+    manager.UpdatePageWatchers<false>(address + page_size + 8, 8,
+                                      PageWatcher::ImageHeap);
+  }
+  peak = PageManager::WriteWatcherPeak();
+  Check(peak.count == 5 && peak.page == address + page_size,
+        "peak was lost when the watchers left");
+  PageManager::ResetWriteWatcherPeak();
+  Check(PageManager::WriteWatcherPeak().count == 0, "reset kept the peak");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Each warning level is reported once, for the first page that reaches it.
+[[noreturn]] void RunWatcherWarnings(const char *log_file) {
+  Config::Initialize();
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::File;
+  options.printf_output_file = log_file;
+  Config::Load(options);
+  Log::Initialize();
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  for (uint32_t count = 0; count < 200; count++) {
+    manager.UpdatePageWatchers<true>(address, page_size,
+                                     PageWatcher::TextureImage);
+  }
+  for (uint32_t count = 0; count < 30; count++) {
+    manager.UpdatePageWatchers<true>(address, page_size,
+                                     PageWatcher::ImageHeap);
+  }
+  for (uint32_t count = 0; count < 230; count++) {
+    manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  }
+  Log::Flush();
+  std::_Exit(PageManager::WriteWatcherPeak().count == 230 &&
+                     PageManager::WriteWatcherPeak().page == address
+                 ? 0
+                 : 1);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -705,7 +777,8 @@ std::string ReadFile(const std::filesystem::path &path) {
   std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char *name, const char *argument = nullptr) {
+void CheckDeathCase(const char *name, const char *argument = nullptr,
+                    uint32_t expected_exit = 322) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -725,10 +798,11 @@ void CheckDeathCase(const char *name, const char *argument = nullptr) {
   Check(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
         "death test timed out");
   DWORD exit_code = 0;
-  Check(
-      GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-          (exit_code == 322 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
-      "death case did not use the PageManager fatal exit");
+  Check(GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+            (exit_code == expected_exit ||
+             (expected_exit == 322 &&
+              exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION)),
+        "death case did not use the PageManager fatal exit");
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
 #else
@@ -756,8 +830,9 @@ void CheckDeathCase(const char *name, const char *argument = nullptr) {
   int status = 0;
   Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
   const bool fatal_exit =
-      WIFEXITED(status) && WEXITSTATUS(status) == (322 & 0xff);
-  const bool fatal_signal = WIFSIGNALED(status);
+      WIFEXITED(status) &&
+      static_cast<uint32_t>(WEXITSTATUS(status)) == (expected_exit & 0xff);
+  const bool fatal_signal = expected_exit == 322 && WIFSIGNALED(status);
   Check(fatal_exit || fatal_signal,
         "death case did not use the PageManager fatal exit");
 #endif
@@ -833,6 +908,35 @@ void TestFatalPaths() {
   }
 }
 
+void TestWatcherWarnings() {
+  const auto log_file = std::filesystem::temp_directory_path() /
+                        "kyty_page_manager_warning_log.txt";
+  std::error_code error;
+  std::filesystem::remove(log_file, error);
+  CheckDeathCase("watcher-warnings", log_file.string().c_str(), 0);
+  const auto text = ReadFile(log_file);
+  std::filesystem::remove(log_file, error);
+  const auto count = [&](const char *needle) {
+    size_t found = 0;
+    for (auto at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(count("PageManager: page 0x") == 3,
+        "warning levels were not reported exactly once each");
+  Check(count(" has 128 write watchers (128 texture cache images, 0 image "
+              "heap, 0 memory tracker), newest: texture cache image; the "
+              "emulator stops at 256\n") == 1 &&
+            count(" has 192 write watchers (192 texture cache images, 0 "
+                  "image heap, 0 memory tracker), newest: texture cache "
+                  "image") == 1 &&
+            count(" has 224 write watchers (200 texture cache images, 24 "
+                  "image heap, 0 memory tracker), newest: image heap") == 1,
+        "warnings did not name the page's watchers");
+}
+
 void TestFatalMessageReachesLogFile() {
   const auto log_file = std::filesystem::temp_directory_path() /
                         "kyty_page_manager_fatal_log.txt";
@@ -877,6 +981,10 @@ int main(int argc, char **argv) {
       std::strcmp(argv[2], "logged-write-overflow") == 0) {
     RunLoggedOverflow(argv[3]);
   }
+  if (argc == 4 && std::strcmp(argv[1], "--death") == 0 &&
+      std::strcmp(argv[2], "watcher-warnings") == 0) {
+    RunWatcherWarnings(argv[3]);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -891,7 +999,9 @@ int main(int argc, char **argv) {
   TestConcurrentSharedWatchers();
   TestTryWriteUnwatched();
   TestWatcherOwners();
+  TestWriteWatcherPeak();
   TestFatalPaths();
+  TestWatcherWarnings();
   TestFatalMessageReachesLogFile();
   std::puts("PageManagerTests: all cases passed");
   return 0;

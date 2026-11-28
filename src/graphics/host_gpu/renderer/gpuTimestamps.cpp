@@ -3,10 +3,13 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -319,7 +322,17 @@ void GpuTimestamps::MaybeRotate(int64_t now_ns) {
 	}
 	m_log_window.Merge(window);
 	if (m_log_window.seconds >= LOG_INTERVAL_S) {
-		LOGF("%s\n", Common::GpuTiming::FormatSummary(m_log_window).c_str());
+		auto line = Common::GpuTiming::FormatSummary(m_log_window);
+		if (m_primary) {
+			// The page manager stops the emulator past 255 write watchers on one page.
+			const auto peak = PageManager::WriteWatcherPeak();
+			char       watchers[96];
+			std::snprintf(watchers, sizeof(watchers),
+			              ", write watchers per page: peak %u (page 0x%016" PRIx64 ")", peak.count,
+			              peak.page);
+			line += watchers;
+		}
+		LOGF("%s\n", line.c_str());
 		m_log_window = {};
 	}
 	// Device and host clocks drift apart slowly; recalibrate once per window.

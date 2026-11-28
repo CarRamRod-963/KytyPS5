@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -76,6 +77,58 @@ public:
 
 private:
 	std::atomic_flag& m_lock;
+};
+
+// The write-watcher peak of the process: count << PeakCountShift | page address.
+constexpr uint32_t    PeakCountShift = 48;
+std::atomic<uint64_t> g_write_watcher_peak {0};
+constexpr size_t      WarnLevels = std::size(PageManager::WarnWriteWatchers);
+std::atomic<bool>     g_write_watcher_warned[WarnLevels] {};
+static_assert(ADDRESS_SIZE <= (1ull << PeakCountShift));
+
+void NoteWriteWatcherPeak(uint64_t page, uint32_t count) noexcept {
+	const auto packed = (static_cast<uint64_t>(count) << PeakCountShift) | page;
+	auto       peak   = g_write_watcher_peak.load(std::memory_order_relaxed);
+	while ((peak >> PeakCountShift) < count &&
+	       !g_write_watcher_peak.compare_exchange_weak(peak, packed, std::memory_order_relaxed)) {
+	}
+}
+
+// Pages that reached a warning level under a region lock; reported once the lock is released.
+class WatcherWarnings final {
+public:
+	WatcherWarnings() = default;
+	~WatcherWarnings() {
+		for (const auto& warning: m_warnings) {
+			if (warning.counts.total != 0) {
+				LOGF("PageManager: page 0x%016" PRIx64
+				     " has %u write watchers (%u texture cache images, %u image heap, %u memory "
+				     "tracker), newest: %s; the emulator stops at 256\n",
+				     warning.page, warning.counts.total, warning.counts.texture_image,
+				     warning.counts.image_heap, warning.counts.MemoryTracker(),
+				     PageWatcherName(warning.watcher));
+			}
+		}
+	}
+	KYTY_CLASS_NO_COPY(WatcherWarnings);
+
+	void Note(uint64_t page, const PageWatcherCounts& counts, PageWatcher watcher) noexcept {
+		NoteWriteWatcherPeak(page, counts.total);
+		for (size_t level = 0; level < WarnLevels; level++) {
+			if (counts.total == PageManager::WarnWriteWatchers[level] &&
+			    !g_write_watcher_warned[level].exchange(true, std::memory_order_relaxed)) {
+				m_warnings[level] = {page, counts, watcher};
+			}
+		}
+	}
+
+private:
+	struct Warning {
+		uint64_t          page = 0;
+		PageWatcherCounts counts;
+		PageWatcher       watcher = PageWatcher::MemoryTracker;
+	};
+	std::array<Warning, WarnLevels> m_warnings {};
 };
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
@@ -236,7 +289,9 @@ struct PageManager::Impl {
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask    = nullptr,
 	                          PageWatcher       watcher = PageWatcher::MemoryTracker) {
-		SpinGuard lock(region.lock);
+		// Declared before the lock, so that its warnings are logged after the lock is released.
+		WatcherWarnings warnings;
+		SpinGuard       lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
@@ -270,6 +325,12 @@ struct PageManager::Impl {
 
 			if (!update) {
 				continue;
+			}
+			if constexpr (track && !is_read) {
+				if (new_count > (g_write_watcher_peak.load(std::memory_order_relaxed) >>
+				                 PeakCountShift)) [[unlikely]] {
+					warnings.Note(address, page.WriteCounts(), watcher);
+				}
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
@@ -352,6 +413,18 @@ bool PageManager::TryWriteUnwatched(uint64_t vaddr, const void* data, uint64_t s
 
 bool PageManager::IsUnwatched(uint64_t vaddr, uint64_t size) {
 	return WithUnwatched(vaddr, size, [] { return true; });
+}
+
+PageWatcherPeak PageManager::WriteWatcherPeak() noexcept {
+	const auto peak = g_write_watcher_peak.load(std::memory_order_relaxed);
+	return {static_cast<uint32_t>(peak >> PeakCountShift), peak & ((1ull << PeakCountShift) - 1u)};
+}
+
+void PageManager::ResetWriteWatcherPeak() noexcept {
+	g_write_watcher_peak.store(0, std::memory_order_relaxed);
+	for (auto& warned: g_write_watcher_warned) {
+		warned.store(false, std::memory_order_relaxed);
+	}
 }
 
 PageWatcherCounts PageManager::WriteWatchers(uint64_t vaddr) {
